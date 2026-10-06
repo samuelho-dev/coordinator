@@ -13,13 +13,13 @@ export function serveRpc(options: {
     response.setHeader("content-type", "application/json");
     response.setHeader("cache-control", "no-store");
     try {
+      const auth = request.headers.authorization;
+      if (!auth?.startsWith("Bearer ") || auth.length > 512) throw new HttpError(401, "Credential required");
+      const principal = options.authorize(auth.slice(7));
       if (request.url === "/healthz" && request.method === "GET") {
         response.end('{"status":"ok"}'); return;
       }
       if (request.url !== "/rpc" || request.method !== "POST") throw new HttpError(404, "Not found");
-      const auth = request.headers.authorization;
-      if (!auth?.startsWith("Bearer ") || auth.length > 512) throw new HttpError(401, "Credential required");
-      const principal = options.authorize(auth.slice(7));
       const chunks: Buffer[] = []; let size = 0;
       for await (const chunk of request) {
         size += Buffer.byteLength(chunk);

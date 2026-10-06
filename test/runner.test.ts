@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { setImmediate as immediate } from "node:timers/promises";
 import { LfFrames, Runner } from "../src/runner.ts";
 import type { RunnerConfig, Work } from "../src/protocol.ts";
 
@@ -12,7 +13,6 @@ test("host JSONL uses complete strict LF frames and bounded unfinished output", 
   assert.deepEqual(frames.push(Buffer.from('{"type":"response","data":"')), []);
   assert.deepEqual(frames.push(Buffer.from('✓"}\n{"type":"agent_end"}\n')), [{ type: "response", data: "✓" }, { type: "agent_end" }]);
   frames.end();
-  assert.throws(() => new LfFrames().push(Buffer.from('{}\r\n')));
   assert.throws(() => new LfFrames().push(Buffer.from([123, 34, 120, 34, 58, 34, 255, 34, 125, 10])));
   assert.throws(() => new LfFrames().push(Buffer.alloc(4 * 1024 * 1024 + 1, 120)));
   const unfinished = new LfFrames(); unfinished.push(Buffer.from('{}')); assert.throws(() => unfinished.end());
@@ -50,5 +50,12 @@ test("SQLite acceptance is unique, complete, conflict-safe and reserves recovere
     assert.deepEqual(await runner.handle("acceptTask", { ...work, taskId: "two" }), { taskId: "two", accepted: false, state: "full", reason: "full" });
     assert.throws(() => new Runner(config), /already owned/);
     assert.deepEqual(await runner.handle("journal", { taskId: "missing" }), { taskId: "missing", accepted: false, state: "not-accepted" });
+    await runner.close(); runner = new Runner({ ...config, stateDirectory: join(root, "expired-state") });
+    await runner.handle("acceptTask", work); await runner.start(); await immediate();
+    const expired = await runner.handle("journal", { taskId: "one" });
+    assert.ok(typeof expired === "object" && expired !== null && "state" in expired); assert.equal(expired.state, "FAILED");
+    assert.equal(runner.database.prepare("SELECT pid FROM tasks WHERE taskId='one'").get()!.pid, null);
+    const next = await runner.handle("acceptTask", { ...work, taskId: "after-expiry", deadline: Date.now() + 60000 });
+    assert.ok(typeof next === "object" && next !== null && "accepted" in next); assert.equal(next.accepted, true);
   } finally { if (runner) await runner.close(); rmSync(root, { recursive: true, force: true }); }
 });

@@ -6,6 +6,11 @@ import { fileURLToPath } from "node:url";
 import { privateFile, type PluginConfig, type RunnerConfig } from "../src/protocol.js";
 
 const args = process.argv.slice(2);
+if (args.includes("--help")) {
+  console.log("pnpm install:host -- --host omp|pi --runtime /absolute/node --host-binary /absolute/omp-or-pi --plugin-config /absolute/private/plugin.json --runner-config /absolute/private/runner.json [--dry-run] [--remote SSH_ALIAS --remote-root /absolute/repository]");
+  console.log("Requires Node SQLite, installed pnpm dependencies and mode-0600 config/credential files. Uses native omp plugin link / Pi install, then Linux user systemd or macOS GUI launchd; Linux logout survival requires user lingering.");
+  process.exit(0);
+}
 const dry = args.includes("--dry-run");
 const option = (name: string): string => {
   const index = args.indexOf(name);
@@ -38,6 +43,8 @@ if (args.includes("--remote")) {
   process.exit(0);
 }
 accessSync(runtime, constants.X_OK); accessSync(binary, constants.X_OK);
+execFileSync(runtime, ["-e", "const s=require('node:sqlite'); const d=new s.DatabaseSync(':memory:');d.close();if(typeof s.backup!=='function')process.exit(1)"], { stdio: "pipe" });
+execFileSync(binary, ["--version"], { stdio: "pipe" });
 const plugin = JSON.parse(privateFile(pluginPath)) as PluginConfig;
 const runner = JSON.parse(privateFile(runnerPath)) as RunnerConfig;
 if (plugin.host !== host) throw new Error("Plugin host mismatch");

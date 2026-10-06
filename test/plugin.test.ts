@@ -4,12 +4,15 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { Schema } from "effect";
+import type { Server } from "node:http";
+import { serveRpc } from "../src/http.ts";
 import coordinator from "../src/plugin.js";
 
 test("actual extension records intent before native send and holds uncertain delivery across incarnation restart", async () => {
   const directory = mkdtempSync(join(tmpdir(), "coordinator-plugin-"));
   const previousConfig = process.env.COORDINATOR_CONFIG;
-  const previousFetch = globalThis.fetch;
+  let server: Server | undefined;
   const hooks = new Map<string, (event: unknown, context: typeof ctx) => Promise<void>>();
   const ctx = { cwd: directory, hasUI: true, isIdle: () => true, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => "native-session", getSessionFile: () => undefined },
@@ -25,15 +28,15 @@ test("actual extension records intent before native send and holds uncertain del
     const stateDirectory = join(directory, "state"); mkdirSync(stateDirectory, { mode: 0o700 });
     const tokenFile = join(directory, "token"); writeFileSync(tokenFile, "test-token", { mode: 0o600 });
     const config = join(directory, "config.json");
-    writeFileSync(config, JSON.stringify({ brokerUrl: "http://127.0.0.1:1", tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
-    process.env.COORDINATOR_CONFIG = config;
-    globalThis.fetch = async (_input, init) => {
-      const envelope = JSON.parse(String(init?.body)) as { method: string; params: { incarnation?: string } };
-      if (envelope.method === "session.heartbeat") incarnation = String(envelope.params.incarnation);
-      if (envelope.method === "task.report") reports.push(envelope.params);
+    server = await serveRpc({ host: "127.0.0.1", port: 0, authorize: token => { assert.equal(token, "test-token"); return {}; }, handle: async (_principal, method, params) => {
+      if (method === "session.heartbeat") incarnation = Schema.decodeUnknownSync(Schema.Struct({ incarnation: Schema.String }))(params).incarnation;
+      if (method === "task.report") reports.push(params);
       const address = { messageId: "message", revision: 1, sessionId: "native-session", incarnation, workerId: "native-worker", repo: "github.com/example/repo", ref: "refs/heads/main", sha, scope: "test", restrictions: "none", expectedEvidence: [], deadline: Date.now() + 60000 };
-      return new Response(JSON.stringify(envelope.method === "session.poll" ? { messages: [], offers: [], releases: [{ taskId: "task", address, readback: address, confirmedRevision: 1, disposition: "ready", request: { prompt: "Substantive task", repo: address.repo, ref: address.ref, sha } }] } : { ok: true }));
-    };
+      return method === "session.poll" ? { messages: [], offers: [], releases: [{ taskId: "task", address, readback: address, confirmedRevision: 1, disposition: "ready", request: { prompt: "Substantive task", repo: address.repo, ref: address.ref, sha } }] } : { ok: true };
+    } });
+    const listening = server.address(); assert.ok(listening && typeof listening !== "string");
+    writeFileSync(config, JSON.stringify({ brokerUrl: `http://127.0.0.1:${listening.port}`, tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
+    process.env.COORDINATOR_CONFIG = config;
     coordinator({ on: (event, handler) => { hooks.set(event, handler); }, registerCommand: () => {},
       sendUserMessage: () => { sends++; throw new Error("native delivery uncertain"); } });
     await assert.rejects(hooks.get("session_start")!({}, ctx));
@@ -42,10 +45,11 @@ test("actual extension records intent before native send and holds uncertain del
     await hooks.get("session_start")!({}, ctx);
     assert.equal(sends, 1);
     assert.equal(reports.length, 1);
-    assert.match(JSON.stringify(reports[0]), /HELD/);
+    assert.equal(Schema.decodeUnknownSync(Schema.Struct({ state: Schema.String }))(reports[0]).state, "HELD");
   } finally {
     await hooks.get("session_shutdown")?.({}, ctx);
-    globalThis.fetch = previousFetch;
+    server?.closeAllConnections();
+    if (server) { const done = Promise.withResolvers<void>(); server.close(() => done.resolve()); await done.promise; }
     if (previousConfig === undefined) delete process.env.COORDINATOR_CONFIG;
     else process.env.COORDINATOR_CONFIG = previousConfig;
     rmSync(directory, { recursive: true, force: true });

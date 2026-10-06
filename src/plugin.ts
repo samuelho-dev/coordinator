@@ -17,7 +17,7 @@ interface Host {
   registerCommand(name: string, options: { description: string; handler: (args: string, ctx: Context) => Promise<void> }): void;
   sendUserMessage(text: string, options: { deliverAs: "followUp" }): void;
 }
-interface Poll { messages: { messageId: string; incarnation: string; payload: unknown; expiresAt: number }[]; offers: Task[]; releases: Task[] }
+interface Poll { messages: { messageId: string; incarnation: string; payload: unknown; expiresAt: number }[]; offers: Task[]; releases: Task[]; archiveEnabled?: boolean }
 
 export default function coordinator(host: Host): void {
   const path = process.env.COORDINATOR_CONFIG;
@@ -50,13 +50,11 @@ export default function coordinator(host: Host): void {
       current.heartbeat = Date.now();
     }
     const poll = await call<Poll>("session.poll", { sessionId, incarnation });
+    if (poll.archiveEnabled === false && journal.state.consent) journal.erase();
     for (const message of poll.messages) {
       if (message.incarnation !== incarnation || message.expiresAt <= Date.now()) continue;
-      if (!journal.handled(`peer:${message.messageId}`)) {
-        // Notifications are receipts, never instructions inserted into model context.
-        notify(ctx, `Coordinator message ${message.messageId}; use /coordinator inbox for metadata.`);
-        journal.handle(`peer:${message.messageId}`);
-      }
+      const newlyHandled = journal.receive(message.messageId, message.payload);
+      if (newlyHandled) notify(ctx, `Coordinator message ${message.messageId}; /coordinator inbox shows the durably received content.`);
       await call("peer.ack", { sessionId, incarnation, messageId: message.messageId });
     }
     for (const offer of poll.offers) {
@@ -67,11 +65,12 @@ export default function coordinator(host: Host): void {
     for (const task of poll.releases) {
       const address = task.address;
       if (!address || task.confirmedRevision !== address.revision || task.disposition !== "ready" || !task.readback || fingerprint(task.readback) !== fingerprint(address) || address.sessionId !== sessionId || address.incarnation !== incarnation) continue;
-      if (address.deadline <= Date.now() || address.repo !== task.request.repo || address.ref !== task.request.ref || address.sha !== task.request.sha || (ctx.agent && address.workerId !== ctx.agent.id)) continue;
+      const approvedAddress = task.instruction?.address;
+      if (address.deadline <= Date.now() || address.repo !== task.request.repo || (approvedAddress ? fingerprint(address) !== fingerprint(approvedAddress) : address.ref !== task.request.ref || address.sha !== task.request.sha) || (ctx.agent && address.workerId !== ctx.agent.id)) continue;
       if (!ctx.isIdle() || ctx.hasPendingMessages()) continue;
       const actual = local(ctx);
       if (actual.repo !== address.repo || actual.ref !== address.ref || actual.sha !== address.sha) {
-        await call("task.readback", { taskId: task.taskId, address, disposition: "hold", reason: "Local repository/ref/SHA changed" });
+        await call("task.readback", { taskId: task.taskId, address, disposition: "hold", reason: "Local repository/ref/SHA changed", nextCheck: Date.now() + 60000 });
         continue;
       }
       const key = `${task.taskId}:${address.revision}`;
@@ -83,8 +82,9 @@ export default function coordinator(host: Host): void {
       }
       if (!journal.releaseIntent(key)) continue;
       // Durable intent precedes the host call. A crash/throw is held, never retried.
-      host.sendUserMessage(task.request.prompt, { deliverAs: "followUp" });
+      host.sendUserMessage(task.instruction?.prompt ?? task.request.prompt, { deliverAs: "followUp" });
       journal.releaseSent(key);
+      await call("task.report", { taskId: task.taskId, sessionId, incarnation, state: "RUNNING", result: { revision: address.revision, promptAdmitted: true, evidenceVerified: false } });
     }
     journal.scan(ctx.sessionManager.getSessionFile());
     await journal.upload((entry) => call("archive.append", { sessionId, ...entry }), 1);
@@ -158,11 +158,20 @@ export default function coordinator(host: Host): void {
       } else if (action === "address") result = await call("task.address", { taskId: data.taskId, address: decode(Address, data.address) });
       else if (action === "confirm") result = await call("task.confirm", data);
       else if (action === "handoff") result = await call("task.handoff", data);
+      else if (action === "instruction") {
+        if (!ctx.hasUI || !await ctx.ui.confirm("Approve later addressed instruction", `Approve exact message ${String(data.taskId)} and its new revision, ref, scope and restrictions? Existing native work is not retroactively gated.`)) return;
+        result = await call("task.instruction", data);
+      }
+      else if (action === "report") result = await call("task.report", { ...data, sessionId, incarnation });
+      else if (action.startsWith("evidence-")) result = await call(`evidence.${action.slice(9)}`, data);
       else if (action === "status") result = await call("task.get", data);
       else if (action === "attach") result = await call("task.attach", data);
       else if (action === "control") result = await call("task.control", data);
       else if (action === "archive") result = await call("archive.list", { ...data, sessionId });
-      else if (action === "inbox") result = await call("session.poll", { sessionId, incarnation });
+      else if (action === "inbox") {
+        if (data.clear === true) { journal.state.inbox = {}; journal.save(); result = { cleared: true }; }
+        else result = journal.state.inbox;
+      }
       else if (action === "identity") result = { sessionId, incarnation, machineId: config.machineId, ...local(ctx), workerId: ctx.agent?.id };
       else throw new Error("Use identity/inbox, submit/status, accept/decline, address/readback/confirm/handoff, hold/clarify/unable, attach/control, participant-consent/consent/optout/archive; JSON arguments required");
       // Status/readback is user-visible, not model context. Never echo credentials or arbitrary server errors.

@@ -16,6 +16,7 @@ const Terminal: Record<string, true> = { SUCCEEDED: true, FAILED: true };
 const TaskInput = Schema.Struct({ taskId: Id });
 const InspectInput = Schema.Struct({ taskId: Id, cursor: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))) });
 const CommandInput = Schema.Struct({ taskId: Id, type: Schema.Literals(["get_state", "get_messages", "abort"]) });
+const PrepareInput = Schema.Struct({ taskId: Id, address: Address });
 const ReleaseInput = Schema.Struct({ taskId: Id, address: Address, prompt: Work.fields.prompt });
 type Json = Record<string, unknown>;
 function record(value: unknown): value is Json { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -30,8 +31,8 @@ export class LfFrames {
     const frames: unknown[] = []; let start = 0;
     for (let end = bytes.indexOf(10); end !== -1; end = bytes.indexOf(10, start)) {
       if (end - start > FRAME_LIMIT) throw new Error("RPC frame overflow");
-      const line = bytes.subarray(start, end);
-      if (line.includes(13) || line.length === 0) throw new Error("Invalid LF frame");
+      const line = bytes.subarray(start, bytes[end - 1] === 13 ? end - 1 : end);
+      if (line.length === 0) throw new Error("Invalid LF frame");
       frames.push(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)));
       start = end + 1;
     }
@@ -177,6 +178,16 @@ export class Runner {
           if (type === "abort") this.state(taskId, "HELD", "operator requested abort; await host outcome");
           return this.boundedResponse(response);
         }
+        case "prepare": {
+          const input = decode(PrepareInput, params); const row = this.requireRow(input.taskId);
+          if (row.state !== "READY" || row.promptId || !row.address) throw new HttpError(409, "Corrected readback requires unprompted live owned child");
+          const prior = decode(Address, JSON.parse(row.address));
+          if (input.address.revision <= prior.revision || input.address.sessionId !== prior.sessionId || input.address.incarnation !== prior.incarnation) throw new HttpError(409, "Correction revision or child binding mismatch");
+          const actual = await this.readback(row, await this.request(row.taskId, "get_state"), input.address);
+          if (fingerprint(actual) !== fingerprint(input.address)) throw new HttpError(409, "Corrected consequential readback mismatch");
+          this.database.prepare("UPDATE tasks SET address=? WHERE taskId=? AND state='READY' AND promptId IS NULL").run(JSON.stringify(actual), row.taskId);
+          this.event(row.taskId, { type: "readback", address: actual }); return actual;
+        }
         case "release": return await this.release(decode(ReleaseInput, params));
         default: throw new HttpError(404, "Unknown method");
       }
@@ -211,6 +222,11 @@ export class Runner {
     try {
       const row = this.requireRow(taskId); if (row.state !== "ACCEPTED" || this.children.has(taskId)) return;
       const work = this.work(row); const repo = this.config.repositories[work.repo]!;
+      if (work.deadline <= Date.now()) {
+        this.state(taskId, "FAILED", "Approved deadline elapsed before launch", { launched: false, evidenceVerified: false });
+        this.database.prepare("UPDATE tasks SET occupied=0 WHERE taskId=?").run(taskId);
+        void this.heartbeat(); return;
+      }
       mkdirSync(join(this.config.stateDirectory, "worktrees"), { recursive: true, mode: 0o700 });
       const registered = git(repo, ["worktree", "list", "--porcelain"]);
       if (!registered.split("\n").includes(`worktree ${row.worktree}`)) git(repo, ["worktree", "add", "--detach", row.worktree, work.sha]);
@@ -253,7 +269,7 @@ export class Runner {
       else { this.state(taskId, "FAILED", "allowlisted checkout preparation failed"); this.database.prepare("UPDATE tasks SET occupied=0 WHERE taskId=?").run(taskId); }
     }
   }
-  private async readback(row: Row, response: Json): Promise<Address> {
+  private async readback(row: Row, response: Json, template?: Address): Promise<Address> {
     this.verifyCheckout(row);
     const work = this.work(row); const data = response.data;
     if (response.success !== true || !record(data) || typeof data.sessionId !== "string" || typeof data.sessionFile !== "string" || data.isStreaming !== false) throw new Error("Unverified durable host identity");
@@ -263,7 +279,7 @@ export class Runner {
     const cwdData = cwdResponse.data;
     if (!record(cwdData) || cwdData.exitCode !== 0 || typeof cwdData.output !== "string" || cwdData.output.trim() !== row.worktree) throw new Error("Host cwd mismatch");
     // Both actual hosts expose sessionId, not a native root worker ID; this owned child retains the approved workerId.
-    return decode(Address, { messageId: row.taskId, revision: 1, workerId: work.workerId, sessionId: data.sessionId,
+    return decode(Address, { messageId: template?.messageId ?? row.taskId, revision: template?.revision ?? 1, workerId: work.workerId, sessionId: data.sessionId,
       incarnation: row.incarnation, repo: inspectedRepo(row.worktree), ref: work.ref, sha: git(row.worktree, ["rev-parse", "HEAD"]),
       scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline });
   }
@@ -308,7 +324,7 @@ export class Runner {
         if (value.status !== "completed") child.failed = true;
         if (value.sessionSettled === true) void this.finish(taskId, child);
       } else if (value.type === "session_settled" && child.started) void this.finish(taskId, child);
-    } else if (value.type === "agent_end" && child.started) void this.finish(taskId, child);
+    } else if ((value.type === "agent_end" || value.type === "agent_settled") && child.started) void this.finish(taskId, child);
   }
   private async finish(taskId: string, child: Child): Promise<void> {
     if (child.completing || child.lost) return; child.completing = true;
@@ -329,8 +345,9 @@ export class Runner {
       throw new HttpError(409, "Prompt delivery uncertain; never replay");
     }
     if (row.state !== "READY") throw new HttpError(409, "Child not ready");
-    const response = await this.request(row.taskId, "get_state"); const actual = await this.readback(this.requireRow(row.taskId), response);
+    const response = await this.request(row.taskId, "get_state"); const actual = await this.readback(this.requireRow(row.taskId), response, decode(Address, JSON.parse(row.address)));
     if (fingerprint(actual) !== fingerprint(input.address)) throw new HttpError(409, "Actual child address changed");
+    if (input.address.deadline <= Date.now()) throw new HttpError(409, "Approved prompt deadline elapsed");
     const promptId = randomUUID();
     const changed = this.database.prepare("UPDATE tasks SET state='PROMPT_INTENT',promptId=? WHERE taskId=? AND state='READY' AND promptId IS NULL").run(promptId, row.taskId);
     if (changed.changes !== 1) throw new HttpError(409, "Prompt already reserved");
