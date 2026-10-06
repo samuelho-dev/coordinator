@@ -162,7 +162,7 @@ test("kernel ownership loss interrupts blocked startup before recovery can overw
   // Attach rejection handling before killing the actual flock helper.
   const outcome = starting.then(() => undefined, (error: unknown) => error);
   try {
-    await f.run(Deferred.await(reached));
+    await Promise.race([f.run(Deferred.await(reached).pipe(Effect.timeout("15 seconds"))), starting]);
     assert.ok(ownership);
     await f.run(ownership.kill());
     await f.run(ownership.exitCode.pipe(Effect.ignore));
