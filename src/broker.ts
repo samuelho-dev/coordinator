@@ -160,16 +160,23 @@ export class Broker {
       const candidate = [...this.runners.values()].find((r) => r.owner === task.owner && r.liveUntil > Date.now() && r.load < r.slots && this.config.principals.some((p) => p.id === r.runnerId && p.repos.includes(task.request.repo) && p.runnerUrl));
       if (!candidate) { await delay(500); continue; }
       const principal = this.config.principals.find((p) => p.id === candidate.runnerId)!;
+      delete task.peerSession; delete task.peerIncarnation; delete task.offerExpires;
+      delete task.address; delete task.readback; delete task.confirmedRevision;
       task.state = "ASSIGNING"; task.runnerId = principal.id; this.save(task);
       candidate.load++;
       try {
         const result = decode(AcceptanceResponse, await rpc(principal.runnerUrl!, this.runnerToken(principal), "acceptTask", task.request, 15000));
         if (result.taskId !== id) throw new HttpError(409, "Runner acceptance task mismatch");
         const current = this.tasks().find((t) => t.taskId === id)!;
+        if (current.runnerId !== principal.id || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
         if (result.accepted) { if (current.state === "ASSIGNING") current.state = "ACCEPTED"; this.save(current); return; }
         if (result.reason === "full" || result.state === "not-accepted") { current.state = "QUEUED"; delete current.runnerId; this.save(current); }
         else { current.state = "HELD"; current.reason = result.reason ?? "Runner declined unsafe material"; this.save(current); }
-      } catch { const current = this.tasks().find((t) => t.taskId === id)!; current.state = "HELD"; current.reason = "Runner acceptance unknown; reassignment blocked"; this.save(current); }
+      } catch {
+        const current = this.tasks().find((t) => t.taskId === id)!;
+        if (current.runnerId !== principal.id || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
+        current.state = "HELD"; current.reason = "Runner acceptance unknown; reassignment blocked"; this.save(current);
+      }
       await delay(500);
     }
     throw new Error("Broker stopping before queue acknowledgement");
@@ -203,7 +210,8 @@ export class Broker {
       const result: { messages: Delivery[]; offers: Task[]; releases: Task[]; archiveEnabled: boolean } = { messages: [], offers: [], releases: [], archiveEnabled: Boolean(this.db.prepare("SELECT enabled FROM consents WHERE owner=? AND session=?").get(principal.owner, input.sessionId)?.enabled) };
       for (const message of messages) { const next = { ...result, messages: [...result.messages, message] }; if (Buffer.byteLength(JSON.stringify(next)) < 60000) result.messages.push(message); }
       for (const task of bound) {
-        const key = task.offerDecision === "pending" && (task.offerExpires ?? 0) > Date.now() ? "offers" : task.address && task.confirmedRevision === task.address.revision && task.disposition === "ready" && task.state === "ACCEPTED" ? "releases" : undefined;
+        const key = !task.runnerId && task.offerDecision === "pending" && (task.offerExpires ?? 0) > Date.now() ? "offers"
+          : !task.runnerId && task.offerDecision === "accepted" && task.address && session.workerId === task.address.workerId && session.repo === task.address.repo && task.address.deadline > Date.now() && task.confirmedRevision === task.address.revision && task.disposition === "ready" && task.state === "ACCEPTED" ? "releases" : undefined;
         if (key && Buffer.byteLength(JSON.stringify({ ...result, [key]: [...result[key], task] })) < 60000) result[key].push(task);
       }
       return result;
@@ -272,7 +280,7 @@ export class Broker {
       if (task.runnerId) throw new HttpError(409, "Durably accepted launch material is immutable; later native instructions require a reconciled handoff");
       if (task.offerDecision !== "accepted") throw new HttpError(409, "Native peer must explicitly accept before later instructions");
       if (task.confirmedRevision !== undefined && !["SUCCEEDED", "FAILED"].includes(task.state)) throw new HttpError(409, "Prior native release is live or uncertain; reconcile before another instruction");
-      if (!task.address || input.address.revision <= task.address.revision || input.address.messageId === task.address.messageId || input.address.repo !== task.request.repo || input.address.workerId !== task.request.workerId || input.address.sessionId !== task.peerSession || input.address.incarnation !== task.peerIncarnation || input.address.deadline <= Date.now()) throw new HttpError(409, "New approved message/revision and exact current recipient required");
+      if (!task.address || input.address.revision <= task.address.revision || input.address.messageId === task.address.messageId || input.address.repo !== task.request.repo || input.address.workerId !== task.address.workerId || input.address.sessionId !== task.peerSession || input.address.incarnation !== task.peerIncarnation || input.address.deadline <= Date.now()) throw new HttpError(409, "New approved message/revision and exact current recipient required");
       this.recipient(principal, input.address);
       task.instruction = { prompt: input.prompt, address: input.address }; task.address = input.address;
       delete task.readback; delete task.confirmedRevision; task.disposition = "hold"; task.reason = "Later instruction awaits new readback"; task.state = "ACCEPTED";
@@ -281,12 +289,17 @@ export class Broker {
     }
     if (method === "task.address") {
       this.role(principal, "coordinator"); const input = decode(Schema.Struct({ taskId: Id, address: Address }), params); const task = this.task(principal, input.taskId); const approved = task.instruction?.address ?? task.request;
-      if (input.address.repo !== approved.repo || input.address.sha !== approved.sha || input.address.ref !== approved.ref || input.address.workerId !== approved.workerId) throw new HttpError(409, "Address does not match approved repo/ref/SHA/worker");
+      if (!task.runnerId) {
+        if (task.offerDecision !== "accepted" || !task.peerSession || !task.peerIncarnation) throw new HttpError(409, "Native address requires accepted peer ownership");
+        const recipient = this.recipient(principal, input.address);
+        if (recipient.workerId !== input.address.workerId || recipient.repo !== input.address.repo) throw new HttpError(409, "Native recipient worker/repository binding changed");
+      }
+      if (input.address.repo !== approved.repo || input.address.sha !== approved.sha || input.address.ref !== approved.ref || input.address.workerId !== (task.address?.workerId ?? approved.workerId)) throw new HttpError(409, "Address does not match approved repo/ref/SHA/current worker");
       if (input.address.scope !== approved.scope || input.address.restrictions !== approved.restrictions || !exact(input.address.expectedEvidence, approved.expectedEvidence) || input.address.deadline !== approved.deadline) throw new HttpError(409, "Address must preserve approved consequential details");
       if (input.address.revision <= (task.address?.revision ?? 0)) { if (exact(input.address, task.address)) return task; throw new HttpError(409, "Address revision must increase"); }
       if (task.confirmedRevision !== undefined && !["SUCCEEDED", "FAILED"].includes(task.state)) throw new HttpError(409, "Confirmed release cannot be reset; reconcile its result first");
       if (task.runnerId && task.address && (input.address.sessionId !== task.address.sessionId || input.address.incarnation !== task.address.incarnation)) throw new HttpError(409, "Use reconciled handoff for a new session");
-      if (task.peerSession && (input.address.sessionId !== task.peerSession || input.address.incarnation !== task.peerIncarnation)) throw new HttpError(409, "Peer address mismatch");
+      if (!task.runnerId && task.peerSession && (input.address.sessionId !== task.peerSession || input.address.incarnation !== task.peerIncarnation)) throw new HttpError(409, "Peer address mismatch");
       task.address = input.address; delete task.readback; delete task.confirmedRevision; task.disposition = "hold"; task.reason = "Awaiting matching readback";
       if (task.instruction) task.instruction.address = input.address;
       this.save(task);
@@ -301,7 +314,8 @@ export class Broker {
     }
     if (method === "task.readback") {
       this.role(principal, "session"); const input = decode(Schema.Struct({ taskId: Id, address: Address, disposition: Schema.Literals(["ready", "unable", "clarify", "hold"]), reason: Schema.optional(Text), nextCheck: Schema.optional(Schema.Number) }), params); const task = this.task(principal, input.taskId);
-      this.session(principal, input.address);
+      const session = this.session(principal, input.address);
+      if (task.runnerId || task.offerDecision !== "accepted" || session.workerId !== input.address.workerId || session.repo !== input.address.repo) throw new HttpError(409, "Native readback requires accepted bound peer ownership, never runner-owned work");
       if (task.peerSession !== input.address.sessionId || task.peerIncarnation !== input.address.incarnation) throw new HttpError(403, "Task/session binding mismatch");
       if (!task.address || !exact(task.address, input.address)) throw new HttpError(409, "Readback mismatch; correct address and read back again");
       if (task.confirmedRevision !== undefined) { if (input.disposition === "ready" && exact(task.readback, input.address)) return task; throw new HttpError(409, "Confirmed release cannot be reset by readback"); }
@@ -311,6 +325,11 @@ export class Broker {
     }
     if (method === "task.confirm") {
       this.role(principal, "coordinator"); const input = decode(Schema.Struct({ taskId: Id, revision: Schema.Int }), params); const task = this.task(principal, input.taskId);
+      if (!task.runnerId) {
+        if (task.offerDecision !== "accepted" || !task.address || task.peerSession !== task.address.sessionId || task.peerIncarnation !== task.address.incarnation) throw new HttpError(409, "Native confirmation requires accepted peer ownership");
+        const recipient = this.recipient(principal, task.address);
+        if (recipient.workerId !== task.address.workerId || recipient.repo !== task.address.repo) throw new HttpError(409, "Native confirmation worker/repository binding changed");
+      }
       if (!task.address || task.address.revision !== input.revision || !task.readback || !exact(task.address, task.readback) || task.disposition !== "ready" || task.address.deadline <= Date.now()) throw new HttpError(409, "Confirmation requires current ready matching readback before deadline");
       if (task.confirmedRevision === input.revision) return task;
       task.confirmedRevision = input.revision; this.save(task);
@@ -339,8 +358,8 @@ export class Broker {
         if (journal.accepted ? !["SUCCEEDED", "FAILED"].includes(journal.state ?? "") : journal.state !== "not-accepted") throw new HttpError(409, "Old runner acceptance remains live or uncertain; handoff blocked");
         task.reconciledRunner = { runnerId: task.runnerId, state: journal.state!, observedAt: Date.now() };
       }
-      const recipient = this.recipient(principal, { sessionId: input.newSessionId, incarnation: input.newIncarnation }); if (recipient.repo !== task.request.repo || recipient.workerId !== task.request.workerId) throw new HttpError(409, "Handoff repo/worker binding mismatch");
-      task.peerSession = input.newSessionId; task.peerIncarnation = input.newIncarnation; task.address = { ...task.address, sessionId: input.newSessionId, incarnation: input.newIncarnation, revision: input.revision };
+      const recipient = this.recipient(principal, { sessionId: input.newSessionId, incarnation: input.newIncarnation }); if (recipient.repo !== task.request.repo || !recipient.workerId) throw new HttpError(409, "Handoff requires verified repo and actual native worker binding");
+      task.peerSession = input.newSessionId; task.peerIncarnation = input.newIncarnation; task.address = { ...task.address, workerId: recipient.workerId, sessionId: input.newSessionId, incarnation: input.newIncarnation, revision: input.revision };
       delete task.runnerId; delete task.instruction; delete task.readback; delete task.confirmedRevision;
       task.offerDecision = "accepted";
       task.disposition = "hold"; task.reason = "Handoff requires new readback"; this.save(task); return task;
@@ -360,7 +379,7 @@ export class Broker {
       this.role(principal, "runner"); const input = decode(Schema.Struct({ runnerId: Id, taskId: Id, address: Address }), params); const task = this.task(principal, input.taskId);
       if (input.runnerId !== principal.id || task.runnerId !== principal.id) throw new HttpError(403, "Assigned runner mismatch");
       const address = input.address;
-      if (address.repo !== task.request.repo || address.ref !== task.request.ref || address.sha !== task.request.sha || address.workerId !== task.request.workerId || address.scope !== task.request.scope || address.restrictions !== task.request.restrictions || !exact(address.expectedEvidence, task.request.expectedEvidence) || address.deadline !== task.request.deadline) throw new HttpError(409, "Runner readback mismatch");
+      if (address.repo !== task.request.repo || address.ref !== task.request.ref || address.sha !== task.request.sha || address.workerId !== address.sessionId || address.scope !== task.request.scope || address.restrictions !== task.request.restrictions || !exact(address.expectedEvidence, task.request.expectedEvidence) || address.deadline !== task.request.deadline) throw new HttpError(409, "Runner readback must bind its actual native session and approved work");
       if (task.address && !exact(task.address, address)) throw new HttpError(409, "Child binding/revision mismatch");
       task.address = address; task.readback = address; task.disposition = "ready";
       if (task.state === "ASSIGNING" || task.state === "QUEUED") task.state = "ACCEPTED";

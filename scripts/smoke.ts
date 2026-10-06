@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer } from "node:net";
@@ -10,10 +10,70 @@ import { DatabaseSync } from "node:sqlite";
 import { digest, fingerprint, rpc, type BrokerConfig, type RunnerConfig, type Task, type Work, type Acceptance, type Address } from "../src/protocol.ts";
 import { inspectGithubRepository } from "../src/evidence.ts";
 import { HttpError, serveRpc } from "../src/http.ts";
+import { CHILD_UID_BASE, LfFrames, requireIsolation, isolationArgs, childEnvironment, ownChildDirectory } from "../src/runner.ts";
+
+if (process.argv.includes("--runner-isolation-only")) {
+  const directory = mkdtempSync(join(tmpdir(), "coordinator-isolation-")); chmodSync(directory, 0o711);
+  const credentials = join(directory, "credentials"), children = join(directory, "children"), model = join(directory, "model");
+  const ownRoot = join(children, "own"), sibling = join(children, "sibling");
+  const own = join(ownRoot, "repo"), sessions = join(ownRoot, "sessions"), home = join(ownRoot, "home");
+  for (const path of [credentials, children, model, ownRoot, own, sessions, home, sibling]) mkdirSync(path, { mode: 0o700 });
+  const token = join(credentials, "runner.token"), controlPath = join(credentials, "control.token"), ledger = join(directory, "runner.sqlite");
+  for (const path of [token, controlPath, ledger, join(sibling, "private")]) writeFileSync(path, "ISOLATION_SECRET", { mode: 0o600 });
+  mkdirSync(join(home, ".omp/agent"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, ".omp/agent/config.yml"), JSON.stringify({ modelRoles: { default: process.env.COORDINATOR_MODEL ?? "openai-codex/gpt-6.1-sol:xhigh" } }), { mode: 0o600 });
+  const launcher = process.env.COORDINATOR_TEST_OMP ?? "/usr/local/bin/omp";
+  const config: RunnerConfig = { id: "isolation-probe", brokerUrl: "http://127.0.0.1", tokenFile: token, controlTokenHash: digest("control"),
+    stateDirectory: join(directory, "state"), host: "127.0.0.1", port: 0, slots: 1, repositories: {}, launchers: { omp: launcher },
+    modelDirectory: model, childDirectory: children, childUidBase: CHILD_UID_BASE };
+  requireIsolation(config);
+  ownChildDirectory(ownRoot, CHILD_UID_BASE + 1); ownChildDirectory(sibling, CHILD_UID_BASE + 2);
+  const child = spawn("/usr/bin/setpriv", [...isolationArgs(CHILD_UID_BASE + 1), launcher, "--mode", "rpc", "--session-dir", sessions, "--no-extensions"],
+    { cwd: own, env: childEnvironment(home), stdio: ["pipe", "pipe", "pipe"] });
+  const frames = new LfFrames(), pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
+  const timer = setTimeout(() => { for (const request of pending.values()) request.reject(new Error("Native isolation probe timeout")); child.kill("SIGKILL"); }, 60000);
+  child.stderr.on("data", () => {});
+  child.stdout.on("data", (chunk: Buffer) => {
+    for (const frame of frames.push(chunk)) {
+      if (typeof frame === "object" && frame !== null && "id" in frame && typeof frame.id === "string") {
+        const request = pending.get(frame.id); if (request) { request.resolve(frame as Record<string, unknown>); pending.delete(frame.id); }
+      }
+    }
+  });
+  child.on("error", (error) => { for (const request of pending.values()) request.reject(error); });
+  child.on("close", () => { for (const request of pending.values()) request.reject(new Error("Native isolation probe exited")); });
+  const request = (type: string, message?: string) => {
+    const id = randomUUID(), result = Promise.withResolvers<Record<string, unknown>>();
+    pending.set(id, result); child.stdin.write(`${JSON.stringify({ id, type, ...(message ? type === "bash" ? { command: message } : { message } : {}) })}\n`); return result.promise;
+  };
+  try {
+    assert.equal((await request("get_state")).success, true);
+    assert.equal((await request("get_messages")).success, true);
+    const quote = (path: string) => `'${path.replace(/'/g, "'\\''")}'`;
+    const denied = [token, controlPath, ledger, join(sibling, "private"), `/proc/${process.pid}/environ`];
+    const command = `set -eu; ${denied.map((path) => `if cat ${quote(path)} >/dev/null 2>&1; then exit 41; fi`).join("; ")}; ` +
+      `test -z "\${GITHUB_PAT-}\${GITHUB_TOKEN-}\${GH_TOKEN-}\${OP_SERVICE_ACCOUNT_TOKEN-}\${COORDINATOR_CONFIG-}"; ` +
+      `test "$(id -u)" = "${CHILD_UID_BASE + 1}"; test "$PWD" = ${quote(own)}; ` +
+      `touch approved-write; test -r "$HOME/.omp/agent/config.yml"; touch ${quote(join(sessions, "approved-session-write"))}; ` +
+      `/usr/local/bin/node -e "const s=Object.fromEntries(require('node:fs').readFileSync('/proc/self/status','utf8').split(String.fromCharCode(10)).map(l=>l.split(':').map(v=>v.trim())));if(s.Groups!==''||['CapInh','CapPrm','CapEff','CapBnd','CapAmb'].some(k=>s[k]!=='0000000000000000')||s.NoNewPrivs!=='1')process.exit(42)"; printf ISOLATION_OK`;
+    const response = await request("bash", command);
+    assert.equal(response.success, true);
+    assert.ok(typeof response.data === "object" && response.data !== null && "exitCode" in response.data && response.data.exitCode === 0);
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Supervisor could not terminate its different-UID native child")), 3000);
+      child.once("close", () => { clearTimeout(timeout); resolve(); });
+      if (!child.kill("SIGKILL")) { clearTimeout(timeout); reject(new Error("Supervisor signal denied")); }
+    });
+    console.log(JSON.stringify({ scenario: "real-native-os-isolation", childUid: CHILD_UID_BASE + 1, forbiddenPathsDenied: denied.length,
+      ownWorkspaceAndSessionWritable: true, modelProfileReadable: true, parentEnvironDenied: true, siblingUidDistinct: true,
+      capabilitiesZero: true, supplementalGroupsEmpty: true, noNewPrivileges: true, nativeStateAndMessagesUsable: true, forbiddenEnvironmentAbsent: true, supervisorTerminationProved: true }));
+  } finally { clearTimeout(timer); child.kill("SIGKILL"); rmSync(directory, { recursive: true, force: true }); }
+  process.exit(0);
+}
 
 const root = resolve(import.meta.dirname, "..");
 const state = process.env.COORDINATOR_SMOKE_DIRECTORY ?? mkdtempSync(join(tmpdir(), "coordinator-sockets-"));
-mkdirSync(state, { recursive: true, mode: 0o700 }); chmodSync(state, 0o700);
+mkdirSync(state, { recursive: true, mode: 0o711 }); chmodSync(state, 0o711);
 const repo = "github.com/samuelho-dev/coordinator";
 const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 const identity = await inspectGithubRepository(repo, process.env.GH_TOKEN ?? execFileSync("gh", ["auth", "token"], { encoding: "utf8" }).trim());
@@ -21,9 +81,9 @@ const secret = () => randomBytes(32).toString("hex");
 const coordinator = secret(), recipient = secret(), runnerToken = secret(), runnerControl = secret(), reviewer = secret(), writer = secret(), outsider = secret();
 const tokenDirectory = join(state, "tokens"); mkdirSync(tokenDirectory, { mode: 0o700 });
 writeFileSync(join(tokenDirectory, "homelab-runner"), runnerControl, { mode: 0o600 });
-const runnerEnrollmentPath = join(state, "runner-enrollment.token"); writeFileSync(runnerEnrollmentPath, runnerToken, { mode: 0o600 });
+const runnerEnrollmentPath = join(tokenDirectory, "runner-enrollment.token"); writeFileSync(runnerEnrollmentPath, runnerToken, { mode: 0o600 });
 const alternateToken = secret(), alternateControl = secret();
-const alternateEnrollmentPath = join(state, "alternate-enrollment.token"); writeFileSync(alternateEnrollmentPath, alternateToken, { mode: 0o600 });
+const alternateEnrollmentPath = join(tokenDirectory, "alternate-enrollment.token"); writeFileSync(alternateEnrollmentPath, alternateToken, { mode: 0o600 });
 writeFileSync(join(tokenDirectory, "alternate-runner"), alternateControl, { mode: 0o600 });
 async function port(): Promise<number> {
   const server = createServer(); const ready = Promise.withResolvers<number>();
@@ -46,10 +106,11 @@ const brokerConfig: BrokerConfig = { database: join(state, "broker", "ledger.sql
   ] };
 const launcher = process.env.COORDINATOR_TEST_OMP ?? "/home/admin/.bun/bin/omp";
 const runnerConfig: RunnerConfig = { id: "homelab-runner", brokerUrl, tokenFile: runnerEnrollmentPath, host: "127.0.0.1", port: runnerPort,
-  stateDirectory: join(state, "runner"), slots: 1, repositories: { [repo]: root }, launchers: { omp: launcher }, controlTokenHash: digest(runnerControl) };
+  stateDirectory: join(state, "runner"), slots: 1, repositories: { [repo]: root }, launchers: { omp: launcher }, controlTokenHash: digest(runnerControl),
+  modelDirectory: process.env.COORDINATOR_MODEL_DIRECTORY ?? "/work/home", childDirectory: join(state, "children"), childUidBase: 1000000 };
 const brokerPath = join(state, "broker.json"), runnerPath = join(state, "runner.json");
 writeFileSync(brokerPath, JSON.stringify(brokerConfig), { mode: 0o600 }); writeFileSync(runnerPath, JSON.stringify(runnerConfig), { mode: 0o600 });
-const alternateConfig: RunnerConfig = { ...runnerConfig, id: "alternate-runner", port: alternatePort, tokenFile: alternateEnrollmentPath, stateDirectory: join(state, "alternate-runner"), controlTokenHash: digest(alternateControl) };
+const alternateConfig: RunnerConfig = { ...runnerConfig, id: "alternate-runner", port: alternatePort, tokenFile: alternateEnrollmentPath, stateDirectory: join(state, "alternate-runner"), childDirectory: join(state, "alternate-children"), childUidBase: 2000000, controlTokenHash: digest(alternateControl) };
 const alternatePath = join(state, "alternate.json"); writeFileSync(alternatePath, JSON.stringify(alternateConfig), { mode: 0o600 });
 const transcript: { scenario: string; observed: unknown; time: string }[] = [];
 function evidence(scenario: string, observed: unknown): void { transcript.push({ scenario, observed, time: new Date().toISOString() }); console.log(JSON.stringify({ scenario, observed })); }

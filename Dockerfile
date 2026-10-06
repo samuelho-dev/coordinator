@@ -1,5 +1,5 @@
 FROM node:24-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git util-linux && rm -rf /var/lib/apt/lists/*
 RUN npm install --global pnpm@11.9.0
 RUN curl --fail --silent --show-error --location https://github.com/can1357/oh-my-pi/releases/download/v18.6.1/omp-linux-x64 --output /usr/local/bin/omp \
     && echo 'c92a6846d02984e84f07c6362d18add3783f528f494ffcf1e0f26e594f327463  /usr/local/bin/omp' | sha256sum --check \
