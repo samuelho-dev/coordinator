@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { setImmediate as immediate } from "node:timers/promises";
 import { LfFrames, Runner } from "../src/runner.ts";
 import { Broker } from "../src/broker.ts";
@@ -56,6 +57,11 @@ test("host JSONL accepts LF and CRLF, rejects invalid UTF-8 and bounded unfinish
 test("real broker-bound SQLite acceptance is unique, conflict-safe and reserves uncertain capacity", async () => {
   const f = await fixture(); let runner: Runner | undefined;
   try {
+    mkdirSync(f.config.stateDirectory, { mode: 0o700 });
+    const legacy = new DatabaseSync(join(f.config.stateDirectory, "runner.sqlite"));
+    legacy.exec("CREATE TABLE owner (id INTEGER PRIMARY KEY, pid INTEGER)");
+    legacy.prepare("INSERT INTO owner(id,pid) VALUES (1,?)").run(process.pid);
+    legacy.close();
     runner = new Runner(f.config);
     const call = (method: string, params: unknown) => runner!.handle(method, params, control);
     const first = await call("acceptTask", f.work);

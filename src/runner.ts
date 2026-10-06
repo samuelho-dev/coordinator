@@ -1,7 +1,7 @@
 import { Schema } from "effect";
 import { DatabaseSync } from "node:sqlite";
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, mkdirSync, realpathSync, statSync, accessSync, constants, existsSync, cpSync, readdirSync, lchownSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, statSync, accessSync, constants, existsSync, cpSync, readdirSync, lchownSync, openSync, closeSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -111,6 +111,7 @@ export class Runner {
   readonly config: RunnerConfig;
   readonly database: DatabaseSync;
   private readonly token: string;
+  private readonly journalLock: number;
   private readonly children = new Map<string, Child>();
   private readonly admissions = new Map<string, { fingerprint: string; promise: Promise<Acceptance> }>();
   private server?: Server;
@@ -139,49 +140,45 @@ export class Runner {
       accessSync(path, constants.X_OK);
     }
     const dbPath = join(input.stateDirectory, "runner.sqlite");
-    this.database = new DatabaseSync(dbPath);
-    chmodSync(dbPath, 0o600);
-    this.database.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS tasks (taskId TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, work TEXT NOT NULL,
-        worktree TEXT NOT NULL, state TEXT NOT NULL, occupied INTEGER NOT NULL, pid INTEGER,
-        incarnation TEXT NOT NULL, address TEXT, promptId TEXT, reason TEXT, result TEXT, detached INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL, payload TEXT NOT NULL);
-      CREATE INDEX IF NOT EXISTS events_task ON events(taskId,seq);
-      CREATE TABLE IF NOT EXISTS owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER);
-      INSERT OR IGNORE INTO owner(id,pid) VALUES (1,NULL);`);
-    this.database.exec("BEGIN IMMEDIATE");
+    this.journalLock = openSync(join(input.stateDirectory, "runner.lock"), "a", 0o600);
+    let database: DatabaseSync | undefined;
     try {
-      const owner = this.database.prepare("SELECT pid FROM owner WHERE id=1").get()!.pid;
-      if (typeof owner === "number") {
-        try { process.kill(owner, 0); throw new Error("Runner journal already owned"); }
-        catch (error) { if (!record(error) || error.code !== "ESRCH") throw error; }
+      // flock locks the shared open-file description; this parent FD keeps it held after the helper exits.
+      try { execFileSync("/usr/bin/flock", ["--exclusive", "--nonblock", "3"], { stdio: ["ignore", "ignore", "ignore", this.journalLock], env: {}, timeout: 10000 }); }
+      catch { throw new Error("Runner journal already owned or OS ownership lock unavailable"); }
+      this.database = database = new DatabaseSync(dbPath);
+      chmodSync(dbPath, 0o600);
+      this.database.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+        CREATE TABLE IF NOT EXISTS tasks (taskId TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, work TEXT NOT NULL,
+          worktree TEXT NOT NULL, state TEXT NOT NULL, occupied INTEGER NOT NULL, pid INTEGER,
+          incarnation TEXT NOT NULL, address TEXT, promptId TEXT, reason TEXT, result TEXT, detached INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL, payload TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS events_task ON events(taskId,seq);
+        DROP TABLE IF EXISTS owner;`);
+      if (!this.database.prepare("PRAGMA table_info(tasks)").all().some((column) => column.name === "detached")) this.database.exec("ALTER TABLE tasks ADD COLUMN detached INTEGER NOT NULL DEFAULT 0");
+      this.database.exec("PRAGMA secure_delete=ON");
+      if (this.database.prepare("PRAGMA user_version").get()?.user_version === 0) {
+        // One-time scrub of legacy raw journals, including deleted SQLite/WAL pages.
+        this.database.prepare("UPDATE tasks SET reason='historical diagnostic omitted' WHERE reason IS NOT NULL").run();
+        for (const event of this.database.prepare("SELECT seq,payload FROM events").all()) {
+          if (typeof event.seq !== "number") throw new Error("Invalid journal event identity");
+          this.database.prepare("UPDATE events SET payload=? WHERE seq=?").run(JSON.stringify(this.eventMetadata(JSON.parse(String(event.payload)))), event.seq);
+        }
+        for (const row of this.database.prepare("SELECT taskId,result FROM tasks WHERE result IS NOT NULL").all()) {
+          if (typeof row.taskId !== "string") throw new Error("Invalid journal task identity");
+          this.database.prepare("UPDATE tasks SET result=? WHERE taskId=?").run(JSON.stringify(this.resultMetadata(JSON.parse(String(row.result)))), row.taskId);
+        }
+        this.database.exec("VACUUM; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA user_version=1");
       }
-      this.database.prepare("UPDATE owner SET pid=? WHERE id=1").run(process.pid);
-      this.database.exec("COMMIT");
-    } catch (error) { this.database.exec("ROLLBACK"); this.database.close(); throw error; }
-    if (!this.database.prepare("PRAGMA table_info(tasks)").all().some((column) => column.name === "detached")) this.database.exec("ALTER TABLE tasks ADD COLUMN detached INTEGER NOT NULL DEFAULT 0");
-    this.database.exec("PRAGMA secure_delete=ON");
-    if (this.database.prepare("PRAGMA user_version").get()?.user_version === 0) {
-      // One-time scrub of legacy raw journals, including deleted SQLite/WAL pages.
-      this.database.prepare("UPDATE tasks SET reason='historical diagnostic omitted' WHERE reason IS NOT NULL").run();
-      for (const event of this.database.prepare("SELECT seq,payload FROM events").all()) {
-        if (typeof event.seq !== "number") throw new Error("Invalid journal event identity");
-        this.database.prepare("UPDATE events SET payload=? WHERE seq=?").run(JSON.stringify(this.eventMetadata(JSON.parse(String(event.payload)))), event.seq);
+      // ponytail: no stdio reattachment exists; uncertain owned children reserve their slot until operator reconciliation.
+      this.database.prepare("UPDATE tasks SET state='HELD',reason='restart: launch or prompt outcome unknown' WHERE occupied=1 AND state!='ACCEPTED'").run();
+      for (const row of this.database.prepare("SELECT ?+rowid AS childUid,* FROM tasks WHERE occupied=1 AND pid IS NOT NULL").all(this.config.childUidBase) as unknown as Row[]) {
+        try { process.kill(row.pid!, 0); }
+        catch (error) {
+          if (record(error) && error.code === "ESRCH") this.database.prepare("UPDATE tasks SET occupied=0,reason='restart: child gone; outcome remains unknown' WHERE taskId=?").run(row.taskId);
+        }
       }
-      for (const row of this.database.prepare("SELECT taskId,result FROM tasks WHERE result IS NOT NULL").all()) {
-        if (typeof row.taskId !== "string") throw new Error("Invalid journal task identity");
-        this.database.prepare("UPDATE tasks SET result=? WHERE taskId=?").run(JSON.stringify(this.resultMetadata(JSON.parse(String(row.result)))), row.taskId);
-      }
-      this.database.exec("VACUUM; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA user_version=1");
-    }
-    // ponytail: no stdio reattachment exists; uncertain owned children reserve their slot until operator reconciliation.
-    this.database.prepare("UPDATE tasks SET state='HELD',reason='restart: launch or prompt outcome unknown' WHERE occupied=1 AND state!='ACCEPTED'").run();
-    for (const row of this.database.prepare("SELECT ?+rowid AS childUid,* FROM tasks WHERE occupied=1 AND pid IS NOT NULL").all(this.config.childUidBase) as unknown as Row[]) {
-      try { process.kill(row.pid!, 0); }
-      catch (error) {
-        if (record(error) && error.code === "ESRCH") this.database.prepare("UPDATE tasks SET occupied=0,reason='restart: child gone; outcome remains unknown' WHERE taskId=?").run(row.taskId);
-      }
-    }
+    } catch (error) { database?.close(); closeSync(this.journalLock); throw error; }
   }
   // ponytail: one million non-overlapping reserved UIDs per runner; accepted rows are never pruned/reused.
   private row(taskId: string): Row | undefined { return this.database.prepare("SELECT ?+rowid AS childUid,* FROM tasks WHERE taskId=?").get(this.config.childUidBase, taskId) as Row | undefined; }
@@ -240,7 +237,7 @@ export class Runner {
     this.closed = true; clearInterval(this.interval);
     if (this.server) { const done = Promise.withResolvers<void>(); this.server.close(() => done.resolve()); await done.promise; }
     // Do not terminate work on transport/service shutdown. The journal stays open while child callbacks exist.
-    if (!this.children.size) { this.database.exec("UPDATE owner SET pid=NULL WHERE id=1"); this.database.close(); }
+    if (!this.children.size) { this.database.close(); closeSync(this.journalLock); }
   }
   private schedule(taskId: string): void { setImmediate(() => { if (this.server && !this.closed) void this.launch(taskId); }); }
   async handle(method: string, params: unknown, controlToken: string): Promise<unknown> {
