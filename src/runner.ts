@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
-import { Address, Work, Id, LIMIT, checkToken, decode, digest, fingerprint, inspectedRepo, privateFile, rpc, type Acceptance, type RunnerConfig, type Task } from "./protocol.ts";
+import { Address, Work, Id, LIMIT, checkToken, decode, digest, fingerprint, inspectedRepo, canonicalRemote, privateFile, rpc, type Acceptance, type RunnerConfig, type Task } from "./protocol.ts";
 import { HttpError, serveRpc } from "./http.ts";
 
 const FRAME_LIMIT = 4 * 1024 * 1024;
@@ -336,7 +336,8 @@ export class Runner {
   private verifyCheckout(row: Row): void {
     const work = this.work(row);
     if (realpathSync(row.worktree) !== row.worktree || !inside(realpathSync(this.config.childDirectory), row.worktree)) throw new Error("Worktree escaped child root");
-    if (inspectedRepo(row.worktree) !== work.repo || git(row.worktree, ["rev-parse", "HEAD"]) !== work.sha || git(row.worktree, ["rev-parse", "--verify", `${work.ref}^{commit}`]) !== work.sha) throw new Error("Checkout identity mismatch");
+    const inspect = (args: string[]) => execFileSync("/usr/bin/setpriv", [...isolationArgs(row.childUid), "git", ...args], { cwd: row.worktree, env: childEnvironment(), encoding: "utf8", timeout: 30000, maxBuffer: LIMIT, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (inspect(["remote"]) !== "origin" || canonicalRemote(inspect(["remote", "get-url", "--all", "origin"])) !== work.repo || inspect(["rev-parse", "HEAD"]) !== work.sha || inspect(["rev-parse", "--verify", `${work.ref}^{commit}`]) !== work.sha) throw new Error("Checkout identity mismatch");
   }
   private async launch(taskId: string): Promise<void> {
     let spawned = false;
@@ -357,12 +358,13 @@ export class Runner {
         git(row.worktree, ["checkout", "--detach", work.sha]);
         git(row.worktree, ["fetch", "--no-tags", repo, "+refs/heads/*:refs/heads/*"]);
       }
-      chmodSync(row.worktree, 0o700); this.verifyCheckout(row);
+      chmodSync(row.worktree, 0o700);
       const sessions = join(childRoot, "sessions"); mkdirSync(sessions, { recursive: true, mode: 0o700 });
       const home = join(childRoot, "home");
       mkdirSync(home, { recursive: true, mode: 0o700 });
       cpSync(this.config.modelDirectory, home, { recursive: true, dereference: true });
       ownChildDirectory(childRoot, row.childUid); chmodSync(childRoot, 0o700);
+      this.verifyCheckout(row);
       this.state(taskId, "LAUNCHING"); // Durable intent must precede spawn: a crash here is intentionally held.
       const process = spawn("/usr/bin/setpriv", [...isolationArgs(row.childUid), this.config.launchers[work.launcher]!,
         "--mode", "rpc", "--session-dir", sessions, "--no-extensions"], {

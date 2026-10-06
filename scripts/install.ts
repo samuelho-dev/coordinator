@@ -13,7 +13,7 @@ function privateFile(path: string): string {
 const args = process.argv.slice(2);
 if (args.includes("--help")) {
   console.log("pnpm install:host -- --runtime /absolute/node --host-binary /absolute/omp-or-pi (--plugin-only --host omp|pi --plugin-config /absolute/private/plugin.json | --runner-only --runner-config /absolute/private/runner.json) [--dry-run] [--remote SSH_ALIAS --remote-root /absolute/repository]");
-  console.log("Run --plugin-only as the native user, then --runner-only as root from a trusted installed release on Linux. Runner config/token must belong to a dedicated non-login service account; release/runtime paths must be root/service-owned and not writable by native accounts. Five bounded capabilities and actual child UID isolation are required. macOS supports plugin-only. Mode-0600 configs/credentials and installed dependencies required.");
+  console.log("Run --plugin-only as the native user, then --runner-only as root from a trusted installed release on Linux. Runner config/token must belong to a dedicated non-login service account; release/runtime paths must be root/service-owned and not writable by native accounts. Six bounded supervisor capabilities and actual cap-zero child UID isolation are required. macOS supports plugin-only. Mode-0600 configs/credentials and installed dependencies required.");
   process.exit(0);
 }
 const dry = args.includes("--dry-run");
@@ -115,7 +115,7 @@ if (runner && runnerPath) {
   if (!isAbsolute(runner.childDirectory) || resolve(runner.childDirectory) !== runner.childDirectory || /[\r\n\u0000]/.test(runner.childDirectory)) throw new Error("Canonical absolute child directory required");
   securePath(dirname(runner.childDirectory));
   // The service owner, not root, creates and validates the child root.
-  const caps = "-all,+chown,+dac_override,+setuid,+setgid,+setpcap";
+  const caps = "-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap";
   try {
     // Native version probes run only as a fresh child UID with every capability cleared.
     execFileSync("/usr/bin/setpriv", [`--reuid=${runner.childUidBase}`, `--regid=${runner.childUidBase}`, "--clear-groups", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", binary, "--version"],
@@ -129,7 +129,7 @@ if (runner && runnerPath) {
   if (statSync(runner.childDirectory).uid !== owner.uid || statSync(runner.childDirectory).gid !== owner.gid) throw new Error("Child directory must belong to the service owner");
   service = "/etc/systemd/system/coordinator-runner.service";
   const quote = (text: string) => `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
-  const capabilities = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_SETPCAP";
+  const capabilities = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP";
   content = `[Unit]\nDescription=Coordinator approved-work runner\nAfter=network-online.target\n[Service]\nType=simple\nUser=${owner.uid}\nGroup=${owner.gid}\nSupplementaryGroups=\nWorkingDirectory=${quote(root)}\nEnvironment=${quote(`COORDINATOR_CONFIG=${runnerPath}`)}\nExecStart=${program.map(quote).join(" ")}\nAmbientCapabilities=${capabilities}\nCapabilityBoundingSet=${capabilities}\nRestart=on-failure\nRestartSec=10\nUMask=0077\nNoNewPrivileges=true\n[Install]\nWantedBy=multi-user.target\n`;
   commands.push({ binary: "/usr/bin/systemctl", args: ["daemon-reload"] }, { binary: "/usr/bin/systemctl", args: ["enable", "--now", "coordinator-runner.service"] });
 }

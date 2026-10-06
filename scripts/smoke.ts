@@ -59,9 +59,14 @@ if (process.argv.includes("--runner-isolation-only")) {
     const response = await request("bash", command);
     assert.equal(response.success, true);
     assert.ok(typeof response.data === "object" && response.data !== null && "exitCode" in response.data && response.data.exitCode === 0);
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Supervisor could not terminate its different-UID native child")), 3000);
+      child.once("close", () => { clearTimeout(timeout); resolve(); });
+      if (!child.kill("SIGKILL")) { clearTimeout(timeout); reject(new Error("Supervisor signal denied")); }
+    });
     console.log(JSON.stringify({ scenario: "real-native-os-isolation", childUid: CHILD_UID_BASE + 1, forbiddenPathsDenied: denied.length,
       ownWorkspaceAndSessionWritable: true, modelProfileReadable: true, parentEnvironDenied: true, siblingUidDistinct: true,
-      capabilitiesZero: true, supplementalGroupsEmpty: true, noNewPrivileges: true, nativeStateAndMessagesUsable: true, forbiddenEnvironmentAbsent: true }));
+      capabilitiesZero: true, supplementalGroupsEmpty: true, noNewPrivileges: true, nativeStateAndMessagesUsable: true, forbiddenEnvironmentAbsent: true, supervisorTerminationProved: true }));
   } finally { clearTimeout(timer); child.kill("SIGKILL"); rmSync(directory, { recursive: true, force: true }); }
   process.exit(0);
 }
