@@ -64,9 +64,10 @@ jobs:
           SOURCE_REF: ${{ github.ref }}
           INVOCATION: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: |
-          cosign sign --yes "$IMAGE"
+          # Match the platform publishers: Kyverno verifyImages consumes legacy cosign storage.
+          cosign sign --yes --new-bundle-format=false --use-signing-config=false --registry-referrers-mode=legacy "$IMAGE"
           jq -n --arg repo "$REPOSITORY" --arg sha "$SOURCE_SHA" --arg ref "$SOURCE_REF" --arg invocation "$INVOCATION" '{buildDefinition:{buildType:"https://actions.github.io/buildtypes/workflow/v1",externalParameters:{repository:$repo,ref:$ref,sha:$sha},resolvedDependencies:[{uri:("git+https://github.com/"+$repo),digest:{gitCommit:$sha}}]},runDetails:{builder:{id:("https://github.com/"+$repo+"/.github/workflows/ci.yaml@"+$ref)},metadata:{invocationId:$invocation}}}' > "$RUNNER_TEMP/provenance.json"
-          cosign attest --yes --type https://slsa.dev/provenance/v1 --predicate "$RUNNER_TEMP/provenance.json" "$IMAGE"
+          cosign attest --yes --new-bundle-format=false --use-signing-config=false --type https://slsa.dev/provenance/v1 --predicate "$RUNNER_TEMP/provenance.json" "$IMAGE"
           cosign verify --certificate-identity-regexp "^https://github.com/$REPOSITORY/" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE"
           cosign verify-attestation --type https://slsa.dev/provenance/v1 --certificate-identity-regexp "^https://github.com/$REPOSITORY/" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE"
           printf 'Image: `%s`\nSource SHA: `%s`\n' "$IMAGE" "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
