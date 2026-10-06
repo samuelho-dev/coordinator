@@ -301,6 +301,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
         return acceptance(existing);
       }
       if ((yield* load()) >= config.slots) return { taskId: work.taskId, accepted: false, state: "full", reason: "full" };
+      if (work.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Assignment expired before durable acceptance" });
       yield* sql.unsafe("INSERT INTO tasks(taskId,fingerprint,work,worktree,state,occupied,incarnation) VALUES (?,?,?,?,'ACCEPTED',1,?)", [work.taskId, hash, encodeJson(Work, work), worktree, incarnation]);
       return acceptance(yield* requireRow(work.taskId));
     })));
@@ -390,11 +391,12 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     const promptId = (yield* platform.crypto.randomUUIDv4);
     yield* owned(sql.withTransaction(Effect.gen(function*() {
       if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
+      if (input.address.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
       const reserved = yield* sql.unsafe("UPDATE tasks SET state='PROMPT_INTENT',promptId=? WHERE taskId=? AND state='READY' AND promptId IS NULL RETURNING taskId", [promptId, row.taskId]);
       if (reserved.length !== 1) return yield* new HttpError({ status: 409, message: "Prompt already reserved" });
       yield* event(row.taskId, { type: "prompt_intent", id: promptId, digest: yield* platform.digest(work.prompt) });
     })));
-    yield* nativeRequest(row.taskId, { type: "prompt", message: work.prompt }, 60000, promptId).pipe(Effect.catch(() => Effect.gen(function*() {
+    yield* nativeRequest(row.taskId, { type: "prompt", message: work.prompt }, 60000, promptId, input.address.deadline).pipe(Effect.catch(() => Effect.gen(function*() {
       yield* hold(row.taskId, "prompt send/admission uncertain; never replay");
       return yield* new HttpError({ status: 409, message: "Prompt send uncertain; held" });
     })));
@@ -443,7 +445,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       child.pending.clear();
     }
   });
-  const nativeRequest = Effect.fn("Runner.request")(function*(taskId: string, params: { type: CommandInput<CommandNames<"native">>["type"]; command?: string; message?: string }, timeout = 30000, forcedId?: string): Effect.fn.Return<NativeFrame, unknown> {
+  const nativeRequest = Effect.fn("Runner.request")(function*(taskId: string, params: { type: CommandInput<CommandNames<"native">>["type"]; command?: string; message?: string }, timeout = 30000, forcedId?: string, approvedDeadline?: number): Effect.fn.Return<NativeFrame, unknown> {
     const id = forcedId ?? (yield* platform.crypto.randomUUIDv4);
     const send = Effect.fnUntraced(function*(frame: NativeFrame): Effect.fn.Return<NativeFrame, unknown> {
       const child = children.get(taskId);
@@ -451,6 +453,10 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       const response = yield* Deferred.make<Json, unknown>();
       child.pending.set(id, { type: frame.type, response });
       return yield* Effect.gen(function*() {
+        if (frame.type === "prompt" && (approvedDeadline === undefined || approvedDeadline <= (yield* Clock.currentTimeMillis))) {
+          yield* hold(taskId, "Approved deadline elapsed before prompt enqueue; never replay");
+          return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
+        }
         yield* Queue.offer(child.input, new TextEncoder().encode(`${encodeJson(NativeFrame, frame)}\n`));
         return yield* decodeEffect(NativeFrame, yield* Deferred.await(response));
       }).pipe(Effect.timeout(timeout), Effect.ensuring(Effect.sync(() => child.pending.delete(id))));

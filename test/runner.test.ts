@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Clock, Context, Deferred, Effect, Layer, ManagedRuntime } from "effect";
+import { Clock, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
 import { Reactivity } from "effect/reactivity";
@@ -214,6 +214,69 @@ test("real broker-bound SQLite acceptance is unique, conflict-safe and reserves 
     }).pipe(Effect.timeout("10 seconds")));
     assert.equal((await f.run(runner.service.row(expired.taskId)))!.pid, null);
   } finally { await f.close(); }
+});
+
+test("deadline expiry during owned SQL admission and prompt transactions never dispatches expired work", async (t) => {
+  for (const phase of ["admission", "prompt reservation", "committed prompt intent"]) await t.test(phase, async () => {
+    const f = await fixture();
+    const runner = await f.open();
+    const originalTransaction = runner.service.sql.withTransaction;
+    const attempted = await f.run(Deferred.make<void>()), unlock = await f.run(Deferred.make<void>());
+    let outcome: Promise<number> | undefined;
+    let commandTime = f.work.deadline - 1;
+    try {
+      let address: Address | undefined;
+      if (phase !== "admission") {
+        await runner.call("acceptTask", f.work);
+        address = decodeJson(Address, (await f.ready(runner.service)).address!);
+        await f.save(f.work, { address, readback: address, confirmedRevision: address.revision, disposition: "ready" });
+      }
+      const clock = await f.run(Clock.Clock);
+      const controlledClock: Clock.Clock = {
+        currentTimeMillis: Effect.sync(() => commandTime), currentTimeMillisUnsafe: () => commandTime,
+        currentTimeNanos: clock.currentTimeNanos, currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
+        monotonicTimeNanos: clock.monotonicTimeNanos, monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+        sleep: (duration) => clock.sleep(duration),
+      };
+      const transaction: typeof originalTransaction = (effect) => phase === "committed prompt intent"
+        ? originalTransaction(effect).pipe(Effect.tap(() => Effect.sync(() => { commandTime = f.work.deadline + 1; })))
+        : Effect.gen(function*() {
+          const locked = yield* Deferred.make<void>();
+          // Keep the real SQLite permit/BEGIN until the waiting command has crossed its deadline.
+          const holder = yield* originalTransaction(Effect.gen(function*() {
+            yield* Deferred.succeed(locked, undefined);
+            yield* Deferred.await(unlock);
+          })).pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.await(locked);
+          yield* Deferred.succeed(attempted, undefined);
+          const exit = yield* originalTransaction(effect).pipe(Effect.exit, Effect.ensuring(Deferred.succeed(unlock, undefined)));
+          yield* Fiber.join(holder);
+          return yield* Exit.isFailure(exit) ? Effect.failCause(exit.cause) : Effect.succeed(exit.value);
+        });
+      Object.defineProperty(runner.service.sql, "withTransaction", { value: transaction, configurable: true, writable: true });
+      const input = phase === "admission" ? request("acceptTask", f.work) : request("release", { taskId: f.work.taskId, address, prompt: f.work.prompt });
+      outcome = f.run(boundaryStatus(runner.service.handle(input, control).pipe(Effect.provideService(Clock.Clock, controlledClock))));
+      if (phase !== "committed prompt intent") {
+        await f.run(Deferred.await(attempted).pipe(Effect.timeout("5 seconds")));
+        commandTime = f.work.deadline + 1;
+        await f.run(Deferred.succeed(unlock, undefined));
+      }
+      assert.equal(await outcome, 409);
+      const row = await f.run(runner.service.row(f.work.taskId));
+      if (phase === "admission") assert.equal(row, undefined);
+      else {
+        assert.equal(row!.state, phase === "committed prompt intent" ? "HELD" : "READY");
+        if (phase === "committed prompt intent") assert.ok(row!.promptId);
+        else assert.equal(row!.promptId, null);
+        assert.equal(row!.occupied, 1);
+      }
+    } finally {
+      await f.run(Deferred.succeed(unlock, undefined));
+      if (outcome) await outcome;
+      Object.defineProperty(runner.service.sql, "withTransaction", { value: originalTransaction, configurable: true, writable: true });
+      await f.close();
+    }
+  });
 });
 
 test("enrollment bearer is health-only and control bearer cannot invent broker work or confirmation", async () => {

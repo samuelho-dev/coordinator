@@ -304,7 +304,7 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   const runnerDb = join(runnerConfig.stateDirectory, "runner.sqlite");
   const row = (yield* sqlRows(runnerDb, "SELECT pid FROM tasks WHERE taskId=?", [worker.taskId]))[0]; workerPid = Number(row?.pid); 
   assert.ok(workerPid > 0);
-  yield* rejects(rpc(runnerUrl, runnerToken, "acceptTask", worker), 403);
+  yield* rejects(rpc(runnerUrl, runnerToken, "acceptTask", worker), 401);
   assert.equal((yield* rpc(runnerUrl, runnerControl, "acceptTask", worker)).taskId, worker.taskId);
   const corrected = { ...accepted.address!, revision: 2 };
   const correctedTask = yield* rpc(brokerUrl, coordinator, "task.address", { taskId: worker.taskId, address: corrected });
