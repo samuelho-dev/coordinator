@@ -9,6 +9,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --prod --frozen-lockfile
 COPY src ./src
 COPY scripts/deploy-init.ts ./scripts/deploy-init.ts
+COPY coordinator-source.bundle ./coordinator-source.bundle
 RUN node -e "const s=require('node:sqlite');const d=new s.DatabaseSync(':memory:');d.close();if(typeof s.backup!=='function')process.exit(1)"
 USER node
 ENV NODE_ENV=production

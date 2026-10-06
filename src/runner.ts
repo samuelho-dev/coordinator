@@ -6,11 +6,10 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
-import { Address, Work, Id, LIMIT, checkToken, decode, digest, fingerprint, inspectedRepo, privateFile, rpc, type Acceptance, type RunnerConfig } from "./protocol.ts";
+import { Address, Work, Id, LIMIT, checkToken, decode, digest, fingerprint, inspectedRepo, privateFile, rpc, type Acceptance, type RunnerConfig, type Task } from "./protocol.ts";
 import { HttpError, serveRpc } from "./http.ts";
 
 const FRAME_LIMIT = 4 * 1024 * 1024;
-const EVENT_LIMIT = 24 * 1024;
 const RETAIN_EVENTS = 128;
 const Terminal: Record<string, true> = { SUCCEEDED: true, FAILED: true };
 const TaskInput = Schema.Struct({ taskId: Id });
@@ -23,7 +22,7 @@ function record(value: unknown): value is Json { return typeof value === "object
 function inside(root: string, path: string): boolean { const r = relative(root, path); return r !== ".." && !r.startsWith(`..${sep}`) && !isAbsolute(r); }
 function git(cwd: string, args: string[]): string { return execFileSync("git", args, { cwd, encoding: "utf8", timeout: 30000, maxBuffer: LIMIT, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
 
-/** Strict LF wire framing; CR and invalid UTF-8 are protocol errors, not delimiters. */
+/** LF wire framing accepts optional CRLF; invalid UTF-8 and incomplete frames are errors. */
 export class LfFrames {
   private pending = Buffer.alloc(0);
   push(chunk: Buffer): unknown[] {
@@ -42,7 +41,7 @@ export class LfFrames {
   }
   end(): void { if (this.pending.length) throw new Error("Incomplete RPC frame"); }
 }
-interface Row { taskId: string; fingerprint: string; work: string; worktree: string; state: string; occupied: number; pid: number | null; incarnation: string; address: string | null; promptId: string | null; reason: string | null; result: string | null; }
+interface Row { taskId: string; fingerprint: string; work: string; worktree: string; state: string; occupied: number; pid: number | null; incarnation: string; address: string | null; promptId: string | null; reason: string | null; result: string | null; detached: number; }
 interface Child {
   process: ChildProcessWithoutNullStreams;
   pending: Map<string, { type: string; resolve: (value: Json) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>;
@@ -50,6 +49,7 @@ interface Child {
 }
 const Config = Schema.Struct({
   id: Id, brokerUrl: Schema.String, tokenFile: Schema.String, host: Schema.String,
+  controlTokenHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
   port: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 65535 })),
   stateDirectory: Schema.String, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 128 })),
   repositories: Schema.Record(Schema.String, Schema.String), launchers: Schema.Record(Schema.String, Schema.String),
@@ -72,6 +72,7 @@ export class Runner {
     if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname))) throw new Error("TLS required");
     this.token = privateFile(input.tokenFile);
     if (this.token.length < 32 || this.token.length > 480) throw new Error("Invalid credential length");
+    if (input.controlTokenHash === digest(this.token)) throw new Error("Distinct enrollment and control credentials required");
     process.umask(0o077); // Inherited by hosts: session files and host artifacts must remain private.
     mkdirSync(input.stateDirectory, { recursive: true, mode: 0o700 });
     if ((statSync(input.stateDirectory).mode & 0o077) !== 0) throw new Error("Private state directory required");
@@ -89,7 +90,7 @@ export class Runner {
     this.database.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS tasks (taskId TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, work TEXT NOT NULL,
         worktree TEXT NOT NULL, state TEXT NOT NULL, occupied INTEGER NOT NULL, pid INTEGER,
-        incarnation TEXT NOT NULL, address TEXT, promptId TEXT, reason TEXT, result TEXT);
+        incarnation TEXT NOT NULL, address TEXT, promptId TEXT, reason TEXT, result TEXT, detached INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL, payload TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS events_task ON events(taskId,seq);
       CREATE TABLE IF NOT EXISTS owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER);
@@ -104,6 +105,21 @@ export class Runner {
       this.database.prepare("UPDATE owner SET pid=? WHERE id=1").run(process.pid);
       this.database.exec("COMMIT");
     } catch (error) { this.database.exec("ROLLBACK"); this.database.close(); throw error; }
+    if (!this.database.prepare("PRAGMA table_info(tasks)").all().some((column) => column.name === "detached")) this.database.exec("ALTER TABLE tasks ADD COLUMN detached INTEGER NOT NULL DEFAULT 0");
+    this.database.exec("PRAGMA secure_delete=ON");
+    if (this.database.prepare("PRAGMA user_version").get()?.user_version === 0) {
+      // One-time scrub of legacy raw journals, including deleted SQLite/WAL pages.
+      this.database.prepare("UPDATE tasks SET reason='historical diagnostic omitted' WHERE reason IS NOT NULL").run();
+      for (const event of this.database.prepare("SELECT seq,payload FROM events").all()) {
+        if (typeof event.seq !== "number") throw new Error("Invalid journal event identity");
+        this.database.prepare("UPDATE events SET payload=? WHERE seq=?").run(JSON.stringify(this.eventMetadata(JSON.parse(String(event.payload)))), event.seq);
+      }
+      for (const row of this.database.prepare("SELECT taskId,result FROM tasks WHERE result IS NOT NULL").all()) {
+        if (typeof row.taskId !== "string") throw new Error("Invalid journal task identity");
+        this.database.prepare("UPDATE tasks SET result=? WHERE taskId=?").run(JSON.stringify(this.resultMetadata(JSON.parse(String(row.result)))), row.taskId);
+      }
+      this.database.exec("VACUUM; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA user_version=1");
+    }
     // ponytail: no stdio reattachment exists; uncertain owned children reserve their slot until operator reconciliation.
     this.database.prepare("UPDATE tasks SET state='HELD',reason='restart: launch or prompt outcome unknown' WHERE occupied=1 AND state!='ACCEPTED'").run();
     for (const row of this.database.prepare("SELECT * FROM tasks WHERE occupied=1 AND pid IS NOT NULL").all() as unknown as Row[]) {
@@ -121,14 +137,34 @@ export class Runner {
       ...(row.address ? { address: decode(Address, JSON.parse(row.address)) } : {}), ...(row.reason ? { reason: row.reason } : {}) };
   }
   private load(): number { return Number(this.database.prepare("SELECT count(*) AS count FROM tasks WHERE occupied=1").get()!.count); }
+  private resultMetadata(value: unknown): Json | null {
+    if (!record(value)) return null;
+    const result: Json = {};
+    for (const key of ["launched", "hostSettled", "evidenceVerified"]) if (typeof value[key] === "boolean") result[key] = value[key];
+    if (typeof value.exitCode === "number" && Number.isSafeInteger(value.exitCode)) result.exitCode = value.exitCode;
+    if (typeof value.signal === "string" && /^SIG[A-Z0-9]{1,16}$/.test(value.signal)) result.signal = value.signal;
+    return result;
+  }
+  private eventMetadata(value: unknown): Json {
+    if (!record(value)) return { type: "host_event", contentOmitted: true };
+    const type = typeof value.type === "string" && /^[a-z_]{1,40}$/.test(value.type) ? value.type : "host_event";
+    const result: Json = { type, contentOmitted: true };
+    if (type === "readback") result.address = decode(Address, value.address);
+    if (typeof value.state === "string" && ["ACCEPTED", "LAUNCHING", "READY", "PROMPT_INTENT", "RUNNING", "SUCCEEDED", "FAILED", "HELD"].includes(value.state)) result.state = value.state;
+    if (typeof value.success === "boolean") result.success = value.success;
+    if (typeof value.status === "string" && ["completed", "failed", "aborted", "error"].includes(value.status)) result.status = value.status;
+    if (typeof value.command === "string" && ["get_state", "get_messages", "bash", "prompt", "abort"].includes(value.command)) result.command = value.command;
+    for (const key of ["fingerprint", "digest"]) if (typeof value[key] === "string" && /^[a-f0-9]{64}$/.test(value[key])) result[key] = value[key];
+    if (typeof value.id === "string" && /^[a-f0-9-]{36}$/.test(value.id)) result.id = value.id;
+    return result;
+  }
   private event(taskId: string, value: unknown): void {
-    let payload = JSON.stringify(value);
-    if (Buffer.byteLength(payload) > EVENT_LIMIT) payload = JSON.stringify({ type: "gap", reason: "oversized event", bytes: Buffer.byteLength(payload) });
+    const payload = JSON.stringify(this.eventMetadata(value));
     this.database.prepare("INSERT INTO events(taskId,payload) VALUES (?,?)").run(taskId, payload);
     this.database.prepare("DELETE FROM events WHERE taskId=? AND seq NOT IN (SELECT seq FROM events WHERE taskId=? ORDER BY seq DESC LIMIT ?)").run(taskId, taskId, RETAIN_EVENTS);
   }
   private state(taskId: string, state: string, reason: string | null = null, result: unknown = null): void {
-    this.database.prepare("UPDATE tasks SET state=?,reason=?,result=? WHERE taskId=?").run(state, reason, JSON.stringify(result), taskId);
+    this.database.prepare("UPDATE tasks SET state=?,reason=?,result=? WHERE taskId=?").run(state, reason, JSON.stringify(this.resultMetadata(result)), taskId);
     this.event(taskId, { type: "runner_state", state, reason });
   }
   private hold(taskId: string, reason: string): void {
@@ -138,9 +174,9 @@ export class Runner {
   }
   async start(): Promise<Server> {
     this.server = await serveRpc({ host: this.config.host, port: this.config.port,
-      authorize: (token) => { if (!checkToken(token, digest(this.token))) throw new HttpError(401, "Unauthorized"); return this.config.id; },
-      handle: (_principal, method, params) => this.handle(method, params) });
-    for (const row of this.database.prepare("SELECT * FROM tasks WHERE state='ACCEPTED' AND occupied=1").all() as unknown as Row[]) this.schedule(row.taskId);
+      authorize: (token) => { if (!checkToken(token, this.config.controlTokenHash) && !checkToken(token, digest(this.token))) throw new HttpError(401, "Unauthorized"); return token; },
+      handle: (token, method, params) => this.handle(method, params, String(token)) });
+    for (const row of this.database.prepare("SELECT * FROM tasks WHERE state='ACCEPTED' AND occupied=1 AND detached=0").all() as unknown as Row[]) this.schedule(row.taskId);
     this.interval = setInterval(() => { void this.heartbeat(); }, 5000);
     void this.heartbeat();
     return this.server;
@@ -151,8 +187,9 @@ export class Runner {
     // Do not terminate work on transport/service shutdown. The journal stays open while child callbacks exist.
     if (!this.children.size) { this.database.exec("UPDATE owner SET pid=NULL WHERE id=1"); this.database.close(); }
   }
-  private schedule(taskId: string): void { setImmediate(() => { if (!this.closed) void this.launch(taskId); }); }
-  async handle(method: string, params: unknown): Promise<unknown> {
+  private schedule(taskId: string): void { setImmediate(() => { if (this.server && !this.closed) void this.launch(taskId); }); }
+  async handle(method: string, params: unknown, controlToken: string): Promise<unknown> {
+    if (!checkToken(controlToken, this.config.controlTokenHash)) throw new HttpError(401, "Control credential required");
     try {
       switch (method) {
         case "acceptTask": return this.accept(decode(Work, params));
@@ -193,10 +230,21 @@ export class Runner {
       }
     } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(400, "Invalid request or unavailable owned child"); }
   }
-  private accept(work: Work): Acceptance {
+  private async brokerTask(work: Work, address?: Address): Promise<Task> {
+    const task = await rpc<Task>(this.config.brokerUrl, this.token, "task.get", { taskId: work.taskId });
+    if (task.taskId !== work.taskId || task.runnerId !== this.config.id || task.fingerprint !== fingerprint(work) || fingerprint(task.request) !== fingerprint(work)) throw new HttpError(403, "Broker task binding mismatch");
+    if (address && (!task.address || !task.readback || task.disposition !== "ready" || task.confirmedRevision !== address.revision ||
+      fingerprint(task.address) !== fingerprint(address) || fingerprint(task.readback) !== fingerprint(address))) throw new HttpError(409, "Broker confirmation or current readback mismatch");
+    return task;
+  }
+  private async accept(work: Work): Promise<Acceptance> {
     if (Buffer.byteLength(JSON.stringify(work)) > LIMIT - 1024) throw new HttpError(413, "Work too large");
     const existing = this.row(work.taskId); const hash = fingerprint(work);
     if (existing) { if (existing.fingerprint !== hash) throw new HttpError(409, "Task fingerprint conflict"); return this.acceptance(existing); }
+    if (this.load() >= this.config.slots) return { taskId: work.taskId, accepted: false, state: "full", reason: "full" };
+    await this.brokerTask(work);
+    const concurrent = this.row(work.taskId);
+    if (concurrent) { if (concurrent.fingerprint !== hash) throw new HttpError(409, "Task fingerprint conflict"); return this.acceptance(concurrent); }
     const repo = this.config.repositories[work.repo]; const launcher = this.config.launchers[work.launcher];
     if (!repo || !launcher) throw new HttpError(403, "Repository or launcher not allowlisted");
     if (!work.ref || work.ref.startsWith("-") || /[\r\n\0]/.test(work.ref)) throw new HttpError(400, "Invalid ref");
@@ -220,7 +268,7 @@ export class Runner {
   private async launch(taskId: string): Promise<void> {
     let spawned = false;
     try {
-      const row = this.requireRow(taskId); if (row.state !== "ACCEPTED" || this.children.has(taskId)) return;
+      const row = this.requireRow(taskId); if (row.state !== "ACCEPTED" || row.detached || this.children.has(taskId)) return;
       const work = this.work(row); const repo = this.config.repositories[work.repo]!;
       if (work.deadline <= Date.now()) {
         this.state(taskId, "FAILED", "Approved deadline elapsed before launch", { launched: false, evidenceVerified: false });
@@ -315,7 +363,7 @@ export class Runner {
       }
       this.event(taskId, { type: "host_response", id: value.id, command: value.command, success: value.success }); return;
     }
-    this.event(taskId, value);
+    this.event(taskId, { type: value.type === "readback" ? "host_event" : value.type, status: value.status });
     const row = this.requireRow(taskId); if (!row.promptId || child.lost) return;
     if (value.type === "agent_start") child.started = true;
     if (value.type === "message_end" && record(value.message) && ["error", "aborted"].includes(String(value.message.stopReason))) child.failed = true;
@@ -345,8 +393,12 @@ export class Runner {
       throw new HttpError(409, "Prompt delivery uncertain; never replay");
     }
     if (row.state !== "READY") throw new HttpError(409, "Child not ready");
+    if (row.detached) throw new HttpError(403, "Task no longer assigned");
+    await this.brokerTask(work, input.address);
     const response = await this.request(row.taskId, "get_state"); const actual = await this.readback(this.requireRow(row.taskId), response, decode(Address, JSON.parse(row.address)));
     if (fingerprint(actual) !== fingerprint(input.address)) throw new HttpError(409, "Actual child address changed");
+    // Native readback awaited RPCs; recheck the ledger immediately before reserving prompt intent.
+    await this.brokerTask(work, input.address);
     if (input.address.deadline <= Date.now()) throw new HttpError(409, "Approved prompt deadline elapsed");
     const promptId = randomUUID();
     const changed = this.database.prepare("UPDATE tasks SET state='PROMPT_INTENT',promptId=? WHERE taskId=? AND state='READY' AND promptId IS NULL").run(promptId, row.taskId);
@@ -361,7 +413,7 @@ export class Runner {
   private async heartbeat(): Promise<void> {
     if (this.closed || this.heartbeatBusy) return; this.heartbeatBusy = true;
     try {
-      const rows = this.database.prepare("SELECT * FROM tasks ORDER BY taskId").all() as unknown as Row[];
+      const rows = this.database.prepare("SELECT * FROM tasks WHERE detached=0 ORDER BY taskId").all() as unknown as Row[];
       // Advertisements are bounded; absence is never represented as not-accepted.
       const journal: Acceptance[] = []; let size = 1024;
       for (const row of rows) { const item = this.acceptance(row); const bytes = Buffer.byteLength(JSON.stringify(item)); if (size + bytes > LIMIT - 1024) break; journal.push(item); size += bytes; }
@@ -373,11 +425,22 @@ export class Runner {
   private async reports(rows: Row[]): Promise<void> {
     try {
       for (const row of rows) {
-        if (row.address && row.state === "READY") await rpc(this.config.brokerUrl, this.token, "runner.readback", { runnerId: this.config.id, taskId: row.taskId, address: JSON.parse(row.address) });
-        if (["RUNNING", "SUCCEEDED", "FAILED", "HELD"].includes(row.state)) await rpc(this.config.brokerUrl, this.token, "runner.report", { runnerId: this.config.id, taskId: row.taskId, state: row.state, result: row.result ? JSON.parse(row.result) : { reason: row.reason } });
+        if (row.detached) continue;
+        try {
+          if (row.address && row.state === "READY") await rpc(this.config.brokerUrl, this.token, "runner.readback", { runnerId: this.config.id, taskId: row.taskId, address: JSON.parse(row.address) });
+          if (["RUNNING", "SUCCEEDED", "FAILED", "HELD"].includes(row.state)) await rpc(this.config.brokerUrl, this.token, "runner.report", { runnerId: this.config.id, taskId: row.taskId, state: row.state, result: row.result ? JSON.parse(row.result) : {} });
+        } catch (error) {
+          if (!(error instanceof Error) || !error.message.startsWith("RPC 403:")) continue;
+          // Only an authenticated ledger denial confirms obsolete ownership; outages remain retryable.
+          try { await rpc(this.config.brokerUrl, this.token, "task.get", { taskId: row.taskId }); }
+          catch (bindingError) {
+            if (!(bindingError instanceof Error) || !bindingError.message.startsWith("RPC 403:")) continue;
+            if (!Terminal[row.state]) this.hold(row.taskId, "broker assignment withdrawn; no replay");
+            this.database.prepare("UPDATE tasks SET detached=1,occupied=CASE WHEN state='HELD' AND pid IS NULL THEN 0 ELSE occupied END WHERE taskId=?").run(row.taskId);
+          }
+        }
       }
-    } catch { /* Durable rows are reported again after broker reconnect. */ }
-    finally { this.reportsBusy = false; }
+    } finally { this.reportsBusy = false; }
   }
 }
 

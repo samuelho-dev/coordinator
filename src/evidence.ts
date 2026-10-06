@@ -3,12 +3,18 @@ import { decode, Id, Sha, Text, type Work } from "./protocol.ts";
 
 const RepoIdentity = Schema.Struct({ id: Schema.Int, full_name: Text, private: Schema.Boolean });
 const Job = Schema.Struct({ id: Schema.Int, name: Text, status: Text, conclusion: Schema.NullOr(Text), started_at: Schema.NullOr(Text), completed_at: Schema.NullOr(Text) });
-const Run = Schema.Struct({ id: Schema.Int, workflow_id: Schema.Int, name: Schema.NullOr(Text), head_sha: Sha, head_branch: Schema.NullOr(Text), run_attempt: Schema.Int, status: Text, conclusion: Schema.NullOr(Text), html_url: Text, created_at: Text });
+const Run = Schema.Struct({ id: Schema.Int, workflow_id: Schema.Int, name: Schema.NullOr(Text), head_sha: Sha, head_branch: Schema.NullOr(Text), pull_requests: Schema.optional(Schema.Array(Schema.Struct({ number: Schema.Int }))), run_attempt: Schema.Int, status: Text, conclusion: Schema.NullOr(Text), html_url: Text, created_at: Text });
+const MergeRef = Schema.Struct({ ref: Text, object: Schema.Struct({ type: Schema.Literal("commit"), sha: Sha }) });
 // GitHub adds fields; decode its selected fields rather than disabling strict product-boundary decoding.
 function select(input: unknown, names: string[]): Record<string, unknown> {
   if (typeof input !== "object" || input === null || Array.isArray(input)) throw new Error("Malformed GitHub response");
   const record = input as Record<string, unknown>;
   return Object.fromEntries(names.map((name) => [name, record[name]]));
+}
+function decodeRun(input: unknown): typeof Run.Type {
+  const fields = select(input, ["id", "workflow_id", "name", "head_sha", "head_branch", "pull_requests", "run_attempt", "status", "conclusion", "html_url", "created_at"]);
+  if (fields.pull_requests !== undefined) fields.pull_requests = array(input, "pull_requests").map((pr) => select(pr, ["number"]));
+  return decode(Run, fields);
 }
 async function github(path: string, token?: string): Promise<unknown> {
   const response = await fetch(`https://api.github.com${path}`, {
@@ -38,20 +44,35 @@ export async function pollCi(work: Work, token?: string): Promise<CiEvidence> {
   const evidence: CiEvidence = { sha: work.sha, repositoryId: work.githubRepoId, ref: work.ref,
     observedAt: new Date().toISOString(), provenance: "GitHub Actions REST exact-SHA run-attempt/jobs", verdict: "unknown", lanes: [] };
   try {
+    const pull = /^refs\/pull\/([1-9]\d*)\/merge$/.exec(work.ref);
+    if (pull && !token) throw new Error("PR merge-ref evidence requires authenticated GitHub metadata");
     const identity = await inspectGithubRepository(work.repo, token);
     if (identity.id !== work.githubRepoId) throw new Error("Repository identity mismatch");
     const base = `/repos/${identity.full_name}`;
+    const mergeRefPath = pull ? `${base}/git/ref/pull/${pull[1]}/merge` : undefined;
+    async function checkMergeRef(): Promise<void> {
+      if (!mergeRefPath) return;
+      const value = await github(mergeRefPath, token);
+      const fields = select(value, ["ref", "object"]);
+      fields.object = select(fields.object, ["type", "sha"]);
+      const current = decode(MergeRef, fields);
+      if (current.ref !== work.ref || current.object.sha !== work.sha) throw new Error("Current PR merge-ref SHA mismatch");
+    }
+    await checkMergeRef();
+    const matchesRef = (run: typeof Run.Type): boolean => pull
+      ? run.pull_requests?.some((pr) => String(pr.number) === pull[1]) === true
+      : run.head_branch === work.ref.replace(/^refs\/heads\//, "") || run.head_branch === work.ref;
     const collection: typeof Run.Type[] = [];
     let truncated = false;
     for (let page = 1; page <= 10; page++) {
       const entries = array(await github(`${base}/actions/runs?head_sha=${work.sha}&per_page=100&page=${page}`, token), "workflow_runs");
-      collection.push(...entries.map((entry) => decode(Run, select(entry, ["id", "workflow_id", "name", "head_sha", "head_branch", "run_attempt", "status", "conclusion", "html_url", "created_at"]))));
+      collection.push(...entries.map(decodeRun));
       if (entries.length < 100) break;
       if (page === 10) truncated = true;
     }
     if (truncated) throw new Error("Run history truncated; cannot prove latest relevant run");
     if (collection.some((run) => run.head_sha !== work.sha)) throw new Error("GitHub exact-SHA query mismatch");
-    const relevant = collection.filter((run) => run.head_sha === work.sha && (run.head_branch === work.ref.replace(/^refs\/heads\//, "") || run.head_branch === work.ref));
+    const relevant = collection.filter((run) => run.head_sha === work.sha && matchesRef(run));
     const latest = new Map<number, typeof Run.Type>();
     for (const run of relevant) {
       const prior = latest.get(run.workflow_id);
@@ -61,8 +82,8 @@ export async function pollCi(work: Work, token?: string): Promise<CiEvidence> {
     const seen: { lane: string; run: typeof Run.Type; jobs: typeof Job.Type[]; green: boolean }[] = [];
     for (const run of latest.values()) {
       const attemptResponse = await github(`${base}/actions/runs/${run.id}/attempts/${run.run_attempt}`, token);
-      const attempt = decode(Run, select(attemptResponse, ["id", "workflow_id", "name", "head_sha", "head_branch", "run_attempt", "status", "conclusion", "html_url", "created_at"]));
-      if (attempt.head_sha !== work.sha || attempt.run_attempt !== run.run_attempt) throw new Error("Attempt SHA/number mismatch");
+      const attempt = decodeRun(attemptResponse);
+      if (attempt.id !== run.id || attempt.workflow_id !== run.workflow_id || attempt.head_sha !== work.sha || attempt.run_attempt !== run.run_attempt || !matchesRef(attempt)) throw new Error("Attempt identity/SHA/ref/number mismatch");
       const jobs: typeof Job.Type[] = [];
       for (let page = 1; page <= 10; page++) {
         const entries = array(await github(`${base}/actions/runs/${run.id}/attempts/${run.run_attempt}/jobs?per_page=100&page=${page}`, token), "jobs");
@@ -82,9 +103,12 @@ export async function pollCi(work: Work, token?: string): Promise<CiEvidence> {
     }
     // Re-read each run after jobs: a rerun queued during polling invalidates old success.
     for (const run of latest.values()) {
-      const current = select(await github(`${base}/actions/runs/${run.id}`, token), ["run_attempt", "status", "head_sha"]);
-      if (current.run_attempt !== run.run_attempt || current.head_sha !== work.sha || current.status !== run.status) verdict = "pending";
+      const currentResponse = await github(`${base}/actions/runs/${run.id}`, token);
+      const current = select(currentResponse, ["run_attempt", "status", "head_sha"]);
+      if (current.run_attempt !== run.run_attempt || current.head_sha !== work.sha || current.status !== run.status || (pull && !matchesRef(decodeRun(currentResponse)))) verdict = "pending";
     }
+    // PR synchronization during polling invalidates the previously tested merge commit.
+    await checkMergeRef();
     evidence.verdict = verdict;
     return evidence;
   } catch (error) {
