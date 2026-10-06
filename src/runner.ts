@@ -363,7 +363,7 @@ export class Runner {
       const home = join(childRoot, "home");
       mkdirSync(home, { recursive: true, mode: 0o700 });
       cpSync(this.config.modelDirectory, home, { recursive: true, dereference: true });
-      ownChildDirectory(childRoot, row.childUid); chmodSync(childRoot, 0o700);
+      ownChildDirectory(childRoot, row.childUid);
       this.verifyCheckout(row);
       this.state(taskId, "LAUNCHING"); // Durable intent must precede spawn: a crash here is intentionally held.
       const process = spawn("/usr/bin/setpriv", [...isolationArgs(row.childUid), this.config.launchers[work.launcher]!,
