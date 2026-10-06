@@ -114,6 +114,7 @@ if (runner && runnerPath) {
   for (const path of [dirname(runnerPath), dirname(runner.tokenFile), runner.stateDirectory, runner.modelDirectory, ...Object.values(runner.repositories)]) securePath(path, true);
   if (!isAbsolute(runner.childDirectory) || resolve(runner.childDirectory) !== runner.childDirectory || /[\r\n\u0000]/.test(runner.childDirectory)) throw new Error("Canonical absolute child directory required");
   securePath(dirname(runner.childDirectory));
+  accessSync("/usr/bin/flock", constants.X_OK);
   // The service owner, not root, creates and validates the child root.
   const caps = "-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap";
   try {
