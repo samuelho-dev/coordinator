@@ -10,7 +10,7 @@ RUN pnpm install --prod --frozen-lockfile
 COPY src ./src
 COPY scripts/deploy-init.ts ./scripts/deploy-init.ts
 COPY coordinator-source.bundle ./coordinator-source.bundle
-RUN node -e "const s=require('node:sqlite');const d=new s.DatabaseSync(':memory:');d.close();if(typeof s.backup!=='function')process.exit(1)"
+RUN node --import tsx --input-type=module -e "import{Context,Effect,Layer}from'effect';import*as S from'@effect/sql-sqlite-node/SqliteClient';await Effect.runPromise(Effect.scoped(Effect.gen(function*(){const c=yield*Layer.build(S.layer({filename:':memory:'}));yield*Context.get(c,S.SqliteClient).unsafe('SELECT 1')})))"
 USER node
 ENV NODE_ENV=production
-CMD ["node", "--import", "tsx", "src/broker.ts"]
+CMD ["node", "--import", "tsx", "src/main.ts", "broker"]

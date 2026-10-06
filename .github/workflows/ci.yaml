@@ -22,7 +22,14 @@ jobs:
           version: 11.9.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
-      - run: sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx --test --test-concurrency=1 test/*.test.ts
+      - name: Run isolated native suite outside private runner home
+        run: |
+          TEST_ROOT="$(mktemp -d /tmp/coordinator-test.XXXXXX)"
+          trap 'rm -rf -- "$TEST_ROOT"' EXIT
+          chmod 0755 "$TEST_ROOT"
+          cp -a package.json tsconfig.json src scripts test node_modules "$TEST_ROOT/"
+          cd "$TEST_ROOT"
+          sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx --test --test-concurrency=1 test/*.test.ts
   publish:
     needs: verify
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
