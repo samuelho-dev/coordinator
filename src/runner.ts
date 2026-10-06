@@ -403,7 +403,6 @@ export class Runner {
     }
   }
   private async readback(row: Row, response: Json, template?: Address): Promise<Address> {
-    this.verifyCheckout(row);
     const work = this.work(row); const data = response.data;
     if (response.success !== true || !record(data) || typeof data.sessionId !== "string" || typeof data.sessionFile !== "string" || data.isStreaming !== false) throw new Error("Unverified durable host identity");
     const sessions = realpathSync(join(this.config.childDirectory, digest(row.taskId), "sessions"));
@@ -411,9 +410,10 @@ export class Runner {
     const cwdResponse = await this.request(row.taskId, "bash", "pwd -P");
     const cwdData = cwdResponse.data;
     if (!record(cwdData) || cwdData.exitCode !== 0 || typeof cwdData.output !== "string" || cwdData.output.trim() !== row.worktree) throw new Error("Host cwd mismatch");
+    this.verifyCheckout(row);
     // Native session identity is the actual addressable root worker, not a fabricated requested ID.
     return decode(Address, { messageId: template?.messageId ?? row.taskId, revision: template?.revision ?? 1, workerId: data.sessionId, sessionId: data.sessionId,
-      incarnation: row.incarnation, repo: inspectedRepo(row.worktree), ref: work.ref, sha: git(row.worktree, ["rev-parse", "HEAD"]),
+      incarnation: row.incarnation, repo: work.repo, ref: work.ref, sha: work.sha,
       scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline });
   }
   private request(taskId: string, type: string, message?: string, timeout = 30000, forcedId?: string): Promise<Json> {
