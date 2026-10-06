@@ -135,6 +135,7 @@ const coordinatorToken = randomBytes(32).toString("hex"), sessionToken = randomB
 const brokerPort = await freePort(), brokerUrl = `http://127.0.0.1:${brokerPort}`;
 const brokerConfig: BrokerConfig = { database: join(directory, "broker", "ledger.sqlite"), host: "127.0.0.1", port: brokerPort,
   backupDirectory: join(directory, "snapshots"), archiveRetentionMs: 86400000, backupRetentionMs: 3600000,
+  repositoryIds: {},
   principals: [{ id: "synthetic-control", owner, roles: ["coordinator"], repos: [repo], tokenHash: digest(coordinatorToken) },
     { id: "synthetic-native", owner, roles: ["session"], repos: [repo], tokenHash: digest(sessionToken) }] };
 const brokerPath = join(directory, "broker.json"); privateJson(brokerPath, brokerConfig);
@@ -161,7 +162,7 @@ try {
     const stateDirectory = privateDirectory(join(hostHome, "journal")), configPath = join(hostHome, "plugin.json");
     const config: PluginConfig = { host, brokerUrl, tokenFile, stateDirectory, machineId: `synthetic-${host}`, selectedRemote: "origin" }; privateJson(configPath, config);
     const runnerPath = join(hostHome, "runner.json");
-    const runner: RunnerConfig = { id: "synthetic-unused-runner", brokerUrl, tokenFile, host: "127.0.0.1", port: await freePort(), stateDirectory: join(hostHome, "runner"), slots: 1, repositories: { [repo]: syntheticRepo }, launchers: { [host]: binary } }; privateJson(runnerPath, runner);
+    const runner: RunnerConfig = { id: "synthetic-unused-runner", brokerUrl, tokenFile, controlTokenHash: digest("synthetic-unused-control-credential"), host: "127.0.0.1", port: await freePort(), stateDirectory: join(hostHome, "runner"), slots: 1, repositories: { [repo]: syntheticRepo }, launchers: { [host]: binary } }; privateJson(runnerPath, runner);
     interface InstallPlan { dryRun: boolean; service: string; launcher: string; operations: { binary: string; args: string[] }[] }
     const plan = JSON.parse(await run(process.execPath, ["--import", join(root, "node_modules/tsx/dist/loader.mjs"), join(root, "scripts/install.ts"), "--host", host, "--runtime", process.execPath, "--host-binary", binary, "--plugin-config", configPath, "--runner-config", runnerPath, "--dry-run"], root, env)) as InstallPlan;
     assert.equal(plan.dryRun, true); assert.ok(plan.service.startsWith(`${hostHome}/`)); assert.ok(plan.launcher.startsWith(`${hostHome}/`));

@@ -50,13 +50,15 @@ export interface Acceptance {
 }
 export interface Principal {
   id: string; owner: string; tokenHash: string; roles: readonly string[]; repos: readonly string[];
-  runnerUrl?: string;
+  runnerUrl?: string; controlTokenHash?: string;
 }
 export interface BrokerConfig { database: string; host: string; port: number; principals: readonly Principal[];
   backupDirectory: string; archiveRetentionMs: number; backupRetentionMs: number; githubTokenEnv?: string;
+  repositoryIds: Record<string, number>;
 }
 export interface RunnerConfig { id: string; brokerUrl: string; tokenFile: string; host: string; port: number;
   stateDirectory: string; slots: number; repositories: Record<string, string>; launchers: Record<string, string>;
+  controlTokenHash: string;
 }
 export interface PluginConfig { brokerUrl: string; tokenFile: string; machineId: string;
   stateDirectory: string; selectedRemote?: string; host: "omp" | "pi";
