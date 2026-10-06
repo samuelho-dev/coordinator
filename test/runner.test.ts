@@ -217,8 +217,9 @@ test("real broker-bound SQLite acceptance is unique, conflict-safe and reserves 
 });
 
 test("deadline expiry during owned SQL admission and prompt transactions never dispatches expired work", async (t) => {
-  for (const phase of ["admission", "prompt reservation", "committed prompt intent"]) await t.test(phase, async () => {
+  for (const phase of ["admission", "prompt reservation", "committed prompt intent"]) await t.test(phase, async (child) => {
     const f = await fixture();
+    child.after(() => f.close());
     const runner = await f.open();
     const originalTransaction = runner.service.sql.withTransaction;
     const attempted = await f.run(Deferred.make<void>()), unlock = await f.run(Deferred.make<void>());
@@ -274,7 +275,6 @@ test("deadline expiry during owned SQL admission and prompt transactions never d
       await f.run(Deferred.succeed(unlock, undefined));
       if (outcome) await outcome;
       Object.defineProperty(runner.service.sql, "withTransaction", { value: originalTransaction, configurable: true, writable: true });
-      await f.close();
     }
   });
 });
