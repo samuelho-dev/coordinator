@@ -1,152 +1,178 @@
-import { execFileSync } from "node:child_process";
-import { accessSync, constants, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import type { PluginConfig, RunnerConfig } from "../src/protocol.js";
+import { Config, Console, Effect, Layer, Option, Schema, Stdio } from "effect";
+import { NodeRuntime, NodeServices } from "@effect/platform-node";
+import { ChildProcess } from "effect/process";
+import { PluginConfig, RunnerConfig, InstallPlan, JsonValue, Commands, CommandError, type CommandInput, type InstallCommand } from "../src/contracts.ts";
+import { Platform } from "../src/platform.ts";
+import { decodeEffect, decodeJson, encodeJson } from "../src/http.ts";
 
-function privateFile(path: string): string {
-  if ((statSync(path).mode & 0o777) !== 0o600) throw new Error(`Mode-0600 file required: ${path}`);
-  return readFileSync(path, "utf8").trim();
-}
-
-const args = process.argv.slice(2);
-if (args.includes("--help")) {
-  console.log("pnpm install:host -- --runtime /absolute/node --host-binary /absolute/omp-or-pi (--plugin-only --host omp|pi --plugin-config /absolute/private/plugin.json | --runner-only --runner-config /absolute/private/runner.json) [--dry-run] [--remote SSH_ALIAS --remote-root /absolute/repository]");
-  console.log("Run --plugin-only as the native user, then --runner-only as root from a trusted installed release on Linux. Runner config/token must belong to a dedicated non-login service account; release/runtime paths must be root/service-owned and not writable by native accounts. Six bounded supervisor capabilities and actual cap-zero child UID isolation are required. macOS supports plugin-only. Mode-0600 configs/credentials and installed dependencies required.");
-  process.exit(0);
-}
-const dry = args.includes("--dry-run");
-const option = (name: string): string => {
-  const index = args.indexOf(name);
-  const value = index >= 0 ? args[index + 1] : undefined;
-  if (!value || value.startsWith("--")) throw new Error(`Required ${name}`);
-  return value;
-};
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const pluginOnly = args.includes("--plugin-only");
-const runnerOnly = args.includes("--runner-only");
-if (pluginOnly === runnerOnly) throw new Error("Select --plugin-only as the native user, then run privileged --runner-only separately; combined/user-service installation is unsupported");
-const host = pluginOnly ? option("--host") : undefined;
-if (host !== undefined && host !== "omp" && host !== "pi") throw new Error("--host must be omp or pi");
-const runtime = option("--runtime");
-const binary = option("--host-binary");
-const pluginPath = pluginOnly ? option("--plugin-config") : undefined;
-const runnerPath = runnerOnly ? option("--runner-config") : undefined;
-for (const path of [runtime, binary, ...(pluginPath ? [pluginPath] : []), ...(runnerPath ? [runnerPath] : [])]) {
-  if (!isAbsolute(path) || /[\r\n\u0000]/.test(path)) throw new Error("Absolute single-line paths required");
-}
-if (args.includes("--remote")) {
-  const destination = option("--remote");
-  const remoteRoot = option("--remote-root");
-  if (!/^[a-zA-Z0-9_.@-]+$/.test(destination) || destination.startsWith("-") || !isAbsolute(remoteRoot) || /[\r\n\u0000]/.test(remoteRoot)) throw new Error("Invalid remote destination/root");
-  const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
-  const remoteArgs = [runtime, "--import", join(remoteRoot, "node_modules/tsx/dist/loader.mjs"), join(remoteRoot, "scripts/install.ts"),
-    "--runtime", runtime, "--host-binary", binary, ...(pluginPath ? ["--plugin-only", "--host", host!, "--plugin-config", pluginPath] : ["--runner-only", "--runner-config", runnerPath!]), ...(dry ? ["--dry-run"] : [])];
-  try {
-    const output = execFileSync("/usr/bin/ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination, remoteArgs.map(shellQuote).join(" ")], { stdio: "pipe", encoding: "utf8" });
-    console.log(JSON.stringify(JSON.parse(output), null, 2));
-  }
-  catch { throw new Error("Remote coordinator install unavailable; repository, dependencies and private configs must already exist at remote absolute paths. No local installation applied."); }
-  process.exit(0);
-}
-if (runnerOnly && (process.platform !== "linux" || process.getuid?.() !== 0)) throw new Error("--runner-only requires root on Linux; macOS runner isolation is unavailable (plugin-only supported)");
-if (pluginOnly && process.getuid?.() === 0) throw new Error("--plugin-only must run as the native nonroot user; root plugin registration is forbidden");
-accessSync(runtime, constants.X_OK); accessSync(binary, constants.X_OK);
-if (pluginOnly) {
-  execFileSync(runtime, ["-e", "const s=require('node:sqlite'); const d=new s.DatabaseSync(':memory:');d.close();if(typeof s.backup!=='function')process.exit(1)"], { stdio: "pipe" });
-  execFileSync(binary, ["--version"], { stdio: "pipe" });
-}
-const plugin = pluginPath ? JSON.parse(privateFile(pluginPath)) as PluginConfig : undefined;
-const runner = runnerPath ? JSON.parse(privateFile(runnerPath)) as RunnerConfig : undefined;
-if (plugin && plugin.host !== host) throw new Error("Plugin host mismatch");
-for (const config of [...(plugin ? [plugin] : []), ...(runner ? [runner] : [])]) {
-  for (const path of [config.stateDirectory, config.tokenFile]) {
-    if (!isAbsolute(path) || /[\r\n\u0000]/.test(path)) throw new Error("Absolute secure configuration paths required");
-  }
-  privateFile(config.tokenFile);
-  if (statSync(dirname(config.tokenFile)).mode & 0o077) throw new Error("Private token directory required");
-}
-const loader = join(root, "node_modules/tsx/dist/loader.mjs");
-accessSync(loader, constants.R_OK);
-const program = [runtime, "--import", loader, join(root, "src/runner.ts")];
-const commands: { binary: string; args: string[] }[] = plugin ? [{ binary, args: host === "omp" ? ["plugin", "link", root] : ["install", root] }] : [];
-const launcher = plugin ? join(homedir(), ".local/bin", `coordinator-${host}`) : undefined;
-const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
-const wrapper = pluginPath ? `#!/bin/sh\nexport COORDINATOR_CONFIG=${shellQuote(pluginPath)}\nexec ${shellQuote(binary)} \"$@\"\n` : undefined;
-let service: string | undefined;
-let content = "";
-if (runner && runnerPath) {
-  const owner = lstatSync(runnerPath);
-  const tokenOwner = lstatSync(runner.tokenFile);
-  if (!owner.isFile() || !tokenOwner.isFile() || (owner.mode & 0o777) !== 0o600 || (tokenOwner.mode & 0o777) !== 0o600 ||
-    owner.uid === 0 || owner.gid === 0 || owner.uid !== tokenOwner.uid || owner.gid !== tokenOwner.gid) throw new Error("Runner config/token must be mode-0600 regular files owned by the same nonroot UID/GID");
-  const account = readFileSync("/etc/passwd", "utf8").split("\n").map((line) => line.split(":")).find((entry) => Number(entry[2]) === owner.uid);
-  if (!account || Number(account[3]) !== owner.gid || !["/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false"].includes(account[6]!)) throw new Error("Runner owner must be a dedicated non-login service account, not a native/plugin user");
-  if (readFileSync("/etc/group", "utf8").split("\n").some((line) => line.split(":")[3]?.split(",").includes(account[0]!))) throw new Error("Dedicated service account must have no supplementary group memberships");
-  if (!Number.isSafeInteger(runner.childUidBase) || runner.childUidBase < 1000000 || runner.childUidBase > 0xffffffff - 1000000 || owner.uid >= 1000000) throw new Error("Dedicated service UID and reserved child UID range required");
-  const securePath = (path: string, privateDirectory = false): void => {
-    if (!isAbsolute(path) || resolve(path) !== path || /[\r\n\u0000]/.test(path) || realpathSync(path) !== path) throw new Error("Canonical absolute runner paths required");
-    const info = statSync(path);
-    if (privateDirectory && (!info.isDirectory() || info.uid !== owner.uid || info.gid !== owner.gid || (info.mode & 0o077))) throw new Error("Private runner directories must belong to the service owner");
-    for (let current = path; ; current = dirname(current)) {
-      const entry = statSync(current);
-      if ((entry.uid !== 0 && entry.uid !== owner.uid) || (entry.mode & 0o022)) throw new Error("Trusted installed release/runtime and runner paths must be root or service-owned, not writable by native accounts");
-      if (current === "/") break;
+const command = Commands["program.install:host"];
+const installHost = Effect.fnUntraced(function*(flags: CommandInput<"program.install:host">) {
+  const platform = yield* Platform;
+  const fs = platform.fs;
+  const { dirname, isAbsolute, join, resolve } = platform.path;
+  if (flags["--help"]) {
+    yield* Console.log(command.description);
+    for (const [name, field] of Object.entries(command.input.fields)) {
+      yield* Console.log(`${name}${Schema.is(field)(true) ? "" : " VALUE"}: ${Schema.resolveAnnotations(field)?.description ?? ""}`);
     }
-  };
-  for (const path of [runnerPath, runner.tokenFile, root]) securePath(path);
-  securePath(realpathSync(runtime));
-  securePath(dirname(runtime));
-  const visited = new Set<string>();
-  const trustedRelease = (path: string): void => {
-    const canonical = realpathSync(path);
-    if (visited.has(canonical)) return;
-    visited.add(canonical);
-    securePath(canonical);
-    if (statSync(canonical).isDirectory()) for (const entry of readdirSync(canonical)) trustedRelease(join(canonical, entry));
-  };
-  trustedRelease(root);
-  for (const path of [binary, ...Object.values(runner.launchers)]) {
-    if (!isAbsolute(path) || /[\r\n\u0000]/.test(path)) throw new Error("Absolute native executable paths required");
-    accessSync(path, constants.X_OK);
+    return;
   }
-  for (const path of [dirname(runnerPath), dirname(runner.tokenFile), runner.stateDirectory, runner.modelDirectory, ...Object.values(runner.repositories)]) securePath(path, true);
-  if (!isAbsolute(runner.childDirectory) || resolve(runner.childDirectory) !== runner.childDirectory || /[\r\n\u0000]/.test(runner.childDirectory)) throw new Error("Canonical absolute child directory required");
-  securePath(dirname(runner.childDirectory));
-  accessSync("/usr/bin/flock", constants.X_OK);
-  // The service owner, not root, creates and validates the child root.
-  const caps = "-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap";
-  try {
+  const dry = flags["--dry-run"] ?? false;
+  const installerPrivateFile = Effect.fnUntraced(function*(path: string) {
+    const info = yield* fs.stat(path);
+    if (info.type !== "File" || (info.mode & 0o777) !== 0o600) return yield* new CommandError({ message: `Mode-0600 file required: ${path}` });
+    return yield* platform.privateFile(path);
+  });
+  const root = resolve(dirname(yield* platform.path.fromFileUrl(new URL(import.meta.url))), "..");
+  const loader = join(root, "node_modules/tsx/dist/loader.mjs");
+  const pluginOnly = flags["--plugin-only"] ?? false, runnerOnly = flags["--runner-only"] ?? false;
+  const host = pluginOnly ? flags["--host"] : undefined;
+  const runtime = flags["--runtime"]!, binary = flags["--host-binary"]!;
+  const pluginPath = pluginOnly ? flags["--plugin-config"] : undefined;
+  const runnerPath = runnerOnly ? flags["--runner-config"] : undefined;
+  const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  if (flags["--remote"]) {
+    const destination = flags["--remote"], remoteRoot = flags["--remote-root"]!;
+    const remoteArgs = [runtime, "--import", join(remoteRoot, "node_modules/tsx/dist/loader.mjs"), join(remoteRoot, "scripts/install.ts"),
+      "--runtime", runtime, "--host-binary", binary, ...(pluginPath ? ["--plugin-only", "--host", host!, "--plugin-config", pluginPath] : ["--runner-only", "--runner-config", runnerPath!]), ...(dry ? ["--dry-run"] : [])];
+    const output = yield* platform.exec(ChildProcess.make("/usr/bin/ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination, remoteArgs.map(shellQuote).join(" ")]), 120000).pipe(
+      Effect.mapError(() => new CommandError({ message: "Remote coordinator install unavailable; repository, dependencies and private configs must already exist at remote absolute paths. No local installation applied." })),
+    );
+    const plan = decodeJson(InstallPlan, output);
+    yield* Console.log(encodeJson(InstallPlan, plan, 2));
+    return plan;
+  }
+  // Effect has no OS platform or current effective UID API; these enforce the native-account privilege boundary.
+  if (runnerOnly && (process.platform !== "linux" || process.getuid?.() !== 0)) return yield* new CommandError({ message: "--runner-only requires root on Linux; macOS runner isolation is unavailable (plugin-only supported)" });
+  if (pluginOnly && process.getuid?.() === 0) return yield* new CommandError({ message: "--plugin-only must run as the native nonroot user; root plugin registration is forbidden" });
+  for (const path of [runtime, binary]) {
+    const info = yield* fs.stat(path);
+    if (info.type !== "File" || !(info.mode & 0o111)) return yield* new CommandError({ message: "Executable runtime/native launcher required" });
+  }
+  yield* fs.readFileString(loader);
+  const sqliteProbe = "import{Context,Effect,Layer}from'effect';import*as SqliteClient from'@effect/sql-sqlite-node/SqliteClient';await Effect.runPromise(Effect.scoped(Effect.gen(function*(){const context=yield*Layer.build(SqliteClient.layer({filename:':memory:'}));yield*Context.get(context,SqliteClient.SqliteClient).unsafe('SELECT 1')})));";
+  if (pluginOnly) {
+    yield* platform.exec(ChildProcess.make(runtime, ["--import", loader, "--input-type=module", "-e", sqliteProbe], { cwd: root }));
+    yield* platform.exec(ChildProcess.make(binary, ["--version"]));
+  }
+  const pluginContents = pluginPath ? yield* installerPrivateFile(pluginPath) : undefined;
+  const runnerContents = runnerPath ? yield* installerPrivateFile(runnerPath) : undefined;
+  const plugin = pluginContents !== undefined ? yield* Effect.try(() => decodeJson(PluginConfig, pluginContents)) : undefined;
+  const runner = runnerContents !== undefined ? yield* Effect.try(() => decodeJson(RunnerConfig, runnerContents)) : undefined;
+  if (plugin && plugin.host !== host) return yield* new CommandError({ message: "Plugin host mismatch" });
+  for (const config of [...(plugin ? [plugin] : []), ...(runner ? [runner] : [])]) {
+    for (const path of [config.stateDirectory, config.tokenFile]) if (!isAbsolute(path) || /[\r\n\u0000]/.test(path)) return yield* new CommandError({ message: "Absolute secure configuration paths required" });
+    yield* installerPrivateFile(config.tokenFile);
+    if ((yield* fs.stat(dirname(config.tokenFile))).mode & 0o077) return yield* new CommandError({ message: "Private token directory required" });
+  }
+  const program = [runtime, "--import", loader, join(root, "src/main.ts"), "runner"];
+  const commands: InstallCommand[] = plugin ? [{ binary, args: host === "omp" ? ["plugin", "link", root] : ["install", root] }] : [];
+  const launcher = plugin ? join(yield* Config.String("HOME"), ".local/bin", `coordinator-${host}`) : undefined;
+  const wrapper = pluginPath ? `#!/bin/sh\nexport COORDINATOR_CONFIG=${shellQuote(pluginPath)}\nexec ${shellQuote(binary)} "$@"\n` : undefined;
+  let service: string | undefined;
+  let content = "";
+  if (runner && runnerPath) {
+    const owner = yield* fs.stat(runnerPath), tokenOwner = yield* fs.stat(runner.tokenFile);
+    const uid = Option.getOrThrow(owner.uid), gid = Option.getOrThrow(owner.gid);
+    if ((yield* fs.realPath(runnerPath)) !== runnerPath || (yield* fs.realPath(runner.tokenFile)) !== runner.tokenFile ||
+      owner.type !== "File" || tokenOwner.type !== "File" || (owner.mode & 0o777) !== 0o600 || (tokenOwner.mode & 0o777) !== 0o600 ||
+      uid === 0 || gid === 0 || uid !== Option.getOrThrow(tokenOwner.uid) || gid !== Option.getOrThrow(tokenOwner.gid)) return yield* new CommandError({ message: "Runner config/token must be mode-0600 regular files owned by the same nonroot UID/GID" });
+    const account = (yield* fs.readFileString("/etc/passwd")).split("\n").map((line) => line.split(":")).find((entry) => Number(entry[2]) === uid);
+    if (!account || Number(account[3]) !== gid || !["/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false"].includes(account[6]!)) return yield* new CommandError({ message: "Runner owner must be a dedicated non-login service account, not a native/plugin user" });
+    if ((yield* fs.readFileString("/etc/group")).split("\n").some((line) => line.split(":")[3]?.split(",").includes(account[0]!))) return yield* new CommandError({ message: "Dedicated service account must have no supplementary group memberships" });
+    if (!Number.isSafeInteger(runner.childUidBase) || runner.childUidBase < 1000000 || runner.childUidBase > 0xffffffff - 1000000 || uid >= 1000000) return yield* new CommandError({ message: "Dedicated service UID and reserved child UID range required" });
+    const securePath = Effect.fnUntraced(function*(path: string, privateDirectory = false) {
+      if (!isAbsolute(path) || resolve(path) !== path || /[\r\n\u0000]/.test(path) || (yield* fs.realPath(path)) !== path) return yield* new CommandError({ message: "Canonical absolute runner paths required" });
+      const info = yield* fs.stat(path);
+      if (privateDirectory && (info.type !== "Directory" || Option.getOrThrow(info.uid) !== uid || Option.getOrThrow(info.gid) !== gid || (info.mode & 0o077))) return yield* new CommandError({ message: "Private runner directories must belong to the service owner" });
+      for (let current = path; ; current = dirname(current)) {
+        const entry = yield* fs.stat(current);
+        if ((Option.getOrThrow(entry.uid) !== 0 && Option.getOrThrow(entry.uid) !== uid) || (entry.mode & 0o022)) return yield* new CommandError({ message: "Trusted installed release/runtime and runner paths must be root or service-owned, not writable by native accounts" });
+        if (current === "/") break;
+      }
+    });
+    for (const path of [runnerPath, runner.tokenFile, root]) yield* securePath(path);
+    yield* securePath(yield* fs.realPath(runtime));
+    yield* securePath(dirname(runtime));
+    const visited = new Set<string>();
+    const trustedRelease = (path: string): Effect.Effect<void, unknown> => Effect.gen(function*() {
+      const canonical = yield* fs.realPath(path);
+      if (visited.has(canonical)) return;
+      visited.add(canonical);
+      yield* securePath(canonical);
+      if ((yield* fs.stat(canonical)).type === "Directory") for (const entry of yield* fs.readDirectory(canonical)) yield* trustedRelease(join(canonical, entry));
+    });
+    yield* trustedRelease(root);
+    for (const path of [binary, ...Object.values(runner.launchers)]) {
+      if (!isAbsolute(path) || /[\r\n\u0000]/.test(path)) return yield* new CommandError({ message: "Absolute native executable paths required" });
+      const info = yield* fs.stat(path);
+      if (info.type !== "File" || !(info.mode & 0o111)) return yield* new CommandError({ message: "Native executable required" });
+    }
+    for (const path of [dirname(runnerPath), dirname(runner.tokenFile), runner.stateDirectory, runner.modelDirectory, ...Object.values(runner.repositories)]) yield* securePath(path, true);
+    if (!isAbsolute(runner.childDirectory) || resolve(runner.childDirectory) !== runner.childDirectory || /[\r\n\u0000]/.test(runner.childDirectory)) return yield* new CommandError({ message: "Canonical absolute child directory required" });
+    yield* securePath(dirname(runner.childDirectory));
+    if (!((yield* fs.stat("/usr/bin/flock")).mode & 0o111)) return yield* new CommandError({ message: "Executable flock required" });
+    const caps = "-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap";
+    const moduleUrl = Effect.fnUntraced(function*(file: string) { return encodeJson(JsonValue, (yield* platform.path.toFileUrl(join(root, file))).href); });
+    const isolationProbe = `${sqliteProbe}
+import { Config, Effect as E, Layer as L } from "effect";
+import { NodeServices } from "@effect/platform-node";
+import { requireIsolation } from ${yield* moduleUrl("src/runner.ts")};
+import { Platform } from ${yield* moduleUrl("src/platform.ts")};
+import { RunnerConfig } from ${yield* moduleUrl("src/contracts.ts")};
+import { decodeJson } from ${yield* moduleUrl("src/http.ts")};
+await E.runPromise(E.gen(function*() {
+  const p = yield* Platform;
+  const text = yield* p.privateFile(yield* Config.String("COORDINATOR_CONFIG"));
+  yield* requireIsolation(decodeJson(RunnerConfig, text));
+}).pipe(E.provide(L.merge(Platform.layer, NodeServices.layer))));`;
     // Native version probes run only as a fresh child UID with every capability cleared.
-    execFileSync("/usr/bin/setpriv", [`--reuid=${runner.childUidBase}`, `--regid=${runner.childUidBase}`, "--clear-groups", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", binary, "--version"],
-      { env: { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", HOME: "/tmp" }, stdio: "pipe", timeout: 10000 });
-    execFileSync("/usr/bin/setpriv", [`--reuid=${owner.uid}`, `--regid=${owner.gid}`, "--clear-groups", `--bounding-set=${caps}`, `--inh-caps=${caps}`, `--ambient-caps=${caps}`, "--no-new-privs",
-      runtime, "--import", loader, "--input-type=module", "-e",
-      `import{readFileSync}from'node:fs';import{DatabaseSync,backup}from'node:sqlite';import{requireIsolation}from${JSON.stringify(pathToFileURL(join(root, "src/runner.ts")).href)};const d=new DatabaseSync(':memory:');d.close();if(typeof backup!=='function')process.exit(1);requireIsolation(JSON.parse(readFileSync(process.argv[1],'utf8')))`,
-      runnerPath], { cwd: root, env: { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8" }, stdio: "pipe", timeout: 30000 });
-  } catch { throw new Error("Actual service UID/capability isolation validation failed; no system service installed"); }
-  securePath(runner.childDirectory);
-  if (statSync(runner.childDirectory).uid !== owner.uid || statSync(runner.childDirectory).gid !== owner.gid) throw new Error("Child directory must belong to the service owner");
-  service = "/etc/systemd/system/coordinator-runner.service";
-  const quote = (text: string) => `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
-  const capabilities = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP";
-  content = `[Unit]\nDescription=Coordinator approved-work runner\nAfter=network-online.target\n[Service]\nType=simple\nUser=${owner.uid}\nGroup=${owner.gid}\nSupplementaryGroups=\nWorkingDirectory=${quote(root)}\nEnvironment=${quote(`COORDINATOR_CONFIG=${runnerPath}`)}\nExecStart=${program.map(quote).join(" ")}\nAmbientCapabilities=${capabilities}\nCapabilityBoundingSet=${capabilities}\nRestart=on-failure\nRestartSec=10\nUMask=0077\nNoNewPrivileges=true\n[Install]\nWantedBy=multi-user.target\n`;
-  commands.push({ binary: "/usr/bin/systemctl", args: ["daemon-reload"] }, { binary: "/usr/bin/systemctl", args: ["enable", "--now", "coordinator-runner.service"] });
-}
-if (!dry) {
-  if (service) {
-    mkdirSync(dirname(service), { recursive: true, mode: 0o700 });
-    writeFileSync(service, content, { mode: 0o600 });
+    yield* Effect.gen(function*() {
+      yield* platform.exec(ChildProcess.make("/usr/bin/setpriv", [`--reuid=${runner.childUidBase}`, `--regid=${runner.childUidBase}`, "--clear-groups", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", binary, "--version"], { env: { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", HOME: "/tmp" }, extendEnv: false }), 10000);
+      yield* platform.exec(ChildProcess.make("/usr/bin/setpriv", [`--reuid=${uid}`, `--regid=${gid}`, "--clear-groups", `--bounding-set=${caps}`, `--inh-caps=${caps}`, `--ambient-caps=${caps}`, "--no-new-privs", runtime, "--import", loader, "--input-type=module", "-e", isolationProbe], { cwd: root, env: { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", COORDINATOR_CONFIG: runnerPath }, extendEnv: false }), 30000);
+    }).pipe(Effect.mapError(() => new CommandError({ message: "Actual service UID/capability isolation validation failed; no system service installed" })));
+    yield* securePath(runner.childDirectory);
+    const childOwner = yield* fs.stat(runner.childDirectory);
+    if (Option.getOrThrow(childOwner.uid) !== uid || Option.getOrThrow(childOwner.gid) !== gid) return yield* new CommandError({ message: "Child directory must belong to the service owner" });
+    service = "/etc/systemd/system/coordinator-runner.service";
+    const quote = (text: string) => `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
+    const capabilities = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP";
+    content = `[Unit]\nDescription=Coordinator approved-work runner\nAfter=network-online.target\n[Service]\nType=simple\nUser=${uid}\nGroup=${gid}\nSupplementaryGroups=\nWorkingDirectory=${quote(root)}\nEnvironment=${quote(`COORDINATOR_CONFIG=${runnerPath}`)}\nExecStart=${program.map(quote).join(" ")}\nAmbientCapabilities=${capabilities}\nCapabilityBoundingSet=${capabilities}\nRestart=on-failure\nRestartSec=10\nUMask=0077\nNoNewPrivileges=true\n[Install]\nWantedBy=multi-user.target\n`;
+    commands.push({ binary: "/usr/bin/systemctl", args: ["daemon-reload"] }, { binary: "/usr/bin/systemctl", args: ["enable", "--now", "coordinator-runner.service"] });
   }
-  if (launcher && wrapper) {
-    mkdirSync(dirname(launcher), { recursive: true, mode: 0o700 });
-    writeFileSync(launcher, wrapper, { mode: 0o700 });
+  if (!dry) {
+    if (service) {
+      yield* fs.makeDirectory(dirname(service), { recursive: true, mode: 0o700 });
+      yield* fs.writeFileString(service, content, { mode: 0o600 });
+    }
+    if (launcher && wrapper) {
+      yield* fs.makeDirectory(dirname(launcher), { recursive: true, mode: 0o700 });
+      yield* fs.writeFileString(launcher, wrapper, { mode: 0o700 });
+    }
+    for (const command of commands) yield* platform.exec(ChildProcess.make(command.binary, command.args, { cwd: root })).pipe(
+      Effect.mapError(() => new CommandError({ message: `Installer operation failed: ${command.binary}; subprocess output suppressed to protect secrets` })),
+    );
   }
-  for (const command of commands) {
-    try { execFileSync(command.binary, command.args, { cwd: root, stdio: "pipe" }); }
-    catch { throw new Error(`Installer operation failed: ${command.binary}; subprocess output suppressed to protect secrets`); }
+  // Print only paths and operation plans, never config contents, tokens, or host subprocess output.
+  const plan: InstallPlan = { dryRun: dry, mode: pluginOnly ? "plugin-only" : "runner-only", service, launcher, program, operations: commands, ...(pluginPath ? { pluginEnvironment: { COORDINATOR_CONFIG: pluginPath } } : {}), host, package: root };
+  yield* Console.log(encodeJson(InstallPlan, plan, 2));
+  return plan;
+});
+
+NodeRuntime.runMain(Effect.gen(function*() {
+  const args = yield* (yield* Stdio.Stdio).args;
+  const flags: Record<string, unknown> = {};
+  for (let index = 0; index < args.length; index++) {
+    const name = args[index]!;
+    if (!Object.hasOwn(command.input.fields, name)) return yield* new CommandError({ message: `Unknown installer flag: ${name}` });
+    if (Object.hasOwn(flags, name)) return yield* new CommandError({ message: `Duplicate installer flag: ${name}` });
+    const field = command.input.fields[name as keyof typeof command.input.fields];
+    if (Schema.is(field)(true)) flags[name] = true;
+    else {
+      const value = args[++index];
+      if (value === undefined || value.startsWith("--")) return yield* new CommandError({ message: `Required value for ${name}` });
+      flags[name] = value;
+    }
   }
-}
-// Print only paths and operation plans, never config contents, tokens, or host subprocess output.
-console.log(JSON.stringify({ dryRun: dry, mode: pluginOnly ? "plugin-only" : "runner-only", service, launcher, program, operations: commands, ...(pluginPath ? { pluginEnvironment: { COORDINATOR_CONFIG: pluginPath } } : {}), host, package: root }, null, 2));
+  return yield* command.executeDecoded({ installHost }, flags, decodeEffect);
+}).pipe(Effect.provide(Layer.merge(Platform.layer, NodeServices.layer))));

@@ -1,137 +1,140 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { digest, fingerprint, LIMIT } from "./protocol.js";
+import { ByteSize, Clock, Context, Effect, Layer, Option, Semaphore } from "effect";
+import { ArchiveEntry, CommandError, JournalState, JsonValue, type ObservedFile, type SafeEntry } from "./contracts.ts";
+import { canonicalJson, decodeJson, encodeJson, LIMIT } from "./http.ts";
+import { Platform } from "./platform.ts";
 
-export function durable(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.tmp`;
-  const fd = openSync(temporary, "w", 0o600);
-  try { writeFileSync(fd, JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(temporary, path);
-  const directory = openSync(dirname(path), "r");
-  try { fsyncSync(directory); } finally { closeSync(directory); }
-}
-
-interface ArchiveEntry { entryId: string; digest: string; payload: unknown; gaps: string[] }
-interface State {
-  handled: Record<string, true>; releases: Record<string, "intent" | "sent">;
-  consent: boolean; participants: string[]; seen: Record<string, string>;
-  fileDigest?: string; spool: ArchiveEntry[]; gaps: string[];
-  inbox: Record<string, { payload: unknown; digest: string; receivedAt: number }>;
-}
-// Archive metadata only: never copy message text, tool arguments/results, thinking, paths,
-// custom data, credentials, or model payloads across this trust boundary.
-export function safeEntry(value: unknown): { id: string; payload: unknown; linked: boolean } | undefined {
+// Archive graph metadata only; no native message content crosses this boundary.
+export function safeEntry(value: unknown): SafeEntry | undefined {
   if (!value || typeof value !== "object") return;
   const entry = value as Record<string, unknown>;
   if (typeof entry.id !== "string" || !/^[a-zA-Z0-9_.:-]{1,160}$/.test(entry.id)) return;
   const type = typeof entry.type === "string" && /^[a-z_]{1,40}$/.test(entry.type) ? entry.type : "omitted";
   const parentId = typeof entry.parentId === "string" && /^[a-zA-Z0-9_.:-]{1,160}$/.test(entry.parentId) ? entry.parentId : null;
   const message = entry.message && typeof entry.message === "object" ? entry.message as Record<string, unknown> : undefined;
-  const role = message && ["user", "assistant", "toolResult"].includes(String(message.role)) ? message.role : undefined;
+  const role = message?.role === "user" || message?.role === "assistant" || message?.role === "toolResult" ? message.role : undefined;
   return { id: entry.id, linked: parentId !== null, payload: { id: entry.id, parentId, type, ...(role ? { role } : {}), contentOmitted: true } };
 }
 
-export class Journal {
-  readonly path: string;
-  state: State;
-  private observedFile?: { path: string; size: number; mtimeMs: number };
-  constructor(directory: string, sessionId: string) {
-    this.path = join(directory, `${digest(sessionId)}.json`);
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    if ((statSync(directory).mode & 0o077) !== 0) throw new Error("Private journal directory required");
-    if (existsSync(this.path) && (statSync(this.path).mode & 0o077) !== 0) throw new Error("Private journal file required");
-    this.state = existsSync(this.path) ? JSON.parse(readFileSync(this.path, "utf8")) as State : {
-      handled: {}, releases: {}, consent: false, participants: [], seen: {}, spool: [], gaps: [], inbox: {},
-    };
-    this.state.inbox ??= {};
-  }
-  save(): void { durable(this.path, this.state); }
-  handled(id: string): boolean { return this.state.handled[id] === true; }
-  handle(id: string): void { this.state.handled[id] = true; this.save(); }
-  receive(messageId: string, payload: unknown): boolean {
-    const hash = fingerprint(payload); const prior = this.state.inbox[messageId];
+const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessionId: string) {
+  const platform = yield* Platform;
+  const fs = platform.fs;
+  const path = platform.path.join(directory, `${yield* platform.digest(sessionId)}.json`);
+  yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
+  if (((yield* fs.stat(directory)).mode & 0o077) !== 0) return yield* Effect.fail(new CommandError({ message: "Private journal directory required" }));
+  const exists = yield* fs.exists(path);
+  if (exists && ((yield* fs.stat(path)).mode & 0o077) !== 0) return yield* Effect.fail(new CommandError({ message: "Private journal file required" }));
+  const state: JournalState = exists ? decodeJson(JournalState, yield* fs.readFileString(path)) : {
+    handled: {}, releases: {}, consent: false, participants: [], seen: {}, spool: [], gaps: [], inbox: {},
+  };
+  const semaphore = yield* Semaphore.make(1);
+  let observedFile: ObservedFile | undefined;
+  let writeFailed = false;
+  const syncDirectory = Effect.scoped(Effect.gen(function*() {
+    const file = yield* fs.open(directory, { flag: "r" });
+    yield* file.sync;
+  }));
+  const persist = Effect.fn("Journal.persist")(function*() {
+    const text = encodeJson(JournalState, state);
+    const temporary = `${path}.tmp`;
+    yield* Effect.scoped(Effect.gen(function*() {
+      const file = yield* fs.open(temporary, { flag: "w", mode: 0o600 });
+      yield* fs.chmod(temporary, 0o600);
+      yield* file.writeAll(new TextEncoder().encode(text));
+      yield* file.sync;
+    }));
+    yield* fs.rename(temporary, path);
+    yield* syncDirectory;
+  }, Effect.onError(() => Effect.sync(() => { writeFailed = true; })));
+  const serial = <A, E>(operation: Effect.Effect<A, E>) => semaphore.withPermits(1)(Effect.suspend<A, E | CommandError, never>(() =>
+    writeFailed ? Effect.fail(new CommandError({ message: "Journal durability unavailable; reopen required" })) : operation
+  ).pipe(Effect.uninterruptible));
+  const handled = Effect.fn("Journal.handled")(function*(id: string) { return state.handled[id] === true; });
+  const save = Effect.fn("Journal.save")(() => serial(persist()));
+  const handle = Effect.fn("Journal.handle")((id: string) => serial(Effect.gen(function*() { state.handled[id] = true; yield* persist(); })));
+  const clearInbox = Effect.fn("Journal.clearInbox")(() => serial(Effect.gen(function*() { state.inbox = {}; yield* persist(); })));
+  const receive = Effect.fn("Journal.receive")((messageId: string, payload: JsonValue) => serial(Effect.gen(function*() {
+    const hash = yield* platform.fingerprint(payload);
+    const prior = state.inbox[messageId];
     if (prior) {
-      if (prior.digest !== hash) throw new Error("Received message ID payload conflict");
+      if (prior.digest !== hash) return yield* Effect.fail(new CommandError({ message: "Received message ID payload conflict" }));
       return false;
     }
-    if (this.handled(`peer:${messageId}`)) return false;
-    if (Buffer.byteLength(JSON.stringify({ ...this.state.inbox, [messageId]: payload })) > 128 * 1024) throw new Error("Local inbox full; handling acknowledgement withheld");
-    this.state.inbox[messageId] = { payload, digest: hash, receivedAt: Date.now() };
-    this.state.handled[`peer:${messageId}`] = true;
-    this.save(); return true;
-  }
-  releaseIntent(key: string): boolean {
-    if (this.state.releases[key]) return false;
-    const intent = `${this.path}.${digest(key)}.intent`;
-    try {
-      const fd = openSync(intent, "wx", 0o600);
-      try { writeFileSync(fd, "intent"); fsyncSync(fd); } finally { closeSync(fd); }
-    } catch (error) {
-      if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") throw error;
-      this.state.releases[key] = "intent"; this.save(); return false;
-    }
-    this.state.releases[key] = "intent"; this.save(); return true;
-  }
-  releaseSent(key: string): void { this.state.releases[key] = "sent"; this.save(); }
-  consent(participants: string[]): void { this.state.consent = true; this.state.participants = participants; this.save(); }
-  erase(): void {
-    this.state.consent = false; this.state.participants = []; this.state.spool = [];
-    this.state.seen = {}; this.state.gaps = []; delete this.state.fileDigest;
-    this.observedFile = undefined;
-    // Keep delivery dedup/intent records: opting out must not enable duplicate prompts.
-    this.save();
-  }
-  coverage(): void {
-    if (!this.state.gaps.length) return;
-    const payload = { coverageOnly: true, gaps: [...this.state.gaps] };
-    const hash = fingerprint(payload);
-    if (this.state.fileDigest !== hash) {
-      this.state.spool.push({ entryId: `coverage:${hash}`, digest: hash, payload, gaps: [...this.state.gaps] });
-      this.state.fileDigest = hash;
-    }
-  }
-  scan(file: string | undefined): void {
-    if (!this.state.consent) return;
-    const gap = (name: string) => { if (!this.state.gaps.includes(name)) this.state.gaps.push(name); };
+    if (state.handled[`peer:${messageId}`]) return false;
+    const entry = { payload, digest: hash, receivedAt: yield* Clock.currentTimeMillis };
+    if (new TextEncoder().encode(canonicalJson({ ...state.inbox, [messageId]: entry })).length > 128 * 1024) return yield* Effect.fail(new CommandError({ message: "Local inbox full; handling acknowledgement withheld" }));
+    state.inbox[messageId] = entry;
+    state.handled[`peer:${messageId}`] = true;
+    yield* persist();
+    return true;
+  })));
+  const releaseIntent = Effect.fn("Journal.releaseIntent")((key: string) => serial(Effect.gen(function*() {
+    if (state.releases[key]) return false;
+    const intent = `${path}.${yield* platform.digest(key)}.intent`;
+    const created = yield* Effect.scoped(Effect.gen(function*() {
+      const file = yield* fs.open(intent, { flag: "wx", mode: 0o600 });
+      yield* file.writeAll(new TextEncoder().encode("intent"));
+      yield* file.sync;
+      yield* syncDirectory;
+      return true;
+    })).pipe(Effect.catch((error) => error.reason._tag === "AlreadyExists" ? Effect.succeed(false) : Effect.fail(error)), Effect.onError(() => Effect.sync(() => { writeFailed = true; })));
+    state.releases[key] = "intent";
+    yield* persist();
+    return created;
+  })));
+  const releaseSent = Effect.fn("Journal.releaseSent")((key: string) => serial(Effect.gen(function*() { state.releases[key] = "sent"; yield* persist(); })));
+  const consent = Effect.fn("Journal.consent")((participants: string[]) => serial(Effect.gen(function*() { state.consent = true; state.participants = participants; yield* persist(); })));
+  const erase = Effect.fn("Journal.erase")(() => serial(Effect.gen(function*() {
+    state.consent = false; state.participants = []; state.spool = []; state.seen = {}; state.gaps = []; delete state.fileDigest; observedFile = undefined;
+    // Delivery dedup/intent records survive opt-out: never admit a duplicate prompt.
+    yield* persist();
+  })));
+  const coverage = Effect.fn("Journal.coverage")(function*() {
+    if (!state.gaps.length) return;
+    const payload = { coverageOnly: true as const, gaps: [...state.gaps] };
+    const hash = yield* platform.fingerprint(payload);
+    if (state.fileDigest !== hash) { state.spool.push({ entryId: `coverage:${hash}`, digest: hash, payload, gaps: [...state.gaps] }); state.fileDigest = hash; }
+  });
+  const scan = Effect.fn("Journal.scan")((file: string | undefined) => serial(Effect.gen(function*() {
+    if (!state.consent) return;
+    const gap = (name: string) => { if (!state.gaps.includes(name)) state.gaps.push(name); };
     gap("content-omitted");
-    if (!file) { gap("ephemeral"); this.coverage(); this.save(); return; }
-    if (!existsSync(file)) { gap("missing"); this.coverage(); this.save(); return; }
-    // ponytail: cap file scans at 8 MiB; larger host journals report coverage loss, not unsafe allocation.
-    const metadata = statSync(file);
-    if (metadata.size > 8 * 1024 * 1024) { gap("overflow"); this.coverage(); this.save(); return; }
-    if (this.observedFile?.path === file && this.observedFile.size === metadata.size && this.observedFile.mtimeMs === metadata.mtimeMs) return;
-    this.observedFile = { path: file, size: metadata.size, mtimeMs: metadata.mtimeMs };
-    const text = readFileSync(file, "utf8");
-    const complete = text.slice(0, text.lastIndexOf("\n") + 1);
-    const lines = complete.split("\n").filter(Boolean);
+    if (!file) { gap("ephemeral"); yield* coverage(); yield* persist(); return; }
+    if (!(yield* fs.exists(file))) { gap("missing"); yield* coverage(); yield* persist(); return; }
+    // ponytail: scans cap at 8 MiB; oversized native journals report coverage loss.
+    const metadata = yield* fs.stat(file);
+    const size = Number(ByteSize.toBigInt(metadata.size));
+    const mtimeMs = Option.getOrUndefined(metadata.mtime)?.getTime();
+    if (size > 8 * 1024 * 1024) { gap("overflow"); yield* coverage(); yield* persist(); return; }
+    if (mtimeMs !== undefined && observedFile?.path === file && observedFile.size === size && observedFile.mtimeMs === mtimeMs) return;
+    const text = yield* fs.readFileString(file);
+    const lines = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean);
     const present = new Set<string>();
     for (const line of lines) {
-      if (Buffer.byteLength(line) > LIMIT) { gap("overflow"); continue; }
-      let raw: unknown;
-      try { raw = JSON.parse(line); } catch { gap("invalid-line"); continue; }
+      if (new TextEncoder().encode(line).length > LIMIT) { gap("overflow"); continue; }
+      let raw: JsonValue;
+      try { raw = decodeJson(JsonValue, line); } catch { gap("invalid-line"); continue; }
       const safe = safeEntry(raw);
       if (!safe) continue;
-      const entryKey = digest(safe.id);
+      const entryKey = yield* platform.digest(safe.id);
       present.add(entryKey);
-      const originalDigest = digest(line);
-      if (this.state.seen[entryKey] === originalDigest) continue;
-      if (this.state.seen[entryKey]) gap("rewrite");
+      const originalDigest = yield* platform.digest(line);
+      if (state.seen[entryKey] === originalDigest) continue;
+      if (state.seen[entryKey]) gap("rewrite");
       if (!safe.linked) gap("unlinked");
-      const payloadDigest = fingerprint(safe.payload);
-      const item = { entryId: safe.id, digest: payloadDigest, payload: safe.payload, gaps: [...this.state.gaps] };
-      if (Buffer.byteLength(JSON.stringify([...this.state.spool, item])) > 510 * 1024) { gap("overflow"); break; }
-      this.state.seen[entryKey] = originalDigest;
-      this.state.spool.push(item);
+      const item = { entryId: safe.id, digest: yield* platform.fingerprint(safe.payload), payload: safe.payload, gaps: [...state.gaps] };
+      if (new TextEncoder().encode(canonicalJson([...state.spool, item])).length > 510 * 1024) { gap("overflow"); break; }
+      state.seen[entryKey] = originalDigest; state.spool.push(item);
     }
-    if (Object.keys(this.state.seen).some((id) => !present.has(id))) gap("rewrite");
-    this.coverage();
-    this.save();
-  }
-  async upload(send: (entry: ArchiveEntry) => Promise<unknown>, maximum = 8): Promise<void> {
-    for (let count = 0; count < maximum && this.state.consent && this.state.spool.length; count++) {
-      await send(this.state.spool[0]!);
-      this.state.spool.shift(); this.save();
-    }
-  }
+    if (Object.keys(state.seen).some((id) => !present.has(id))) gap("rewrite");
+    yield* coverage(); yield* persist();
+    observedFile = mtimeMs === undefined ? undefined : { path: file, size, mtimeMs };
+  })));
+  const upload = Effect.fn("Journal.upload")((send: (entry: ArchiveEntry) => Effect.Effect<unknown, unknown>, maximum = 8) => serial(Effect.gen(function*() {
+    for (let count = 0; count < maximum && state.consent && state.spool.length; count++) { yield* send(state.spool[0]!); state.spool.shift(); yield* persist(); }
+  })));
+  return { path, state, save, handled, handle, clearInbox, receive, releaseIntent, releaseSent, consent, erase, scan, upload };
+});
+
+export class Journal extends Context.Service<Journal>()("coordinator/Journal", { make: makeJournal }) {
+  static layer(directory: string, sessionId: string) { return Layer.effect(this, this.make(directory, sessionId)); }
 }

@@ -8,7 +8,14 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "ignoreEffectWarningsInTscExitCode": true,
+        "ignoreEffectErrorsInTscExitCode": false
+      }
+    ]
   },
   "include": ["src/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"]
 }
