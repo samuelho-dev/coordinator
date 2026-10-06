@@ -4,11 +4,10 @@ import { isAbsolute } from "node:path";
 import { Address, Work, decode, inspectedRepo, privateFile, rpc, fingerprint, type PluginConfig, type Task } from "./protocol.js";
 import { Journal } from "./journal.js";
 
-// Structural subset shared by omp 18.6.1 and Pi 0.84.2: no runtime host import,
-// and no model-callable logging/control tool.
+// Structural subset shared by omp 18.6.1 and Pi 1.0.4 (Pi 0.84.2 source-compatible).
+// Address the native session, not an unavailable sub-worker API; no runtime host import.
 interface Context {
   cwd: string; hasUI: boolean; isIdle(): boolean; hasPendingMessages(): boolean;
-  agent?: { id: string };
   sessionManager: { getSessionId(): string; getSessionFile(): string | undefined };
   ui: { notify(text: string, level?: "info" | "warning" | "error"): void; confirm(title: string, text: string): Promise<boolean> };
 }
@@ -46,7 +45,7 @@ export default function coordinator(host: Host): void {
     if (ctx.sessionManager.getSessionId() !== sessionId) return;
     current.repo = inspectedRepo(ctx.cwd, config.selectedRemote);
     if (Date.now() - current.heartbeat >= 10000) {
-      await call("session.heartbeat", { sessionId, incarnation, machineId: config.machineId, host: config.host, repo: current.repo, ...(ctx.agent ? { workerId: ctx.agent.id } : {}) });
+      await call("session.heartbeat", { sessionId, incarnation, machineId: config.machineId, host: config.host, repo: current.repo, workerId: sessionId });
       current.heartbeat = Date.now();
     }
     const poll = await call<Poll>("session.poll", { sessionId, incarnation });
@@ -66,7 +65,7 @@ export default function coordinator(host: Host): void {
       const address = task.address;
       if (!address || task.confirmedRevision !== address.revision || task.disposition !== "ready" || !task.readback || fingerprint(task.readback) !== fingerprint(address) || address.sessionId !== sessionId || address.incarnation !== incarnation) continue;
       const approvedAddress = task.instruction?.address;
-      if (address.deadline <= Date.now() || address.repo !== task.request.repo || (approvedAddress ? fingerprint(address) !== fingerprint(approvedAddress) : address.ref !== task.request.ref || address.sha !== task.request.sha) || (ctx.agent && address.workerId !== ctx.agent.id)) continue;
+      if (address.deadline <= Date.now() || address.repo !== task.request.repo || (approvedAddress ? fingerprint(address) !== fingerprint(approvedAddress) : address.ref !== task.request.ref || address.sha !== task.request.sha) || address.workerId !== sessionId) continue;
       if (!ctx.isIdle() || ctx.hasPendingMessages()) continue;
       const actual = local(ctx);
       if (actual.repo !== address.repo || actual.ref !== address.ref || actual.sha !== address.sha) {
@@ -149,10 +148,10 @@ export default function coordinator(host: Host): void {
         result = await call("task.submit", work);
       } else if (action === "readback" || ["hold", "clarify", "unable"].includes(action)) {
         const address = decode(Address, data.address);
-        if (address.sessionId !== sessionId || address.incarnation !== incarnation) throw new Error("Readback must address this incarnation");
+        if (address.sessionId !== sessionId || address.incarnation !== incarnation || address.workerId !== sessionId) throw new Error("Readback must address this native session incarnation and worker");
         if (action === "readback") {
           const actual = local(ctx);
-          if (address.repo !== actual.repo || address.sha !== actual.sha || address.ref !== actual.ref || (ctx.agent && address.workerId !== ctx.agent.id)) throw new Error("Readback does not match local repository/ref/SHA/worker");
+          if (address.deadline <= Date.now() || address.repo !== actual.repo || address.sha !== actual.sha || address.ref !== actual.ref) throw new Error("Readback does not match current local repository/ref/SHA/worker/deadline");
         }
         result = await call("task.readback", { taskId: data.taskId, address, disposition: action === "readback" ? "ready" : action, ...(data.reason === undefined ? {} : { reason: data.reason }), ...(data.nextCheck === undefined ? {} : { nextCheck: data.nextCheck }) });
       } else if (action === "address") result = await call("task.address", { taskId: data.taskId, address: decode(Address, data.address) });
@@ -172,7 +171,7 @@ export default function coordinator(host: Host): void {
         if (data.clear === true) { journal.state.inbox = {}; journal.save(); result = { cleared: true }; }
         else result = journal.state.inbox;
       }
-      else if (action === "identity") result = { sessionId, incarnation, machineId: config.machineId, ...local(ctx), workerId: ctx.agent?.id };
+      else if (action === "identity") result = { sessionId, incarnation, machineId: config.machineId, ...local(ctx), workerId: sessionId, workerIdentitySource: "native-session" };
       else throw new Error("Use identity/inbox, submit/status, accept/decline, address/readback/confirm/handoff, hold/clarify/unable, attach/control, participant-consent/consent/optout/archive; JSON arguments required");
       // Status/readback is user-visible, not model context. Never echo credentials or arbitrary server errors.
       notify(ctx, JSON.stringify(result));

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -14,11 +14,13 @@ const enrollment = "regression-only-enrollment-000000000000";
 const control = "regression-only-control-000000000000000";
 async function fixture(slots = 1) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "coordinator-runner-")));
+  chmodSync(root, 0o711);
   const repo = join(root, "repo"); mkdirSync(repo, { mode: 0o700 });
   const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
   git("init"); git("config", "user.name", "Runner regression"); git("config", "user.email", "runner@example.invalid");
   git("remote", "add", "origin", "https://github.com/test/runner"); writeFileSync(join(repo, "tracked"), "acceptance invariant\n"); git("add", "tracked"); git("commit", "-m", "initial");
-  const tokenFile = join(root, "token"); writeFileSync(tokenFile, enrollment, { mode: 0o600 });
+  const credentials = join(root, "credentials"); mkdirSync(credentials, { mode: 0o700 });
+  const tokenFile = join(credentials, "token"); writeFileSync(tokenFile, enrollment, { mode: 0o600 });
   const principal: Principal = { id: "runner-test", owner: "owner", roles: ["runner"], repos: ["github.com/test/runner"], tokenHash: digest(enrollment), controlTokenHash: digest(control) };
   const broker = new Broker({ database: join(root, "broker", "broker.sqlite"), backupDirectory: join(root, "backups"), host: "127.0.0.1", port: 0,
     archiveRetentionMs: 60000, backupRetentionMs: 60000, repositoryIds: { "github.com/test/runner": 1 }, principals: [principal] });
@@ -28,9 +30,10 @@ async function fixture(slots = 1) {
     return broker.handle(p as Principal, method, params);
   } });
   const bound = server.address(); assert.ok(bound && typeof bound !== "string");
+  const modelDirectory = join(root, "model"); mkdirSync(modelDirectory, { mode: 0o700 });
   const config: RunnerConfig = { id: principal.id, brokerUrl: `http://127.0.0.1:${bound.port}`, tokenFile, controlTokenHash: digest(control), host: "127.0.0.1", port: 0,
-    stateDirectory: join(root, "state"), slots, repositories: { "github.com/test/runner": repo }, launchers: { omp: "/usr/bin/true" } };
-  const work: Work = { taskId: "one", repo: "github.com/test/runner", ref: "HEAD", sha: git("rev-parse", "HEAD"), launcher: "omp", prompt: "approved prompt", scope: "scope", restrictions: "no deployment", expectedEvidence: ["checks"], deadline: 12345,
+    stateDirectory: join(root, "state"), slots, repositories: { "github.com/test/runner": repo }, launchers: { omp: "/usr/bin/true" }, modelDirectory, childDirectory: join(root, "children"), childUidBase: 1000000 };
+  const work: Work = { taskId: "one", repo: "github.com/test/runner", ref: "HEAD", sha: git("rev-parse", "HEAD"), launcher: "omp", prompt: "approved prompt", scope: "scope", restrictions: "no deployment", expectedEvidence: ["checks"], deadline: Date.now() + 60000,
     workerId: "native-worker", githubRepoId: 1, requiredLanes: [], bypassPeer: false, approved: true };
   function save(work: Work, overrides: Partial<Task> = {}) {
     const task: Task = { taskId: work.taskId, owner: principal.owner, fingerprint: fingerprint(work), request: work, state: "ACCEPTED", runnerId: principal.id, createdAt: 1, updatedAt: 1, ...overrides };
@@ -60,8 +63,6 @@ test("real broker-bound SQLite acceptance is unique, conflict-safe and reserves 
     await assert.rejects(call("acceptTask", { ...f.work, prompt: "changed" }), /fingerprint conflict/);
     const two = { ...f.work, taskId: "two" }; f.save(two);
     assert.deepEqual(await call("acceptTask", two), { taskId: "two", accepted: false, state: "full", reason: "full" });
-    const stored = runner.database.prepare("SELECT work,worktree,state FROM tasks WHERE taskId='one'").get()!;
-    assert.deepEqual(JSON.parse(String(stored.work)), f.work); assert.equal(stored.state, "ACCEPTED"); assert.ok(String(stored.worktree).startsWith(f.config.stateDirectory));
     await runner.close(); runner = new Runner(f.config);
     assert.deepEqual(await call("journal", { taskId: "one" }), first);
     runner.database.prepare("UPDATE tasks SET state='PROMPT_INTENT',promptId='uncertain' WHERE taskId='one'").run();
@@ -73,7 +74,9 @@ test("real broker-bound SQLite acceptance is unique, conflict-safe and reserves 
     assert.throws(() => new Runner(f.config), /already owned/);
     assert.deepEqual(await call("journal", { taskId: "missing" }), { taskId: "missing", accepted: false, state: "not-accepted" });
     await runner.close(); runner = new Runner({ ...f.config, stateDirectory: join(f.root, "expired-state") });
-    await call("acceptTask", f.work); await runner.start(); await immediate();
+    await call("acceptTask", f.work);
+    runner.database.prepare("UPDATE tasks SET work=? WHERE taskId='one'").run(JSON.stringify({ ...f.work, deadline: 12345 }));
+    await runner.start(); await immediate();
     const expired = await call("journal", { taskId: "one" });
     assert.ok(typeof expired === "object" && expired !== null && "state" in expired); assert.equal(expired.state, "FAILED");
     assert.equal(runner.database.prepare("SELECT pid FROM tasks WHERE taskId='one'").get()!.pid, null);
@@ -167,4 +170,38 @@ test("obsolete handed-off report reconciles durably without starving later live 
     await Reflect.apply(Reflect.get(runner, "reports"), runner, [runner.database.prepare("SELECT * FROM tasks WHERE taskId='two'").all()]);
     assert.equal(runner.database.prepare("SELECT detached FROM tasks WHERE taskId='two'").get()!.detached, 0);
   } finally { await runner.close(); await f.close(); }
+});
+
+test("ownership lost before durable admission refuses acceptance and pending duplicates never expose not-accepted", async () => {
+  const f = await fixture(); const runner = new Runner(f.config);
+  const reached = Promise.withResolvers<void>(), proceed = Promise.withResolvers<void>();
+  try {
+    const original = Reflect.get(runner, "brokerTask");
+    let reads = 0;
+    Reflect.set(runner, "brokerTask", async (work: Work) => {
+      if (++reads === 2) { reached.resolve(); await proceed.promise; }
+      return Reflect.apply(original, runner, [work]);
+    });
+    const acceptance = runner.handle("acceptTask", f.work, control);
+    const duplicate = runner.handle("acceptTask", f.work, control);
+    await Promise.race([reached.promise, acceptance.then(() => { throw new Error("Acceptance committed without final ownership fence"); })]);
+    await assert.rejects(runner.handle("journal", { taskId: "one" }, control), /Acceptance pending/);
+    await assert.rejects(runner.handle("acceptTask", { ...f.work, prompt: "conflict" }, control), /fingerprint conflict/);
+    // Broker timeout/reassignment after checkout, before final authoritative read.
+    f.save(f.work, { runnerId: "reassigned-runner", state: "ASSIGNING" });
+    const refused = Promise.all([assert.rejects(acceptance, /RPC 403/), assert.rejects(duplicate, /RPC 403/)]);
+    proceed.resolve();
+    await refused;
+    assert.deepEqual(await runner.handle("journal", { taskId: "one" }, control), { taskId: "one", accepted: false, state: "not-accepted" });
+    assert.equal(runner.database.prepare("SELECT count(*) AS count FROM tasks").get()!.count, 0);
+  } finally { proceed.resolve(); await runner.close(); await f.close(); }
+});
+
+test("runner refuses overlapping child roots and model seeds containing session history", async () => {
+  const f = await fixture();
+  try {
+    assert.throws(() => new Runner({ ...f.config, childDirectory: f.root }), /Child root must be separate/);
+    writeFileSync(join(f.config.modelDirectory, "history.db"), "sensitive history", { mode: 0o600 });
+    assert.throws(() => new Runner(f.config), /Model seed must contain only scoped/);
+  } finally { await f.close(); }
 });

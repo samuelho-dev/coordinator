@@ -22,7 +22,7 @@ jobs:
           version: 11.9.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
-      - run: pnpm test
+      - run: sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_OMP /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+setuid,+setgid,+setpcap --no-new-privs "$(command -v pnpm)" test
         env:
           COORDINATOR_TEST_OMP: ${{ github.workspace }}/node_modules/.bin/omp
   publish:

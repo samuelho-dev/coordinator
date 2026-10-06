@@ -1,8 +1,8 @@
 import { Schema } from "effect";
 import { DatabaseSync } from "node:sqlite";
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, mkdirSync, realpathSync, statSync, accessSync, constants } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { chmodSync, mkdirSync, realpathSync, statSync, accessSync, constants, existsSync, cpSync, readdirSync, lchownSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
@@ -22,6 +22,56 @@ function record(value: unknown): value is Json { return typeof value === "object
 function inside(root: string, path: string): boolean { const r = relative(root, path); return r !== ".." && !r.startsWith(`..${sep}`) && !isAbsolute(r); }
 function git(cwd: string, args: string[]): string { return execFileSync("git", args, { cwd, encoding: "utf8", timeout: 30000, maxBuffer: LIMIT, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
 
+export const CHILD_UID_BASE = 1000000;
+/** setpriv clears groups and every capability before executing an untrusted child. */
+export function isolationArgs(uid: number): string[] {
+  if (process.platform !== "linux" || !Number.isSafeInteger(uid) || uid < CHILD_UID_BASE || uid >= 0xffffffff) throw new Error("Isolated Linux child UID required; macOS is plugin-only");
+  return [`--reuid=${uid}`, `--regid=${uid}`, "--clear-groups", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs"];
+}
+export function childEnvironment(home?: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", ...(home ? { HOME: home } : {}) };
+  for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OMP_AUTH_BROKER_URL", "OMP_AUTH_BROKER_TOKEN"]) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+  return env;
+}
+export function ownChildDirectory(path: string, uid: number): void {
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) ownChildDirectory(child, uid);
+    else lchownSync(child, uid, uid);
+  }
+  lchownSync(path, uid, uid);
+}
+export function requireIsolation(config: RunnerConfig): void {
+  const privatePaths = [config.stateDirectory, dirname(config.tokenFile), config.modelDirectory, ...Object.values(config.repositories)];
+  if (!isAbsolute(config.childDirectory) || resolve(config.childDirectory) !== config.childDirectory ||
+    privatePaths.some((path) => inside(config.childDirectory, path) || inside(path, config.childDirectory))) throw new Error("Child root must be separate from private runner data");
+  if (!isAbsolute(config.modelDirectory) || realpathSync(config.modelDirectory) !== config.modelDirectory || !statSync(config.modelDirectory).isDirectory()) throw new Error("Canonical model seed required");
+  mkdirSync(config.childDirectory, { recursive: true, mode: 0o711 });
+  if (realpathSync(config.childDirectory) !== config.childDirectory) throw new Error("Canonical child root required");
+  chmodSync(config.childDirectory, 0o711);
+  for (let parent = dirname(config.childDirectory); parent !== "/"; parent = dirname(parent)) {
+    if (!(statSync(parent).mode & 0o001)) throw new Error("Child root ancestors must permit traversal without exposing private runner directories");
+  }
+  const modelFiles = [".omp/agent/config.yml", ".omp/agent/auth.json", ".omp/agent/models.json",
+    ".pi/agent/settings.json", ".pi/agent/auth.json", ".pi/agent/models.json"];
+  const checkSeed = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name), name = relative(config.modelDirectory, path);
+      if (entry.isDirectory() && modelFiles.some((file) => file.startsWith(`${name}/`))) checkSeed(path);
+      else if (!entry.isFile() || !modelFiles.includes(name)) throw new Error("Model seed must contain only scoped model config/auth, not sessions, history or symlinks");
+    }
+  };
+  checkSeed(config.modelDirectory);
+  try {
+    execFileSync("/usr/bin/setpriv", [...isolationArgs(CHILD_UID_BASE), process.execPath, "-e",
+      "const f=require('node:fs'),s=Object.fromEntries(f.readFileSync('/proc/self/status','utf8').split(String.fromCharCode(10)).map(l=>l.split(':').map(v=>v.trim())));if(process.getuid()!==1000000||process.getgid()!==1000000||s.Groups!==''||['CapInh','CapPrm','CapEff','CapBnd','CapAmb'].some(k=>s[k]!=='0000000000000000')||s.NoNewPrivs!=='1')process.exit(1)"],
+      { env: childEnvironment(), stdio: "pipe", timeout: 10000 });
+    for (const launcher of Object.values(config.launchers)) execFileSync("/usr/bin/setpriv", [...isolationArgs(CHILD_UID_BASE), launcher, "--version"], { env: childEnvironment("/tmp"), stdio: "pipe", timeout: 10000 });
+  }
+  catch { throw new Error("OS child UID/capability isolation unavailable; runner enrollment/launch blocked"); }
+}
 /** LF wire framing accepts optional CRLF; invalid UTF-8 and incomplete frames are errors. */
 export class LfFrames {
   private pending = Buffer.alloc(0);
@@ -41,7 +91,7 @@ export class LfFrames {
   }
   end(): void { if (this.pending.length) throw new Error("Incomplete RPC frame"); }
 }
-interface Row { taskId: string; fingerprint: string; work: string; worktree: string; state: string; occupied: number; pid: number | null; incarnation: string; address: string | null; promptId: string | null; reason: string | null; result: string | null; detached: number; }
+interface Row { taskId: string; childUid: number; fingerprint: string; work: string; worktree: string; state: string; occupied: number; pid: number | null; incarnation: string; address: string | null; promptId: string | null; reason: string | null; result: string | null; detached: number; }
 interface Child {
   process: ChildProcessWithoutNullStreams;
   pending: Map<string, { type: string; resolve: (value: Json) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>;
@@ -53,6 +103,8 @@ const Config = Schema.Struct({
   port: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 65535 })),
   stateDirectory: Schema.String, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 128 })),
   repositories: Schema.Record(Schema.String, Schema.String), launchers: Schema.Record(Schema.String, Schema.String),
+  modelDirectory: Schema.String, childDirectory: Schema.String,
+  childUidBase: Schema.Int.check(Schema.isBetween({ minimum: CHILD_UID_BASE, maximum: 0xffffffff - CHILD_UID_BASE })),
 });
 
 export class Runner {
@@ -60,6 +112,7 @@ export class Runner {
   readonly database: DatabaseSync;
   private readonly token: string;
   private readonly children = new Map<string, Child>();
+  private readonly admissions = new Map<string, { fingerprint: string; promise: Promise<Acceptance> }>();
   private server?: Server;
   private interval?: NodeJS.Timeout;
   private heartbeatBusy = false;
@@ -70,6 +123,7 @@ export class Runner {
     if (!isAbsolute(input.stateDirectory) || !isAbsolute(input.tokenFile)) throw new Error("Absolute private paths required");
     const endpoint = new URL(input.brokerUrl);
     if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname))) throw new Error("TLS required");
+    requireIsolation(this.config);
     this.token = privateFile(input.tokenFile);
     if (this.token.length < 32 || this.token.length > 480) throw new Error("Invalid credential length");
     if (input.controlTokenHash === digest(this.token)) throw new Error("Distinct enrollment and control credentials required");
@@ -122,14 +176,15 @@ export class Runner {
     }
     // ponytail: no stdio reattachment exists; uncertain owned children reserve their slot until operator reconciliation.
     this.database.prepare("UPDATE tasks SET state='HELD',reason='restart: launch or prompt outcome unknown' WHERE occupied=1 AND state!='ACCEPTED'").run();
-    for (const row of this.database.prepare("SELECT * FROM tasks WHERE occupied=1 AND pid IS NOT NULL").all() as unknown as Row[]) {
+    for (const row of this.database.prepare("SELECT ?+rowid AS childUid,* FROM tasks WHERE occupied=1 AND pid IS NOT NULL").all(this.config.childUidBase) as unknown as Row[]) {
       try { process.kill(row.pid!, 0); }
       catch (error) {
         if (record(error) && error.code === "ESRCH") this.database.prepare("UPDATE tasks SET occupied=0,reason='restart: child gone; outcome remains unknown' WHERE taskId=?").run(row.taskId);
       }
     }
   }
-  private row(taskId: string): Row | undefined { return this.database.prepare("SELECT * FROM tasks WHERE taskId=?").get(taskId) as Row | undefined; }
+  // ponytail: one million non-overlapping reserved UIDs per runner; accepted rows are never pruned/reused.
+  private row(taskId: string): Row | undefined { return this.database.prepare("SELECT ?+rowid AS childUid,* FROM tasks WHERE taskId=?").get(this.config.childUidBase, taskId) as Row | undefined; }
   private requireRow(taskId: string): Row { const row = this.row(taskId); if (!row) throw new HttpError(404, "Task not accepted"); return row; }
   private work(row: Row): Work { return decode(Work, JSON.parse(row.work)); }
   private acceptance(row: Row): Acceptance {
@@ -176,7 +231,7 @@ export class Runner {
     this.server = await serveRpc({ host: this.config.host, port: this.config.port,
       authorize: (token) => { if (!checkToken(token, this.config.controlTokenHash) && !checkToken(token, digest(this.token))) throw new HttpError(401, "Unauthorized"); return token; },
       handle: (token, method, params) => this.handle(method, params, String(token)) });
-    for (const row of this.database.prepare("SELECT * FROM tasks WHERE state='ACCEPTED' AND occupied=1 AND detached=0").all() as unknown as Row[]) this.schedule(row.taskId);
+    for (const row of this.database.prepare("SELECT ?+rowid AS childUid,* FROM tasks WHERE state='ACCEPTED' AND occupied=1 AND detached=0").all(this.config.childUidBase) as unknown as Row[]) this.schedule(row.taskId);
     this.interval = setInterval(() => { void this.heartbeat(); }, 5000);
     void this.heartbeat();
     return this.server;
@@ -192,8 +247,12 @@ export class Runner {
     if (!checkToken(controlToken, this.config.controlTokenHash)) throw new HttpError(401, "Control credential required");
     try {
       switch (method) {
-        case "acceptTask": return this.accept(decode(Work, params));
-        case "journal": { const { taskId } = decode(TaskInput, params); const row = this.row(taskId); return row ? this.acceptance(row) : { taskId, accepted: false, state: "not-accepted" }; }
+        case "acceptTask": return this.admit(decode(Work, params));
+        case "journal": {
+          const { taskId } = decode(TaskInput, params);
+          if (this.admissions.has(taskId)) throw new HttpError(503, "Acceptance pending; ownership unknown");
+          const row = this.row(taskId); return row ? this.acceptance(row) : { taskId, accepted: false, state: "not-accepted" };
+        }
         case "inspect": {
           const { taskId, cursor = 0 } = decode(InspectInput, params); const row = this.requireRow(taskId);
           const rows = this.database.prepare("SELECT seq,payload FROM events WHERE taskId=? AND seq>? ORDER BY seq LIMIT 2").all(taskId, cursor);
@@ -237,6 +296,16 @@ export class Runner {
       fingerprint(task.address) !== fingerprint(address) || fingerprint(task.readback) !== fingerprint(address))) throw new HttpError(409, "Broker confirmation or current readback mismatch");
     return task;
   }
+  private admit(work: Work): Promise<Acceptance> {
+    const hash = fingerprint(work), pending = this.admissions.get(work.taskId);
+    if (pending) {
+      if (pending.fingerprint !== hash) throw new HttpError(409, "Task fingerprint conflict");
+      return pending.promise;
+    }
+    const promise = this.accept(work).finally(() => { this.admissions.delete(work.taskId); });
+    this.admissions.set(work.taskId, { fingerprint: hash, promise });
+    return promise;
+  }
   private async accept(work: Work): Promise<Acceptance> {
     if (Buffer.byteLength(JSON.stringify(work)) > LIMIT - 1024) throw new HttpError(413, "Work too large");
     const existing = this.row(work.taskId); const hash = fingerprint(work);
@@ -249,7 +318,11 @@ export class Runner {
     if (!repo || !launcher) throw new HttpError(403, "Repository or launcher not allowlisted");
     if (!work.ref || work.ref.startsWith("-") || /[\r\n\0]/.test(work.ref)) throw new HttpError(400, "Invalid ref");
     if (git(repo, ["rev-parse", "--verify", `${work.ref}^{commit}`]) !== work.sha || git(repo, ["rev-parse", "--verify", `${work.sha}^{commit}`]) !== work.sha) throw new HttpError(409, "Exact ref/SHA unavailable");
-    const worktree = join(this.config.stateDirectory, "worktrees", digest(work.taskId));
+    const assigned = await this.brokerTask(work);
+    if (work.deadline <= Date.now() || assigned.state !== "ASSIGNING" && assigned.state !== "ACCEPTED") throw new HttpError(409, "Assignment expired or no longer dispatchable");
+    const accepted = this.row(work.taskId);
+    if (accepted) { if (accepted.fingerprint !== hash) throw new HttpError(409, "Task fingerprint conflict"); return this.acceptance(accepted); }
+    const worktree = join(this.config.childDirectory, digest(work.taskId), "repo");
     this.database.exec("BEGIN IMMEDIATE");
     try {
       if (this.load() >= this.config.slots) { this.database.exec("COMMIT"); return { taskId: work.taskId, accepted: false, state: "full", reason: "full" }; }
@@ -262,7 +335,7 @@ export class Runner {
   }
   private verifyCheckout(row: Row): void {
     const work = this.work(row);
-    if (realpathSync(row.worktree) !== row.worktree || !inside(realpathSync(this.config.stateDirectory), row.worktree)) throw new Error("Worktree escaped private root");
+    if (realpathSync(row.worktree) !== row.worktree || !inside(realpathSync(this.config.childDirectory), row.worktree)) throw new Error("Worktree escaped child root");
     if (inspectedRepo(row.worktree) !== work.repo || git(row.worktree, ["rev-parse", "HEAD"]) !== work.sha || git(row.worktree, ["rev-parse", "--verify", `${work.ref}^{commit}`]) !== work.sha) throw new Error("Checkout identity mismatch");
   }
   private async launch(taskId: string): Promise<void> {
@@ -270,20 +343,30 @@ export class Runner {
     try {
       const row = this.requireRow(taskId); if (row.state !== "ACCEPTED" || row.detached || this.children.has(taskId)) return;
       const work = this.work(row); const repo = this.config.repositories[work.repo]!;
+      if (row.childUid >= this.config.childUidBase + CHILD_UID_BASE) throw new Error("Reserved child UID range exhausted");
       if (work.deadline <= Date.now()) {
         this.state(taskId, "FAILED", "Approved deadline elapsed before launch", { launched: false, evidenceVerified: false });
         this.database.prepare("UPDATE tasks SET occupied=0 WHERE taskId=?").run(taskId);
         void this.heartbeat(); return;
       }
-      mkdirSync(join(this.config.stateDirectory, "worktrees"), { recursive: true, mode: 0o700 });
-      const registered = git(repo, ["worktree", "list", "--porcelain"]);
-      if (!registered.split("\n").includes(`worktree ${row.worktree}`)) git(repo, ["worktree", "add", "--detach", row.worktree, work.sha]);
+      const childRoot = join(this.config.childDirectory, digest(taskId));
+      mkdirSync(childRoot, { recursive: true, mode: 0o700 });
+      if (!existsSync(join(row.worktree, ".git"))) {
+        git(repo, ["clone", "--no-hardlinks", "--no-checkout", repo, row.worktree]);
+        git(row.worktree, ["remote", "set-url", "origin", git(repo, ["remote", "get-url", "origin"])]);
+        git(row.worktree, ["checkout", "--detach", work.sha]);
+        git(row.worktree, ["fetch", "--no-tags", repo, "+refs/heads/*:refs/heads/*"]);
+      }
       chmodSync(row.worktree, 0o700); this.verifyCheckout(row);
-      const sessions = join(this.config.stateDirectory, "sessions", digest(taskId)); mkdirSync(sessions, { recursive: true, mode: 0o700 });
+      const sessions = join(childRoot, "sessions"); mkdirSync(sessions, { recursive: true, mode: 0o700 });
+      const home = join(childRoot, "home");
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      cpSync(this.config.modelDirectory, home, { recursive: true, dereference: true });
+      ownChildDirectory(childRoot, row.childUid); chmodSync(childRoot, 0o700);
       this.state(taskId, "LAUNCHING"); // Durable intent must precede spawn: a crash here is intentionally held.
-      const process = spawn(this.config.launchers[work.launcher]!, ["--mode", "rpc", "--session-dir", sessions, "--no-extensions"], {
-        cwd: row.worktree, env: { ...globalThis.process.env, COORDINATOR_WORKER_ID: work.workerId, COORDINATOR_INCARNATION: row.incarnation },
-        stdio: ["pipe", "pipe", "pipe"], detached: true,
+      const process = spawn("/usr/bin/setpriv", [...isolationArgs(row.childUid), this.config.launchers[work.launcher]!,
+        "--mode", "rpc", "--session-dir", sessions, "--no-extensions"], {
+        cwd: row.worktree, env: childEnvironment(home), stdio: ["pipe", "pipe", "pipe"], detached: true,
       });
       spawned = true;
       const child: Child = { process, pending: new Map(), lost: false, completing: false, started: false, failed: false };
@@ -321,13 +404,13 @@ export class Runner {
     this.verifyCheckout(row);
     const work = this.work(row); const data = response.data;
     if (response.success !== true || !record(data) || typeof data.sessionId !== "string" || typeof data.sessionFile !== "string" || data.isStreaming !== false) throw new Error("Unverified durable host identity");
-    const sessions = realpathSync(join(this.config.stateDirectory, "sessions", digest(row.taskId)));
+    const sessions = realpathSync(join(this.config.childDirectory, digest(row.taskId), "sessions"));
     if (!isAbsolute(data.sessionFile) || !inside(sessions, resolve(data.sessionFile))) throw new Error("Unexpected session path");
     const cwdResponse = await this.request(row.taskId, "bash", "pwd -P");
     const cwdData = cwdResponse.data;
     if (!record(cwdData) || cwdData.exitCode !== 0 || typeof cwdData.output !== "string" || cwdData.output.trim() !== row.worktree) throw new Error("Host cwd mismatch");
-    // Both actual hosts expose sessionId, not a native root worker ID; this owned child retains the approved workerId.
-    return decode(Address, { messageId: template?.messageId ?? row.taskId, revision: template?.revision ?? 1, workerId: work.workerId, sessionId: data.sessionId,
+    // Native session identity is the actual addressable root worker, not a fabricated requested ID.
+    return decode(Address, { messageId: template?.messageId ?? row.taskId, revision: template?.revision ?? 1, workerId: data.sessionId, sessionId: data.sessionId,
       incarnation: row.incarnation, repo: inspectedRepo(row.worktree), ref: work.ref, sha: git(row.worktree, ["rev-parse", "HEAD"]),
       scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline });
   }
@@ -413,7 +496,7 @@ export class Runner {
   private async heartbeat(): Promise<void> {
     if (this.closed || this.heartbeatBusy) return; this.heartbeatBusy = true;
     try {
-      const rows = this.database.prepare("SELECT * FROM tasks WHERE detached=0 ORDER BY taskId").all() as unknown as Row[];
+      const rows = this.database.prepare("SELECT ?+rowid AS childUid,* FROM tasks WHERE detached=0 ORDER BY taskId").all(this.config.childUidBase) as unknown as Row[];
       // Advertisements are bounded; absence is never represented as not-accepted.
       const journal: Acceptance[] = []; let size = 1024;
       for (const row of rows) { const item = this.acceptance(row); const bytes = Buffer.byteLength(JSON.stringify(item)); if (size + bytes > LIMIT - 1024) break; journal.push(item); size += bytes; }

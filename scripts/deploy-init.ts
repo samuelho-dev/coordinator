@@ -39,6 +39,8 @@ if (mode === "broker") {
   file("/config/health.header", `authorization: Bearer ${runner}`);
 } else if (mode === "runner") {
   directory("/work"); directory("/work/repos"); directory("/work/runner"); directory("/work/home");
+  chmodSync("/work", 0o711);
+  directory("/work/children"); chmodSync("/work/children", 0o711);
   const checkout = "/work/repos/coordinator";
   const sha = process.env.COORDINATOR_IMAGE_SHA;
   if (!sha || !/^[a-f0-9]{40}$/.test(sha)) throw new Error("Pinned full image source SHA required");
@@ -60,7 +62,8 @@ if (mode === "broker") {
   const controlTokenHash = credential("HOMELAB_RUNNER_CONTROL_HASH");
   file("/config/runner.token", runner); file("/config/health.header", `authorization: Bearer ${runner}`);
   const config: RunnerConfig = { id: "homelab-runner", brokerUrl, tokenFile: "/config/runner.token", host: "0.0.0.0", port: 8788,
-    stateDirectory: "/work/runner", slots: 1, repositories: { [repo]: checkout }, launchers: { omp: "/usr/local/bin/omp" }, controlTokenHash };
+    stateDirectory: "/work/runner", slots: 1, repositories: { [repo]: checkout }, launchers: { omp: "/usr/local/bin/omp" }, controlTokenHash,
+    modelDirectory: "/work/home", childDirectory: "/work/children", childUidBase: 1000000 };
   file("/config/runner.json", config);
 } else throw new Error("Initializer mode must be broker or runner");
 console.log(`coordinator ${mode} enrollment initialized`);

@@ -31,7 +31,7 @@ test("actual extension records intent before native send and holds uncertain del
     server = await serveRpc({ host: "127.0.0.1", port: 0, authorize: token => { assert.equal(token, "test-token"); return {}; }, handle: async (_principal, method, params) => {
       if (method === "session.heartbeat") incarnation = Schema.decodeUnknownSync(Schema.Struct({ incarnation: Schema.String }))(params).incarnation;
       if (method === "task.report") reports.push(params);
-      const address = { messageId: "message", revision: 1, sessionId: "native-session", incarnation, workerId: "native-worker", repo: "github.com/example/repo", ref: "refs/heads/main", sha, scope: "test", restrictions: "none", expectedEvidence: [], deadline: Date.now() + 60000 };
+      const address = { messageId: "message", revision: 1, sessionId: "native-session", incarnation, workerId: "native-session", repo: "github.com/example/repo", ref: "refs/heads/main", sha, scope: "test", restrictions: "none", expectedEvidence: [], deadline: Date.now() + 60000 };
       return method === "session.poll" ? { messages: [], offers: [], releases: [{ taskId: "task", address, readback: address, confirmedRevision: 1, disposition: "ready", request: { prompt: "Substantive task", repo: address.repo, ref: address.ref, sha } }] } : { ok: true };
     } });
     const listening = server.address(); assert.ok(listening && typeof listening !== "string");
