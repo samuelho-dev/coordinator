@@ -25,6 +25,10 @@ test("native plugin persists intent before send and holds uncertain delivery aft
   let approval = true;
   let duringConfirm: (() => Promise<void>) | undefined;
   const terminalOutput: string[] = [];
+  const status = (frame = terminalOutput.at(-1)) => Object.fromEntries((frame?.slice(7, -2) ?? "").split(":").map((pair) => {
+    const equals = pair.indexOf("=");
+    return [pair.slice(0, equals), pair.slice(equals + 1)];
+  }));
   const ctx: Context = { cwd: directory, mode: "tui", hasUI: true, isIdle: () => true, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => "native-session", getSessionFile: () => undefined },
     ui: { notify: () => {}, confirm: async () => { await duringConfirm?.(); return approval; } } };
@@ -70,16 +74,17 @@ test("native plugin persists intent before send and holds uncertain delivery aft
   if (!plugin) return yield* Effect.fail(new CommandError({ message: "Expected configured plugin" }));
   assert.equal((yield* Effect.exit(plugin.start(ctx)))._tag, "Failure");
   yield* plugin.native("agent_start", { type: "agent_start" }, ctx);
-  assert.equal(terminalOutput.at(-1), "\x1b]7501;app=pi:state=working\x1b\\");
-  const beforeEnd = terminalOutput.length;
-  yield* plugin.native("agent_end", { type: "agent_end", messages: [] }, ctx);
-  assert.equal(terminalOutput.length, beforeEnd, "Pi must wait for whole-agent settlement, not the retry boundary");
+  assert.equal(status().state, "working");
   yield* plugin.native("ui_prompt_start", { type: "ui_prompt_start", kind: "input" }, ctx);
-  assert.equal(terminalOutput.at(-1), "\x1b]7501;app=pi:state=blocked:kind=question:msg=V2FpdGluZyBmb3IgYW4gYW5zd2Vy\x1b\\");
-  yield* plugin.native("agent_before_settle", { type: "agent_before_settle", outcome: "error" }, ctx);
-  yield* plugin.native("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(status().state, "blocked");
+  assert.equal(status().kind, "question");
+  yield* plugin.native("agent_settled", { type: "agent_settled", outcome: "error" }, ctx);
   yield* plugin.native("ui_prompt_end", { type: "ui_prompt_end", kind: "input" }, ctx);
-  assert.equal(terminalOutput.at(-1), "\x1b]7501;app=pi:state=error\x1b\\", "Dialog resolution restores the latest native outcome, never stale working");
+  assert.equal(status().state, "error", "Dialog resolution restores the latest native outcome, never stale working");
+  assert.equal(status().kind, undefined);
+  yield* plugin.native("ui_prompt_end", { type: "ui_prompt_end", kind: "input" }, ctx);
+  yield* plugin.native("ui_prompt_start", { type: "ui_prompt_start", kind: "input" }, ctx);
+  assert.equal(status().kind, undefined, "An end delivered before start cannot leave a dismissed dialog blocked");
   const beforeRpc = terminalOutput.length;
   yield* plugin.native("agent_start", { type: "agent_start" }, { ...ctx, mode: "rpc" });
   assert.equal(terminalOutput.length, beforeRpc, "TTY-backed RPC with UI must never receive OSC");
@@ -92,20 +97,47 @@ test("native plugin persists intent before send and holds uncertain delivery aft
   yield* plugin.command('report {"taskId":"task","state":"HELD","result":{},"sessionId":"forged"}', ctx);
   assert.equal(requests, priorRequests, "Catalog rejects model-supplied session identity before remote execution");
   approval = false;
-  duringConfirm = () => Effect.runPromise(plugin.native("agent_before_settle", { type: "agent_before_settle", outcome: "error" }, ctx).pipe(
-    Effect.andThen(plugin.native("agent_settled", { type: "agent_settled" }, ctx)),
-  ));
+  duringConfirm = () => Effect.runPromise(plugin.native("agent_settled", { type: "agent_settled", outcome: "error" }, ctx));
   const beforePermission = terminalOutput.length;
   yield* plugin.command('confirm {"taskId":"task","revision":1}', ctx);
-  assert.ok(terminalOutput.slice(beforePermission).includes("\x1b]7501;app=pi:state=blocked:kind=permission:msg=V2FpdGluZyBmb3IgcGVybWlzc2lvbg==\x1b\\"));
-  assert.equal(terminalOutput.at(-1), "\x1b]7501;app=pi:state=error\x1b\\", "Approval completion restores the outcome that changed while the real confirmation Promise was pending");
+  assert.ok(terminalOutput.slice(beforePermission).some((frame) => status(frame).state === "blocked" && status(frame).kind === "permission"));
+  assert.equal(status().state, "error", "Approval completion restores the outcome that changed while the real confirmation Promise was pending");
+  assert.equal(status().kind, undefined);
   duringConfirm = undefined;
+  yield* plugin.native("agent_start", { type: "agent_start" }, ctx);
+  yield* plugin.native("agent_settled", { type: "agent_settled", outcome: "aborted" }, ctx);
+  assert.equal(status().state, "idle", "Native cancellation is idle, not a completed task");
   yield* plugin.command('control {"taskId":"task","type":"get_messages"}', ctx);
   yield* plugin.command('control {"taskId":"task","type":"abort"}', ctx);
   assert.equal(requests, priorRequests, "Declined native approval must not reach the broker");
   assert.equal(sends, 1);
   assert.equal(reports[0]?.state, "HELD");
   yield* plugin.stop();
+  yield* platform.fs.writeFileString(config, canonicalJson({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: "machine", host: "omp" }), { mode: 0o600 });
+  const ompContext = yield* Layer.build(Plugin.layer({ on: () => {}, registerCommand: () => {}, sendUserMessage: () => { assert.fail("Status must not dispatch work"); } }).pipe(
+    Layer.provide(Layer.merge(Layer.succeed(Platform, platform), Layer.succeed(Mcp, mcp))),
+    Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
+    Layer.provide(Stdio.layerTest({
+      stdoutIsTerminal: Effect.succeed(true),
+      stdout: () => Sink.forEach((chunk: string | Uint8Array) => Effect.sync(() => {
+        if (typeof chunk === "string") terminalOutput.push(chunk);
+      })),
+    })),
+  ));
+  const omp = EffectContext.get(ompContext, Plugin);
+  if (!omp) return yield* new CommandError({ message: "Expected configured OMP plugin" });
+  yield* omp.native("agent_start", { type: "agent_start" }, ctx);
+  yield* omp.native("agent_settled", { type: "agent_settled", outcome: "completed" }, { ...ctx, hasPendingMessages: () => true });
+  assert.equal(status().state, "done", "Deferred next-turn context must not suppress native settlement");
+  yield* omp.native("agent_start", { type: "agent_start" }, ctx);
+  yield* omp.native("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "permission" }, ctx);
+  yield* omp.native("agent_settled", { type: "agent_settled", outcome: "error" }, ctx);
+  assert.equal(status().state, "blocked", "Terminal outcome does not erase a genuine pending native approval");
+  yield* omp.native("tool_approval_resolved", { type: "tool_approval_resolved", toolCallId: "permission" }, ctx);
+  assert.equal(status().state, "error", "OMP approval release exposes the authoritative final outcome");
+  yield* omp.native("agent_start", { type: "agent_start" }, ctx);
+  yield* omp.native("agent_settled", { type: "agent_settled", outcome: "aborted" }, ctx);
+  assert.equal(status().state, "idle", "Native cancellation is not completion");
 })).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer)))));
 
 test("a refused startup heartbeat keeps scoped enrollment alive until the prior lease fence clears", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {

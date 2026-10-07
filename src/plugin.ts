@@ -23,7 +23,6 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
   const tui = (ctx: Context) => terminal && ctx.hasUI && ctx.mode === "tui";
   let statusContext: Context | undefined;
   let base: "idle" | "working" | "done" | "error" = "idle";
-  let outcome: "completed" | "aborted" | "error" = "completed";
   let confirmations = 0;
   let questions = 0;
   const approvals = new Set<string>();
@@ -44,37 +43,24 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
     questions = 0;
     approvals.clear();
     if (!exiting || blocked || (base !== "done" && base !== "error")) yield* report(ctx, true);
-    if (!exiting) { base = "idle"; outcome = "completed"; }
+    if (!exiting) base = "idle";
   });
   const native = Effect.fn("Plugin.nativeStatus")(function*(name: NativeEventName, event: unknown, ctx: Context) {
     const data = typeof event === "object" && event !== null ? event : undefined;
-    if (name === "agent_start") { base = "working"; outcome = "completed"; }
-    if (name === "input") {
-      if (!ctx.isIdle()) return;
-      base = "idle";
-      outcome = "completed";
+    if (name === "agent_start") base = "working";
+    else if (name === "agent_settled" && data && "outcome" in data) {
+      if (data.outcome === "completed") base = "done";
+      else if (data.outcome === "aborted") base = "idle";
+      else if (data.outcome === "error") base = "error";
+      else return;
     }
-    if (name === "turn_end" || name === "message_end") {
-      const message = data && "message" in data ? data.message : undefined;
-      if (typeof message === "object" && message !== null && "role" in message && message.role === "assistant" && "stopReason" in message) {
-        outcome = message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
-      }
+    else if (name === "tool_approval_requested" && tui(ctx) && data && "toolCallId" in data && typeof data.toolCallId === "string") approvals.add(data.toolCallId);
+    else if (name === "tool_approval_resolved" && data && "toolCallId" in data && typeof data.toolCallId === "string") approvals.delete(data.toolCallId);
+    else if ((name === "ui_prompt_start" || name === "ui_prompt_end") && tui(ctx) && data && "kind" in data && typeof data.kind === "string" && ["select", "confirm", "input", "editor", "custom"].includes(data.kind)) {
+      // End may arrive first when another extension delays start; retain its credit.
+      questions += name === "ui_prompt_start" ? 1 : -1;
     }
-    if (name === "agent_before_settle" || name === "turn_end") {
-      if (data && "outcome" in data && (data.outcome === "completed" || data.outcome === "aborted" || data.outcome === "error")) outcome = data.outcome;
-    }
-    if (name === "agent_end") {
-      if (data && "willContinue" in data && data.willContinue === true) return;
-      // Pi >=0.80.4 settles after automatic retry/compaction/continuation.
-      if (config.host === "pi") return;
-      if (ctx.hasPendingMessages()) return;
-      base = outcome === "aborted" ? "idle" : outcome === "error" ? "error" : "done";
-    }
-    if (name === "agent_settled") base = outcome === "aborted" ? "idle" : outcome === "error" ? "error" : "done";
-    if (name === "tool_approval_requested" && tui(ctx) && data && "toolCallId" in data && typeof data.toolCallId === "string") approvals.add(data.toolCallId);
-    if (name === "tool_approval_resolved" && data && "toolCallId" in data && typeof data.toolCallId === "string") approvals.delete(data.toolCallId);
-    if (name === "ui_prompt_start" && tui(ctx) && data && "kind" in data && typeof data.kind === "string" && ["select", "confirm", "input", "editor", "custom"].includes(data.kind)) questions++;
-    if (name === "ui_prompt_end") questions = Math.max(0, questions - 1);
+    else return;
     yield* report(ctx);
   });
   const semaphore = yield* Semaphore.make(1);
@@ -292,12 +278,11 @@ export default async function coordinator(host: Host): Promise<void> {
     const observe = (name: NativeEventName) => host.on(name, async (event, ctx): Promise<void> => {
       if (!disposed) await runtime.runPromise(Plugin.use((plugin) => plugin ? plugin.native(name, event, ctx) : Effect.void));
     });
-    for (const name of ["input", "agent_start", "agent_end", "turn_end", "message_end"] satisfies NativeEventName[]) observe(name);
-    if (initial.config.host === "pi") {
-      for (const name of ["agent_before_settle", "agent_settled", "ui_prompt_start", "ui_prompt_end"] satisfies NativeEventName[]) observe(name);
-    } else {
-      for (const name of ["tool_approval_requested", "tool_approval_resolved"] satisfies NativeEventName[]) observe(name);
-    }
+    for (const name of ["agent_start", "agent_settled"] satisfies NativeEventName[]) observe(name);
+    const prompts = initial.config.host === "pi"
+      ? ["ui_prompt_start", "ui_prompt_end"] as const
+      : ["tool_approval_requested", "tool_approval_resolved"] as const;
+    for (const name of prompts) observe(name);
     host.on("session_shutdown", async () => { await runtime.dispose(); disposed = true; });
     host.registerCommand("coordinator", { description: "Coordinator: explicit addressed dispatch, status, consent and runner-owned control (JSON arguments)", handler: (args, ctx) => runtime.runPromise(Plugin.use((plugin) => plugin ? plugin.command(args, ctx) : Effect.void)) });
   } catch (error) { await runtime.dispose(); throw error; }
