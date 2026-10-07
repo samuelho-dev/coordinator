@@ -184,7 +184,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         (client) => Effect.tryPromise(() => client.close()).pipe(Effect.catchCause(() => Effect.void)),
       );
       yield* Effect.tryPromise({ try: (signal) => client.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: { token: async () => token }, fetch: (input, init) => sdkFetch(input, { ...init, signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal }), requestInit: { redirect: "error" } })), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: error instanceof Error ? error.message : String(error) }) });
-      const result = yield* Effect.tryPromise({ try: (signal) => client.callTool({ name: method, arguments: decode(Schema.Record(Schema.String, Schema.Unknown), Schema.encodeUnknownSync(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(input)) }, { signal, timeout: timeoutMs }), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: error instanceof Error ? error.message : String(error) }) });
+      const result = yield* Effect.tryPromise({ try: (signal) => client.callTool({ name: descriptor.method ?? method, arguments: decode(Schema.Record(Schema.String, Schema.Unknown), Schema.encodeUnknownSync(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(input)) }, { signal, timeout: timeoutMs }), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: error instanceof Error ? error.message : String(error) }) });
       if (result.isError) {
         const failure = result.structuredContent ?? (yield* Effect.try(() => {
           const text = result.content.find((item) => item.type === "text");
@@ -219,7 +219,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         const principal = yield* options.authorize(token);
         return yield* options.handle(principal, yield* decodeEffect(RunnerRequest, { method: name, params }));
       });
-      const tools = Object.values(Commands).filter((descriptor) => descriptor.target === options.target || descriptor.target === "shared").map((descriptor) => {
+      const tools = Object.entries(Commands).filter(([, descriptor]) => descriptor.target === options.target || descriptor.target === "shared").map(([id, descriptor]) => {
         // Runtime schemas remain context-free; the domain decodes its discriminated request.
         const makeTool = (name: string, input: Schema.Top & Schema.ConstraintCodec<unknown, unknown>, output: Schema.Top & Schema.ConstraintCodec<unknown, unknown>, description: string) => {
           const failureCodec = Schema.toCodecJson(ToolFailure);
@@ -249,14 +249,14 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
           }));
           return registration.pipe(Layer.provide(toolkit.toLayer({
             [name]: (params: unknown) => Effect.gen(function*() {
-              const result = yield* handle(name, params);
+              const result = yield* handle(id, params);
               const value = yield* decodeEffect(output, { result });
               if (resultSize(value) > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Result too large; use cursor pagination" });
               return value;
             }).pipe(Effect.catchCause((cause) => Effect.fail({ error: boundaryFailure(cause) }))),
           })));
         };
-        return makeTool(descriptor.name, descriptor.input, descriptor.structuredOutput, descriptor.description);
+        return makeTool(descriptor.method ?? id, descriptor.input, descriptor.structuredOutput, descriptor.description);
       });
       const native = McpServer.layerHttp({ name: "coordinator", version: "0.1.0", path: "/mcp", protocols: [McpProtocol.v2026_07_28, McpProtocol.v2025_11_25], allowedOrigins: [] });
       const app = yield* HttpRouter.toHttpEffect(tools.reduce(

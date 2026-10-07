@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Clock, Effect, Layer, ManagedRuntime } from "effect";
-import { HttpClient, HttpClientResponse } from "effect/http";
+import { createServer } from "node:http";
+import { NodeHttpClient } from "@effect/platform-node";
+import { Clock, Effect, Fiber, Layer, ManagedRuntime } from "effect";
+import { TestClock } from "effect/testing";
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { pollCi } from "../src/evidence.ts";
 import { JsonValue, type Work } from "../src/contracts.ts";
 import { encodeJson } from "../src/http.ts";
@@ -67,4 +70,39 @@ test("PR merge-ref CI requires the exact current merge SHA and authenticated mat
       }
     }
   } finally { await runtime.dispose(); }
+});
+
+test("GitHub response body deadline returns unknown and closes the stalled request scope", { timeout: 5000 }, async () => {
+  let headersReceived!: () => void;
+  let requestClosed!: () => void;
+  const headers = new Promise<void>((resolve) => { headersReceived = resolve; });
+  const closed = new Promise<void>((resolve) => { requestClosed = resolve; });
+  const server = createServer((_request, response) => {
+    response.on("close", requestClosed);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.write('{"id":42');
+  });
+  await new Promise<void>((resolve, reject) => server.listen(0, "127.0.0.1", resolve).once("error", reject));
+  const address = server.address();
+  assert(address && typeof address === "object");
+  const runtime = ManagedRuntime.make(Layer.merge(NodeHttpClient.layerNodeHttp, TestClock.layer()));
+  try {
+    const result = await runtime.runPromise(Effect.gen(function*() {
+      const native = yield* HttpClient.HttpClient;
+      const client = HttpClient.transform(HttpClient.mapRequest(native, (request) => {
+        const target = new URL(request.url);
+        return HttpClientRequest.setUrl(request, `http://127.0.0.1:${address.port}${target.pathname}${target.search}`);
+      }), (response) => response.pipe(Effect.tap(() => Effect.sync(headersReceived))));
+      const fiber = yield* pollCi(work).pipe(Effect.provideService(HttpClient.HttpClient, client), Effect.forkChild);
+      yield* TestClock.withLive(Effect.promise(() => headers));
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("15 seconds");
+      return yield* Fiber.join(fiber);
+    }));
+    assert.equal(result.verdict, "unknown");
+    await closed;
+  } finally {
+    await runtime.dispose();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
