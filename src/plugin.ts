@@ -5,7 +5,7 @@ import { decodeJson, decodeEffect, canonicalJson, Mcp } from "./http.ts";
 import { Platform } from "./platform.ts";
 import { Journal } from "./journal.ts";
 
-const pluginCommands = Object.values(Commands).filter((command) => command.target === "plugin");
+const pluginCommands = Object.entries(Commands).filter((entry): entry is [string, Extract<(typeof Commands)[keyof typeof Commands], { target: "plugin" }>] => entry[1].target === "plugin");
 const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
   const platform = yield* Platform;
   const mcp = yield* Mcp;
@@ -103,9 +103,9 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
     const split = args.trim().indexOf(" ");
     const action = split < 0 ? args.trim() : args.trim().slice(0, split);
     if (action === "" || action === "help") {
-      return yield* notify(ctx, pluginCommands.map((entry) => `${entry.name.slice("plugin.".length)}: ${entry.description}`).join("\n"));
+      return yield* notify(ctx, pluginCommands.map(([id, entry]) => `${id.slice("plugin.".length)}: ${entry.description}`).join("\n"));
     }
-    const entry = pluginCommands.find((entry) => entry.name === `plugin.${action}`);
+    const entry = pluginCommands.find(([id]) => id === `plugin.${action}`)?.[1];
     if (!entry) throw new Error("Unknown coordinator action; use /coordinator help");
     const data: unknown = split < 0 ? {} : decodeJson(Json, args.trim().slice(split + 1));
     const current = active;

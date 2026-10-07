@@ -14,13 +14,15 @@ function decodeRun(input: JsonValue): Run {
   return decode(Run, fields);
 }
 const github = Effect.fn("GitHub.request")(function*(path: string, token?: string) {
-  const client = yield* HttpClient.HttpClient;
-  const response = yield* client.get(`https://api.github.com${path}`, {
-    headers: { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", ...(token ? { authorization: `Bearer ${token}` } : {}) },
-  }).pipe(Effect.timeout("15 seconds"));
-  if (response.status < 200 || response.status >= 300) return yield* new HttpError({ status: 502, message: `GitHub unavailable (${response.status})` });
-  const text = yield* response.text;
-  return yield* Effect.try(() => decodeJson(JsonValue, text));
+  return yield* Effect.scoped(Effect.gen(function*() {
+    const client = HttpClient.withScope(yield* HttpClient.HttpClient);
+    const response = yield* client.get(`https://api.github.com${path}`, {
+      headers: { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    });
+    if (response.status < 200 || response.status >= 300) return yield* new HttpError({ status: 502, message: `GitHub unavailable (${response.status})` });
+    const text = yield* response.text;
+    return yield* Effect.try(() => decodeJson(JsonValue, text));
+  })).pipe(Effect.timeout("15 seconds"));
 });
 function array(input: JsonValue, key: string): JsonValue[] {
   const value = select(input, [key])[key];

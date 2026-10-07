@@ -15,8 +15,7 @@ const taskResultSize = mcpResultSizer(Commands["task.get"].structuredOutput);
 const archiveResultSize = mcpResultSizer(Commands["archive.list"].structuredOutput);
 export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
   make: Effect.gen(function*() {
-    const input = yield* BrokerConfiguration;
-    const config = yield* Effect.try(() => decode(BrokerConfig, input));
+    const config = yield* BrokerConfiguration;
     const platform = yield* Platform;
     const mcp = yield* Mcp;
     const client = yield* HttpClient.HttpClient;

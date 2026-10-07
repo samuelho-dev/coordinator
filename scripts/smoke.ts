@@ -253,11 +253,13 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   yield* rpc(brokerUrl, writer, "archive.append", archive); yield* rpc(brokerUrl, writer, "archive.append", archive);
   const unsafePayload = { ...payload, text: "unsafe-raw-content-must-not-persist" };
   // Send malformed arguments directly to MCP: the typed client deliberately rejects them before transport.
+  const archiveId = "archive.append";
+  const archiveMethod = Commands[archiveId].method ?? archiveId;
   const unsafeResponse = yield* client.execute(HttpClientRequest.post(new URL("/mcp", brokerUrl)).pipe(
     HttpClientRequest.setHeaders({ authorization: `Bearer ${writer}`, accept: "application/json, text/event-stream",
-      "mcp-protocol-version": "2026-07-28", "mcp-method": "tools/call", "mcp-name": Commands["archive.append"].name }),
+      "mcp-protocol-version": "2026-07-28", "mcp-method": "tools/call", "mcp-name": archiveMethod }),
     HttpClientRequest.bodyText(encodeJson(JsonValue, { jsonrpc: "2.0", id: "unsafe-archive", method: "tools/call",
-      params: { name: Commands["archive.append"].name, arguments: { ...archive, entryId: "unsafe", payload: unsafePayload, digest: yield* fingerprint(unsafePayload) },
+      params: { name: archiveMethod, arguments: { ...archive, entryId: "unsafe", payload: unsafePayload, digest: yield* fingerprint(unsafePayload) },
         _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} } } }), "application/json"),
   ));
   assert.equal(unsafeResponse.status, 200);
