@@ -2,7 +2,7 @@ import { Clock, Config, Context, Effect, Layer, Option, Schedule, Semaphore } fr
 import * as PersistedQueue from "effect/persistence/PersistedQueue";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { HttpClient, HttpServer } from "effect/http";
-import { Commands, Address, Work, Id, BrokerConfig, Task, LiveSession, ArchivePayload, ArchiveEntry, ArchiveRow, JournalState, Json, JsonValue, Poll, EvidenceObservation, HttpError, type CommandCapabilities, type CommandInput, type CommandOutput, type BrokerRequest, type Principal, type Role, type SessionKey, type LiveRunner, type Delivery } from "./contracts.ts";
+import { Commands, Address, Work, TaskId, SessionId, RunnerId, WorkerId, Repo, Sha, Hash, BrokerConfig, Task, LiveSession, ArchivePayload, ArchiveEntry, ArchiveRow, JournalState, Json, JsonValue, Poll, Delivery, EvidenceObservation, HttpError, type CommandCapabilities, type CommandInput, type CommandOutput, type BrokerRequest, type Principal, type Role, type SessionKey, type LiveRunner } from "./contracts.ts";
 import { Platform } from "./platform.ts";
 import { Mcp, serverLayer, decode, decodeEffect, decodeJson, encodeJson, mcpResultSizer, MCP_RESULT_LIMIT } from "./http.ts";
 import { pollCi } from "./evidence.ts";
@@ -37,8 +37,8 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     for (const statement of ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000"]) yield* sql.unsafe(statement);
     yield* migrateBroker(sql);
     yield* sql.unsafe("PRAGMA secure_delete=ON");
-    const sessions = new Map<string, LiveSession>();
-    const runners = new Map<string, LiveRunner>();
+    const sessions = new Map<SessionId, LiveSession>();
+    const runners = new Map<RunnerId, LiveRunner>();
     const versions = new WeakMap<Task, string>();
     for (const row of yield* sql.unsafe<Json>("SELECT data FROM sessions")) {
       const value = decodeJson(LiveSession, String(row.data));
@@ -47,7 +47,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     }
     for (const file of yield* platform.fs.readDirectory(config.backupDirectory)) if (file.endsWith(".partial")) yield* platform.fs.remove(platform.path.join(config.backupDirectory, file));
     yield* platform.fs.remove(platform.path.join(platform.path.dirname(config.database), "snapshot.partial"), { force: true });
-    const queue = yield* PersistedQueue.make({ name: "coordinator.dispatch", schema: Id, maxAttempts: Number.MAX_SAFE_INTEGER }).pipe(Effect.provideContext(services));
+    const queue = yield* PersistedQueue.make({ name: "coordinator.dispatch", schema: TaskId, maxAttempts: Number.MAX_SAFE_INTEGER }).pipe(Effect.provideContext(services));
     const exact = Effect.fnUntraced(function*(a: unknown, b: unknown) {
       return (yield* platform.fingerprint(a)) === (yield* platform.fingerprint(b));
     });
@@ -92,11 +92,11 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     if (!roles.some((role) => principal.roles.includes(role))) return yield* new HttpError({ status: 403, message: "Operation not authorized" });
   
     });
-    const repo = Effect.fn("Broker.repo")(function*(principal: Principal, repo: string) {
+    const repo = Effect.fn("Broker.repo")(function*(principal: Principal, repo: typeof Repo.Type) {
     if (!principal.repos.includes(repo)) return yield* new HttpError({ status: 403, message: "Repository not authorized" });
   
     });
-    const loadTask = Effect.fn("Broker.task")(function*(principal: Principal, id: string) {
+    const loadTask = Effect.fn("Broker.task")(function*(principal: Principal, id: TaskId) {
     const row = (yield* sql.unsafe<Json>("SELECT data FROM tasks WHERE id=?", [id]))[0];
     if (!row) return yield* new HttpError({ status: 404, message: "Task not found" });
     const task = decodeJson(Task, String(row.data));
@@ -152,8 +152,8 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     yield* queue.offer(task.taskId, { id: task.taskId });
   
     });
-    const runnerPrincipal = (task: Task) => { return config.principals.find((p) => p.id === task.runnerId && p.owner === task.owner && p.roles.includes("runner")); };
-    const assign = Effect.fn("Broker.assign")(function*(id: string) {
+    const runnerPrincipal = (task: Task) => { return config.principals.find((p) => p.roles.includes("runner") && RunnerId.make(p.id) === task.runnerId && p.owner === task.owner); };
+    const assign = Effect.fn("Broker.assign")(function*(id: TaskId) {
     while (true) {
       const now = yield* Clock.currentTimeMillis;
       const task = (yield* tasks()).find((t) => t.taskId === id);
@@ -162,40 +162,41 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         const principal = runnerPrincipal(task);
         if (!principal?.runnerUrl) { task.state = "HELD"; task.reason = "Assigned runner no longer enrolled"; (yield* save(task)); yield* Effect.sleep(1000); continue; }
         const runnerUrl = principal.runnerUrl;
+        const runnerId = RunnerId.make(principal.id);
         yield* Effect.gen(function*() {
           const result = yield* mcp.call(runnerUrl, yield* runnerToken(principal), "journal", { taskId: id });
           const current = (yield* tasks()).find((t) => t.taskId === id);
-          if (!current || current.runnerId !== principal.id || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
+          if (!current || current.runnerId !== runnerId || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
           if (result.taskId !== id) return yield* new HttpError({ status: 409, message: "Runner journal task mismatch" });
           if (result.accepted) { current.state = ["HELD", "PROMPT_INTENT"].includes(result.state ?? "") ? "HELD" : "ACCEPTED"; current.reason = result.reason; yield* save(current); return; }
           if (result.state === "not-accepted") { current.state = "QUEUED"; delete current.runnerId; yield* save(current); }
           else { current.state = "HELD"; current.reason = "Runner acceptance unknown; reassignment blocked"; yield* save(current); }
         }).pipe(Effect.catch(() => Effect.gen(function*() {
           const current = (yield* tasks()).find((t) => t.taskId === id);
-          if (!current || current.runnerId !== principal.id || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
+          if (!current || current.runnerId !== runnerId || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
           current.state = "HELD"; current.reason = "Runner acceptance unknown; reassignment blocked"; yield* save(current);
         })));
         yield* Effect.sleep(1000); continue;
       }
       if (task.state === "HELD") { yield* Effect.sleep(1000); continue; }
-      const candidate = [...runners.values()].find((r) => r.owner === task.owner && r.liveUntil > now && r.load < r.slots && config.principals.some((p) => p.id === r.runnerId && p.repos.includes(task.request.repo) && p.runnerUrl));
+      const candidate = [...runners.values()].find((r) => r.owner === task.owner && r.liveUntil > now && r.load < r.slots && config.principals.some((p) => p.roles.includes("runner") && RunnerId.make(p.id) === r.runnerId && p.repos.includes(task.request.repo) && p.runnerUrl));
       if (!candidate) { yield* Effect.sleep(500); continue; }
-      const principal = config.principals.find((p) => p.id === candidate.runnerId)!;
+      const principal = config.principals.find((p) => p.roles.includes("runner") && RunnerId.make(p.id) === candidate.runnerId)!;
       delete task.peerSession; delete task.peerIncarnation; delete task.offerExpires;
       delete task.address; delete task.readback; delete task.confirmedRevision;
-      task.state = "ASSIGNING"; task.runnerId = principal.id; (yield* save(task));
+      task.state = "ASSIGNING"; task.runnerId = candidate.runnerId; (yield* save(task));
       candidate.load++;
       yield* Effect.gen(function*() {
         const result = (yield* mcp.call(principal.runnerUrl!, (yield* runnerToken(principal)), "acceptTask", task.request, 15000));
         if (result.taskId !== id) return yield* new HttpError({ status: 409, message: "Runner acceptance task mismatch" });
         const current = (yield* tasks()).find((t) => t.taskId === id);
-        if (!current || current.runnerId !== principal.id || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
+        if (!current || current.runnerId !== candidate.runnerId || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
         if (result.accepted) { if (current.state === "ASSIGNING") current.state = "ACCEPTED"; (yield* save(current)); return; }
         if (result.reason === "full" || result.state === "not-accepted") { current.state = "QUEUED"; delete current.runnerId; (yield* save(current)); }
         else { current.state = "HELD"; current.reason = result.reason ?? "Runner declined unsafe material"; (yield* save(current)); }
       }).pipe(Effect.catch(() => Effect.gen(function*() {
         const current = (yield* tasks()).find((t) => t.taskId === id);
-        if (!current || current.runnerId !== principal.id || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
+        if (!current || current.runnerId !== candidate.runnerId || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
         current.state = "HELD"; current.reason = "Runner acceptance unknown; reassignment blocked"; (yield* save(current));
       })));
       yield* Effect.sleep(500);
@@ -212,16 +213,16 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     return token;
   
     });
-    const appendEvidence = Effect.fn("Broker.appendEvidence")(function*(task: Task, principal: Principal, kind: string, sha: string, data: Json) {
+    const appendEvidence = Effect.fn("Broker.appendEvidence")(function*(task: Task, principal: Principal, kind: string, sha: typeof Sha.Type, data: Json) {
     const now = yield* Clock.currentTimeMillis;
     (yield* sql.unsafe("INSERT INTO evidence(task,kind,sha,principal,data,observed) VALUES (?,?,?,?,?,?)", [task.taskId, kind, sha, principal.id, encodeJson(Json, data), now]));
   
     });
     const bindCommandCapabilities = (principal: Principal, now: number): CommandCapabilities<"broker"> => {
-      const readableTask = Effect.fn("Broker.readableTask")(function*(taskId: string) {
+      const readableTask = Effect.fn("Broker.readableTask")(function*(taskId: TaskId) {
         (yield* role(principal, "coordinator", "session", "reviewer", "runner")); const task = (yield* loadTask(principal, taskId));
-        if (principal.roles.includes("runner") && task.runnerId !== principal.id) return yield* new HttpError({ status: 403, message: "Assigned runner mismatch" });
-        if (principal.roles.includes("session") && !principal.roles.includes("coordinator") && !principal.roles.includes("reviewer")) { const recipient = sessions.get(task.peerSession ?? ""); if (recipient?.principal !== principal.id) return yield* new HttpError({ status: 403, message: "Task is not addressed to this session" }); }
+        if (principal.roles.includes("runner") && task.runnerId !== RunnerId.make(principal.id)) return yield* new HttpError({ status: 403, message: "Assigned runner mismatch" });
+        if (principal.roles.includes("session") && !principal.roles.includes("coordinator") && !principal.roles.includes("reviewer")) { const recipient = task.peerSession ? sessions.get(task.peerSession) : undefined; if (recipient?.principal !== principal.id) return yield* new HttpError({ status: 403, message: "Task is not addressed to this session" }); }
         return task;
       });
       return {
@@ -237,7 +238,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         }),
         pollSession: Effect.fn("Broker.pollSession")(function*(params: CommandInput<"session.poll">): Effect.fn.Return<CommandOutput<"session.poll">, unknown> {
           (yield* role(principal, "session")); const input = params; const session = (yield* boundSession(principal, input)); session.polledAt = now;
-          const messages: Delivery[] = (yield* sql.unsafe<Json>("SELECT id,incarnation,payload,expires FROM peers WHERE owner=? AND session=? AND incarnation=? AND expires>? ORDER BY expires LIMIT 8", [principal.owner, input.sessionId, input.incarnation, now])).map((r) => ({ messageId: String(r.id), incarnation: String(r.incarnation), payload: decodeJson(JsonValue, String(r.payload)), expiresAt: Number(r.expires) }));
+          const messages: Delivery[] = (yield* sql.unsafe<Json>("SELECT id,incarnation,payload,expires FROM peers WHERE owner=? AND session=? AND incarnation=? AND expires>? ORDER BY expires LIMIT 8", [principal.owner, input.sessionId, input.incarnation, now])).map((r) => decode(Delivery, { messageId: r.id, incarnation: r.incarnation, payload: decodeJson(JsonValue, String(r.payload)), expiresAt: r.expires }));
           const bound = (yield* tasks()).filter((task) => task.owner === principal.owner && task.peerSession === input.sessionId && task.peerIncarnation === input.incarnation);
           const result: Poll = { messages: [], offers: [], releases: [], archiveEnabled: Boolean((yield* sql.unsafe<Json>("SELECT enabled FROM consents WHERE owner=? AND session=?", [principal.owner, input.sessionId]))[0]?.enabled) };
           for (const message of messages) { const next = { ...result, messages: [...result.messages, message] }; if (pollResultSize({ result: next }) < 60000) result.messages.push(message); }
@@ -258,7 +259,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           (yield* recipient(principal, input));
           if (new TextEncoder().encode(encodeJson(JsonValue, input.payload)).byteLength > 8000) return yield* new HttpError({ status: 413, message: "Peer payload too large" });
           const hash = (yield* platform.fingerprint({ ...input, owner: principal.owner, sender: principal.id })); const prior = (yield* sql.unsafe<Json>("SELECT fingerprint FROM peers WHERE id=?", [input.messageId]))[0];
-          if (prior && prior.fingerprint !== hash) return yield* new HttpError({ status: 409, message: "Message ID conflict" });
+          if (prior && decode(Hash, prior.fingerprint) !== hash) return yield* new HttpError({ status: 409, message: "Message ID conflict" });
           if (!prior) (yield* sql.unsafe("INSERT INTO peers VALUES (?,?,?,?,?,?,?,?)", [input.messageId, principal.owner, principal.id, input.sessionId, input.incarnation, encodeJson(JsonValue, input.payload), hash, now + input.ttlMs]));
           return { delivered: false, committed: true, messageId: input.messageId };
         }),
@@ -370,12 +371,13 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           }
           if (!task.address || task.address.revision !== input.revision || !task.readback || !(yield* exact(task.address, task.readback)) || task.disposition !== "ready" || task.address.deadline <= now) return yield* new HttpError({ status: 409, message: "Confirmation requires current ready matching readback before deadline" });
           if (task.confirmedRevision === input.revision) return task;
+          const address = task.address;
           task.confirmedRevision = input.revision; yield* saveReturnedTask(task);
           if (task.runnerId) {
             const runner = runnerPrincipal(task);
             yield* Effect.gen(function*() {
               if (!runner?.runnerUrl) return yield* new HttpError({ status: 409, message: "Runner unavailable" });
-              (yield* mcp.call(runner.runnerUrl, (yield* runnerToken(runner)), "release", { taskId: task.taskId, address: task.address, prompt: task.request.prompt }, 15000));
+              (yield* mcp.call(runner.runnerUrl, (yield* runnerToken(runner)), "release", { taskId: task.taskId, address, prompt: task.request.prompt }, 15000));
             }).pipe(Effect.catch(() => Effect.gen(function*() {
               task.state = "HELD"; task.reason = "Prompt delivery uncertain; inspect assigned runner journal, never replay automatically"; (yield* save(task));
               return yield* new HttpError({ status: 409, message: task.reason });
@@ -410,14 +412,15 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           task.state = input.state; task.result = input.result; return yield* saveReturnedTask(task);
         }),
         heartbeatRunner: Effect.fn("Broker.heartbeatRunner")(function*(params: CommandInput<"runner.heartbeat">): Effect.fn.Return<CommandOutput<"runner.heartbeat">, unknown> {
-          (yield* role(principal, "runner")); const input = params; if (input.runnerId !== principal.id || !principal.runnerUrl) return yield* new HttpError({ status: 403, message: "Runner enrollment mismatch" });
+          (yield* role(principal, "runner")); const runnerId = RunnerId.make(principal.id); const input = params; if (input.runnerId !== runnerId || !principal.runnerUrl) return yield* new HttpError({ status: 403, message: "Runner enrollment mismatch" });
           runners.set(input.runnerId, { runnerId: input.runnerId, owner: principal.owner, slots: input.slots, load: input.load, liveUntil: now + 15000 }); return { ok: true };
         }),
         readbackRunner: Effect.fn("Broker.readbackRunner")(function*(params: CommandInput<"runner.readback">): Effect.fn.Return<CommandOutput<"runner.readback">, unknown> {
           (yield* role(principal, "runner")); const input = params; const task = (yield* loadTask(principal, input.taskId));
-          if (input.runnerId !== principal.id || task.runnerId !== principal.id) return yield* new HttpError({ status: 403, message: "Assigned runner mismatch" });
+          const runnerId = RunnerId.make(principal.id);
+          if (input.runnerId !== runnerId || task.runnerId !== runnerId) return yield* new HttpError({ status: 403, message: "Assigned runner mismatch" });
           const address = input.address;
-          if (address.repo !== task.request.repo || address.ref !== task.request.ref || address.sha !== task.request.sha || address.workerId !== address.sessionId || address.scope !== task.request.scope || address.restrictions !== task.request.restrictions || !(yield* exact(address.expectedEvidence, task.request.expectedEvidence)) || address.deadline !== task.request.deadline) return yield* new HttpError({ status: 409, message: "Runner readback must bind its actual native session and approved work" });
+          if (address.repo !== task.request.repo || address.ref !== task.request.ref || address.sha !== task.request.sha || address.workerId !== WorkerId.make(address.sessionId) || address.scope !== task.request.scope || address.restrictions !== task.request.restrictions || !(yield* exact(address.expectedEvidence, task.request.expectedEvidence)) || address.deadline !== task.request.deadline) return yield* new HttpError({ status: 409, message: "Runner readback must bind its actual native session and approved work" });
           if (task.address && !(yield* exact(task.address, address))) return yield* new HttpError({ status: 409, message: "Child binding/revision mismatch" });
           task.address = address; task.readback = address; task.disposition = "ready";
           if (task.state === "ASSIGNING" || task.state === "QUEUED") task.state = "ACCEPTED";
@@ -425,7 +428,8 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         }),
         reportRunner: Effect.fn("Broker.reportRunner")(function*(params: CommandInput<"runner.report">): Effect.fn.Return<CommandOutput<"runner.report">, unknown> {
           (yield* role(principal, "runner")); const input = params; const task = (yield* loadTask(principal, input.taskId));
-          if (input.runnerId !== principal.id || task.runnerId !== principal.id) return yield* new HttpError({ status: 403, message: "Assigned runner mismatch" });
+          const runnerId = RunnerId.make(principal.id);
+          if (input.runnerId !== runnerId || task.runnerId !== runnerId) return yield* new HttpError({ status: 403, message: "Assigned runner mismatch" });
           if ((task.state === "SUCCEEDED" || task.state === "FAILED") && input.state !== task.state) return yield* new HttpError({ status: 409, message: "Terminal runner result cannot regress" });
           if (input.state === "RUNNING" && (!task.address || task.confirmedRevision !== task.address.revision)) return yield* new HttpError({ status: 409, message: "Substantive prompt not confirmed" });
           task.state = input.state; task.result = input.result; (yield* save(task)); return { ok: true };
@@ -445,7 +449,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           (yield* appendEvidence(task, principal, "ci", work.sha, { ...evidence, policy: (yield* platform.fingerprint({ ref: work.ref, requiredLanes: [...work.requiredLanes].sort() })) })); return evidence;
         }),
         recordLocalEvidence: Effect.fn("Broker.recordLocalEvidence")(function*(params: CommandInput<"evidence.local">): Effect.fn.Return<CommandOutput<"evidence.local">, unknown> {
-          (yield* role(principal, "coordinator", "runner")); const input = params; const task = (yield* loadTask(principal, input.taskId)); if (principal.roles.includes("runner") && task.runnerId !== principal.id) return yield* new HttpError({ status: 403, message: "Assigned runner mismatch" }); (yield* appendEvidence(task, principal, "local", input.sha, input)); return { recorded: true };
+          (yield* role(principal, "coordinator", "runner")); const input = params; const task = (yield* loadTask(principal, input.taskId)); if (principal.roles.includes("runner") && task.runnerId !== RunnerId.make(principal.id)) return yield* new HttpError({ status: 403, message: "Assigned runner mismatch" }); (yield* appendEvidence(task, principal, "local", input.sha, input)); return { recorded: true };
         }),
         recordDeploymentEvidence: Effect.fn("Broker.recordDeploymentEvidence")(function*(params: CommandInput<"evidence.deployment">): Effect.fn.Return<CommandOutput<"evidence.deployment">, unknown> {
           (yield* role(principal, "coordinator")); const input = params; const task = (yield* loadTask(principal, input.taskId)); (yield* appendEvidence(task, principal, "deployment", input.sha, input)); return { recorded: true };
@@ -461,23 +465,23 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           (yield* repo(principal, session.repo));
           if (!input.enabled && principal.owner !== input.owner) {
             const consent = (yield* sql.unsafe<Json>("SELECT participants FROM consents WHERE owner=? AND session=?", [input.owner, input.sessionId]))[0];
-            if (!consent || !decodeJson(JournalState.fields.participants, String(consent.participants)).includes(principal.owner)) return yield* new HttpError({ status: 403, message: "Not an enrolled archive participant" });
+            if (!consent || !decodeJson(JournalState.fields.participants, String(consent.participants)).includes(principal.id)) return yield* new HttpError({ status: 403, message: "Not an enrolled archive participant" });
           }
 
-            (yield* sql.unsafe("INSERT INTO participant_consents VALUES (?,?,?,?) ON CONFLICT(owner,session,participant) DO UPDATE SET enabled=excluded.enabled", [input.owner, input.sessionId, principal.owner, input.enabled ? 1 : 0]));
+            (yield* sql.unsafe("INSERT INTO participant_consents VALUES (?,?,?,?) ON CONFLICT(owner,session,participant) DO UPDATE SET enabled=excluded.enabled", [input.owner, input.sessionId, principal.id, input.enabled ? 1 : 0]));
             if (!input.enabled) {
               (yield* sql.unsafe("UPDATE consents SET enabled=0 WHERE owner=? AND session=?", [input.owner, input.sessionId]));
               (yield* sql.unsafe("DELETE FROM archive WHERE owner=? AND session=?", [input.owner, input.sessionId]));
             }
 
-          return { participant: principal.owner, enabled: input.enabled };
+          return { participant: principal.id, enabled: input.enabled };
         }),
         consentArchive: Effect.fn("Broker.consentArchive")(function*(params: CommandInput<"archive.consent">): Effect.fn.Return<CommandOutput<"archive.consent">, unknown> {
           (yield* role(principal, "session")); const input = params;
           const session = sessions.get(input.sessionId); if (!session || session.principal !== principal.id || session.owner !== principal.owner) return yield* new HttpError({ status: 403, message: "Consent session mismatch" });
-          if (input.enabled && (!input.participants.length || !input.participants.includes(principal.owner))) return yield* new HttpError({ status: 400, message: "Explicit owner/participant consent required" });
+          if (input.enabled && (!input.participants.length || !input.participants.includes(principal.id))) return yield* new HttpError({ status: 400, message: "Explicit owner/participant consent required" });
           for (const participant of input.participants) {
-            if (participant !== principal.owner && input.enabled && !(yield* sql.unsafe<Json>("SELECT enabled FROM participant_consents WHERE owner=? AND session=? AND participant=?", [principal.owner, input.sessionId, participant]))[0]?.enabled) return yield* new HttpError({ status: 403, message: "Each participant must explicitly consent using their own enrolled credential" });
+            if (participant !== principal.id && input.enabled && !(yield* sql.unsafe<Json>("SELECT enabled FROM participant_consents WHERE owner=? AND session=? AND participant=?", [principal.owner, input.sessionId, participant]))[0]?.enabled) return yield* new HttpError({ status: 403, message: "Each participant must explicitly consent using their own enrolled credential" });
           }
           (yield* sql.unsafe("INSERT INTO consents VALUES (?,?,?,?) ON CONFLICT(owner,session) DO UPDATE SET enabled=excluded.enabled,participants=excluded.participants", [principal.owner, input.sessionId, input.enabled ? 1 : 0, encodeJson(JournalState.fields.participants, input.participants)])); return { enabled: input.enabled };
         }),
@@ -488,7 +492,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           const payload = encodeJson(ArchivePayload, input.payload); if (new TextEncoder().encode(payload).byteLength > 16000) return yield* new HttpError({ status: 413, message: "Archive entry too large" });
           if ((yield* platform.fingerprint(input.payload)) !== input.digest) return yield* new HttpError({ status: 409, message: "Archive digest mismatch" });
           const prior = (yield* sql.unsafe<Json>("SELECT digest FROM archive WHERE owner=? AND session=? AND entry=?", [principal.owner, input.sessionId, input.entryId]));
-          const gaps = prior.some((row) => row.digest !== input.digest) ? [...input.gaps, "entry-rewrite"] : input.gaps;
+          const gaps = prior.some((row) => decode(Hash, row.digest) !== input.digest) ? [...input.gaps, "entry-rewrite"] : input.gaps;
           (yield* sql.unsafe("INSERT OR IGNORE INTO archive(owner,session,entry,digest,payload,gaps,created) VALUES (?,?,?,?,?,?,?)", [principal.owner, input.sessionId, input.entryId, input.digest, payload, encodeJson(ArchiveEntry.fields.gaps, gaps), now])); return { appended: true, digest: input.digest };
         }),
         listArchive: Effect.fn("Broker.listArchive")(function*(params: CommandInput<"archive.list">): Effect.fn.Return<CommandOutput<"archive.list">, unknown> {

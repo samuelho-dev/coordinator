@@ -5,7 +5,7 @@ import { Hex } from "effect/encoding";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { HttpServer } from "effect/http";
 import { NodeRuntime } from "@effect/platform-node";
-import { NativeFrame, NativeState, NativeIdentity, Inbox, JournalState, InstallPlan, JsonValue, BrokerConfig, PluginConfig, Commands, CommandError, HttpError, type FramePending, type Observation, type ArchiveRow, type Address, type Work } from "../src/contracts.ts";
+import { NativeFrame, NativeRequestId, TaskId, MessageId, SessionId, MachineId, WorkerId, PrincipalId, OwnerId, ArchiveEntryId, GitHubRepositoryId, Repo, Sha, NativeState, NativeIdentity, Inbox, JournalState, InstallPlan, JsonValue, BrokerConfig, PluginConfig, Commands, CommandError, HttpError, type FramePending, type Observation, type ArchiveRow, type Address, type Work } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { canonicalJson, decode, decodeJson, encodeJson, Mcp, serverLayer } from "../src/http.ts";
 import { LfFrames } from "../src/runner.ts";
@@ -74,7 +74,7 @@ const runHostSmoke = () => Effect.gen(function*() {
   }).pipe(Effect.timeoutOrElse({ duration: 30000, orElse: () => Effect.fail(new CommandError({ message: `${label}: deadline expired` })) }));
   class NativeRpc {
     readonly frames: NativeFrame[] = [];
-    readonly pending = new Map<string, FramePending>();
+    readonly pending = new Map<NativeRequestId, FramePending>();
     failure: CommandError | undefined;
     private diagnostics = "";
     constructor(readonly child: ChildProcessSpawner.ChildProcessHandle, readonly input: Queue.Queue<Uint8Array, Cause.Done>, readonly host: string) {}
@@ -109,12 +109,12 @@ const runHostSmoke = () => Effect.gen(function*() {
         this.pending.clear();
       });
     }
-    send(value: unknown) {
+    send(value: JsonValue) {
       return Effect.suspend(() => this.failure ? Effect.fail(this.failure) : Queue.offer(this.input, new TextEncoder().encode(`${encodeJson(JsonValue, value)}\n`)));
     }
     request(type: string, fields: Record<string, JsonValue> = {}) {
       return Effect.gen({ self: this }, function*() {
-        const id = yield* crypto.randomUUIDv4, result = yield* Deferred.make<NativeFrame, CommandError>();
+        const id = NativeRequestId.make(yield* crypto.randomUUIDv4), result = yield* Deferred.make<NativeFrame, CommandError>();
         this.pending.set(id, result);
         return yield* Effect.gen({ self: this }, function*() {
           yield* this.send({ type, id, ...fields });
@@ -166,7 +166,7 @@ const runHostSmoke = () => Effect.gen(function*() {
       return output;
     }).pipe(Effect.timeout(30000), Effect.ensuring(stop(child)));
   });
-  const repo = "github.com/samuelho-dev/coordinator", owner = "synthetic-host-smoke-owner";
+  const repo = Repo.make("github.com/samuelho-dev/coordinator"), owner = OwnerId.make("synthetic-host-smoke-owner");
   const coordinatorToken = Hex.encode(yield* crypto.randomBytes(32)), sessionToken = Hex.encode(yield* crypto.randomBytes(32));
   const brokerPort = yield* Effect.scoped(Effect.gen(function*() {
     const server = yield* HttpServer.HttpServer;
@@ -177,9 +177,9 @@ const runHostSmoke = () => Effect.gen(function*() {
   const brokerUrl = `http://127.0.0.1:${brokerPort}`;
   const brokerConfig: BrokerConfig = { database: join(directory, "broker", "ledger.sqlite"), host: "127.0.0.1", port: brokerPort,
     backupDirectory: join(directory, "snapshots"), archiveRetentionMs: 86400000, backupRetentionMs: 3600000,
-    repositoryIds: { [repo]: 1 },
-    principals: [{ id: "synthetic-control", owner, roles: ["coordinator"], repos: [repo], tokenHash: yield* platform.digest(coordinatorToken) },
-      { id: "synthetic-native", owner, roles: ["session"], repos: [repo], tokenHash: yield* platform.digest(sessionToken) }] };
+    repositoryIds: { [repo]: GitHubRepositoryId.make(1) },
+    principals: [{ id: PrincipalId.make("synthetic-control"), owner, roles: ["coordinator"], repos: [repo], tokenHash: yield* platform.digest(coordinatorToken) },
+      { id: PrincipalId.make("synthetic-native"), owner, roles: ["session"], repos: [repo], tokenHash: yield* platform.digest(sessionToken) }] };
   const brokerPath = join(directory, "broker.json"); yield* fileSystem.writeFileString(brokerPath, encodeJson(BrokerConfig, brokerConfig), { mode: 0o600 });
   const home = yield* privateDirectory(join(directory, "broker-home")), brokerEnv = isolatedEnvironment(home, join(home, "agent"));
   const syntheticRepo = yield* privateDirectory(join(directory, "synthetic-repository"));
@@ -194,7 +194,7 @@ const runHostSmoke = () => Effect.gen(function*() {
   yield* git(["init", "--initial-branch=main"]);
   yield* git(["-c", "user.name=Synthetic Smoke", "-c", "user.email=synthetic@example.invalid", "commit", "--allow-empty", "-m", "Synthetic native host smoke only"]);
   yield* git(["remote", "add", "origin", "https://github.com/samuelho-dev/coordinator.git"]);
-  const sha = yield* git(["rev-parse", "HEAD"]);
+  const sha = decode(Sha, yield* git(["rev-parse", "HEAD"]));
   const [broker, , brokerScope] = yield* start(runtime, ["--import", join(root, "node_modules/tsx/dist/loader.mjs"), join(root, "src/main.ts"), "broker"], root, { ...brokerEnv, COORDINATOR_CONFIG: brokerPath });
   yield* Stream.runDrain(broker.stdout).pipe(Effect.forkIn(brokerScope));
   yield* Stream.runDrain(broker.stderr).pipe(Effect.forkIn(brokerScope));
@@ -211,17 +211,17 @@ const runHostSmoke = () => Effect.gen(function*() {
     yield* record(`${host}.version`, { binary, version });
     const tokenFile = join(hostHome, "session.token"); yield* (fileSystem.writeFileString(tokenFile, sessionToken, { mode: 0o600 }));
     const stateDirectory = yield* privateDirectory(join(hostHome, "journal")), configPath = join(hostHome, "plugin.json");
-    const config: PluginConfig = { host, brokerUrl, tokenFile, stateDirectory, machineId: `synthetic-${host}`, selectedRemote: "origin" }; yield* (fileSystem.writeFileString(configPath, encodeJson(PluginConfig, config), { mode: 0o600 }));
+    const config: PluginConfig = { host, brokerUrl, tokenFile, stateDirectory, machineId: MachineId.make(`synthetic-${host}`), selectedRemote: "origin" }; yield* (fileSystem.writeFileString(configPath, encodeJson(PluginConfig, config), { mode: 0o600 }));
     const plan = decodeJson(InstallPlan, yield* run(runtime, ["--import", join(root, "node_modules/tsx/dist/loader.mjs"), join(root, "scripts/install.ts"), "--host", host, "--runtime", runtime, "--host-binary", binary, "--plugin-config", configPath, "--plugin-only", "--dry-run"], root, env));
     assert.equal(plan.dryRun, true); assert.equal(plan.service, undefined); assert.ok(plan.launcher?.startsWith(`${hostHome}/`));
     yield* record(`${host}.installer-dry-run`, plan);
-    const syntheticId = (yield* crypto.randomUUIDv4), entryId = "synthetic-diagnostic-only";
+    const syntheticId = SessionId.make(yield* crypto.randomUUIDv4), entryId = ArchiveEntryId.make("synthetic-diagnostic-only");
     const sessionFile = join(hostHome, "synthetic-owned-session.jsonl");
     const timestamp = new Date(yield* Clock.currentTimeMillis).toISOString();
     yield* (fileSystem.writeFileString(sessionFile, [
       { type: "session", version: 3, id: syntheticId, timestamp, cwd: syntheticRepo },
       { type: "custom", id: entryId, parentId: null, timestamp, customType: "coordinator-smoke-synthetic-only", data: { diagnostic: "SYNTHETIC_CONTENT_MUST_NOT_UPLOAD" } },
-    ].map(item => encodeJson(JsonValue, item)).join("\n") + "\n", { mode: 0o600 }));
+    ].map(item => encodeJson(JsonValue, decode(JsonValue, item))).join("\n") + "\n", { mode: 0o600 }));
     const sessions = yield* privateDirectory(join(hostHome, "sessions"));
     const launch = Effect.fnUntraced(function*(explicit: boolean) {
       const [child, input, scope] = yield* start(binary, ["--mode", "rpc", "--session", sessionFile, "--session-dir", sessions, ...(explicit ? ["-e", join(root, "src/plugin.ts")] : [])], syntheticRepo, { ...env, COORDINATOR_CONFIG: configPath });
@@ -234,7 +234,7 @@ const runHostSmoke = () => Effect.gen(function*() {
     assert.equal(identity.machineId, `synthetic-${host}`); assert.equal(identity.repo, repo); assert.equal(identity.ref, "refs/heads/main"); assert.equal(identity.sha, sha); assert.match(identity.incarnation, /^[a-f0-9-]{36}$/);
     assert.equal(identity.workerId, state.sessionId); assert.equal(identity.workerIdentitySource, "native-session");
     yield* record(`${host}.explicit-extension-session-start`, { state, identity });
-    const messageId = (yield* crypto.randomUUIDv4), payload = { note: "synthetic durable native inbox" };
+    const messageId = MessageId.make(yield* crypto.randomUUIDv4), payload = { note: "synthetic durable native inbox" };
     const payloadDigest = yield* platform.fingerprint(payload), journalHash = yield* platform.digest(syntheticId);
     yield* rpc(brokerUrl, coordinatorToken, "peer.send", { messageId, sessionId: identity.sessionId, incarnation: identity.incarnation, payload, ttlMs: 60000 });
     const inbox = yield* until(() => native.command("inbox", value => typeof value === "object" && value !== null).pipe(Effect.map(value => decode(Inbox, value))), value => value[messageId]?.digest === payloadDigest, `${host}: durable inbox receipt`);
@@ -258,7 +258,7 @@ const runHostSmoke = () => Effect.gen(function*() {
     assert.equal(identity.workerId, syntheticId); assert.equal(identity.workerIdentitySource, "native-session");
     // Native SIGTERM need not emit session_shutdown: preserve the broker's prior-incarnation lease fence.
     // This send is accepted only after the installed extension itself has heartbeated AND polled.
-    const enrollmentProbe = { messageId: (yield* crypto.randomUUIDv4), sessionId: identity.sessionId, incarnation: identity.incarnation, payload: { note: "fresh installed native enrollment" }, ttlMs: 60000 };
+    const enrollmentProbe = { messageId: MessageId.make(yield* crypto.randomUUIDv4), sessionId: identity.sessionId, incarnation: identity.incarnation, payload: { note: "fresh installed native enrollment" }, ttlMs: 60000 };
     const enrollmentDigest = yield* platform.fingerprint(enrollmentProbe.payload);
     yield* until(() => rpc(brokerUrl, coordinatorToken, "peer.send", enrollmentProbe).pipe(Effect.as(true), Effect.catch(error =>
       error instanceof HttpError && error.status === 409 ? Effect.succeed(false) : Effect.fail(error)
@@ -268,11 +268,11 @@ const runHostSmoke = () => Effect.gen(function*() {
     // Actual session_start performs heartbeat then poll; task.submit must find that fresh native enrollment.
     // No runner is started: a correctly targeted peer must own the offer before any runner dispatch.
     const work = Effect.fnUntraced(function*(workerId = identity.workerId) { return {
-      taskId: (yield* crypto.randomUUIDv4), repo, ref: identity.ref, sha, launcher: host,
+      taskId: TaskId.make(yield* crypto.randomUUIDv4), repo, ref: identity.ref, sha, launcher: host,
       prompt: "Synthetic bounded work; must not enter model context without coordinator confirmation.",
       scope: "Synthetic native ownership/readback only", restrictions: "No model turn or external operation",
       expectedEvidence: ["synthetic addressed ready readback"], deadline: (yield* Clock.currentTimeMillis) + 60000,
-      workerId, githubRepoId: 1, requiredLanes: ["synthetic-native-readback"], bypassPeer: false, approved: true,
+      workerId, githubRepoId: GitHubRepositoryId.make(1), requiredLanes: ["synthetic-native-readback"], bypassPeer: false, approved: true,
     } satisfies Work; });
     const poll = () => rpc(brokerUrl, sessionToken, "session.poll", { sessionId: identity.sessionId, incarnation: identity.incarnation });
     const offered = Effect.fnUntraced(function*(request: Work) {
@@ -283,7 +283,7 @@ const runHostSmoke = () => Effect.gen(function*() {
       yield* native.frame(from, frame => frame.type === "extension_ui_request" && frame.method === "notify" && typeof frame.message === "string" && frame.message.startsWith(`Coordinator offer ${task.taskId}:`));
       return task;
     });
-    const wrong = yield* rpc(brokerUrl, coordinatorToken, "task.submit", (yield* work(`wrong-${yield* crypto.randomUUIDv4}`)));
+    const wrong = yield* rpc(brokerUrl, coordinatorToken, "task.submit", (yield* work(WorkerId.make(`wrong-${yield* crypto.randomUUIDv4}`))));
     assert.equal(wrong.offerDecision, "expired"); assert.equal(wrong.peerSession, undefined);
     yield* record(`${host}.wrong-target-not-offered`, { taskId: wrong.taskId, targetedWorker: wrong.request.workerId, enrolledWorker: identity.workerId, offerDecision: wrong.offerDecision });
     const declinedOffer = yield* offered(yield* work());
@@ -297,12 +297,12 @@ const runHostSmoke = () => Effect.gen(function*() {
     assert.equal(accepted.state, "ACCEPTED"); assert.equal(accepted.runnerId, undefined);
     assert.deepEqual((yield* poll()).releases, []);
     const address: Address = {
-      messageId: (yield* crypto.randomUUIDv4), revision: 1, workerId: identity.workerId, sessionId: identity.sessionId,
+      messageId: MessageId.make(yield* crypto.randomUUIDv4), revision: 1, workerId: identity.workerId, sessionId: identity.sessionId,
       incarnation: identity.incarnation, repo, ref: identity.ref, sha, scope: accepted.request.scope,
       restrictions: accepted.request.restrictions, expectedEvidence: accepted.request.expectedEvidence, deadline: accepted.request.deadline,
     };
     yield* rpc(brokerUrl, coordinatorToken, "task.address", { taskId: accepted.taskId, address });
-    for (const change of [{ workerId: `wrong-${(yield* crypto.randomUUIDv4)}` }, { repo: "github.com/synthetic/wrong" }, { ref: "refs/heads/wrong" }, { sha: "0".repeat(40) }, { deadline: (yield* Clock.currentTimeMillis) - 1 }]) {
+    for (const change of [{ workerId: WorkerId.make(`wrong-${(yield* crypto.randomUUIDv4)}`) }, { repo: Repo.make("github.com/synthetic/wrong") }, { ref: "refs/heads/wrong" }, { sha: Sha.make("0".repeat(40)) }, { deadline: (yield* Clock.currentTimeMillis) - 1 }]) {
       yield* native.rejectedCommand(`readback ${encodeJson(JsonValue, { taskId: accepted.taskId, address: { ...address, ...change } })}`);
     }
     const ready = decode(Commands["task.readback"].output, yield* native.command(`readback ${encodeJson(JsonValue, { taskId: accepted.taskId, address })}`, value => decode(Commands["task.readback"].output, value).disposition === "ready"));
@@ -319,11 +319,12 @@ const runHostSmoke = () => Effect.gen(function*() {
       for (;;) { const page = yield* rpc(brokerUrl, coordinatorToken, "archive.list", { sessionId: syntheticId, cursor }); rows.push(...page); if (page.length < 2) return rows; cursor = page.at(-1)!.sequence; }
     });
     assert.deepEqual(yield* archive(), []);
-    // Grant solely OUR synthetic owner's metadata consent via actual host confirmation.
+    // Grant solely OUR synthetic participant's metadata consent via actual host confirmation.
     const from = native.frames.length;
-    const consent = yield* native.request("prompt", { message: `/coordinator consent ${encodeJson(JsonValue, { participants: [owner] })}` }).pipe(Effect.forkScoped); // Scoped fiber cannot leak a pending confirmation.
+    const participant = PrincipalId.make("synthetic-native");
+    const consent = yield* native.request("prompt", { message: `/coordinator consent ${encodeJson(JsonValue, { participants: [participant] })}` }).pipe(Effect.forkScoped); // Scoped fiber cannot leak a pending confirmation.
     const confirmation = yield* native.frame(from, frame => frame.type === "extension_ui_request" && frame.method === "confirm" && frame.title === "Your session archive consent");
-    assert.ok(typeof confirmation.message === "string" && confirmation.message.includes(owner)); assert.ok(typeof confirmation.message === "string" && confirmation.message.includes("content is omitted"));
+    assert.ok(typeof confirmation.message === "string" && confirmation.message.includes(participant)); assert.ok(typeof confirmation.message === "string" && confirmation.message.includes("content is omitted"));
     assert.ok(confirmation.id);
     yield* native.send({ type: "extension_ui_response", id: confirmation.id, confirmed: true }); yield* Fiber.join(consent);
     yield* native.frame(from, frame => frame.type === "extension_ui_request" && frame.method === "notify" && frame.message === '{"enabled":true}');
@@ -344,7 +345,7 @@ const runHostSmoke = () => Effect.gen(function*() {
     const replacement = decode(NativeState, (yield* native.request("get_state")).data); assert.notEqual(replacement.sessionId, syntheticId);
     const next = decode(NativeIdentity, yield* native.command("identity", value => decode(NativeIdentity, value).sessionId === replacement.sessionId));
     assert.notEqual(next.incarnation, identity.incarnation);
-    yield* rejected(rpc(brokerUrl, coordinatorToken, "peer.send", { messageId: (yield* crypto.randomUUIDv4), sessionId: syntheticId, incarnation: identity.incarnation, payload, ttlMs: 60000 }), 409);
+    yield* rejected(rpc(brokerUrl, coordinatorToken, "peer.send", { messageId: MessageId.make(yield* crypto.randomUUIDv4), sessionId: syntheticId, incarnation: identity.incarnation, payload, ttlMs: 60000 }), 409);
     assert.equal(replacement.isStreaming, false);
     yield* record(`${host}.native-session-replacement-lifecycle`, { oldSessionId: syntheticId, replacement: next, oldAddressRejected: 409 });
     assert.equal(native.frames.filter(frame => frame.type === "agent_start").length, 0, "Installed native commands must not start model work");

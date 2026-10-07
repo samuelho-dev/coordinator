@@ -2,7 +2,7 @@ import { Context, Crypto, Effect, FileSystem, Layer, Option, Path, Result, Strea
 import { Hex } from "effect/encoding";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { NodeServices } from "@effect/platform-node";
-import { CommandError, Repo } from "./contracts.ts";
+import { CommandError, Hash, Repo } from "./contracts.ts";
 import { canonicalJson, decode } from "./http.ts";
 
 const utf8 = new TextEncoder();
@@ -11,7 +11,7 @@ const webCryptoBytes = (bytes: Uint8Array) => {
   if (!(bytes.buffer instanceof ArrayBuffer)) throw new Error("Unsupported cryptographic buffer");
   return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 };
-export function canonicalRemote(remote: string): string {
+export function canonicalRemote(remote: string): Repo {
   const scp = /^([^@:\s]+@)?([^:\/\s]+):([^\/\s][^\s]*)$/.exec(remote);
   const url = scp ? new URL(`ssh://${scp[2]}/${scp[3]}`) : new URL(remote);
   if (!["https:", "ssh:", "git:"].includes(url.protocol) || url.search || url.hash) throw new Error("Unsupported remote");
@@ -27,7 +27,7 @@ export class Platform extends Context.Service<Platform>()("@samuelho/coordinator
     const crypto = yield* Crypto.Crypto;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const digest = Effect.fnUntraced(function*(value: string) {
-      return Hex.encode(yield* crypto.digest("SHA-256", utf8.encode(value)));
+      return Hash.make(Hex.encode(yield* crypto.digest("SHA-256", utf8.encode(value))));
     });
     const fingerprint = Effect.fnUntraced(function*(value: unknown) {
       return yield* digest(canonicalJson(value));
@@ -42,8 +42,8 @@ export class Platform extends Context.Service<Platform>()("@samuelho/coordinator
       catch: () => new CommandError({ message: "Cryptographic key import failed" }),
     });
     const comparisonKey = yield* importHmac(yield* crypto.randomBytes(32));
-    const expectedMacs = new Map<string, Uint8Array<ArrayBuffer>>();
-    const checkToken = Effect.fnUntraced(function*(token: string, hash: string) {
+    const expectedMacs = new Map<Hash, Uint8Array<ArrayBuffer>>();
+    const checkToken = Effect.fnUntraced(function*(token: string, hash: Hash) {
       if (hash.length !== 64 || !/^[a-f0-9]{64}$/.test(hash)) return false;
       let expectedMac = expectedMacs.get(hash);
       if (expectedMac === undefined) {

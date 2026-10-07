@@ -6,7 +6,7 @@ import { HttpServer } from "effect/http";
 import { canonicalJson, decode, Mcp, serverLayer } from "../src/http.ts";
 import { Platform } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
-import { CommandError, HttpError, Task, type Context, type BrokerRequest } from "../src/contracts.ts";
+import { CommandError, HttpError, Task, Principal, SessionId, JournalReleaseKey, type Context, type BrokerRequest, type IncarnationId } from "../src/contracts.ts";
 import { Plugin } from "../src/plugin.ts";
 
 test("native plugin persists intent before send and holds uncertain delivery after scoped restart", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -33,13 +33,13 @@ test("native plugin persists intent before send and holds uncertain delivery aft
     sessionManager: { getSessionId: () => "native-session", getSessionFile: () => undefined },
     ui: { notify: () => {}, confirm: async () => { await duringConfirm?.(); return approval; } } };
   let sends = 0;
-  let incarnation = "";
+  let incarnation: IncarnationId | undefined;
   const reports: Extract<BrokerRequest, { method: "task.report" }>["params"][] = [];
   let requests = 0;
   const serverContext = yield* Layer.build(serverLayer("127.0.0.1", 0));
   const server = EffectContext.get(serverContext, HttpServer.HttpServer);
   yield* mcp.serve(server, { target: "broker",
-    authorize: () => Effect.succeed({ id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"] as const, repos: ["github.com/example/repo"] }),
+    authorize: () => Effect.succeed(decode(Principal, { id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
     handle: (_principal, request) => Effect.gen(function*() {
       requests++;
       const now = yield* Clock.currentTimeMillis;
@@ -50,8 +50,8 @@ test("native plugin persists intent before send and holds uncertain delivery aft
       const task = decode(Task, { taskId: "task", owner: "owner", fingerprint: yield* platform.fingerprint(work), state: "ACCEPTED", createdAt: now, updatedAt: now, address, readback: address, confirmedRevision: 1, disposition: "ready", request: work });
       if (request.method === "session.poll") return { messages: [], offers: [], releases: [task] };
       if (request.method === "task.report") {
-        const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, "native-session").pipe(Layer.provide(Layer.succeed(Platform, platform)))), Journal);
-        assert.equal(persisted.state.releases["task:1"], "intent");
+        const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, SessionId.make("native-session")).pipe(Layer.provide(Layer.succeed(Platform, platform)))), Journal);
+        assert.equal(persisted.state.releases[JournalReleaseKey.make("task:1")], "intent");
         reports.push(request.params);
         return { ...task, state: request.params.state, result: request.params.result };
       }
@@ -89,8 +89,8 @@ test("native plugin persists intent before send and holds uncertain delivery aft
   yield* plugin.native("agent_start", { type: "agent_start" }, { ...ctx, mode: "rpc" });
   assert.equal(terminalOutput.length, beforeRpc, "TTY-backed RPC with UI must never receive OSC");
   assert.equal(sends, 1);
-  const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, "native-session")), Journal);
-  assert.equal(persisted.state.releases["task:1"], "intent");
+  const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, SessionId.make("native-session"))), Journal);
+  assert.equal(persisted.state.releases[JournalReleaseKey.make("task:1")], "intent");
   yield* plugin.stop();
   yield* plugin.start(ctx);
   const priorRequests = requests;
@@ -156,7 +156,7 @@ test("a refused startup heartbeat keeps scoped enrollment alive until the prior 
   let heartbeatAttempts = 0;
   let polls = 0;
   yield* mcp.serve(server, { target: "broker",
-    authorize: () => Effect.succeed({ id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] }),
+    authorize: () => Effect.succeed(decode(Principal, { id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
     handle: (_principal, request) => Effect.gen(function*() {
       if (request.method === "session.heartbeat") {
         heartbeatAttempts++;

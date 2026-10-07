@@ -6,13 +6,13 @@ import { Clock, Effect, Fiber, Layer, ManagedRuntime } from "effect";
 import { TestClock } from "effect/testing";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { pollCi } from "../src/evidence.ts";
-import { JsonValue, type Work } from "../src/contracts.ts";
-import { encodeJson } from "../src/http.ts";
+import { JsonValue, Work, Sha } from "../src/contracts.ts";
+import { decode, encodeJson } from "../src/http.ts";
 
 function response(value: JsonValue): Response { return new Response(encodeJson(JsonValue, value), { headers: { "content-type": "application/json" } }); }
 
-const sha = "1".repeat(40);
-const work: Work = { taskId: "evidence-task", repo: "github.com/owner/repo", ref: "main", sha, launcher: "omp", prompt: "approved", scope: "scope", restrictions: "no merge", expectedEvidence: ["CI/verify"], deadline: (await Effect.runPromise(Clock.currentTimeMillis)) + 60000, workerId: "worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: true, approved: true };
+const sha = Sha.make("1".repeat(40));
+const work = decode(Work, { taskId: "evidence-task", repo: "github.com/owner/repo", ref: "main", sha, launcher: "omp", prompt: "approved", scope: "scope", restrictions: "no merge", expectedEvidence: ["CI/verify"], deadline: (await Effect.runPromise(Clock.currentTimeMillis)) + 60000, workerId: "worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: true, approved: true });
 
 test("exact-SHA latest-attempt CI refuses prior green, missing/skipped/cancelled lanes and polling races", async () => {
   let respond = (_url: string): Response => response({});
@@ -44,7 +44,7 @@ test("PR merge-ref CI requires the exact current merge SHA and authenticated mat
   let respond = (_url: string): Response => response({});
   const client = HttpClient.make((request, url) => Effect.sync(() => HttpClientResponse.fromWeb(request, respond(url.toString()))));
   const runtime = ManagedRuntime.make(Layer.succeed(HttpClient.HttpClient, client));
-  const headSha = "2".repeat(40);
+  const headSha = Sha.make("2".repeat(40));
   try {
     for (const scenario of ["green", "wrong-pr", "head-sha-run", "head-sha-request", "merge-mismatch", "ref-race", "association-race", "api-loss", "unauthenticated"] as const) {
       let refReads = 0;

@@ -6,7 +6,7 @@ import { lookup } from "node:dns";
 import type { LookupFunction } from "node:net";
 import { McpProtocol, McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { BackupError, SnapshotList, BrokerRequest, RunnerRequest, ConnectHosts, HttpError, CommandError, BoundaryError, Json, McpToolName, Commands, type McpCommandName, type McpEndpoint } from "./contracts.ts";
+import { BackupError, SnapshotList, BrokerRequest, RunnerRequest, ConnectHosts, HttpError, CommandError, BoundaryError, Json, McpToolName, Commands, McpCommandName, type CommandInput, type McpEndpoint } from "./contracts.ts";
 
 export const LIMIT = 64 * 1024;
 export const MCP_RESULT_LIMIT = LIMIT - 1024;
@@ -23,7 +23,7 @@ export function decodeEffect<S extends Schema.Constraint>(schema: S, value: unkn
 export function decodeJson<S extends Schema.ConstraintDecoder<unknown> & Schema.ConstraintEncoder<unknown>>(schema: S, text: string): S["Type"] {
   return decode(Schema.fromJsonString(Schema.toCodecJson(schema)), text);
 }
-export function encodeJson<S extends Schema.ConstraintDecoder<unknown> & Schema.ConstraintEncoder<unknown>>(schema: S, value: unknown, space?: number | string): string {
+export function encodeJson<S extends Schema.ConstraintDecoder<unknown> & Schema.ConstraintEncoder<unknown>>(schema: S, value: S["Type"], space?: number | string): string {
   // Storage keeps omitted optional fields; only MCP's object wire uses canonical JSON nulls.
   return Schema.encodeUnknownSync(Schema.fromJsonString(schema, { space }), { onExcessProperty: "error" })(value);
 }
@@ -147,7 +147,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
   make: Effect.gen(function*() {
     const http = yield* HttpClient.HttpClient;
     // Each call owns its SDK connection: bearer contexts never share state or an authenticated session.
-    const call = <const M extends McpCommandName>(url: string, token: string, method: M, params: unknown, timeoutMs = 10000): Effect.Effect<(typeof Commands)[M]["output"]["Type"], unknown> => Effect.scoped(Effect.gen(function*() {
+    const call = <const M extends McpCommandName>(url: string, token: string, method: M, params: CommandInput<M>, timeoutMs = 10000): Effect.Effect<(typeof Commands)[M]["output"]["Type"], unknown> => Effect.scoped(Effect.gen(function*() {
       const descriptor = Commands[method];
       const input = yield* decodeEffect(descriptor.input, params);
       const endpoint = yield* Effect.try(() => new URL("/mcp", url));
@@ -208,7 +208,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         else yield* options.authorize(auth.slice(7));
         return auth.slice(7);
       });
-      const handle = (name: string, params: unknown) => Effect.gen(function*() {
+      const handle = (name: McpCommandName, params: unknown) => Effect.gen(function*() {
         // This service is restored by native MCP for each request, never captured at registration.
         const token = yield* authorize;
         if (name === "health") return yield* Commands.health.execute({ health: () => Effect.succeed({ status: "ok" as const }) }, {});
@@ -220,6 +220,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         return yield* options.handle(principal, yield* decodeEffect(RunnerRequest, { method: name, params }));
       });
       const tools = Object.entries(Commands).filter(([, descriptor]) => descriptor.target === options.target || descriptor.target === "shared").map(([id, descriptor]) => {
+        const commandName = decode(McpCommandName, id);
         // Runtime schemas remain context-free; the domain decodes its discriminated request.
         const makeTool = (name: string, input: Schema.Top & Schema.ConstraintCodec<unknown, unknown>, output: Schema.Top & Schema.ConstraintCodec<unknown, unknown>, description: string) => {
           const failureCodec = Schema.toCodecJson(ToolFailure);
@@ -249,14 +250,14 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
           }));
           return registration.pipe(Layer.provide(toolkit.toLayer({
             [name]: (params: unknown) => Effect.gen(function*() {
-              const result = yield* handle(id, params);
+              const result = yield* handle(commandName, params);
               const value = yield* decodeEffect(output, { result });
               if (resultSize(value) > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Result too large; use cursor pagination" });
               return value;
             }).pipe(Effect.catchCause((cause) => Effect.fail({ error: boundaryFailure(cause) }))),
           })));
         };
-        return makeTool(descriptor.method ?? id, descriptor.input, descriptor.structuredOutput, descriptor.description);
+        return makeTool(descriptor.method ?? commandName, descriptor.input, descriptor.structuredOutput, descriptor.description);
       });
       const native = McpServer.layerHttp({ name: "coordinator", version: "0.1.0", path: "/mcp", protocols: [McpProtocol.v2026_07_28, McpProtocol.v2025_11_25], allowedOrigins: [] });
       const app = yield* HttpRouter.toHttpEffect(tools.reduce(
@@ -266,7 +267,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
       return yield* server.serve(Effect.gen(function*() {
         const request = yield* HttpServerRequest.HttpServerRequest;
         yield* authorize;
-        if (request.url === "/healthz" && request.method === "GET") return HttpServerResponse.text(encodeJson(Commands.health.output, yield* handle("health", {})), { contentType: "application/json", headers: { "cache-control": "no-store" } });
+        if (request.url === "/healthz" && request.method === "GET") return HttpServerResponse.text(encodeJson(Commands.health.output, yield* decodeEffect(Commands.health.output, yield* handle("health", {}))), { contentType: "application/json", headers: { "cache-control": "no-store" } });
         if (Number(request.headers["content-length"] ?? 0) > LIMIT) return yield* new HttpError({ status: 413, message: "Request too large" });
         const body = request.method === "POST" ? yield* request.json.pipe(Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT))) : undefined;
         const method = body && typeof body === "object" && !Array.isArray(body) && "method" in body ? body.method : undefined;

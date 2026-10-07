@@ -1,7 +1,7 @@
 import { Clock, Effect } from "effect";
 import { HttpClient } from "effect/http";
 import { HttpError } from "./contracts.ts";
-import { RepoIdentity, Job, Run, MergeRef, JsonValue, type Json, type Work, type CiEvidence, type CiSeen } from "./contracts.ts";
+import { Repo, GitHubWorkflowId, GitHubPullRequestNumber, RepoIdentity, Job, Run, MergeRef, JsonValue, type Json, type Work, type CiEvidence, type CiSeen } from "./contracts.ts";
 import { decode, decodeJson } from "./http.ts";
 // GitHub adds fields; decode its selected fields rather than disabling strict product-boundary decoding.
 function select(input: JsonValue | undefined, names: string[]): Json {
@@ -29,7 +29,7 @@ function array(input: JsonValue, key: string): JsonValue[] {
   if (!Array.isArray(value)) throw new Error("Malformed GitHub collection");
   return value;
 }
-export const inspectGithubRepository = Effect.fn("GitHub.inspectRepository")(function*(repo: string, token?: string) {
+export const inspectGithubRepository = Effect.fn("GitHub.inspectRepository")(function*(repo: typeof Repo.Type, token?: string) {
   const parts = repo.split("/");
   if (parts[0] !== "github.com" || parts.length !== 3) return yield* new HttpError({ status: 502, message: "GitHub evidence requires a GitHub repository" });
   const value = yield* github(`/repos/${parts[1]}/${parts[2]}`, token);
@@ -41,10 +41,11 @@ export const pollCi = Effect.fn("GitHub.pollCi")(function*(work: Work, token?: s
   return yield* Effect.gen(function*() {
     const pull = /^refs\/pull\/([1-9]\d*)\/merge$/.exec(work.ref);
     if (pull && !token) return yield* new HttpError({ status: 502, message: "PR merge-ref evidence requires authenticated GitHub metadata" });
+    const pullNumber = pull ? yield* Effect.try(() => decode(GitHubPullRequestNumber, Number(pull[1]))) : undefined;
     const identity = yield* inspectGithubRepository(work.repo, token);
     if (identity.id !== work.githubRepoId) return yield* new HttpError({ status: 502, message: "Repository identity mismatch" });
     const base = `/repos/${identity.full_name}`;
-    const mergeRefPath = pull ? `${base}/git/ref/pull/${pull[1]}/merge` : undefined;
+    const mergeRefPath = pullNumber !== undefined ? `${base}/git/ref/pull/${pullNumber}/merge` : undefined;
     const checkMergeRef = Effect.fnUntraced(function*() {
       if (!mergeRefPath) return;
       const value = yield* github(mergeRefPath, token);
@@ -54,8 +55,8 @@ export const pollCi = Effect.fn("GitHub.pollCi")(function*(work: Work, token?: s
       if (current.ref !== work.ref || current.object.sha !== work.sha) return yield* new HttpError({ status: 502, message: "Current PR merge-ref SHA mismatch" });
     });
     yield* checkMergeRef();
-    const matchesRef = (run: Run): boolean => pull
-      ? run.pull_requests?.some((pr) => String(pr.number) === pull[1]) === true
+    const matchesRef = (run: Run): boolean => pullNumber !== undefined
+      ? run.pull_requests?.some((pr) => pr.number === pullNumber) === true
       : run.head_branch === work.ref.replace(/^refs\/heads\//, "") || run.head_branch === work.ref;
     const collection: Run[] = [];
     let truncated = false;
@@ -69,7 +70,7 @@ export const pollCi = Effect.fn("GitHub.pollCi")(function*(work: Work, token?: s
     if (truncated) return yield* new HttpError({ status: 502, message: "Run history truncated; cannot prove latest relevant run" });
     if (collection.some((run) => run.head_sha !== work.sha)) return yield* new HttpError({ status: 502, message: "GitHub exact-SHA query mismatch" });
     const relevant = collection.filter((run) => run.head_sha === work.sha && matchesRef(run));
-    const latest = new Map<number, Run>();
+    const latest = new Map<GitHubWorkflowId, Run>();
     for (const run of relevant) {
       const prior = latest.get(run.workflow_id);
       if (!prior || run.id > prior.id || (run.id === prior.id && run.run_attempt > prior.run_attempt)) latest.set(run.workflow_id, run);

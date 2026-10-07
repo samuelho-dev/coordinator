@@ -3,7 +3,7 @@ import { ChildProcess } from "effect/process";
 import { HttpServer } from "effect/http";
 import { Reactivity } from "effect/reactivity";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
-import { Address, Work, RunnerConfig, RunnerRow, Json, JsonValue, RunnerEvent, RunnerResult, RunnerInspection, NativeFrame, NativeResponse, Acceptance, HttpError, CommandError, Commands, type CommandCapabilities, type CommandInput, type CommandNames, type RunnerReleased, type RunnerRelease, type RunnerRequest, type NativeChild, type RunnerAdmission, type Task } from "./contracts.ts";
+import { Address, Work, RunnerConfig, RunnerRow, Json, JsonValue, RunnerEvent, RunnerResult, RunnerInspection, NativeFrame, NativeState, NativeRequestId, TaskId, MessageId, IncarnationId, WorkerId, UserId, NativeResponse, Acceptance, HttpError, CommandError, Commands, type CommandCapabilities, type CommandInput, type CommandNames, type RunnerReleased, type RunnerRelease, type RunnerRequest, type NativeChild, type RunnerAdmission, type Task } from "./contracts.ts";
 import { Platform } from "./platform.ts";
 import { Mcp, serverLayer, decode, decodeEffect, decodeJson, encodeJson, canonicalJson, LIMIT, MCP_RESULT_LIMIT, mcpResultSizer } from "./http.ts";
 import { migrateRunner } from "./database.ts";
@@ -12,9 +12,9 @@ const FRAME_LIMIT = 4 * 1024 * 1024;
 const RETAIN_EVENTS = 128;
 const Terminal: Record<string, true> = { SUCCEEDED: true, FAILED: true };
 function record(value: unknown): value is Json { return typeof value === "object" && value !== null && !Array.isArray(value); }
-export const CHILD_UID_BASE = 1000000;
+export const CHILD_UID_BASE = UserId.make(1000000);
 /** setpriv clears groups and every capability before executing an untrusted child. */
-export function isolationArgs(uid: number): string[] {
+export function isolationArgs(uid: UserId): string[] {
   // Effect has no operating-system platform identifier API; enrollment also proves Linux isolation through setpriv.
   if (process.platform !== "linux" || !Number.isSafeInteger(uid) || uid < CHILD_UID_BASE || uid >= 0xffffffff) throw new Error("Isolated Linux child UID required; macOS is plugin-only");
   return [`--reuid=${uid}`, `--regid=${uid}`, "--clear-groups", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs"];
@@ -27,7 +27,7 @@ export const childEnvironment = Effect.fn("Runner.childEnvironment")(function*(h
   }
   return env;
 });
-export const ownChildDirectory = Effect.fn("Runner.ownChildDirectory")(function*(path: string, uid: number): Effect.fn.Return<void, unknown, Platform> {
+export const ownChildDirectory = Effect.fn("Runner.ownChildDirectory")(function*(path: string, uid: UserId): Effect.fn.Return<void, unknown, Platform> {
   const { fs: fileSystem, path: paths } = yield* Platform;
   const join = paths.join;
   for (const name of yield* (fileSystem.readDirectory(path))) {
@@ -132,7 +132,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
   const fork = Effect.fnUntraced(function*(effect: Effect.Effect<unknown, unknown>) {
     yield* effect.pipe(Effect.catchCause(() => Effect.void), Effect.forkScoped, Effect.provideService(Scope.Scope, ownerScope));
   });
-  const children = new Map<string, NativeChild>(), admissions = new Map<string, RunnerAdmission>();
+  const children = new Map<TaskId, NativeChild>(), admissions = new Map<TaskId, RunnerAdmission>();
   const reportLock = yield* Semaphore.make(1);
   const fatal = yield* Deferred.make<never, CommandError>();
   let closed = false, ownershipLost = false, heartbeatBusy = false, reportsBusy = false;
@@ -167,8 +167,8 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
           (yield* sql.unsafe("UPDATE events SET payload=? WHERE seq=?", [encodeJson(RunnerEvent, eventMetadata(decodeJson(JsonValue, String(event.payload)))), event.seq]));
         }
         for (const row of (yield* sql.unsafe<Json>("SELECT taskId,result FROM tasks WHERE result IS NOT NULL"))) {
-          if (typeof row.taskId !== "string") return yield* Effect.fail(new CommandError({ message: "Invalid journal task identity" }));
-          (yield* sql.unsafe("UPDATE tasks SET result=? WHERE taskId=?", [encodeJson(RunnerResult, resultMetadata(decodeJson(JsonValue, String(row.result)))), row.taskId]));
+          const taskId = yield* decodeEffect(TaskId, row.taskId);
+          (yield* sql.unsafe("UPDATE tasks SET result=? WHERE taskId=?", [encodeJson(RunnerResult, resultMetadata(decodeJson(JsonValue, String(row.result)))), taskId]));
         }
         for (const statement of ["VACUUM", "PRAGMA wal_checkpoint(TRUNCATE)", "PRAGMA user_version=1"]) yield* sql.unsafe(statement);
       }
@@ -183,23 +183,23 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
         }
       }
   });
-  const getRow = Effect.fn("Runner.row")(function*(taskId: string): Effect.fn.Return<RunnerRow | undefined, unknown> { const value = ((yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE taskId=?", [config.childUidBase, taskId]))[0]); return value ? decode(RunnerRow, value) : undefined; });
-  const requireRow = Effect.fn("Runner.requireRow")(function*(taskId: string): Effect.fn.Return<RunnerRow, unknown> { const row = (yield* getRow(taskId)); if (!row) return yield* new HttpError({ status: 404, message: "Task not accepted" }); return row; });
+  const getRow = Effect.fn("Runner.row")(function*(taskId: TaskId): Effect.fn.Return<RunnerRow | undefined, unknown> { const value = ((yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE taskId=?", [config.childUidBase, taskId]))[0]); return value ? decode(RunnerRow, value) : undefined; });
+  const requireRow = Effect.fn("Runner.requireRow")(function*(taskId: TaskId): Effect.fn.Return<RunnerRow, unknown> { const row = (yield* getRow(taskId)); if (!row) return yield* new HttpError({ status: 404, message: "Task not accepted" }); return row; });
   const taskWork = (row: RunnerRow): Work => { return decodeJson(Work, row.work); };
   const acceptance = (row: RunnerRow): Acceptance => {
     return { taskId: row.taskId, accepted: true, state: row.state, worktree: row.worktree,
       ...(row.address ? { address: decodeJson(Address, row.address) } : {}), ...(row.reason ? { reason: row.reason } : {}) };
   };
   const load = Effect.fn("Runner.load")(function*(): Effect.fn.Return<number, unknown> { return Number(((yield* sql.unsafe<Json>("SELECT count(*) AS count FROM tasks WHERE occupied=1"))[0])!.count); });
-  const resultMetadata = (value: unknown): Json | null => {
+  const resultMetadata = (value: unknown): RunnerResult => {
     if (!record(value)) return null;
     const result: Json = {};
     for (const key of ["launched", "hostSettled", "evidenceVerified"]) if (typeof value[key] === "boolean") result[key] = value[key];
     if (typeof value.exitCode === "number" && Number.isSafeInteger(value.exitCode)) result.exitCode = value.exitCode;
     if (typeof value.signal === "string" && /^SIG[A-Z0-9]{1,16}$/.test(value.signal)) result.signal = value.signal;
-    return result;
+    return decode(RunnerResult, result);
   };
-  const eventMetadata = (value: unknown): Json => {
+  const eventMetadata = (value: unknown): RunnerEvent => {
     if (!record(value)) return { type: "host_event", contentOmitted: true };
     const type = typeof value.type === "string" && /^[a-z_]{1,40}$/.test(value.type) ? value.type : "host_event";
     const result: Json = { type, contentOmitted: true };
@@ -210,14 +210,14 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     if (typeof value.command === "string" && ["get_state", "get_messages", "bash", "prompt", "abort"].includes(value.command)) result.command = value.command;
     for (const key of ["fingerprint", "digest"]) if (typeof value[key] === "string" && /^[a-f0-9]{64}$/.test(value[key])) result[key] = value[key];
     if (typeof value.id === "string" && /^[a-f0-9-]{36}$/.test(value.id)) result.id = value.id;
-    return result;
+    return decode(RunnerEvent, result);
   };
-  const event = Effect.fn("Runner.event")(function*(taskId: string, value: unknown): Effect.fn.Return<void, unknown> {
+  const event = Effect.fn("Runner.event")(function*(taskId: TaskId, value: unknown): Effect.fn.Return<void, unknown> {
     const payload = encodeJson(RunnerEvent, eventMetadata(value));
     (yield* sql.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", [taskId, payload]));
     (yield* sql.unsafe("DELETE FROM events WHERE taskId=? AND seq NOT IN (SELECT seq FROM events WHERE taskId=? ORDER BY seq DESC LIMIT ?)", [taskId, taskId, RETAIN_EVENTS]));
   }, owned);
-  const state = Effect.fn("Runner.state")(function*(taskId: string, state: string, reason: string | null = null, result: unknown = null): Effect.fn.Return<void, unknown> {
+  const state = Effect.fn("Runner.state")(function*(taskId: TaskId, state: string, reason: string | null = null, result: unknown = null): Effect.fn.Return<void, unknown> {
     (yield* sql.unsafe("UPDATE tasks SET state=?,reason=?,result=? WHERE taskId=?", [state, reason, encodeJson(RunnerResult, resultMetadata(result)), taskId]));
     (yield* event(taskId, { type: "runner_state", state, reason }));
   }, owned);
@@ -292,7 +292,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     const accepted = (yield* getRow(work.taskId));
     if (accepted) { if (accepted.fingerprint !== hash) return yield* new HttpError({ status: 409, message: "Task fingerprint conflict" }); return acceptance(accepted); }
     const worktree = join(config.childDirectory, (yield* platform.digest(work.taskId)), "repo");
-    const incarnation = yield* platform.crypto.randomUUIDv4;
+    const incarnation = IncarnationId.make(yield* platform.crypto.randomUUIDv4);
     const reserved = yield* owned(sql.withTransaction(Effect.gen(function*() {
       if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
       const existing = yield* getRow(work.taskId);
@@ -318,8 +318,10 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     if ((yield* inspect(["remote"])) !== "origin" || platform.canonicalRemote(yield* inspect(["remote", "get-url", "--all", "origin"])) !== work.repo || (yield* inspect(["rev-parse", "HEAD"])) !== work.sha || (yield* inspect(["rev-parse", "--verify", `${work.ref}^{commit}`])) !== work.sha) return yield* Effect.fail(new CommandError({ message: "Checkout identity mismatch" }));
   });
   const readback = Effect.fn("Runner.readback")(function*(row: RunnerRow, response: NativeFrame, template?: Address): Effect.fn.Return<Address, unknown> {
-    const work = taskWork(row); const data = response.data;
-    if (response.success !== true || !record(data) || typeof data.sessionId !== "string" || typeof data.sessionFile !== "string" || data.isStreaming !== false) return yield* Effect.fail(new CommandError({ message: "Unverified durable host identity" }));
+    const work = taskWork(row);
+    if (response.success !== true) return yield* Effect.fail(new CommandError({ message: "Unverified durable host identity" }));
+    const data = yield* decodeEffect(NativeState, response.data);
+    if (typeof data.sessionFile !== "string" || data.isStreaming !== false) return yield* Effect.fail(new CommandError({ message: "Unverified durable host identity" }));
     const sessions = yield* (fileSystem.realPath(join(config.childDirectory, (yield* platform.digest(row.taskId)), "sessions")));
     if (!isAbsolute(data.sessionFile) || !inside(sessions, resolve(data.sessionFile))) return yield* Effect.fail(new CommandError({ message: "Unexpected session path" }));
     const cwdResponse = yield* nativeRequest(row.taskId, { type: "bash", command: "pwd -P" });
@@ -327,7 +329,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     if (!record(cwdData) || cwdData.exitCode !== 0 || typeof cwdData.output !== "string" || cwdData.output.trim() !== row.worktree) return yield* Effect.fail(new CommandError({ message: "Host cwd mismatch" }));
     yield* verifyCheckout(row);
     // Native session identity is the actual addressable root worker, not a fabricated requested ID.
-    return decode(Address, { messageId: template?.messageId ?? row.taskId, revision: template?.revision ?? 1, workerId: data.sessionId, sessionId: data.sessionId,
+    return decode(Address, { messageId: template?.messageId ?? MessageId.make(row.taskId), revision: template?.revision ?? 1, workerId: WorkerId.make(data.sessionId), sessionId: data.sessionId,
       incarnation: row.incarnation, repo: work.repo, ref: work.ref, sha: work.sha,
       scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline });
   });
@@ -339,34 +341,36 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       : decode(NativeResponse, response);
     return nativeResponseSize({ result: projected }) <= MCP_RESULT_LIMIT ? projected : decode(NativeResponse, { type: "gap", reason: "host response exceeds endpoint bound", command: response.command });
   };
-  const frame = Effect.fn("Runner.frame")(function*(taskId: string, child: NativeChild | undefined, value: unknown): Effect.fn.Return<void, unknown> {
+  const frame = Effect.fn("Runner.frame")(function*(taskId: TaskId, child: NativeChild | undefined, value: unknown): Effect.fn.Return<void, unknown> {
     if (!record(value) || typeof value.type !== "string") return yield* Effect.fail(new CommandError({ message: "Malformed RPC object" }));
     if (value.type === "rpc_chunk") return yield* Effect.fail(new CommandError({ message: "Unnegotiated chunk protocol" }));
     if (value.type === "response") {
       if (typeof value.id !== "string" || typeof value.command !== "string" || typeof value.success !== "boolean") return yield* Effect.fail(new CommandError({ message: "Malformed response" }));
-      const pending = child?.pending.get(value.id);
+      const response = yield* decodeEffect(NativeFrame, value);
+      const id = yield* decodeEffect(NativeRequestId, response.id);
+      const pending = child?.pending.get(id);
       if (pending) {
-        if (pending.type !== value.command) return yield* Effect.fail(new CommandError({ message: "Response command mismatch" }));
-        child!.pending.delete(value.id);
-        if (value.success) yield* Deferred.succeed(pending.response, value); else yield* Deferred.fail(pending.response, new CommandError({ message: "Host command rejected" }));
+        if (pending.type !== response.command) return yield* Effect.fail(new CommandError({ message: "Response command mismatch" }));
+        child!.pending.delete(id);
+        if (response.success) yield* Deferred.succeed(pending.response, response); else yield* Deferred.fail(pending.response, new CommandError({ message: "Host command rejected" }));
       }
-      (yield* event(taskId, { type: "host_response", id: value.id, command: value.command, success: value.success })); return;
+      (yield* event(taskId, { type: "host_response", id, command: response.command, success: response.success })); return;
     }
     (yield* event(taskId, { type: value.type === "readback" ? "host_event" : value.type, status: value.status }));
     const row = (yield* requireRow(taskId)); if (!row.promptId || !child || child.lost) return;
     if (value.type === "agent_start") child.started = true;
     if (value.type === "message_end" && record(value.message) && ["error", "aborted"].includes(String(value.message.stopReason))) child.failed = true;
     if (taskWork(row).launcher === "omp") {
-      if (value.type === "prompt_result" && value.id === row.promptId) {
+      if (value.type === "prompt_result" && decode(NativeRequestId, value.id) === row.promptId) {
         if (value.status !== "completed") child.failed = true;
         if (value.sessionSettled === true) yield* fork(finish(taskId, child));
       } else if (value.type === "session_settled" && child.started) yield* fork(finish(taskId, child));
     } else if ((value.type === "agent_end" || value.type === "agent_settled") && child.started) yield* fork(finish(taskId, child));
   });
-  const finish = Effect.fn("Runner.finish")(function*(taskId: string, child: NativeChild): Effect.fn.Return<void, unknown> {
+  const finish = Effect.fn("Runner.finish")(function*(taskId: TaskId, child: NativeChild): Effect.fn.Return<void, unknown> {
     if (child.completing || child.lost) return; child.completing = true;
-      const response = yield* nativeRequest(taskId, { type: "get_state" }); const data = response.data;
-      if (!record(data) || data.isStreaming !== false || data.isCompacting !== false || data.hasPendingAsyncWork === true || data.isSettled === false || Number(data.pendingMessageCount ?? data.queuedMessageCount ?? 0) !== 0) { child.completing = false; return; }
+      const response = yield* nativeRequest(taskId, { type: "get_state" }); const data = yield* decodeEffect(NativeState, response.data);
+      if (data.isStreaming !== false || data.isCompacting !== false || data.hasPendingAsyncWork === true || data.isSettled === false || Number(data.pendingMessageCount ?? data.queuedMessageCount ?? 0) !== 0) { child.completing = false; return; }
       const row = (yield* requireRow(taskId));
       if (!row.address || data.sessionId !== decodeJson(Address, row.address).sessionId) return yield* Effect.fail(new CommandError({ message: "Host identity changed" }));
       (yield* state(taskId, child.failed ? "FAILED" : "SUCCEEDED", null, { hostSettled: true, evidenceVerified: false }));
@@ -388,7 +392,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     // Native readback awaited RPCs; recheck the ledger immediately before reserving prompt intent.
     yield* brokerTask(work, input.address);
     if (input.address.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
-    const promptId = (yield* platform.crypto.randomUUIDv4);
+    const promptId = NativeRequestId.make(yield* platform.crypto.randomUUIDv4);
     yield* owned(sql.withTransaction(Effect.gen(function*() {
       if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
       if (input.address.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
@@ -424,7 +428,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       if (!row || row.detached) return;
       yield* Effect.gen(function*() {
         if (row.address && row.state === "READY") yield* rpc.call(config.brokerUrl, token, "runner.readback", { runnerId: config.id, taskId: row.taskId, address: decodeJson(Address, row.address) });
-        if (["RUNNING", "SUCCEEDED", "FAILED", "HELD"].includes(row.state)) yield* rpc.call(config.brokerUrl, token, "runner.report", { runnerId: config.id, taskId: row.taskId, state: row.state, result: row.result ? decodeJson(JsonValue, row.result) : {} });
+        if (row.state === "RUNNING" || row.state === "SUCCEEDED" || row.state === "FAILED" || row.state === "HELD") yield* rpc.call(config.brokerUrl, token, "runner.report", { runnerId: config.id, taskId: row.taskId, state: row.state, result: row.result ? decodeJson(JsonValue, row.result) : {} });
       }).pipe(Effect.catch((error) => Effect.gen(function*() {
         if (!(error instanceof HttpError) || error.status !== 403) return;
         // Read the typed error rather than treating a network failure or report conflict as stale ownership.
@@ -436,7 +440,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     })).pipe(Effect.asVoid, Effect.ensuring(Effect.sync(() => { reportsBusy = false; })));
   }, (effect) => reportLock.withPermit(effect));
 
-  const hold = Effect.fn("Runner.hold")(function*(taskId: string, reason: string) {
+  const hold = Effect.fn("Runner.hold")(function*(taskId: TaskId, reason: string) {
     yield* state(taskId, "HELD", reason);
     const child = children.get(taskId);
     if (child) {
@@ -445,12 +449,12 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       child.pending.clear();
     }
   });
-  const nativeRequest = Effect.fn("Runner.request")(function*(taskId: string, params: { type: CommandInput<CommandNames<"native">>["type"]; command?: string; message?: string }, timeout = 30000, forcedId?: string, approvedDeadline?: number): Effect.fn.Return<NativeFrame, unknown> {
-    const id = forcedId ?? (yield* platform.crypto.randomUUIDv4);
+  const nativeRequest = Effect.fn("Runner.request")(function*(taskId: TaskId, params: { type: CommandInput<CommandNames<"native">>["type"]; command?: string; message?: string }, timeout = 30000, forcedId?: NativeRequestId, approvedDeadline?: number): Effect.fn.Return<NativeFrame, unknown> {
+    const id = forcedId ?? NativeRequestId.make(yield* platform.crypto.randomUUIDv4);
     const send = Effect.fnUntraced(function*(frame: NativeFrame): Effect.fn.Return<NativeFrame, unknown> {
       const child = children.get(taskId);
       if (!child || child.lost) return yield* Effect.fail(new CommandError({ message: "Owned child stdio unavailable" }));
-      const response = yield* Deferred.make<Json, unknown>();
+      const response = yield* Deferred.make<NativeFrame, unknown>();
       child.pending.set(id, { type: frame.type, response });
       return yield* Effect.gen(function*() {
         if (frame.type === "prompt" && (approvedDeadline === undefined || approvedDeadline <= (yield* Clock.currentTimeMillis))) {
@@ -458,7 +462,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
           return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
         }
         yield* Queue.offer(child.input, new TextEncoder().encode(`${encodeJson(NativeFrame, frame)}\n`));
-        return yield* decodeEffect(NativeFrame, yield* Deferred.await(response));
+        return yield* Deferred.await(response);
       }).pipe(Effect.timeout(timeout), Effect.ensuring(Effect.sync(() => child.pending.delete(id))));
     });
     const capabilities: CommandCapabilities<"native"> = {
@@ -482,10 +486,10 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     yield* fork(accept(work).pipe(Effect.exit, Effect.flatMap((exit) => Deferred.done(response, exit)), Effect.ensuring(Effect.sync(() => admissions.delete(work.taskId)))));
     return yield* Deferred.await(response);
   });
-  const schedule = Effect.fnUntraced(function*(taskId: string) { if (!closed) yield* fork(launch(taskId)); });
+  const schedule = Effect.fnUntraced(function*(taskId: TaskId) { if (!closed) yield* fork(launch(taskId)); });
 
 
-  const launch = Effect.fn("Runner.launch")(function*(taskId: string) {
+  const launch = Effect.fn("Runner.launch")(function*(taskId: TaskId) {
     let launchIntent = false;
     let childScope: Scope.Closeable | undefined;
     yield* Effect.gen(function*() {
@@ -526,7 +530,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       }
       const child: NativeChild = { process, scope: childScope, input, pending: new Map(), lost: false, completing: false, started: false, failed: false };
       children.set(taskId, child);
-      yield* owned(sql.unsafe("UPDATE tasks SET pid=? WHERE taskId=?", [Number(process.pid), taskId]));
+      yield* owned(sql.unsafe("UPDATE tasks SET pid=? WHERE taskId=?", [process.pid, taskId]));
       yield* Scope.addFinalizer(child.scope, Effect.gen(function*() {
         const row = yield* getRow(taskId);
         if (row && !Terminal[row.state]) yield* hold(taskId, "child scope closed: outcome unknown; no replay");

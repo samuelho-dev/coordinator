@@ -1,7 +1,7 @@
 import { Config, Console, Effect, Layer, Option, Stdio } from "effect";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { BrokerConfig, RunnerConfig, ModelProfile, Commands, CommandError } from "../src/contracts.ts";
+import { BrokerConfig, RunnerConfig, ModelProfile, Commands, CommandError, Hash, ObjectBackupConfig, Repo, Sha, UserId } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { decodeEffect, encodeJson } from "../src/http.ts";
 import { ownChildDirectory } from "../src/runner.ts";
@@ -11,7 +11,7 @@ NodeRuntime.runMain(Effect.gen(function*() {
   const args = yield* (yield* Stdio.Stdio).args;
   const mode = args[0];
   if (args.length !== 1 || (mode !== "broker" && mode !== "runner")) return yield* new CommandError({ message: "Initializer mode must be broker or runner" });
-  const repo = "github.com/samuelho-dev/coordinator";
+  const repo = Repo.make("github.com/samuelho-dev/coordinator");
   const brokerUrl = yield* Config.String("COORDINATOR_BROKER_URL");
   if (!brokerUrl.startsWith("https://")) return yield* new CommandError({ message: "Private TLS broker URL required" });
   const credential = Effect.fnUntraced(function*(field: string) {
@@ -41,14 +41,14 @@ NodeRuntime.runMain(Effect.gen(function*() {
     if (!runnerUrl.startsWith("https://") || !macUrl.startsWith("https://")) return yield* new CommandError({ message: "Private TLS runner URLs required" });
     const backupEndpoint = yield* Config.String("COORDINATOR_BACKUP_ENDPOINT").pipe(Config.option);
     const objectBackup = Option.isSome(backupEndpoint) ? {
-      endpoint: backupEndpoint.value, region: yield* Config.String("COORDINATOR_BACKUP_REGION"), bucket: yield* Config.String("COORDINATOR_BACKUP_BUCKET"),
+      endpoint: backupEndpoint.value, region: yield* decodeEffect(ObjectBackupConfig.fields.region, yield* Config.String("COORDINATOR_BACKUP_REGION")), bucket: yield* Config.String("COORDINATOR_BACKUP_BUCKET"),
       accessKeyFile: "/config/backup-access-key", secretKeyFile: "/config/backup-secret-key",
     } : undefined;
     if (objectBackup) {
       yield* file(objectBackup.accessKeyFile, yield* Config.String("COORDINATOR_BACKUP_ACCESS_KEY"));
       yield* file(objectBackup.secretKeyFile, yield* Config.String("COORDINATOR_BACKUP_SECRET_KEY"));
     }
-    const config: BrokerConfig = {
+    const config = yield* decodeEffect(BrokerConfig, {
       database: "/data/ledger.sqlite", host: "0.0.0.0", port: 8787, backupDirectory: "/backups",
       archiveRetentionMs: 30 * 86400000, backupRetentionMs: 3 * 86400000,
       ...(objectBackup ? { objectBackup } : {}),
@@ -60,7 +60,7 @@ NodeRuntime.runMain(Effect.gen(function*() {
         { id: "archive-writer", owner: "samuelho-dev", roles: ["archive-writer"], repos: [repo], tokenHash: yield* platform.digest(yield* credential("ARCHIVE_WRITER_TOKEN")) },
         { id: "mac-runner", owner: "samuelho-dev", roles: ["runner"], repos: [repo], tokenHash: yield* platform.digest(yield* credential("MAC_RUNNER_TOKEN")), controlTokenHash: yield* platform.digest(yield* credential("MAC_RUNNER_CONTROL_TOKEN")), runnerUrl: macUrl },
       ],
-    };
+    });
     yield* file("/config/tokens/mac-runner", yield* credential("MAC_RUNNER_CONTROL_TOKEN"));
     yield* file("/config/tokens/homelab-runner", control);
     yield* file("/config/broker.json", encodeJson(BrokerConfig, config));
@@ -72,8 +72,9 @@ NodeRuntime.runMain(Effect.gen(function*() {
     yield* platform.fs.chmod("/work", 0o711);
     yield* platform.fs.chmod("/work/children", 0o711);
     const checkout = "/work/repos/coordinator";
-    const sha = yield* Config.String("COORDINATOR_IMAGE_SHA");
-    if (!/^[a-f0-9]{40}$/.test(sha)) return yield* new CommandError({ message: "Pinned full image source SHA required" });
+    const imageSha = yield* Config.String("COORDINATOR_IMAGE_SHA");
+    if (!/^[a-f0-9]{40}$/.test(imageSha)) return yield* new CommandError({ message: "Pinned full image source SHA required" });
+    const sha = Sha.make(imageSha);
     const bundle = "/app/coordinator-source.bundle";
     if ((yield* platform.exec(ChildProcess.make("git", ["bundle", "list-heads", bundle]))).trim() !== `${sha} HEAD`) return yield* new CommandError({ message: "Image source bundle does not match pinned SHA" });
     const git = (args: string[], cwd?: string) => platform.exec(ChildProcess.make("git", ["-c", `safe.directory=${checkout}`, ...args], { cwd }));
@@ -83,21 +84,21 @@ NodeRuntime.runMain(Effect.gen(function*() {
       yield* git(["remote", "set-url", "origin", "https://github.com/samuelho-dev/coordinator.git"], checkout);
       yield* git(["update-ref", "refs/heads/main", sha], checkout);
       yield* git(["checkout", "--detach", sha], checkout);
-      yield* ownChildDirectory(checkout, 1000);
+      yield* ownChildDirectory(checkout, UserId.make(1000));
     }).pipe(Effect.mapError(() => new CommandError({ message: "Private allowlisted repository initialization failed" })));
     yield* directory("/work/home/.omp");
     yield* directory("/work/home/.omp/agent");
     const profile = "/work/home/.omp/agent/config.yml";
     if (!(yield* platform.fs.exists(profile))) yield* file(profile, encodeJson(ModelProfile, { modelRoles: { default: yield* Config.String("COORDINATOR_MODEL").pipe(Config.withDefault("openai-codex/gpt-6.1-sol:xhigh")) } }));
     const runner = yield* credential("HOMELAB_RUNNER_TOKEN");
-    const controlTokenHash = yield* credential("HOMELAB_RUNNER_CONTROL_HASH");
+    const controlTokenHash = yield* decodeEffect(Hash, yield* credential("HOMELAB_RUNNER_CONTROL_HASH"));
     yield* file("/config/runner.token", runner);
     yield* file("/config/health.header", `authorization: Bearer ${runner}`);
-    const config: RunnerConfig = {
+    const config = yield* decodeEffect(RunnerConfig, {
       id: "homelab-runner", brokerUrl, tokenFile: "/config/runner.token", host: "0.0.0.0", port: 8788,
       stateDirectory: "/work/runner", slots: 1, repositories: { [repo]: checkout }, launchers: { omp: "/usr/local/bin/omp" }, controlTokenHash,
-      modelDirectory: "/work/home", childDirectory: "/work/children", childUidBase: 1000000,
-    };
+      modelDirectory: "/work/home", childDirectory: "/work/children", childUidBase: UserId.make(1000000),
+    });
     yield* file("/config/runner.json", encodeJson(RunnerConfig, config));
   });
   yield* Commands[`program.deploy-init.${mode}`].executeDecoded({ initializeBrokerDeployment, initializeRunnerDeployment }, {}, decodeEffect);

@@ -1,32 +1,74 @@
 import { Deferred, Effect, Queue, Schema, type Cause, type Scope } from "effect";
 import { Tool } from "effect/ai";
-import type { ChildProcessSpawner } from "effect/process";
+import { ChildProcessSpawner } from "effect/process";
 import type { Journal } from "./journal.ts";
 
-export const Id = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_.:-]{1,160}$/));
+const identifierPattern = Schema.isPattern(/^[a-zA-Z0-9_.:-]{1,160}$/);
+const identifier = Schema.String.check(identifierPattern);
+export const TaskId = identifier.pipe(Schema.brand("@samuelho/coordinator/TaskId"));
+export type TaskId = typeof TaskId.Type;
+export const MessageId = identifier.pipe(Schema.brand("@samuelho/coordinator/MessageId"));
+export type MessageId = typeof MessageId.Type;
+export const SessionId = identifier.pipe(Schema.brand("@samuelho/coordinator/SessionId"));
+export type SessionId = typeof SessionId.Type;
+export const IncarnationId = identifier.pipe(Schema.brand("@samuelho/coordinator/IncarnationId"));
+export type IncarnationId = typeof IncarnationId.Type;
+export const MachineId = identifier.pipe(Schema.brand("@samuelho/coordinator/MachineId"));
+export type MachineId = typeof MachineId.Type;
+export const WorkerId = identifier.pipe(Schema.brand("@samuelho/coordinator/WorkerId"));
+export type WorkerId = typeof WorkerId.Type;
+export const RunnerId = identifier.pipe(Schema.brand("@samuelho/coordinator/RunnerId"));
+export type RunnerId = typeof RunnerId.Type;
+export const PrincipalId = identifier.pipe(Schema.brand("@samuelho/coordinator/PrincipalId"));
+export type PrincipalId = typeof PrincipalId.Type;
+export const OwnerId = identifier.pipe(Schema.brand("@samuelho/coordinator/OwnerId"));
+export type OwnerId = typeof OwnerId.Type;
+export const ArchiveEntryId = identifier.pipe(Schema.brand("@samuelho/coordinator/ArchiveEntryId"));
+export type ArchiveEntryId = typeof ArchiveEntryId.Type;
+export const NativeRequestId = Schema.String.pipe(Schema.brand("@samuelho/coordinator/NativeRequestId"));
+export type NativeRequestId = typeof NativeRequestId.Type;
+const nativeRequestId = NativeRequestId.check(identifierPattern);
+export const JournalHandledKey = Schema.String.pipe(Schema.brand("@samuelho/coordinator/JournalHandledKey"));
+export type JournalHandledKey = typeof JournalHandledKey.Type;
+export const JournalReleaseKey = Schema.String.pipe(Schema.brand("@samuelho/coordinator/JournalReleaseKey"));
+export type JournalReleaseKey = typeof JournalReleaseKey.Type;
+export const GitHubRepositoryId = Schema.Int.pipe(Schema.brand("@samuelho/coordinator/GitHubRepositoryId"));
+export type GitHubRepositoryId = typeof GitHubRepositoryId.Type;
+export const GitHubRunId = Schema.Int.pipe(Schema.brand("@samuelho/coordinator/GitHubRunId"));
+export type GitHubRunId = typeof GitHubRunId.Type;
+export const GitHubWorkflowId = Schema.Int.pipe(Schema.brand("@samuelho/coordinator/GitHubWorkflowId"));
+export type GitHubWorkflowId = typeof GitHubWorkflowId.Type;
+export const GitHubJobId = Schema.Int.pipe(Schema.brand("@samuelho/coordinator/GitHubJobId"));
+export type GitHubJobId = typeof GitHubJobId.Type;
+export const GitHubPullRequestNumber = Schema.Int.pipe(Schema.brand("@samuelho/coordinator/GitHubPullRequestNumber"));
+export type GitHubPullRequestNumber = typeof GitHubPullRequestNumber.Type;
+export const UserId = Schema.Int.pipe(Schema.brand("@samuelho/coordinator/UserId"));
+export type UserId = typeof UserId.Type;
+export const ProcessId = Schema.Int.pipe(Schema.fromBrand("ProcessId", ChildProcessSpawner.ProcessId));
+export type ProcessId = typeof ProcessId.Type;
 export const Text = Schema.String.check(Schema.isMaxLength(16000));
-export const Sha = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/));
-export const Hash = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
-export const Repo = Schema.String.check(Schema.isPattern(/^[a-z0-9.-]+\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/));
+export const Sha = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/)).pipe(Schema.brand("@samuelho/coordinator/Sha"));
+export const Hash = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)).pipe(Schema.brand("@samuelho/coordinator/Hash"));
+export const Repo = Schema.String.check(Schema.isPattern(/^[a-z0-9.-]+\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/)).pipe(Schema.brand("@samuelho/coordinator/Repo"));
 export const JsonValue = Schema.MutableJson;
 export type JsonValue = typeof JsonValue.Type;
 export const Json = Schema.Record(Schema.String, Schema.mutableKey(JsonValue));
 export type Json = typeof Json.Type;
 const strings = Schema.mutable(Schema.Array(Text));
 const boundedStrings = strings.check(Schema.isMaxLength(32));
-const ids = Schema.mutable(Schema.Array(Id));
+const participants = Schema.mutable(Schema.Array(PrincipalId));
 const port = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 65535 }));
 
 export const Address = Schema.Struct({
-  messageId: Id, revision: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000000 })),
-  workerId: Id, sessionId: Id, incarnation: Id, repo: Repo, ref: Text, sha: Sha,
+  messageId: MessageId, revision: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000000 })),
+  workerId: WorkerId, sessionId: SessionId, incarnation: IncarnationId, repo: Repo, ref: Text, sha: Sha,
   scope: Text, restrictions: Text, expectedEvidence: boundedStrings, deadline: Schema.Finite,
 });
 export type Address = typeof Address.Type;
 export const Work = Schema.Struct({
-  taskId: Id, repo: Repo, ref: Text, sha: Sha, launcher: Schema.Literals(["omp", "pi"]),
+  taskId: TaskId, repo: Repo, ref: Text, sha: Sha, launcher: Schema.Literals(["omp", "pi"]),
   prompt: Text, scope: Text, restrictions: Text, expectedEvidence: boundedStrings, deadline: Schema.Finite,
-  workerId: Id, githubRepoId: Schema.Int, requiredLanes: boundedStrings,
+  workerId: WorkerId, githubRepoId: GitHubRepositoryId, requiredLanes: boundedStrings,
   bypassPeer: Schema.Boolean, approved: Schema.Literal(true),
 });
 export type Work = typeof Work.Type;
@@ -34,16 +76,16 @@ export const TaskState = Schema.Literals(["QUEUED", "ASSIGNING", "ACCEPTED", "RU
 export type TaskState = typeof TaskState.Type;
 export const ReportState = Schema.Literals(["RUNNING", "SUCCEEDED", "FAILED", "HELD"]);
 export const Disposition = Schema.Literals(["ready", "unable", "clarify", "hold"]);
-export const EvidenceTarget = Schema.Struct({ sha: Sha, ref: Text, repositoryId: Schema.Int, requiredLanes: strings });
+export const EvidenceTarget = Schema.Struct({ sha: Sha, ref: Text, repositoryId: GitHubRepositoryId, requiredLanes: strings });
 export type EvidenceTarget = typeof EvidenceTarget.Type;
 export const Instruction = Schema.Struct({ prompt: Text, address: Schema.mutableKey(Address) });
 export type Instruction = typeof Instruction.Type;
-export const ReconciledRunner = Schema.Struct({ runnerId: Id, state: Text, observedAt: Schema.Finite });
-export const EvidenceObservation = Schema.Struct({ kind: Text, sha: Sha, principal: Id, data: JsonValue, observedAt: Schema.Finite, stale: Schema.Boolean });
+export const ReconciledRunner = Schema.Struct({ runnerId: RunnerId, state: Text, observedAt: Schema.Finite });
+export const EvidenceObservation = Schema.Struct({ kind: Text, sha: Sha, principal: PrincipalId, data: JsonValue, observedAt: Schema.Finite, stale: Schema.Boolean });
 export type EvidenceObservation = typeof EvidenceObservation.Type;
 export const Task = Schema.Struct({
-  taskId: Id, owner: Id, fingerprint: Hash, request: Work, state: Schema.mutableKey(TaskState),
-  runnerId: Schema.mutableKey(Schema.optional(Id)), peerSession: Schema.mutableKey(Schema.optional(Id)), peerIncarnation: Schema.mutableKey(Schema.optional(Id)),
+  taskId: TaskId, owner: OwnerId, fingerprint: Hash, request: Work, state: Schema.mutableKey(TaskState),
+  runnerId: Schema.mutableKey(Schema.optional(RunnerId)), peerSession: Schema.mutableKey(Schema.optional(SessionId)), peerIncarnation: Schema.mutableKey(Schema.optional(IncarnationId)),
   offerExpires: Schema.mutableKey(Schema.optional(Schema.Finite)),
   offerDecision: Schema.mutableKey(Schema.optional(Schema.Literals(["pending", "accepted", "declined", "expired", "bypass"]))),
   address: Schema.mutableKey(Schema.optional(Address)), readback: Schema.mutableKey(Schema.optional(Address)), confirmedRevision: Schema.mutableKey(Schema.optional(Schema.Int)),
@@ -53,109 +95,110 @@ export const Task = Schema.Struct({
   evidenceTarget: Schema.mutableKey(Schema.optional(EvidenceTarget)), instruction: Schema.mutableKey(Schema.optional(Instruction)), reconciledRunner: Schema.mutableKey(Schema.optional(ReconciledRunner)),
 });
 export type Task = typeof Task.Type;
-export const Acceptance = Schema.Struct({ taskId: Id, accepted: Schema.Boolean, state: Schema.optional(Text), worktree: Schema.optional(Text), address: Schema.optional(Address), reason: Schema.optional(Text) });
+export const Acceptance = Schema.Struct({ taskId: TaskId, accepted: Schema.Boolean, state: Schema.optional(Text), worktree: Schema.optional(Text), address: Schema.optional(Address), reason: Schema.optional(Text) });
 export type Acceptance = typeof Acceptance.Type;
 export const Role = Schema.Literals(["coordinator", "session", "runner", "archive-writer", "reviewer", "admin"]);
-export const Principal = Schema.Struct({ id: Id, owner: Id, tokenHash: Hash, roles: Schema.Array(Role), repos: Schema.Array(Repo), runnerUrl: Schema.optional(Text), controlTokenHash: Schema.optional(Hash) });
+export const Principal = Schema.Struct({ id: PrincipalId, owner: OwnerId, tokenHash: Hash, roles: Schema.Array(Role), repos: Schema.Array(Repo), runnerUrl: Schema.optional(Text), controlTokenHash: Schema.optional(Hash) });
 export type Principal = typeof Principal.Type;
-export const ObjectBackupConfig = Schema.Struct({ endpoint: Text, region: Id, bucket: Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/)), accessKeyFile: Text, secretKeyFile: Text });
+export const ObjectBackupConfig = Schema.Struct({ endpoint: Text, region: identifier, bucket: Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/)), accessKeyFile: Text, secretKeyFile: Text });
 export type ObjectBackupConfig = typeof ObjectBackupConfig.Type;
 const HttpsObjectBackupConfig = Schema.Struct({
   ...ObjectBackupConfig.fields,
   endpoint: Text.check(Schema.isPattern(/^https:\/\/[^/?#@\\\s]+\/?$/i), Schema.makeFilter((value) => URL.canParse(value) ? undefined : "Valid HTTPS object backup authority required")),
 });
-export const SnapshotKey = Schema.String.check(Schema.isPattern(/^sanitized\/[0-9]{13}\.sqlite$/));
+export const SnapshotKey = Schema.String.check(Schema.isPattern(/^sanitized\/[0-9]{13}\.sqlite$/)).pipe(Schema.brand("@samuelho/coordinator/SnapshotKey"));
 export type SnapshotKey = typeof SnapshotKey.Type;
 export const SnapshotList = Schema.Struct({ keys: Schema.Array(SnapshotKey), next: Schema.optional(Schema.String.check(Schema.isPattern(/^[A-Za-z0-9+/=._:-]{1,4096}$/))) });
 export type SnapshotList = typeof SnapshotList.Type;
-export const BrokerConfig = Schema.Struct({ database: Text, host: Text, port, principals: Schema.mutableKey(Schema.Array(Principal)), backupDirectory: Text, archiveRetentionMs: Schema.Finite, backupRetentionMs: Schema.Finite, objectBackup: Schema.optional(HttpsObjectBackupConfig), githubTokenEnv: Schema.optional(Text), repositoryIds: Schema.Record(Repo, Schema.Int.check(Schema.isGreaterThan(0))) });
+export const BrokerConfig = Schema.Struct({ database: Text, host: Text, port, principals: Schema.mutableKey(Schema.Array(Principal)), backupDirectory: Text, archiveRetentionMs: Schema.Finite, backupRetentionMs: Schema.Finite, objectBackup: Schema.optional(HttpsObjectBackupConfig), githubTokenEnv: Schema.optional(Text), repositoryIds: Schema.Record(Repo, GitHubRepositoryId.check(Schema.isGreaterThan(0))) });
 export type BrokerConfig = typeof BrokerConfig.Type;
 export const RunnerConfig = Schema.Struct({
-  id: Id, brokerUrl: Schema.String, tokenFile: Schema.String, host: Schema.String, port, controlTokenHash: Hash,
+  id: RunnerId, brokerUrl: Schema.String, tokenFile: Schema.String, host: Schema.String, port, controlTokenHash: Hash,
   stateDirectory: Schema.String, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 128 })),
-  repositories: Schema.Record(Schema.String, Schema.String), launchers: Schema.Record(Schema.String, Schema.String),
+  repositories: Schema.Record(Schema.String.pipe(Schema.brand("@samuelho/coordinator/Repo")), Schema.String), launchers: Schema.Record(Schema.String, Schema.String),
   modelDirectory: Schema.String, childDirectory: Schema.String,
-  childUidBase: Schema.Int.check(Schema.isBetween({ minimum: 1000000, maximum: 0xffffffff - 1000000 })),
+  childUidBase: UserId.check(Schema.isBetween({ minimum: 1000000, maximum: 0xffffffff - 1000000 })),
 });
 export type RunnerConfig = typeof RunnerConfig.Type;
-export const PluginConfig = Schema.Struct({ brokerUrl: Schema.String, tokenFile: Schema.String, machineId: Id, stateDirectory: Schema.String, selectedRemote: Schema.optional(Schema.String), host: Schema.Literals(["omp", "pi"]) });
+export const PluginConfig = Schema.Struct({ brokerUrl: Schema.String, tokenFile: Schema.String, machineId: MachineId, stateDirectory: Schema.String, selectedRemote: Schema.optional(Schema.String), host: Schema.Literals(["omp", "pi"]) });
 export type PluginConfig = typeof PluginConfig.Type;
 export const ConnectHosts = Schema.Record(Schema.String, Schema.String);
 
-export const Session = Schema.Struct({ sessionId: Id, incarnation: Id, machineId: Id, host: Schema.Literals(["pi", "omp"]), repo: Repo, workerId: Schema.optional(Id) });
+export const Session = Schema.Struct({ sessionId: SessionId, incarnation: IncarnationId, machineId: MachineId, host: Schema.Literals(["pi", "omp"]), repo: Repo, workerId: Schema.optional(WorkerId) });
 export type Session = typeof Session.Type;
-export const SessionKey = Schema.Struct({ sessionId: Id, incarnation: Id });
+export const SessionKey = Schema.Struct({ sessionId: SessionId, incarnation: IncarnationId });
 export type SessionKey = typeof SessionKey.Type;
-export const TaskKey = Schema.Struct({ taskId: Id });
+export const TaskKey = Schema.Struct({ taskId: TaskId });
 export type TaskKey = typeof TaskKey.Type;
-export const LiveSession = Schema.Struct({ ...Session.fields, owner: Id, principal: Id, verified: Schema.mutableKey(Schema.Boolean), liveUntil: Schema.mutableKey(Schema.Finite), polledAt: Schema.mutableKey(Schema.Finite) });
+export const LiveSession = Schema.Struct({ ...Session.fields, owner: OwnerId, principal: PrincipalId, verified: Schema.mutableKey(Schema.Boolean), liveUntil: Schema.mutableKey(Schema.Finite), polledAt: Schema.mutableKey(Schema.Finite) });
 export type LiveSession = typeof LiveSession.Type;
-export const LiveRunner = Schema.Struct({ runnerId: Id, owner: Id, slots: Schema.Int, load: Schema.mutableKey(Schema.Int), liveUntil: Schema.Finite });
+export const LiveRunner = Schema.Struct({ runnerId: RunnerId, owner: OwnerId, slots: Schema.Int, load: Schema.mutableKey(Schema.Int), liveUntil: Schema.Finite });
 export type LiveRunner = typeof LiveRunner.Type;
-export const Delivery = Schema.Struct({ messageId: Id, incarnation: Id, payload: JsonValue, expiresAt: Schema.Finite });
+export const Delivery = Schema.Struct({ messageId: MessageId, incarnation: IncarnationId, payload: JsonValue, expiresAt: Schema.Finite });
 export type Delivery = typeof Delivery.Type;
 export const Poll = Schema.Struct({ messages: Schema.mutable(Schema.Array(Delivery)), offers: Schema.mutable(Schema.Array(Task)), releases: Schema.mutable(Schema.Array(Task)), archiveEnabled: Schema.optional(Schema.Boolean) });
 export type Poll = typeof Poll.Type;
 
 // Only privacy-projected metadata is archive content; peer/native control payloads are separate JSON.
 export const ArchivePayload = Schema.Union([
-  Schema.Struct({ id: Id, parentId: Schema.NullOr(Id), type: Schema.String.check(Schema.isPattern(/^[a-z_]{1,40}$/)), role: Schema.optional(Schema.Literals(["user", "assistant", "toolResult"])), contentOmitted: Schema.Literal(true) }),
+  Schema.Struct({ id: ArchiveEntryId, parentId: Schema.NullOr(ArchiveEntryId), type: Schema.String.check(Schema.isPattern(/^[a-z_]{1,40}$/)), role: Schema.optional(Schema.Literals(["user", "assistant", "toolResult"])), contentOmitted: Schema.Literal(true) }),
   Schema.Struct({ coverageOnly: Schema.Literal(true), gaps: boundedStrings }),
 ]);
 export type ArchivePayload = typeof ArchivePayload.Type;
-export const ArchiveEntry = Schema.Struct({ entryId: Id, digest: Hash, payload: ArchivePayload, gaps: strings });
+export const ArchiveEntry = Schema.Struct({ entryId: ArchiveEntryId, digest: Hash, payload: ArchivePayload, gaps: strings });
 export type ArchiveEntry = typeof ArchiveEntry.Type;
 export const ArchiveRow = Schema.Struct({ ...ArchiveEntry.fields, sequence: Schema.Int, createdAt: Schema.Finite });
 export type ArchiveRow = typeof ArchiveRow.Type;
 export const InboxEntry = Schema.Struct({ payload: JsonValue, digest: Hash, receivedAt: Schema.Finite });
 export type InboxEntry = typeof InboxEntry.Type;
-export const Inbox = Schema.Record(Schema.String, Schema.mutableKey(InboxEntry));
+export const Inbox = Schema.Record(Schema.String.pipe(Schema.brand("@samuelho/coordinator/MessageId")), Schema.mutableKey(InboxEntry));
 export const JournalState = Schema.Struct({
-  handled: Schema.Record(Schema.String, Schema.mutableKey(Schema.Literal(true))),
-  releases: Schema.Record(Schema.String, Schema.mutableKey(Schema.Literals(["intent", "sent"]))),
-  consent: Schema.mutableKey(Schema.Boolean), participants: Schema.mutableKey(ids), seen: Schema.mutableKey(Schema.Record(Schema.String, Schema.mutableKey(Schema.String))),
+  handled: Schema.Record(JournalHandledKey, Schema.mutableKey(Schema.Literal(true))),
+  releases: Schema.Record(JournalReleaseKey, Schema.mutableKey(Schema.Literals(["intent", "sent"]))),
+  consent: Schema.mutableKey(Schema.Boolean), participants: Schema.mutableKey(participants), seen: Schema.mutableKey(Schema.Record(Schema.String.pipe(Schema.brand("@samuelho/coordinator/Hash")), Schema.mutableKey(Schema.String.pipe(Schema.brand("@samuelho/coordinator/Hash"))))),
   fileDigest: Schema.mutableKey(Schema.optional(Hash)), spool: Schema.mutableKey(Schema.mutable(Schema.Array(ArchiveEntry))), gaps: Schema.mutableKey(strings),
   inbox: Schema.mutableKey(Inbox.pipe(Schema.withDecodingDefaultKey(Effect.sync(() => ({}))))),
 });
 export type JournalState = typeof JournalState.Type;
-export const SafeEntry = Schema.Struct({ id: Id, payload: ArchivePayload, linked: Schema.Boolean });
+export const SafeEntry = Schema.Struct({ id: ArchiveEntryId, payload: ArchivePayload, linked: Schema.Boolean });
 export type SafeEntry = typeof SafeEntry.Type;
 export const ObservedFile = Schema.Struct({ path: Schema.String, size: Schema.Finite, mtimeMs: Schema.Finite });
 export type ObservedFile = typeof ObservedFile.Type;
 
-export const RepoIdentity = Schema.Struct({ id: Schema.Int, full_name: Text, private: Schema.Boolean });
-export const Job = Schema.Struct({ id: Schema.Int, name: Text, status: Text, conclusion: Schema.NullOr(Text), started_at: Schema.NullOr(Text), completed_at: Schema.NullOr(Text) });
-export const Run = Schema.Struct({ id: Schema.Int, workflow_id: Schema.Int, name: Schema.NullOr(Text), head_sha: Sha, head_branch: Schema.NullOr(Text), pull_requests: Schema.optional(Schema.Array(Schema.Struct({ number: Schema.Int }))), run_attempt: Schema.Int, status: Text, conclusion: Schema.NullOr(Text), html_url: Text, created_at: Text });
+export const RepoIdentity = Schema.Struct({ id: GitHubRepositoryId, full_name: Text, private: Schema.Boolean });
+export const Job = Schema.Struct({ id: GitHubJobId, name: Text, status: Text, conclusion: Schema.NullOr(Text), started_at: Schema.NullOr(Text), completed_at: Schema.NullOr(Text) });
+export const Run = Schema.Struct({ id: GitHubRunId, workflow_id: GitHubWorkflowId, name: Schema.NullOr(Text), head_sha: Sha, head_branch: Schema.NullOr(Text), pull_requests: Schema.optional(Schema.Array(Schema.Struct({ number: GitHubPullRequestNumber }))), run_attempt: Schema.Int, status: Text, conclusion: Schema.NullOr(Text), html_url: Text, created_at: Text });
 export const MergeRef = Schema.Struct({ ref: Text, object: Schema.Struct({ type: Schema.Literal("commit"), sha: Sha }) });
-export const CiLane = Schema.Struct({ lane: Text, runId: Schema.optional(Schema.Int), attempt: Schema.optional(Schema.Int), status: Schema.optional(Text), conclusion: Schema.optional(Schema.NullOr(Text)), jobs: Schema.optional(Schema.mutable(Schema.Array(Job))) });
-export const CiEvidence = Schema.Struct({ sha: Sha, repositoryId: Schema.Int, ref: Text, observedAt: Text, provenance: Text, verdict: Schema.mutableKey(Schema.Literals(["green", "pending", "failed", "unknown"])), reason: Schema.mutableKey(Schema.optional(Text)), lanes: Schema.mutable(Schema.Array(CiLane)) });
+export const CiLane = Schema.Struct({ lane: Text, runId: Schema.optional(GitHubRunId), attempt: Schema.optional(Schema.Int), status: Schema.optional(Text), conclusion: Schema.optional(Schema.NullOr(Text)), jobs: Schema.optional(Schema.mutable(Schema.Array(Job))) });
+export const CiEvidence = Schema.Struct({ sha: Sha, repositoryId: GitHubRepositoryId, ref: Text, observedAt: Text, provenance: Text, verdict: Schema.mutableKey(Schema.Literals(["green", "pending", "failed", "unknown"])), reason: Schema.mutableKey(Schema.optional(Text)), lanes: Schema.mutable(Schema.Array(CiLane)) });
 export type CiEvidence = typeof CiEvidence.Type;
 export const CiSeen = Schema.Struct({ lane: Text, run: Run, jobs: Schema.mutable(Schema.Array(Job)), green: Schema.Boolean });
 export type CiSeen = typeof CiSeen.Type;
-export const LocalEvidence = Schema.Struct({ taskId: Id, sha: Sha, commands: strings, passed: Schema.Boolean });
+export const LocalEvidence = Schema.Struct({ taskId: TaskId, sha: Sha, commands: strings, passed: Schema.Boolean });
 export type LocalEvidence = typeof LocalEvidence.Type;
-export const DeploymentEvidence = Schema.Struct({ taskId: Id, sha: Sha, environment: Text, url: Text, observedState: Text, provenance: Text });
+export const DeploymentEvidence = Schema.Struct({ taskId: TaskId, sha: Sha, environment: Text, url: Text, observedState: Text, provenance: Text });
 export type DeploymentEvidence = typeof DeploymentEvidence.Type;
-export const ReviewEvidence = Schema.Struct({ taskId: Id, sha: Sha, decision: Schema.Literals(["approved", "changes-requested"]), note: Text });
+export const ReviewEvidence = Schema.Struct({ taskId: TaskId, sha: Sha, decision: Schema.Literals(["approved", "changes-requested"]), note: Text });
 export type ReviewEvidence = typeof ReviewEvidence.Type;
 
-export const RunnerRow = Schema.Struct({ taskId: Id, childUid: Schema.Int, fingerprint: Hash, work: Schema.String, worktree: Schema.String, state: Schema.String, occupied: Schema.Int, pid: Schema.NullOr(Schema.Int), incarnation: Id, address: Schema.NullOr(Schema.String), promptId: Schema.NullOr(Schema.String), reason: Schema.NullOr(Schema.String), result: Schema.NullOr(Schema.String), detached: Schema.Int });
+export const RunnerRow = Schema.Struct({ taskId: TaskId, childUid: UserId, fingerprint: Hash, work: Schema.String, worktree: Schema.String, state: Schema.String, occupied: Schema.Int, pid: Schema.NullOr(ProcessId), incarnation: IncarnationId, address: Schema.NullOr(Schema.String), promptId: Schema.NullOr(NativeRequestId), reason: Schema.NullOr(Schema.String), result: Schema.NullOr(Schema.String), detached: Schema.Int });
 export type RunnerRow = typeof RunnerRow.Type;
-export const NativeState = Schema.StructWithRest(Schema.Struct({ sessionId: Schema.String, sessionFile: Schema.optional(Schema.String), isStreaming: Schema.Boolean, messageCount: Schema.Int, isCompacting: Schema.optional(Schema.Boolean), isSettled: Schema.optional(Schema.Boolean), hasPendingAsyncWork: Schema.optional(Schema.Boolean), pendingMessageCount: Schema.optional(Schema.Int), queuedMessageCount: Schema.optional(Schema.Int) }), [Schema.Record(Schema.String, Schema.UndefinedOr(JsonValue))]);
+export const NativeState = Schema.StructWithRest(Schema.Struct({ sessionId: Schema.String.pipe(Schema.brand("@samuelho/coordinator/SessionId")), sessionFile: Schema.optional(Schema.String), isStreaming: Schema.Boolean, messageCount: Schema.Int, isCompacting: Schema.optional(Schema.Boolean), isSettled: Schema.optional(Schema.Boolean), hasPendingAsyncWork: Schema.optional(Schema.Boolean), pendingMessageCount: Schema.optional(Schema.Int), queuedMessageCount: Schema.optional(Schema.Int) }), [Schema.Record(Schema.String, Schema.UndefinedOr(JsonValue))]);
 export type NativeState = typeof NativeState.Type;
-export const NativeFrame = Schema.StructWithRest(Schema.Struct({ type: Schema.String, id: Schema.optional(Schema.String), command: Schema.optional(Schema.String), success: Schema.optional(Schema.Boolean), data: Schema.optional(JsonValue), method: Schema.optional(Schema.String), message: Schema.optional(JsonValue), title: Schema.optional(Schema.String), notifyType: Schema.optional(Schema.String), status: Schema.optional(Schema.String), sessionSettled: Schema.optional(Schema.Boolean) }), [Schema.Record(Schema.String, Schema.UndefinedOr(JsonValue))]);
+export const NativeFrame = Schema.StructWithRest(Schema.Struct({ type: Schema.String, id: Schema.optional(NativeRequestId), command: Schema.optional(Schema.String), success: Schema.optional(Schema.Boolean), data: Schema.optional(JsonValue), method: Schema.optional(Schema.String), message: Schema.optional(JsonValue), title: Schema.optional(Schema.String), notifyType: Schema.optional(Schema.String), status: Schema.optional(Schema.String), sessionSettled: Schema.optional(Schema.Boolean) }), [Schema.Record(Schema.String, Schema.UndefinedOr(JsonValue))]);
 export type NativeFrame = typeof NativeFrame.Type;
-export const NativeIdentity = Schema.Struct({ sessionId: Id, incarnation: Id, machineId: Id, repo: Repo, ref: Text, sha: Sha, workerId: Id, workerIdentitySource: Schema.Literal("native-session") });
+export const NativeIdentity = Schema.Struct({ sessionId: SessionId, incarnation: IncarnationId, machineId: MachineId, repo: Repo, ref: Text, sha: Sha, workerId: WorkerId, workerIdentitySource: Schema.Literal("native-session") });
 export type NativeIdentity = typeof NativeIdentity.Type;
 const nativeProcess = Schema.declare<ChildProcessSpawner.ChildProcessHandle>((value): value is ChildProcessSpawner.ChildProcessHandle => typeof value === "object" && value !== null && "pid" in value && "stdin" in value && "stdout" in value && "stderr" in value && "kill" in value);
 const closeableScope = Schema.declare<Scope.Closeable>((value): value is Scope.Closeable => typeof value === "object" && value !== null && "~effect/Scope/Closeable" in value);
 const processInput = Schema.declare<Queue.Queue<Uint8Array, Cause.Done>>(Queue.isQueue<Uint8Array, Cause.Done>);
-export const NativePending = Schema.Struct({ type: Schema.String, response: Schema.declare<Deferred.Deferred<Json, unknown>>(Deferred.isDeferred<Json, unknown>) });
+export const NativePending = Schema.Struct({ type: Schema.String, response: Schema.declare<Deferred.Deferred<NativeFrame, unknown>>(Deferred.isDeferred<NativeFrame, unknown>) });
 export type NativePending = typeof NativePending.Type;
 const isNativePending = Schema.is(NativePending);
-const nativePendingMap = Schema.declare<Map<string, NativePending>>((value): value is Map<string, NativePending> => {
+const isNativeRequestId = Schema.is(NativeRequestId);
+const nativePendingMap = Schema.declare<Map<NativeRequestId, NativePending>>((value): value is Map<NativeRequestId, NativePending> => {
   if (!(value instanceof Map)) return false;
-  for (const [key, item] of value) if (typeof key !== "string" || !isNativePending(item)) return false;
+  for (const [key, item] of value) if (!isNativeRequestId(key) || !isNativePending(item)) return false;
   return true;
 });
 export const NativeChild = Schema.Struct({ process: nativeProcess, scope: closeableScope, input: processInput, pending: nativePendingMap, lost: Schema.mutableKey(Schema.Boolean), completing: Schema.mutableKey(Schema.Boolean), started: Schema.mutableKey(Schema.Boolean), failed: Schema.mutableKey(Schema.Boolean) });
@@ -172,7 +215,7 @@ export const RunnerRelease = Schema.Struct({ ...RunnerPrepare.fields, prompt: Wo
 export type RunnerRelease = typeof RunnerRelease.Type;
 export const RunnerReleased = Schema.Struct({ released: Schema.Literal(true) });
 export type RunnerReleased = typeof RunnerReleased.Type;
-export const RunnerEvent = Schema.Struct({ type: Schema.String.check(Schema.isPattern(/^[a-z_]{1,40}$/)), contentOmitted: Schema.optional(Schema.Literal(true)), address: Schema.optional(Address), state: Schema.optional(Schema.Literals(["ACCEPTED", "LAUNCHING", "READY", "PROMPT_INTENT", "RUNNING", "SUCCEEDED", "FAILED", "HELD"])), success: Schema.optional(Schema.Boolean), status: Schema.optional(Schema.Literals(["completed", "failed", "aborted", "error"])), command: Schema.optional(Schema.Literals(["get_state", "get_messages", "bash", "prompt", "abort"])), fingerprint: Schema.optional(Hash), digest: Schema.optional(Hash), id: Schema.optional(Schema.String), reason: Schema.optional(Text), before: Schema.optional(Schema.Int), seq: Schema.optional(Schema.Int) });
+export const RunnerEvent = Schema.Struct({ type: Schema.String.check(Schema.isPattern(/^[a-z_]{1,40}$/)), contentOmitted: Schema.optional(Schema.Literal(true)), address: Schema.optional(Address), state: Schema.optional(Schema.Literals(["ACCEPTED", "LAUNCHING", "READY", "PROMPT_INTENT", "RUNNING", "SUCCEEDED", "FAILED", "HELD"])), success: Schema.optional(Schema.Boolean), status: Schema.optional(Schema.Literals(["completed", "failed", "aborted", "error"])), command: Schema.optional(Schema.Literals(["get_state", "get_messages", "bash", "prompt", "abort"])), fingerprint: Schema.optional(Hash), digest: Schema.optional(Hash), id: Schema.optional(NativeRequestId), reason: Schema.optional(Text), before: Schema.optional(Schema.Int), seq: Schema.optional(Schema.Int) });
 export type RunnerEvent = typeof RunnerEvent.Type;
 export const RunnerResult = Schema.NullOr(Schema.Struct({ launched: Schema.optional(Schema.Boolean), hostSettled: Schema.optional(Schema.Boolean), evidenceVerified: Schema.optional(Schema.Boolean), exitCode: Schema.optional(Schema.Int), signal: Schema.optional(Schema.String.check(Schema.isPattern(/^SIG[A-Z0-9]{1,16}$/))) }));
 export type RunnerResult = typeof RunnerResult.Type;
@@ -204,7 +247,7 @@ export const Host = Schema.Struct({
   sendUserMessage: Schema.declare<(text: string, options: { deliverAs: "followUp" }) => void>((value): value is (text: string, options: { deliverAs: "followUp" }) => void => typeof value === "function"),
 });
 export type Host = typeof Host.Type;
-export const PluginActive = Schema.Struct({ ctx: Context, sessionId: Id, incarnation: Id, journal: Schema.declare<Journal["Service"]>((value): value is Journal["Service"] => typeof value === "object" && value !== null && "state" in value && "receive" in value && "save" in value), repo: Schema.mutableKey(Repo), heartbeat: Schema.mutableKey(Schema.Finite) });
+export const PluginActive = Schema.Struct({ ctx: Context, sessionId: SessionId, workerId: WorkerId, incarnation: IncarnationId, journal: Schema.declare<Journal["Service"]>((value): value is Journal["Service"] => typeof value === "object" && value !== null && "state" in value && "receive" in value && "save" in value), repo: Schema.mutableKey(Repo), heartbeat: Schema.mutableKey(Schema.Finite) });
 export type PluginActive = typeof PluginActive.Type;
 export const Observation = Schema.Struct({ operation: Schema.String, observed: JsonValue });
 export type Observation = typeof Observation.Type;
@@ -268,8 +311,8 @@ export const Commands = {
   "session.heartbeat": command("broker", "heartbeatSession", "Renew the verified native session lease without replacing a live incarnation.", Session, Schema.Struct({ liveUntil: Schema.Finite }), { exposure: "internal", transaction: "transaction" }),
   "session.poll": command("broker", "pollSession", "Fetch owner- and incarnation-scoped peer messages, offers and releases.", SessionKey, Poll, { exposure: "internal", transaction: "transaction" }),
   "session.stop": command("broker", "stopSession", "Revoke the bound session and its peer deliveries.", SessionKey, Schema.Struct({ stopped: Schema.Literal(true) }), { exposure: "internal", transaction: "transaction" }),
-  "peer.send": command("broker", "sendPeer", "Commit an expiring addressed message to a verified recipient; commitment is not delivery.", Schema.Struct({ messageId: Id, ...SessionKey.fields, payload: JsonValue, ttlMs: Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 60000 })) }), Schema.Struct({ delivered: Schema.Literal(false), committed: Schema.Literal(true), messageId: Id }), { exposure: "tool", transaction: "transaction" }),
-  "peer.ack": command("broker", "acknowledgePeer", "Acknowledge a message for the exact live session incarnation.", Schema.Struct({ ...SessionKey.fields, messageId: Id }), Schema.Struct({ handled: Schema.Literal(true) }), { exposure: "internal", transaction: "transaction" }),
+  "peer.send": command("broker", "sendPeer", "Commit an expiring addressed message to a verified recipient; commitment is not delivery.", Schema.Struct({ messageId: MessageId, ...SessionKey.fields, payload: JsonValue, ttlMs: Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 60000 })) }), Schema.Struct({ delivered: Schema.Literal(false), committed: Schema.Literal(true), messageId: MessageId }), { exposure: "tool", transaction: "transaction" }),
+  "peer.ack": command("broker", "acknowledgePeer", "Acknowledge a message for the exact live session incarnation.", Schema.Struct({ ...SessionKey.fields, messageId: MessageId }), Schema.Struct({ handled: Schema.Literal(true) }), { exposure: "internal", transaction: "transaction" }),
   "peer.reply": command("broker", "replyPeer", "Accept or decline an unexpired peer offer for the bound native session.", Schema.Struct({ ...SessionKey.fields, ...TaskKey.fields, decision: Schema.Literals(["accepted", "declined"]) }), Task, { exposure: "internal", transaction: "transaction", offer: true }),
   "task.submit": command("broker", "submitTask", "Record exact human-approved bounded work, preserving idempotent task identity.", Work, Task, { exposure: "tool", transaction: "transaction", offer: true, approval: "exact-work" }),
   "task.get": command("broker", "getTask", "Read an authorized task and current evidence observations, including staleness.", TaskKey, Task, { exposure: "tool", transaction: "transaction" }),
@@ -279,29 +322,29 @@ export const Commands = {
   "task.address": command("broker", "addressTask", "Bind an increased address revision while preserving approved work and reconciling runner readback.", RunnerPrepare, Task, { exposure: "tool", transaction: "remote" }),
   "task.readback": command("broker", "readbackTask", "Record the bound native peer's actual readiness or reasoned disposition.", Schema.Struct({ ...RunnerPrepare.fields, disposition: Disposition, reason: Schema.optional(Text), nextCheck: Schema.optional(Schema.Finite) }), Task, { exposure: "internal", transaction: "transaction" }),
   "task.confirm": command("broker", "confirmTask", "Explicitly confirm matching ready readback and release the approved instruction before its deadline.", Schema.Struct({ ...TaskKey.fields, revision: Schema.Int }), Task, { exposure: "tool", transaction: "remote", approval: "release" }),
-  "task.handoff": command("broker", "handoffTask", "Rebind to a verified native recipient only after old ownership has safely reconciled.", Schema.Struct({ ...TaskKey.fields, oldSessionId: Id, oldIncarnation: Id, newSessionId: Id, newIncarnation: Id, revision: Schema.Int }), Task, { exposure: "tool", transaction: "remote", approval: "handoff" }),
+  "task.handoff": command("broker", "handoffTask", "Rebind to a verified native recipient only after old ownership has safely reconciled.", Schema.Struct({ ...TaskKey.fields, oldSessionId: SessionId, oldIncarnation: IncarnationId, newSessionId: SessionId, newIncarnation: IncarnationId, revision: Schema.Int }), Task, { exposure: "tool", transaction: "remote", approval: "handoff" }),
   "task.report": command("broker", "reportTask", "Record a confirmed addressed native peer's state and result without terminal regression.", Schema.Struct({ ...SessionKey.fields, ...TaskKey.fields, state: ReportState, result: JsonValue }), Task, { exposure: "internal", transaction: "transaction" }),
-  "runner.heartbeat": command("broker", "heartbeatRunner", "Renew the enrolled runner capacity lease and reconcile its durable journal.", Schema.Struct({ runnerId: Id, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 64 })), load: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100000 })), journal: Schema.Array(Acceptance).check(Schema.isMaxLength(256)) }), ok, { exposure: "internal", transaction: "transaction" }),
-  "runner.readback": command("broker", "readbackRunner", "Persist assigned runner readback bound to the actual child session.", Schema.Struct({ runnerId: Id, ...RunnerPrepare.fields }), ok, { exposure: "internal", transaction: "transaction" }),
-  "runner.report": command("broker", "reportRunner", "Persist assigned runner state and result without terminal regression.", Schema.Struct({ runnerId: Id, ...TaskKey.fields, state: ReportState, result: JsonValue }), ok, { exposure: "internal", transaction: "transaction" }),
+  "runner.heartbeat": command("broker", "heartbeatRunner", "Renew the enrolled runner capacity lease and reconcile its durable journal.", Schema.Struct({ runnerId: RunnerId, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 64 })), load: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100000 })), journal: Schema.Array(Acceptance).check(Schema.isMaxLength(256)) }), ok, { exposure: "internal", transaction: "transaction" }),
+  "runner.readback": command("broker", "readbackRunner", "Persist assigned runner readback bound to the actual child session.", Schema.Struct({ runnerId: RunnerId, ...RunnerPrepare.fields }), ok, { exposure: "internal", transaction: "transaction" }),
+  "runner.report": command("broker", "reportRunner", "Persist assigned runner state and result without terminal regression.", Schema.Struct({ runnerId: RunnerId, ...TaskKey.fields, state: ReportState, result: JsonValue }), ok, { exposure: "internal", transaction: "transaction" }),
   "evidence.target": command("broker", "targetEvidence", "Set the SHA/ref/CI observation target; this does not authorize execution.", Schema.Struct({ ...TaskKey.fields, sha: Sha, ref: Text, requiredLanes: strings.check(Schema.isBetweenLength(1, 32)) }), Schema.Struct({ target: EvidenceTarget, executionAuthorized: Schema.Literal(false) }), { exposure: "tool", transaction: "transaction" }),
   "evidence.ci": command("broker", "collectCiEvidence", "Collect CI observations for the task's evidence target with enrolled provenance.", TaskKey, CiEvidence, { exposure: "tool", transaction: "remote" }),
   "evidence.local": command("broker", "recordLocalEvidence", "Record caller-asserted commands and results; this operation does not run checks.", LocalEvidence, recorded, { exposure: "tool", transaction: "transaction" }),
   "evidence.deployment": command("broker", "recordDeploymentEvidence", "Record a caller-supplied deployment observation; this operation does not deploy.", DeploymentEvidence, recorded, { exposure: "tool", transaction: "transaction" }),
   "evidence.review": command("broker", "recordReviewEvidence", "Record an enrolled reviewer's decision with trusted reviewer identity.", ReviewEvidence, recorded, { exposure: "tool", transaction: "transaction" }),
-  "archive.participantConsent": command("broker", "consentParticipant", "Enroll or revoke the authenticated participant's consent after explicit human consent.", Schema.Struct({ owner: Id, sessionId: Id, enabled: Schema.Boolean }), Schema.Struct({ participant: Id, enabled: Schema.Boolean }), { exposure: "internal", transaction: "transaction", approval: "participant-consent" }),
-  "archive.consent": command("broker", "consentArchive", "Set bound session archive enrollment with separately consenting participants.", Schema.Struct({ sessionId: Id, participants: ids.check(Schema.isMaxLength(32)), enabled: Schema.Boolean }), Schema.Struct({ enabled: Schema.Boolean }), { exposure: "internal", transaction: "transaction", approval: "archive-consent" }),
-  "archive.append": command("broker", "appendArchive", "Append only privacy-projected journal metadata under active consent.", Schema.Struct({ sessionId: Id, ...ArchiveEntry.fields, gaps: boundedStrings }), Schema.Struct({ appended: Schema.Literal(true), digest: Hash }), { exposure: "internal", transaction: "transaction" }),
-  "archive.list": command("broker", "listArchive", "Read authorized sanitized archive metadata in bounded pages.", Schema.Struct({ sessionId: Id, cursor: Schema.optional(Schema.Int) }), Schema.mutable(Schema.Array(ArchiveRow)), { exposure: "tool", transaction: "transaction" }),
-  "archive.delete": command("broker", "deleteArchive", "Revoke archive enrollment and delete server rows; local optout additionally erases the journal.", Schema.Struct({ sessionId: Id }), Schema.Struct({ revoked: Schema.Literal(true), deleted: Schema.Literal(true), backupPolicy: Schema.Literal("journal rows and enrollment are omitted from every broker snapshot") }), { exposure: "internal", transaction: "transaction" }),
+  "archive.participantConsent": command("broker", "consentParticipant", "Enroll or revoke the authenticated participant's consent after explicit human consent.", Schema.Struct({ owner: OwnerId, sessionId: SessionId, enabled: Schema.Boolean }), Schema.Struct({ participant: PrincipalId, enabled: Schema.Boolean }), { exposure: "internal", transaction: "transaction", approval: "participant-consent" }),
+  "archive.consent": command("broker", "consentArchive", "Set bound session archive enrollment with separately consenting participants.", Schema.Struct({ sessionId: SessionId, participants: participants.check(Schema.isMaxLength(32)), enabled: Schema.Boolean }), Schema.Struct({ enabled: Schema.Boolean }), { exposure: "internal", transaction: "transaction", approval: "archive-consent" }),
+  "archive.append": command("broker", "appendArchive", "Append only privacy-projected journal metadata under active consent.", Schema.Struct({ sessionId: SessionId, ...ArchiveEntry.fields, gaps: boundedStrings }), Schema.Struct({ appended: Schema.Literal(true), digest: Hash }), { exposure: "internal", transaction: "transaction" }),
+  "archive.list": command("broker", "listArchive", "Read authorized sanitized archive metadata in bounded pages.", Schema.Struct({ sessionId: SessionId, cursor: Schema.optional(Schema.Int) }), Schema.mutable(Schema.Array(ArchiveRow)), { exposure: "tool", transaction: "transaction" }),
+  "archive.delete": command("broker", "deleteArchive", "Revoke archive enrollment and delete server rows; local optout additionally erases the journal.", Schema.Struct({ sessionId: SessionId }), Schema.Struct({ revoked: Schema.Literal(true), deleted: Schema.Literal(true), backupPolicy: Schema.Literal("journal rows and enrollment are omitted from every broker snapshot") }), { exposure: "internal", transaction: "transaction" }),
   acceptTask: command("runner", "acceptTask", "Admit approved work after broker fingerprint, repository, SHA and capacity checks.", Work, Acceptance, { exposure: "internal" }),
   journal: command("runner", "journalTask", "Reconcile durable runner acceptance without treating pending acceptance as rejection.", TaskKey, Acceptance, { exposure: "internal" }),
   inspect: command("runner", "inspectTask", "Read capped privacy-projected child events and explicit retention gaps.", RunnerInspect, RunnerInspection, { exposure: "internal" }),
   command: command("runner", "commandTask", "Perform broker-authorized child control and hold aborted work pending host outcome.", RunnerCommand, NativeResponse, { exposure: "internal" }),
   prepare: command("runner", "prepareTask", "Correct an unprompted child's address after reading actual native state.", RunnerPrepare, Address, { exposure: "internal" }),
   release: command("runner", "releaseTask", "Durably record prompt intent then deliver exact confirmed work; never replay uncertain sends.", RunnerRelease, RunnerReleased, { exposure: "internal" }),
-  "plugin.participant-consent": command("plugin", "pluginParticipantConsent", "Ask native UI consent before enrolling or revoking this participant.", Schema.Struct({ owner: Id, sessionId: Id, enabled: Schema.Boolean }), Schema.Struct({ participant: Id, enabled: Schema.Boolean }), { exposure: "local", approval: "participant-consent" }),
-  "plugin.consent": command("plugin", "pluginConsent", "Ask human consent, enroll the active session remotely and persist local journal consent.", Schema.Struct({ participants: ids.check(Schema.isBetweenLength(1, 32)) }), Schema.Struct({ enabled: Schema.Literal(true) }), { exposure: "local", approval: "archive-consent" }),
+  "plugin.participant-consent": command("plugin", "pluginParticipantConsent", "Ask native UI consent before enrolling or revoking this participant.", Schema.Struct({ owner: OwnerId, sessionId: SessionId, enabled: Schema.Boolean }), Schema.Struct({ participant: PrincipalId, enabled: Schema.Boolean }), { exposure: "local", approval: "participant-consent" }),
+  "plugin.consent": command("plugin", "pluginConsent", "Ask human consent, enroll the active session remotely and persist local journal consent.", Schema.Struct({ participants: participants.check(Schema.isBetweenLength(1, 32)) }), Schema.Struct({ enabled: Schema.Literal(true) }), { exposure: "local", approval: "archive-consent" }),
   "plugin.optout": command("plugin", "pluginOptout", "Revoke remote consent before erasing the local journal and deleting server archive rows.", empty, Schema.Struct({ enabled: Schema.Literal(false) }), { exposure: "local" }),
   "plugin.accept": command("plugin", "pluginAccept", "Accept an unexpired offer using the active native session identity.", TaskKey, Task, { exposure: "local" }),
   "plugin.decline": command("plugin", "pluginDecline", "Decline an unexpired offer using the active native session identity.", TaskKey, Task, { exposure: "local" }),
@@ -312,7 +355,7 @@ export const Commands = {
   "plugin.unable": command("plugin", "pluginUnable", "Report inability with a reason from the bound native identity.", pluginReadback, Task, { exposure: "local" }),
   "plugin.address": command("plugin", "pluginAddress", "Bind an approved task address through broker ownership and revision fences.", RunnerPrepare, Task, { exposure: "local" }),
   "plugin.confirm": command("plugin", "pluginConfirm", "Explicitly confirm matching ready readback to release approved work.", Schema.Struct({ ...TaskKey.fields, revision: Schema.Int }), Task, { exposure: "local", approval: "release" }),
-  "plugin.handoff": command("plugin", "pluginHandoff", "Request safe ownership handoff to a verified new native recipient.", Schema.Struct({ ...TaskKey.fields, oldSessionId: Id, oldIncarnation: Id, newSessionId: Id, newIncarnation: Id, revision: Schema.Int }), Task, { exposure: "local", approval: "handoff" }),
+  "plugin.handoff": command("plugin", "pluginHandoff", "Request safe ownership handoff to a verified new native recipient.", Schema.Struct({ ...TaskKey.fields, oldSessionId: SessionId, oldIncarnation: IncarnationId, newSessionId: SessionId, newIncarnation: IncarnationId, revision: Schema.Int }), Task, { exposure: "local", approval: "handoff" }),
   "plugin.instruction": command("plugin", "pluginInstruction", "Ask UI approval of the exact later instruction before recording it.", Schema.Struct({ ...RunnerPrepare.fields, prompt: Text, approved: Schema.Literal(true) }), Task, { exposure: "local", approval: "exact-instruction" }),
   "plugin.report": command("plugin", "pluginReport", "Report task state with session and incarnation injected from the active host.", Schema.Struct({ ...TaskKey.fields, state: ReportState, result: JsonValue }), Task, { exposure: "local" }),
   "plugin.evidence-target": command("plugin", "pluginEvidenceTarget", "Set an observation target without authorizing execution.", Schema.Struct({ ...TaskKey.fields, sha: Sha, ref: Text, requiredLanes: strings.check(Schema.isBetweenLength(1, 32)) }), Schema.Struct({ target: EvidenceTarget, executionAuthorized: Schema.Literal(false) }), { exposure: "local" }),
@@ -326,11 +369,11 @@ export const Commands = {
   "plugin.archive": command("plugin", "pluginArchive", "Read sanitized archive rows with the active session injected.", Schema.Struct({ cursor: Schema.optional(Schema.Int) }), Schema.mutable(Schema.Array(ArchiveRow)), { exposure: "local" }),
   "plugin.inbox": command("plugin", "pluginInbox", "Read or explicitly clear the active session's durable local inbox.", Schema.Struct({ clear: Schema.optional(Schema.Boolean) }), Schema.Union([Inbox, Schema.Struct({ cleared: Schema.Literal(true) })]), { exposure: "local" }),
   "plugin.identity": command("plugin", "pluginIdentity", "Read actual native session, worker and local repository identity.", empty, NativeIdentity, { exposure: "local" }),
-  "native.get_state": command("native", "nativeGetState", "Read private child state for actual readback and completion reconciliation.", Schema.Struct({ id: Id, type: Schema.Literal("get_state") }), NativeFrame, { exposure: "private" }),
-  "native.get_messages": command("native", "nativeGetMessages", "Read private child messages; response may contain sensitive content.", Schema.Struct({ id: Id, type: Schema.Literal("get_messages") }), NativeFrame, { exposure: "private" }),
-  "native.bash": command("native", "nativeBash", "Execute internal native-child readback or isolation proof shell commands.", Schema.Struct({ id: Id, type: Schema.Literal("bash"), command: Text }), NativeFrame, { exposure: "private" }),
-  "native.prompt": command("native", "nativePrompt", "Deliver the private child prompt only after durable approved release intent.", Schema.Struct({ id: Id, type: Schema.Literal("prompt"), message: Text }), NativeFrame, { exposure: "private" }),
-  "native.abort": command("native", "nativeAbort", "Abort the private native child under runner ownership control.", Schema.Struct({ id: Id, type: Schema.Literal("abort") }), NativeFrame, { exposure: "private" }),
+  "native.get_state": command("native", "nativeGetState", "Read private child state for actual readback and completion reconciliation.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("get_state") }), NativeFrame, { exposure: "private" }),
+  "native.get_messages": command("native", "nativeGetMessages", "Read private child messages; response may contain sensitive content.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("get_messages") }), NativeFrame, { exposure: "private" }),
+  "native.bash": command("native", "nativeBash", "Execute internal native-child readback or isolation proof shell commands.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("bash"), command: Text }), NativeFrame, { exposure: "private" }),
+  "native.prompt": command("native", "nativePrompt", "Deliver the private child prompt only after durable approved release intent.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("prompt"), message: Text }), NativeFrame, { exposure: "private" }),
+  "native.abort": command("native", "nativeAbort", "Abort the private native child under runner ownership control.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("abort") }), NativeFrame, { exposure: "private" }),
   "program.broker": command("program", "runBroker", "Start the broker using COORDINATOR_CONFIG private file and remain serving.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" }),
   "program.runner": command("program", "runRunner", "Start the isolated runner using COORDINATOR_CONFIG private file and await failure.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" }),
   "program.install:host": command("program", "installHost", "Install one native plugin or privileged runner; help returns usage, dry-run still validates isolation.", Schema.Struct({
@@ -403,7 +446,6 @@ export const McpCommandName = Schema.Union([McpToolName, ...requests(Commands, "
 export type McpCommandName = typeof McpCommandName.Type;
 export const BoundaryError = Schema.Struct({ error: Schema.String });
 export type BoundaryError = typeof BoundaryError.Type;
-export type Id = typeof Id.Type;
 export type Text = typeof Text.Type;
 export type Sha = typeof Sha.Type;
 export type Hash = typeof Hash.Type;

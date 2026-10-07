@@ -1,7 +1,7 @@
 import { Config, Console, Effect, Layer, Option, Schema, Stdio } from "effect";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { PluginConfig, RunnerConfig, InstallPlan, JsonValue, Commands, CommandError, type CommandInput, type InstallCommand } from "../src/contracts.ts";
+import { PluginConfig, RunnerConfig, InstallPlan, JsonValue, Commands, CommandError, UserId, type CommandInput, type InstallCommand } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { decodeEffect, decodeJson, encodeJson } from "../src/http.ts";
 
@@ -73,7 +73,7 @@ const installHost = Effect.fnUntraced(function*(flags: CommandInput<"program.ins
   let content = "";
   if (runner && runnerPath) {
     const owner = yield* fs.stat(runnerPath), tokenOwner = yield* fs.stat(runner.tokenFile);
-    const uid = Option.getOrThrow(owner.uid), gid = Option.getOrThrow(owner.gid);
+    const uid = yield* decodeEffect(UserId, Option.getOrThrow(owner.uid)), gid = Option.getOrThrow(owner.gid);
     if ((yield* fs.realPath(runnerPath)) !== runnerPath || (yield* fs.realPath(runner.tokenFile)) !== runner.tokenFile ||
       owner.type !== "File" || tokenOwner.type !== "File" || (owner.mode & 0o777) !== 0o600 || (tokenOwner.mode & 0o777) !== 0o600 ||
       uid === 0 || gid === 0 || uid !== Option.getOrThrow(tokenOwner.uid) || gid !== Option.getOrThrow(tokenOwner.gid)) return yield* new CommandError({ message: "Runner config/token must be mode-0600 regular files owned by the same nonroot UID/GID" });

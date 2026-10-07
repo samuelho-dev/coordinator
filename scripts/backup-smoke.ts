@@ -5,31 +5,30 @@ import { NodeRuntime, NodeStdio } from "@effect/platform-node";
 import { SqliteClient } from "@effect/sql-sqlite-node";
 import { SnapshotStore } from "../src/backup.ts";
 import { Broker } from "../src/broker.ts";
-import { BackupError, BrokerRequest, Commands, Json, JsonValue, JournalState, LiveSession, ObjectBackupConfig, SnapshotKey, Task, type BrokerConfig, type Principal } from "../src/contracts.ts";
+import { ArchiveEntryId, BackupError, BrokerConfig, BrokerRequest, Commands, GitHubRepositoryId, Json, JsonValue, JournalState, LiveSession, ObjectBackupConfig, Principal, Repo, SnapshotKey, Task } from "../src/contracts.ts";
 import { decode, decodeJson, encodeJson, Mcp } from "../src/http.ts";
 import { Platform } from "../src/platform.ts";
 
 const runBackupSmoke = () => Effect.gen(function*() {
   const platform = yield* Platform;
   const stdio = yield* Stdio.Stdio;
-  const print = (value: unknown) => Stream.make(`${encodeJson(JsonValue, value)}\n`).pipe(Stream.run(stdio.stdout()));
   const configPath = yield* Config.String("COORDINATOR_BACKUP_SMOKE_CONFIG");
   const objectBackup = decodeJson(ObjectBackupConfig, yield* platform.privateFile(configPath));
   if (!["127.0.0.1", "[::1]", "localhost"].includes(new URL(objectBackup.endpoint).hostname) || objectBackup.bucket !== "coordinator-backup-proof") return yield* Effect.fail(new BackupError({ message: "Backup smoke requires its isolated loopback proof bucket" }));
   const state = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-backup-smoke-" });
-  const repo = "github.com/proof/backup";
+  const repo = Repo.make("github.com/proof/backup");
   const enrollment = `enrollment-plaintext-${yield* platform.crypto.randomUUIDv4}`;
   const transcript = `raw-transcript-${yield* platform.crypto.randomUUIDv4}`;
   yield* platform.fs.writeFileString(platform.path.join(state, "enrollment.token"), enrollment, { flag: "wx", mode: 0o600 });
   yield* platform.fs.writeFileString(platform.path.join(state, "native-session-private.jsonl"), transcript, { flag: "wx", mode: 0o600 });
-  const principal: Principal = {
+  const principal = decode(Principal, {
     id: "proof-session", owner: "proof-owner", roles: ["session", "coordinator"], repos: [repo],
     tokenHash: yield* platform.digest(enrollment),
-  };
+  });
   const config: BrokerConfig = {
     database: platform.path.join(state, "broker", "ledger.sqlite"), backupDirectory: platform.path.join(state, "snapshots"),
     host: "127.0.0.1", port: 0, archiveRetentionMs: 86_400_000, backupRetentionMs: 3_600_000,
-    repositoryIds: { [repo]: 1 }, principals: [principal], objectBackup,
+    repositoryIds: { [repo]: GitHubRepositoryId.make(1) }, principals: [principal], objectBackup,
   };
   const brokerContext = yield* Layer.build(Broker.layer(config));
   const broker = Context.get(brokerContext, Broker);
@@ -55,10 +54,10 @@ const runBackupSmoke = () => Effect.gen(function*() {
   yield* broker.sql.unsafe("INSERT INTO tasks(id,data) VALUES (?,?)", [task.taskId, encodeJson(Task, task)]);
   yield* broker.sql.unsafe("INSERT INTO sessions(id,data) VALUES (?,?)", [session.sessionId, encodeJson(LiveSession, session)]);
   broker.sessions.set(session.sessionId, session);
-  yield* broker.sql.unsafe("INSERT INTO consents(owner,session,enabled,participants) VALUES (?,?,?,?)", [principal.owner, session.sessionId, 1, encodeJson(JournalState.fields.participants, [principal.owner])]);
-  yield* broker.sql.unsafe("INSERT INTO participant_consents(owner,session,participant,enabled) VALUES (?,?,?,?)", [principal.owner, session.sessionId, principal.owner, 1]);
+  yield* broker.sql.unsafe("INSERT INTO consents(owner,session,enabled,participants) VALUES (?,?,?,?)", [principal.owner, session.sessionId, 1, encodeJson(JournalState.fields.participants, [principal.id])]);
+  yield* broker.sql.unsafe("INSERT INTO participant_consents(owner,session,participant,enabled) VALUES (?,?,?,?)", [principal.owner, session.sessionId, principal.id, 1]);
   yield* broker.sql.unsafe("INSERT INTO archive(owner,session,entry,digest,payload,gaps,created) VALUES (?,?,?,?,?,?,?)",
-    [principal.owner, session.sessionId, "raw-fixture", yield* platform.digest(transcript), transcript, "[]", now]);
+    [principal.owner, session.sessionId, ArchiveEntryId.make("raw-fixture"), yield* platform.digest(transcript), transcript, "[]", now]);
 
   const firstFile = yield* broker.snapshot();
   yield* broker.handle(principal, decode(BrokerRequest, { method: "archive.delete", params: { sessionId: session.sessionId } }));
@@ -105,11 +104,11 @@ const runBackupSmoke = () => Effect.gen(function*() {
   yield* store.restore(secondKey, currentAgain);
   assert.deepEqual(yield* platform.fs.readFile(currentAgain), yield* platform.fs.readFile(secondRestored));
 
-  yield* print({ scenario: "application-object-backup", fixtureOnly: true,
+  yield* Stream.make(`${encodeJson(JsonValue, { scenario: "application-object-backup", fixtureOnly: true,
     uploadedBytesRestored: true, restoredSqliteOpened: true, taskMetadataSurvived: true,
     privacy: { archive: 0, consents: 0, participantConsents: 0, rawTranscriptAbsent: true, enrollmentPlaintextAbsent: true },
     optOutSnapshotSafe: true, existingRestoreTargetPreserved: true, expiredOldObject: true, currentObjectRetained: true,
-    productionBackupClaim: false });
+    productionBackupClaim: false })}\n`).pipe(Stream.run(stdio.stdout()));
 });
 
 function decodeSnapshotKey(file: string, basename: (path: string) => string): SnapshotKey {

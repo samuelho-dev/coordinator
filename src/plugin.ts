@@ -2,8 +2,8 @@ import { Clock, Config, Context as EffectContext, Effect, Exit, Layer, ManagedRu
 import { Base64 } from "effect/encoding";
 import { NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { Commands, CommandError, PluginConfig, PluginDeclined, Json, type CommandCapabilities, type CommandInput, type Context, type Host, type PluginActive, type McpToolName, type NativeEventName } from "./contracts.ts";
-import { decodeJson, decodeEffect, canonicalJson, Mcp } from "./http.ts";
+import { Commands, CommandError, PluginConfig, PluginDeclined, Json, SessionId, IncarnationId, WorkerId, Sha, JournalHandledKey, JournalReleaseKey, type CommandCapabilities, type CommandInput, type Context, type Host, type PluginActive, type McpToolName, type NativeEventName } from "./contracts.ts";
+import { decode, decodeJson, decodeEffect, canonicalJson, Mcp } from "./http.ts";
 import { Platform } from "./platform.ts";
 import { Journal } from "./journal.ts";
 
@@ -67,7 +67,7 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
   let active: PluginActive | undefined;
   let sessionScope: Scope.Closeable | undefined;
   const serial = <A, E>(effect: Effect.Effect<A, E>) => semaphore.withPermits(1)(effect);
-  const call = <const M extends McpToolName>(method: M, params: unknown) => mcp.call(config.brokerUrl, token, method, params);
+  const call = <const M extends McpToolName>(method: M, params: CommandInput<M>) => mcp.call(config.brokerUrl, token, method, params);
   const notify = (ctx: Context, text: string, level: "info" | "warning" | "error" = "info") => Effect.sync(() => ctx.ui.notify(text, level));
   const confirm = (ctx: Context, title: string, text: string) => Effect.acquireUseRelease(
     Effect.sync(() => { confirmations++; }),
@@ -80,16 +80,16 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
   const local = Effect.fn("Plugin.local")(function*(ctx: Context) {
     return { repo: yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote),
       ref: (yield* platform.exec(ChildProcess.make("git", ["rev-parse", "--symbolic-full-name", "HEAD"], { cwd: ctx.cwd }))).trim(),
-      sha: (yield* platform.exec(ChildProcess.make("git", ["rev-parse", "HEAD"], { cwd: ctx.cwd }))).trim() };
+      sha: Sha.make((yield* platform.exec(ChildProcess.make("git", ["rev-parse", "HEAD"], { cwd: ctx.cwd }))).trim()) };
   });
   const tick = Effect.fn("Plugin.tick")(function*() {
     const current = active;
     if (!current) return;
-    const { ctx, sessionId, incarnation, journal } = current;
+    const { ctx, sessionId, incarnation, workerId, journal } = current;
     if (ctx.sessionManager.getSessionId() !== sessionId) return;
     current.repo = (yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote));
     if ((yield* Clock.currentTimeMillis) - current.heartbeat >= 10000) {
-      yield* call("session.heartbeat", { sessionId, incarnation, machineId: config.machineId, host: config.host, repo: current.repo, workerId: sessionId });
+      yield* call("session.heartbeat", { sessionId, incarnation, machineId: config.machineId, host: config.host, repo: current.repo, workerId });
       current.heartbeat = (yield* Clock.currentTimeMillis);
     }
     const poll = yield* call("session.poll", { sessionId, incarnation });
@@ -101,22 +101,23 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
       yield* call("peer.ack", { sessionId, incarnation, messageId: message.messageId });
     }
     for (const offer of poll.offers) {
-      if (yield* journal.handled(`offer:${offer.taskId}`)) continue;
+      const handledKey = JournalHandledKey.make(`offer:${offer.taskId}`);
+      if (yield* journal.handled(handledKey)) continue;
       yield* notify(ctx, `Coordinator offer ${offer.taskId}: ${offer.request.repo} ${offer.request.ref} ${offer.request.sha}. /coordinator status {"taskId":"${offer.taskId}"}; then accept or decline explicitly.`);
-      yield* journal.handle(`offer:${offer.taskId}`);
+      yield* journal.handle(handledKey);
     }
     for (const task of poll.releases) {
       const address = task.address;
       if (!address || task.confirmedRevision !== address.revision || task.disposition !== "ready" || !task.readback || (yield* platform.fingerprint(task.readback)) !== (yield* platform.fingerprint(address)) || address.sessionId !== sessionId || address.incarnation !== incarnation) continue;
       const approvedAddress = task.instruction?.address;
-      if (address.deadline <= (yield* Clock.currentTimeMillis) || address.repo !== task.request.repo || (approvedAddress ? (yield* platform.fingerprint(address)) !== (yield* platform.fingerprint(approvedAddress)) : address.ref !== task.request.ref || address.sha !== task.request.sha) || address.workerId !== sessionId) continue;
+      if (address.deadline <= (yield* Clock.currentTimeMillis) || address.repo !== task.request.repo || (approvedAddress ? (yield* platform.fingerprint(address)) !== (yield* platform.fingerprint(approvedAddress)) : address.ref !== task.request.ref || address.sha !== task.request.sha) || address.workerId !== workerId) continue;
       if (!ctx.isIdle() || ctx.hasPendingMessages()) continue;
       const actual = yield* local(ctx);
       if (actual.repo !== address.repo || actual.ref !== address.ref || actual.sha !== address.sha) {
         yield* call("task.readback", { taskId: task.taskId, address, disposition: "hold", reason: "Local repository/ref/SHA changed", nextCheck: (yield* Clock.currentTimeMillis) + 60000 });
         continue;
       }
-      const key = `${task.taskId}:${address.revision}`;
+      const key = JournalReleaseKey.make(`${task.taskId}:${address.revision}`);
       if (journal.state.releases[key]) {
         if (journal.state.releases[key] === "intent") {
           yield* call("task.report", { taskId: task.taskId, sessionId, incarnation, state: "HELD", result: { reason: "Release delivery uncertain; explicit new addressed revision required" } });
@@ -148,10 +149,11 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
     yield* stop();
     yield* resetStatus(ctx, false);
     yield* report(ctx);
-    const sessionId = ctx.sessionManager.getSessionId();
+    const sessionId = decode(SessionId, ctx.sessionManager.getSessionId());
+    const workerId = WorkerId.make(sessionId);
     sessionScope = yield* Scope.make();
     const context = yield* Layer.buildWithScope(Journal.layer(config.stateDirectory, sessionId).pipe(Layer.provide(Layer.succeed(Platform, platform))), sessionScope);
-    active = { ctx, sessionId, incarnation: yield* platform.crypto.randomUUIDv4, repo: yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote), journal: EffectContext.get(context, Journal), heartbeat: 0 };
+    active = { ctx, sessionId, workerId, incarnation: IncarnationId.make(yield* platform.crypto.randomUUIDv4), repo: yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote), journal: EffectContext.get(context, Journal), heartbeat: 0 };
     yield* Effect.gen(function*() {
       yield* Effect.sleep("1 second");
       yield* serial(tick()).pipe(Effect.catchCause(() => notify(ctx, "Coordinator connection or journal unavailable; dispatch held.", "warning")));
@@ -169,13 +171,13 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
     const data: unknown = split < 0 ? {} : decodeJson(Json, args.trim().slice(split + 1));
     const current = active;
     if (!current || current.sessionId !== ctx.sessionManager.getSessionId()) throw new Error("Session not enrolled");
-    const { sessionId, incarnation, journal } = current;
+    const { sessionId, incarnation, workerId, journal } = current;
     const approve = Effect.fn("Plugin.approve")(function*(title: string, text: string) {
       if (!ctx.hasUI || !(yield* confirm(ctx, title, text))) return yield* Effect.fail(new PluginDeclined({ message: "Human approval declined or unavailable" }));
     });
     const readback = Effect.fn("Plugin.readback")(function*(data: CommandInput<"plugin.readback">, disposition: "ready" | "hold" | "clarify" | "unable") {
       const { address } = data;
-      if (address.sessionId !== sessionId || address.incarnation !== incarnation || address.workerId !== sessionId) return yield* Effect.fail(new CommandError({ message: "Readback must address this native session incarnation and worker" }));
+      if (address.sessionId !== sessionId || address.incarnation !== incarnation || address.workerId !== workerId) return yield* Effect.fail(new CommandError({ message: "Readback must address this native session incarnation and worker" }));
       if (disposition === "ready") {
         const actual = yield* local(ctx);
         if (address.deadline <= (yield* Clock.currentTimeMillis) || address.repo !== actual.repo || address.sha !== actual.sha || address.ref !== actual.ref) return yield* Effect.fail(new CommandError({ message: "Readback does not match current local repository/ref/SHA/worker/deadline" }));
@@ -244,7 +246,7 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
         return journal.state.inbox;
       }),
       pluginIdentity: () => Effect.gen(function*() {
-        return { sessionId, incarnation, machineId: config.machineId, ...(yield* local(ctx)), workerId: sessionId, workerIdentitySource: "native-session" as const };
+        return { sessionId, incarnation, machineId: config.machineId, ...(yield* local(ctx)), workerId, workerIdentitySource: "native-session" as const };
       }),
     };
     const result = yield* entry.executeDecoded(capabilities, data, decodeEffect);

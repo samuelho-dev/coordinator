@@ -3,6 +3,8 @@ import { test } from "node:test";
 import { Effect } from "effect";
 import { Hex } from "effect/encoding";
 import { Platform } from "../src/platform.ts";
+import { Hash } from "../src/contracts.ts";
+import { decode } from "../src/http.ts";
 
 test("RFC 4231 HMAC uses exact key views and stored SHA-256 credentials stay unchanged", () => Effect.runPromise(Effect.gen(function*() {
   const platform = yield* Platform;
@@ -14,13 +16,13 @@ test("RFC 4231 HMAC uses exact key views and stored SHA-256 credentials stay unc
   assert.equal(backing[0], 0xff);
   assert.equal(backing[21], 0xff);
 
-  const hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+  const hash = Hash.make("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
   assert.equal(yield* platform.digest("abc"), hash);
   assert.equal(yield* platform.checkToken("abc", hash), true);
   assert.equal(yield* platform.checkToken("counterfeit", hash), false);
   assert.equal(yield* platform.checkToken("", hash), false);
   assert.equal(yield* platform.checkToken("abc", hash), true);
   for (const malformed of ["", hash.slice(1), `${hash}0`, `${hash}\n`, hash.toUpperCase(), "g".repeat(64)]) {
-    assert.equal(yield* platform.checkToken("abc", malformed), false);
+    assert.throws(() => decode(Hash, malformed));
   }
 }).pipe(Effect.provide(Platform.layer))));

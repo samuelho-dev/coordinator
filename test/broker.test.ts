@@ -4,12 +4,12 @@ import { Clock, Deferred, Effect, Fiber, Layer, ManagedRuntime } from "effect";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { Broker } from "../src/broker.ts";
-import { Commands, HttpError, JsonValue, Task, type Address, type BrokerConfig, type Work } from "../src/contracts.ts";
+import { Commands, HttpError, JsonValue, Task, Address, BrokerConfig, Work, Repo, Sha, TaskId, MessageId, RunnerId, SessionId, IncarnationId, MachineId, WorkerId, ReportState, type CommandInput } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
 import { Mcp, decode, encodeJson } from "../src/http.ts";
 
-const repo = "github.com/test/broker", sha = "1".repeat(40);
+const repo = Repo.make("github.com/test/broker"), sha = Sha.make("1".repeat(40));
 const coordinator = "coordinator-regression-only-credential", peer = "native-peer-regression-only-credential", reviewer = "reviewer-regression-only-credential";
 function response(value: JsonValue): Response { return new Response(encodeJson(JsonValue, value), { headers: { "content-type": "application/json" } }); }
 
@@ -21,12 +21,12 @@ test("native release fences and independent evidence survive stale peers and CI 
   const now = await setup.runPromise(Clock.currentTimeMillis);
   let respond = (_url: string): Response => response({});
   const client = HttpClient.make((request, url) => Effect.sync(() => HttpClientResponse.fromWeb(request, respond(url.toString()))));
-  const config: BrokerConfig = { database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0, backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
+  const config = decode(BrokerConfig, { database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0, backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
     repositoryIds: { [repo]: 42 }, principals: [
       { id: "coordinator", owner: "owner", roles: ["coordinator"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(coordinator)) },
       { id: "peer", owner: "owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(peer)) },
       { id: "reviewer", owner: "owner", roles: ["reviewer"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(reviewer)) },
-    ] };
+    ] });
   const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(Layer.merge(base, Layer.succeed(HttpClient.HttpClient, client)))));
   const broker = await runtime.runPromise(Broker);
   const mcp = await setup.runPromise(Mcp);
@@ -38,11 +38,11 @@ test("native release fences and independent evidence survive stale peers and CI 
       onFailure: (error) => { assert.ok(error instanceof HttpError); assert.equal(error.status, 409); },
       onSuccess: () => assert.fail("Expected rejected conflict"),
     })));
-    const session = { sessionId: "owner-session", incarnation: "native-incarnation", machineId: "machine", host: "omp", repo, workerId: "wrong-worker" };
+    let session: CommandInput<"session.heartbeat"> = { sessionId: SessionId.make("owner-session"), incarnation: IncarnationId.make("native-incarnation"), machineId: MachineId.make("machine"), host: "omp", repo, workerId: WorkerId.make("wrong-worker") };
     const key = { sessionId: session.sessionId, incarnation: session.incarnation };
     await setup.runPromise(mcp.call(url, peer, "session.heartbeat", session)); await setup.runPromise(mcp.call(url, peer, "session.poll", key));
     const receiver = await setup.runPromise(Journal.make(platform.path.join(root, "receiver"), session.sessionId));
-    const messageIds = Array.from({ length: 5 }, (_, index) => `large-peer-${index}`);
+    const messageIds = Array.from({ length: 5 }, (_, index) => MessageId.make(`large-peer-${index}`));
     const largePayload = "x".repeat(7900);
     for (const messageId of messageIds) await setup.runPromise(mcp.call(url, coordinator, "peer.send", { ...key, messageId, payload: largePayload, ttlMs: 60000 }));
     const delivered = (await setup.runPromise(mcp.call(url, peer, "session.poll", key))).messages;
@@ -55,14 +55,14 @@ test("native release fences and independent evidence survive stale peers and CI 
     assert.deepEqual((await setup.runPromise(mcp.call(url, peer, "session.poll", key))).messages, []);
     const reopenedReceiver = await setup.runPromise(Journal.make(platform.path.join(root, "receiver"), session.sessionId));
     assert.deepEqual(Object.keys(reopenedReceiver.state.inbox).sort(), messageIds);
-    const work: Work = { taskId: "wrong-worker-offer", repo, ref: "refs/heads/main", sha, launcher: "omp", prompt: "approved bounded work", scope: "s".repeat(16000), restrictions: "no deployment", expectedEvidence: ["CI/verify"], deadline: now + 60000,
-      workerId: "native-worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: false, approved: true };
+    const work = decode(Work, { taskId: "wrong-worker-offer", repo, ref: "refs/heads/main", sha, launcher: "omp", prompt: "approved bounded work", scope: "s".repeat(16000), restrictions: "no deployment", expectedEvidence: ["CI/verify"], deadline: now + 60000,
+      workerId: "native-worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: false, approved: true });
     assert.throws(() => decode(Commands["task.submit"].input, { ...work, deadline: JSON.parse("1e400") }));
     const unavailable = await setup.runPromise(mcp.call(url, coordinator, "task.submit", work));
     assert.equal(unavailable.offerDecision, "expired"); assert.equal(unavailable.peerSession, undefined);
-    session.workerId = work.workerId;
+    session = { ...session, workerId: work.workerId };
     await setup.runPromise(mcp.call(url, peer, "session.heartbeat", session)); await setup.runPromise(mcp.call(url, peer, "session.poll", key));
-    const expiring = await setup.runPromise(mcp.call(url, coordinator, "task.submit", { ...work, taskId: "expires-while-queued", scope: "bounded queued offer" }));
+    const expiring = await setup.runPromise(mcp.call(url, coordinator, "task.submit", { ...work, taskId: TaskId.make("expires-while-queued"), scope: "bounded queued offer" }));
     assert.equal(expiring.offerDecision, "pending");
     assert.ok(expiring.offerExpires !== undefined);
     const offerExpires = expiring.offerExpires;
@@ -99,11 +99,11 @@ test("native release fences and independent evidence survive stale peers and CI 
     const expiredStored = await setup.runPromise(mcp.call(url, coordinator, "task.get", { taskId: expiring.taskId }));
     assert.equal(expiredStored.offerDecision, "pending");
     assert.equal(expiredStored.state, "QUEUED");
-    const acceptedWork = { ...work, taskId: "bound-native-work" };
+    const acceptedWork = { ...work, taskId: TaskId.make("bound-native-work") };
     const offered = await setup.runPromise(mcp.call(url, coordinator, "task.submit", acceptedWork)); assert.equal(offered.offerDecision, "pending");
-    const report = (state: string) => mcp.call(url, peer, "task.report", { ...key, taskId: acceptedWork.taskId, state, result: { completed: true } });
+    const report = (state: typeof ReportState.Type) => mcp.call(url, peer, "task.report", { ...key, taskId: acceptedWork.taskId, state, result: { completed: true } });
     await conflict(report("SUCCEEDED"));
-    const address: Address = { ...key, messageId: acceptedWork.taskId, revision: 1, workerId: work.workerId, repo, ref: work.ref, sha, scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline };
+    const address: Address = { ...key, messageId: MessageId.make(acceptedWork.taskId), revision: 1, workerId: work.workerId, repo, ref: work.ref, sha, scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline };
     await conflict(mcp.call(url, coordinator, "task.address", { taskId: acceptedWork.taskId, address }));
     await conflict(mcp.call(url, peer, "task.readback", { taskId: acceptedWork.taskId, address, disposition: "ready" }));
     await conflict(mcp.call(url, coordinator, "task.confirm", { taskId: acceptedWork.taskId, revision: 1 }));
@@ -117,7 +117,7 @@ test("native release fences and independent evidence survive stale peers and CI 
     assert.deepEqual(released[0]?.readback, address);
     await conflict(mcp.call(url, peer, "task.readback", { taskId: acceptedWork.taskId, address, disposition: "hold", reason: "too late", nextCheck: now + 1000 }));
     await conflict(mcp.call(url, coordinator, "task.address", { taskId: acceptedWork.taskId, address: { ...address, revision: 2 } }));
-    const next = { ...session, sessionId: "next-session", incarnation: "next-incarnation", workerId: "replacement-native-worker" };
+    const next = { ...session, sessionId: SessionId.make("next-session"), incarnation: IncarnationId.make("next-incarnation"), workerId: WorkerId.make("replacement-native-worker") };
     await setup.runPromise(mcp.call(url, peer, "session.heartbeat", next)); await setup.runPromise(mcp.call(url, peer, "session.poll", { sessionId: next.sessionId, incarnation: next.incarnation }));
     const handoff = { taskId: acceptedWork.taskId, oldSessionId: key.sessionId, oldIncarnation: key.incarnation, newSessionId: next.sessionId, newIncarnation: next.incarnation, revision: 2 };
     await conflict(mcp.call(url, coordinator, "task.handoff", handoff));
@@ -125,7 +125,7 @@ test("native release fences and independent evidence survive stale peers and CI 
     await setup.runPromise(report("SUCCEEDED"));
     await conflict(report("RUNNING"));
     const stored = await setup.runPromise(mcp.call(url, coordinator, "task.get", { taskId: acceptedWork.taskId }));
-    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [encodeJson(Task, { ...stored, runnerId: "assigned-runner" }), stored.taskId]));
+    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [encodeJson(Task, { ...stored, runnerId: RunnerId.make("assigned-runner") }), stored.taskId]));
     await conflict(report("SUCCEEDED"));
     await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [encodeJson(Task, stored), stored.taskId]));
     // Existing pre-cutover pending confirmations cannot become native releases after decline/runner acceptance.
@@ -136,12 +136,13 @@ test("native release fences and independent evidence survive stale peers and CI 
     await conflict(mcp.call(url, coordinator, "task.confirm", { taskId: stored.taskId, revision: 1 }));
     assert.deepEqual((await setup.runPromise(mcp.call(url, peer, "session.poll", key))).releases, []);
     await setup.runPromise(mcp.call(url, peer, "peer.reply", { ...key, taskId: stored.taskId, decision: "declined" }));
-    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [encodeJson(Task, { ...legacyPending, state: "ACCEPTED", offerDecision: "declined", runnerId: "assigned-runner" }), stored.taskId]));
+    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [encodeJson(Task, { ...legacyPending, state: "ACCEPTED", offerDecision: "declined", runnerId: RunnerId.make("assigned-runner") }), stored.taskId]));
     assert.deepEqual((await setup.runPromise(mcp.call(url, peer, "session.poll", key))).releases, []);
     await conflict(mcp.call(url, peer, "task.readback", { taskId: stored.taskId, address, disposition: "ready" }));
     await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [encodeJson(Task, stored), stored.taskId]));
     const transferred = await setup.runPromise(mcp.call(url, coordinator, "task.handoff", handoff));
     assert.equal(transferred.address?.workerId, next.workerId);
+    assert.ok(transferred.address);
     await conflict(mcp.call(url, peer, "task.readback", { taskId: stored.taskId, address: { ...transferred.address, workerId: work.workerId }, disposition: "ready" }));
     await setup.runPromise(mcp.call(url, coordinator, "task.address", { taskId: stored.taskId, address: transferred.address }));
     await setup.runPromise(mcp.call(url, peer, "task.readback", { taskId: stored.taskId, address: transferred.address, disposition: "ready" }));
