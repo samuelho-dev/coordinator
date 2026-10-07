@@ -196,7 +196,7 @@ export const Context = Schema.Struct({
   }),
 });
 export type Context = typeof Context.Type;
-export const NativeEventName = Schema.Literals(["session_start", "session_shutdown", "session_switch", "input", "agent_start", "agent_end", "turn_end", "message_end", "agent_before_settle", "agent_settled", "ui_prompt_start", "ui_prompt_end", "tool_approval_requested", "tool_approval_resolved"]);
+export const NativeEventName = Schema.Literals(["session_start", "session_shutdown", "session_switch", "input", "agent_start", "agent_end", "turn_end", "message_end", "agent_before_settle", "agent_settled", "auto_retry_end", "ui_prompt_start", "ui_prompt_end", "tool_approval_requested", "tool_approval_resolved"]);
 export type NativeEventName = typeof NativeEventName.Type;
 export const Host = Schema.Struct({
   on: Schema.declare<(event: NativeEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown>((value): value is (event: NativeEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown => typeof value === "function"),
