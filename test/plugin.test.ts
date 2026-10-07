@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { Clock, ConfigProvider, Context as EffectContext, Deferred, Effect, Layer } from "effect";
+import { Clock, ConfigProvider, Context as EffectContext, Deferred, Effect, Layer, Sink, Stdio } from "effect";
 import { ChildProcess } from "effect/process";
 import { HttpServer } from "effect/http";
 import { canonicalJson, decode, Mcp, serverLayer } from "../src/http.ts";
@@ -23,9 +23,11 @@ test("native plugin persists intent before send and holds uncertain delivery aft
   yield* platform.fs.writeFileString(tokenFile, "test-token", { mode: 0o600 });
   const config = platform.path.join(directory, "config.json");
   let approval = true;
-  const ctx: Context = { cwd: directory, hasUI: true, isIdle: () => true, hasPendingMessages: () => false,
+  let duringConfirm: (() => Promise<void>) | undefined;
+  const terminalOutput: string[] = [];
+  const ctx: Context = { cwd: directory, mode: "tui", hasUI: true, isIdle: () => true, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => "native-session", getSessionFile: () => undefined },
-    ui: { notify: () => {}, confirm: async () => approval } };
+    ui: { notify: () => {}, confirm: async () => { await duringConfirm?.(); return approval; } } };
   let sends = 0;
   let incarnation = "";
   const reports: Extract<BrokerRequest, { method: "task.report" }>["params"][] = [];
@@ -57,10 +59,30 @@ test("native plugin persists intent before send and holds uncertain delivery aft
   const pluginContext = yield* Layer.build(Plugin.layer({ on: () => {}, registerCommand: () => {}, sendUserMessage: () => { sends++; throw new CommandError({ message: "native delivery uncertain" }); } }).pipe(
     Layer.provide(Layer.merge(Layer.succeed(Platform, platform), Layer.succeed(Mcp, mcp))),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
+    Layer.provide(Stdio.layerTest({
+      stdoutIsTerminal: Effect.succeed(true),
+      stdout: () => Sink.forEach((chunk: string | Uint8Array) => Effect.sync(() => {
+        if (typeof chunk === "string") terminalOutput.push(chunk);
+      })),
+    })),
   ));
   const plugin = EffectContext.get(pluginContext, Plugin);
   if (!plugin) return yield* Effect.fail(new CommandError({ message: "Expected configured plugin" }));
   assert.equal((yield* Effect.exit(plugin.start(ctx)))._tag, "Failure");
+  yield* plugin.native("agent_start", { type: "agent_start" }, ctx);
+  assert.equal(terminalOutput.at(-1), "\x1b]7501;app=pi:state=working\x1b\\");
+  const beforeEnd = terminalOutput.length;
+  yield* plugin.native("agent_end", { type: "agent_end", messages: [] }, ctx);
+  assert.equal(terminalOutput.length, beforeEnd, "Pi must wait for whole-agent settlement, not the retry boundary");
+  yield* plugin.native("ui_prompt_start", { type: "ui_prompt_start", kind: "input" }, ctx);
+  assert.equal(terminalOutput.at(-1), "\x1b]7501;app=pi:state=blocked:kind=question:msg=V2FpdGluZyBmb3IgYW4gYW5zd2Vy\x1b\\");
+  yield* plugin.native("agent_before_settle", { type: "agent_before_settle", outcome: "error" }, ctx);
+  yield* plugin.native("agent_settled", { type: "agent_settled" }, ctx);
+  yield* plugin.native("ui_prompt_end", { type: "ui_prompt_end", kind: "input" }, ctx);
+  assert.equal(terminalOutput.at(-1), "\x1b]7501;app=pi:state=error\x1b\\", "Dialog resolution restores the latest native outcome, never stale working");
+  const beforeRpc = terminalOutput.length;
+  yield* plugin.native("agent_start", { type: "agent_start" }, { ...ctx, mode: "rpc" });
+  assert.equal(terminalOutput.length, beforeRpc, "TTY-backed RPC with UI must never receive OSC");
   assert.equal(sends, 1);
   const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, "native-session")), Journal);
   assert.equal(persisted.state.releases["task:1"], "intent");
@@ -70,7 +92,14 @@ test("native plugin persists intent before send and holds uncertain delivery aft
   yield* plugin.command('report {"taskId":"task","state":"HELD","result":{},"sessionId":"forged"}', ctx);
   assert.equal(requests, priorRequests, "Catalog rejects model-supplied session identity before remote execution");
   approval = false;
+  duringConfirm = () => Effect.runPromise(plugin.native("agent_before_settle", { type: "agent_before_settle", outcome: "error" }, ctx).pipe(
+    Effect.andThen(plugin.native("agent_settled", { type: "agent_settled" }, ctx)),
+  ));
+  const beforePermission = terminalOutput.length;
   yield* plugin.command('confirm {"taskId":"task","revision":1}', ctx);
+  assert.ok(terminalOutput.slice(beforePermission).includes("\x1b]7501;app=pi:state=blocked:kind=permission:msg=V2FpdGluZyBmb3IgcGVybWlzc2lvbg==\x1b\\"));
+  assert.equal(terminalOutput.at(-1), "\x1b]7501;app=pi:state=error\x1b\\", "Approval completion restores the outcome that changed while the real confirmation Promise was pending");
+  duringConfirm = undefined;
   yield* plugin.command('control {"taskId":"task","type":"get_messages"}', ctx);
   yield* plugin.command('control {"taskId":"task","type":"abort"}', ctx);
   assert.equal(requests, priorRequests, "Declined native approval must not reach the broker");
@@ -113,12 +142,13 @@ test("a refused startup heartbeat keeps scoped enrollment alive until the prior 
   });
   if (!("port" in server.address)) return yield* Effect.fail(new CommandError({ message: "Expected TCP server" }));
   yield* platform.fs.writeFileString(config, canonicalJson({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
-  const ctx: Context = { cwd: directory, hasUI: true, isIdle: () => true, hasPendingMessages: () => false,
+  const ctx: Context = { cwd: directory, mode: "rpc", hasUI: true, isIdle: () => true, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => "native-session", getSessionFile: () => undefined },
     ui: { notify: () => {}, confirm: async () => true } };
   const pluginContext = yield* Layer.build(Plugin.layer({ on: () => {}, registerCommand: () => {}, sendUserMessage: () => { assert.fail("Enrollment must not admit a prompt"); } }).pipe(
     Layer.provide(Layer.merge(Layer.succeed(Platform, platform), Layer.succeed(Mcp, mcp))),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
+    Layer.provide(Stdio.layerTest({})),
   ));
   const plugin = EffectContext.get(pluginContext, Plugin);
   if (!plugin) return yield* Effect.fail(new CommandError({ message: "Expected configured plugin" }));

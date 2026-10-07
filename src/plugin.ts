@@ -1,6 +1,8 @@
-import { Clock, Config, Context as EffectContext, Effect, Exit, Layer, ManagedRuntime, Option, Scope, Semaphore } from "effect";
+import { Clock, Config, Context as EffectContext, Effect, Exit, Layer, ManagedRuntime, Option, Scope, Semaphore, Stdio as EffectStdio, Stream } from "effect";
+import { Base64 } from "effect/encoding";
+import { NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { Commands, CommandError, PluginConfig, PluginDeclined, Json, type CommandCapabilities, type CommandInput, type Context, type Host, type PluginActive, type McpToolName } from "./contracts.ts";
+import { Commands, CommandError, PluginConfig, PluginDeclined, Json, type CommandCapabilities, type CommandInput, type Context, type Host, type PluginActive, type McpToolName, type NativeEventName } from "./contracts.ts";
 import { decodeJson, decodeEffect, canonicalJson, Mcp } from "./http.ts";
 import { Platform } from "./platform.ts";
 import { Journal } from "./journal.ts";
@@ -16,13 +18,79 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
   const config = decodeJson(PluginConfig, yield* platform.privateFile(path));
   if (!platform.path.isAbsolute(config.stateDirectory) || !platform.path.isAbsolute(config.tokenFile) || !["omp", "pi"].includes(config.host) || !/^[a-zA-Z0-9_.:-]{1,160}$/.test(config.machineId)) return yield* Effect.fail(new CommandError({ message: "Invalid coordinator configuration" }));
   const token = yield* platform.privateFile(config.tokenFile);
+  const stdio = yield* EffectStdio.Stdio;
+  const terminal = yield* stdio.stdoutIsTerminal;
+  const tui = (ctx: Context) => terminal && ctx.hasUI && ctx.mode === "tui";
+  let statusContext: Context | undefined;
+  let base: "idle" | "working" | "done" | "error" = "idle";
+  let outcome: "completed" | "aborted" | "error" = "completed";
+  let confirmations = 0;
+  let questions = 0;
+  const approvals = new Set<string>();
+  // ponytail: one bounded root record; no IDs, progress, titles or heartbeat.
+  const permissionMessage = Base64.encode("Waiting for permission");
+  const questionMessage = Base64.encode("Waiting for an answer");
+  const report = Effect.fn("Plugin.reportStatus")(function*(ctx: Context, clear = false) {
+    statusContext = ctx;
+    if (!tui(ctx)) return;
+    const permission = confirmations > 0 || approvals.size > 0;
+    const kind = permission ? "permission" : questions > 0 ? "question" : undefined;
+    const fields = clear ? "state=clear" : kind ? `state=blocked:kind=${kind}:msg=${permission ? permissionMessage : questionMessage}` : `state=${base}`;
+    yield* Stream.make(`\x1b]7501;app=${config.host}:${fields}\x1b\\`).pipe(Stream.run(stdio.stdout({ endOnDone: false })), Effect.catchCause(() => Effect.void));
+  });
+  const resetStatus = Effect.fn("Plugin.resetStatus")(function*(ctx: Context, exiting: boolean) {
+    const blocked = confirmations > 0 || approvals.size > 0 || questions > 0;
+    confirmations = 0;
+    questions = 0;
+    approvals.clear();
+    if (!exiting || blocked || (base !== "done" && base !== "error")) yield* report(ctx, true);
+    if (!exiting) { base = "idle"; outcome = "completed"; }
+  });
+  const native = Effect.fn("Plugin.nativeStatus")(function*(name: NativeEventName, event: unknown, ctx: Context) {
+    const data = typeof event === "object" && event !== null ? event : undefined;
+    if (name === "agent_start") { base = "working"; outcome = "completed"; }
+    if (name === "input") {
+      if (!ctx.isIdle()) return;
+      base = "idle";
+      outcome = "completed";
+    }
+    if (name === "turn_end" || name === "message_end") {
+      const message = data && "message" in data ? data.message : undefined;
+      if (typeof message === "object" && message !== null && "role" in message && message.role === "assistant" && "stopReason" in message) {
+        outcome = message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
+      }
+    }
+    if (name === "agent_before_settle" || name === "turn_end") {
+      if (data && "outcome" in data && (data.outcome === "completed" || data.outcome === "aborted" || data.outcome === "error")) outcome = data.outcome;
+    }
+    if (name === "agent_end") {
+      if (data && "willContinue" in data && data.willContinue === true) return;
+      // Pi >=0.80.4 settles after automatic retry/compaction/continuation.
+      if (config.host === "pi") return;
+      if (ctx.hasPendingMessages()) return;
+      base = outcome === "aborted" ? "idle" : outcome === "error" ? "error" : "done";
+    }
+    if (name === "agent_settled") base = outcome === "aborted" ? "idle" : outcome === "error" ? "error" : "done";
+    if (name === "tool_approval_requested" && tui(ctx) && data && "toolCallId" in data && typeof data.toolCallId === "string") approvals.add(data.toolCallId);
+    if (name === "tool_approval_resolved" && data && "toolCallId" in data && typeof data.toolCallId === "string") approvals.delete(data.toolCallId);
+    if (name === "ui_prompt_start" && tui(ctx) && data && "kind" in data && typeof data.kind === "string" && ["select", "confirm", "input", "editor", "custom"].includes(data.kind)) questions++;
+    if (name === "ui_prompt_end") questions = Math.max(0, questions - 1);
+    yield* report(ctx);
+  });
   const semaphore = yield* Semaphore.make(1);
   let active: PluginActive | undefined;
   let sessionScope: Scope.Closeable | undefined;
   const serial = <A, E>(effect: Effect.Effect<A, E>) => semaphore.withPermits(1)(effect);
   const call = <const M extends McpToolName>(method: M, params: unknown) => mcp.call(config.brokerUrl, token, method, params);
   const notify = (ctx: Context, text: string, level: "info" | "warning" | "error" = "info") => Effect.sync(() => ctx.ui.notify(text, level));
-  const confirm = (ctx: Context, title: string, text: string) => Effect.tryPromise(() => ctx.ui.confirm(title, text));
+  const confirm = (ctx: Context, title: string, text: string) => Effect.acquireUseRelease(
+    Effect.sync(() => { confirmations++; }),
+    () => report(ctx).pipe(Effect.andThen(Effect.tryPromise(() => ctx.ui.confirm(title, text)))),
+    () => Effect.gen(function*() {
+      confirmations = Math.max(0, confirmations - 1);
+      yield* report(ctx);
+    }),
+  );
   const local = Effect.fn("Plugin.local")(function*(ctx: Context) {
     return { repo: yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote),
       ref: (yield* platform.exec(ChildProcess.make("git", ["rev-parse", "--symbolic-full-name", "HEAD"], { cwd: ctx.cwd }))).trim(),
@@ -86,9 +154,14 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
       Effect.catchCause(() => notify(previous.ctx, "Coordinator stop unavailable; prior enrollment expires by heartbeat lease.", "warning"))
     );
   });
-  yield* Effect.addFinalizer(() => serial(stop()));
+  yield* Effect.addFinalizer(() => Effect.gen(function*() {
+    if (statusContext) yield* resetStatus(statusContext, true);
+    yield* serial(stop());
+  }));
   const start = Effect.fn("Plugin.start")((ctx: Context) => serial(Effect.gen(function*() {
     yield* stop();
+    yield* resetStatus(ctx, false);
+    yield* report(ctx);
     const sessionId = ctx.sessionManager.getSessionId();
     sessionScope = yield* Scope.make();
     const context = yield* Layer.buildWithScope(Journal.layer(config.stateDirectory, sessionId).pipe(Layer.provide(Layer.succeed(Platform, platform))), sessionScope);
@@ -195,7 +268,7 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
     Effect.catch((error) => error instanceof PluginDeclined ? Effect.void : Effect.fail(error)),
     Effect.catchCause(() => notify(ctx, "Coordinator command failed; no automatic retry. Check exact JSON fields, authorization and connection.", "error")),
   )));
-  return { config, start, stop: () => serial(stop()), command };
+  return { config, start, stop: () => serial(stop()), command, native };
 });
 
 export class Plugin extends EffectContext.Service<Plugin>()("coordinator/Plugin", { make: makePlugin }) {
@@ -204,7 +277,7 @@ export class Plugin extends EffectContext.Service<Plugin>()("coordinator/Plugin"
 
 // This initializer and native SDK callbacks are the only Promise/runtime boundary.
 export default async function coordinator(host: Host): Promise<void> {
-  const layer = Plugin.layer(host).pipe(Layer.provide(Layer.merge(Platform.layer, Mcp.layer)));
+  const layer = Plugin.layer(host).pipe(Layer.provide(Layer.merge(Platform.layer, Mcp.layer)), Layer.provide(NodeServices.layer));
   let runtime = ManagedRuntime.make(layer);
   try {
     const initial = await runtime.runPromise(Plugin);
@@ -216,6 +289,15 @@ export default async function coordinator(host: Host): Promise<void> {
     };
     host.on("session_start", start);
     if (initial.config.host === "omp") host.on("session_switch", start);
+    const observe = (name: NativeEventName) => host.on(name, async (event, ctx): Promise<void> => {
+      if (!disposed) await runtime.runPromise(Plugin.use((plugin) => plugin ? plugin.native(name, event, ctx) : Effect.void));
+    });
+    for (const name of ["input", "agent_start", "agent_end", "turn_end", "message_end"] satisfies NativeEventName[]) observe(name);
+    if (initial.config.host === "pi") {
+      for (const name of ["agent_before_settle", "agent_settled", "ui_prompt_start", "ui_prompt_end"] satisfies NativeEventName[]) observe(name);
+    } else {
+      for (const name of ["tool_approval_requested", "tool_approval_resolved"] satisfies NativeEventName[]) observe(name);
+    }
     host.on("session_shutdown", async () => { await runtime.dispose(); disposed = true; });
     host.registerCommand("coordinator", { description: "Coordinator: explicit addressed dispatch, status, consent and runner-owned control (JSON arguments)", handler: (args, ctx) => runtime.runPromise(Plugin.use((plugin) => plugin ? plugin.command(args, ctx) : Effect.void)) });
   } catch (error) { await runtime.dispose(); throw error; }

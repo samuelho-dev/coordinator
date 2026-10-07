@@ -179,6 +179,7 @@ export const NativeResponse = Schema.Union([NativeFrame, Schema.Struct({ type: S
 // Pi and omp expose this minimal structural subset; no runtime host dependency.
 export const Context = Schema.Struct({
   cwd: Schema.String, hasUI: Schema.Boolean,
+  mode: Schema.Literals(["tui", "rpc", "json", "print"]),
   isIdle: Schema.declare<() => boolean>((value): value is () => boolean => typeof value === "function"),
   hasPendingMessages: Schema.declare<() => boolean>((value): value is () => boolean => typeof value === "function"),
   sessionManager: Schema.Struct({
@@ -191,8 +192,10 @@ export const Context = Schema.Struct({
   }),
 });
 export type Context = typeof Context.Type;
+export const NativeEventName = Schema.Literals(["session_start", "session_shutdown", "session_switch", "input", "agent_start", "agent_end", "turn_end", "message_end", "agent_before_settle", "agent_settled", "ui_prompt_start", "ui_prompt_end", "tool_approval_requested", "tool_approval_resolved"]);
+export type NativeEventName = typeof NativeEventName.Type;
 export const Host = Schema.Struct({
-  on: Schema.declare<(event: "session_start" | "session_shutdown" | "session_switch", handler: (event: unknown, ctx: Context) => Promise<void>) => unknown>((value): value is (event: "session_start" | "session_shutdown" | "session_switch", handler: (event: unknown, ctx: Context) => Promise<void>) => unknown => typeof value === "function"),
+  on: Schema.declare<(event: NativeEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown>((value): value is (event: NativeEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown => typeof value === "function"),
   registerCommand: Schema.declare<(name: string, options: { description: string; handler: (args: string, ctx: Context) => Promise<void> }) => void>((value): value is (name: string, options: { description: string; handler: (args: string, ctx: Context) => Promise<void> }) => void => typeof value === "function"),
   sendUserMessage: Schema.declare<(text: string, options: { deliverAs: "followUp" }) => void>((value): value is (text: string, options: { deliverAs: "followUp" }) => void => typeof value === "function"),
 });
