@@ -143,7 +143,9 @@ const runHostSmoke = () => Effect.gen(function*() {
     const tokenFile = join(home, "native.token"), endpointFile = join(home, "endpoint.json"), configFile = join(home, "native-plugin.json");
     yield* fs.writeFileString(tokenFile, token, { flag: "wx", mode: 0o600 });
     yield* fs.writeFileString(configFile, yield* Schema.encodeEffect(Schema.fromJsonString(NativePluginConfig))({ host, endpointFile, tokenFile }), { flag: "wx", mode: 0o600 });
-    const brokerTokenFile = join(home, "broker.token"), pluginConfigFile = join(home, "coordinator-plugin.json"), stateDirectory = join(home, "coordinator-state");
+    const pluginDirectory = join(env.XDG_CONFIG_HOME, "coordinator");
+    yield* fs.makeDirectory(pluginDirectory, { recursive: true, mode: 0o700 });
+    const brokerTokenFile = join(home, "broker.token"), pluginConfigFile = join(pluginDirectory, "plugin.json"), stateDirectory = join(home, "coordinator-state");
     yield* fs.writeFileString(brokerTokenFile, sessionToken, { flag: "wx", mode: 0o600 });
     yield* fs.writeFileString(pluginConfigFile, yield* Schema.encodeEffect(Schema.fromJsonString(PluginConfig))({
       brokerUrl, tokenFile: brokerTokenFile, machineId: MachineId.make(`stock-${host}`), stateDirectory, host,
@@ -152,7 +154,7 @@ const runHostSmoke = () => Effect.gen(function*() {
     const client = yield* connectNativeClient({
       host, command: binary, args: ["--mode", "rpc", "--session-dir", sessions, "--no-extensions", "--model", "coordinator-scripted/scripted",
         ...(host === "omp" ? ["--no-ui"] : []), "-e", join(root, "dist/plugins/plugin.js")],
-      cwd: root, env: { ...env, COORDINATOR_CONFIG: pluginConfigFile, COORDINATOR_NATIVE_CONFIG: configFile }, connectTimeoutMs: 60000, plugin: { endpointFile, token },
+      cwd: root, env: { ...env, COORDINATOR_NATIVE_CONFIG: configFile }, connectTimeoutMs: 60000, plugin: { endpointFile, token },
     }).pipe(Effect.provideService(Scope.Scope, scope));
     yield* Effect.gen(function*() {
       const state = yield* client.call("native.get_state", { binding: client.binding }, { timeoutMs: 10000 });

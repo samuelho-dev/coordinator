@@ -11,7 +11,7 @@ import { CommandError, HttpError, Task, Principal, PluginConfig, JournalReleaseK
 import type { Context, BrokerRequest } from "../src/contracts.ts";
 import { Plugin } from "../src/plugin.ts";
 
-test("owned SDK identity fences durable delivery, outcomes and private terminal metadata", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+test("ordinary host startup discovers private plugin config and fences owned SDK delivery", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
   const mcp = yield* Mcp;
   const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-plugin-" });
@@ -28,7 +28,9 @@ test("owned SDK identity fences durable delivery, outcomes and private terminal 
   yield* platform.exec(ChildProcess.make("git", ["-c", "user.name=Coordinator Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "test"], { cwd: directory }));
   yield* platform.exec(ChildProcess.make("git", ["remote", "add", "origin", "https://github.com/example/repo.git"], { cwd: directory }));
   const sha = (yield* platform.exec(ChildProcess.make("git", ["rev-parse", "HEAD"], { cwd: directory }))).trim();
-  const stateDirectory = platform.path.join(directory, "state"), tokenFile = platform.path.join(directory, "token"), config = platform.path.join(directory, "config.json");
+  const stateDirectory = platform.path.join(directory, "state"), tokenFile = platform.path.join(directory, "token");
+  const configDirectory = platform.path.join(directory, "config", "coordinator"), config = platform.path.join(configDirectory, "plugin.json");
+  yield* platform.fs.makeDirectory(configDirectory, { recursive: true, mode: 0o700 });
   yield* platform.fs.writeFileString(tokenFile, "test-token", { mode: 0o600 });
   const terminalOutput: string[] = [], notifications: string[] = [];
   const ctx: Context = { cwd: directory, mode: "tui", hasUI: true, model: { provider: "coordinator-unavailable", id: "unavailable" },
@@ -77,8 +79,8 @@ test("owned SDK identity fences durable delivery, outcomes and private terminal 
   } }), { mode: 0o600 });
   yield* platform.fs.writeFileString(config, Schema.encodeUnknownSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
   const service = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
-    Layer.provide(Layer.merge(Layer.succeed(Platform, platform), Layer.succeed(Mcp, mcp))),
-    Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
+    Layer.provide(Layer.succeed(Platform, platform)),
+    Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ XDG_CONFIG_HOME: platform.path.join(directory, "config") }))),
     Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(true), stdout: () => Sink.forEach((chunk: string | Uint8Array) => Effect.sync(() => { if (typeof chunk === "string") terminalOutput.push(chunk); })) })),
   )), Plugin);
   assert.ok(service);
@@ -137,7 +139,7 @@ test("a refused startup heartbeat retains scoped enrollment until its lease fenc
   const ctx: Context = { cwd: directory, mode: "rpc", hasUI: false,
     sessionManager: { getSessionId: () => "parent-session" }, ui: { notify: () => {}, confirm: async () => false } };
   const plugin = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
-    Layer.provide(Layer.merge(Layer.succeed(Platform, platform), Layer.succeed(Mcp, mcp))),
+    Layer.provide(Layer.succeed(Platform, platform)),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
     Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(false) })),
   )), Plugin);
@@ -151,3 +153,20 @@ test("a refused startup heartbeat retains scoped enrollment until its lease fenc
   yield* Effect.sleep("1200 millis");
   assert.equal(polls, stoppedPolls, "Retirement cancels periodic polling");
 })).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer)))));
+
+test("unconfigured hosts stay disabled but present insecure or malformed plugin config fails closed", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+  const platform = yield* Platform;
+  const home = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-config-" });
+  const directory = platform.path.join(home, ".config", "coordinator"), config = platform.path.join(directory, "plugin.json");
+  const layer = Plugin.layer.pipe(
+    Layer.provide(Layer.succeed(Platform, platform)),
+    Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ HOME: home }))),
+    Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(false) })),
+  );
+  assert.equal(EffectContext.get(yield* Layer.build(layer), Plugin), undefined);
+  yield* platform.fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
+  yield* platform.fs.writeFileString(config, "{}", { mode: 0o644 });
+  assert.equal((yield* Effect.exit(Layer.build(layer)))._tag, "Failure", "Present public-readable enrollment must not silently disable the plugin");
+  yield* platform.fs.chmod(config, 0o600);
+  assert.equal((yield* Effect.exit(Layer.build(layer)))._tag, "Failure", "Present malformed enrollment must not silently disable the plugin");
+})).pipe(Effect.provide(Platform.layer))));

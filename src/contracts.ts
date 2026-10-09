@@ -117,9 +117,9 @@ export const RunnerConfig = Schema.Struct({
   childUidBase: UserId.check(Schema.isBetween({ minimum: 1000000, maximum: 0xffffffff - 1000000 })),
 });
 export type RunnerConfig = typeof RunnerConfig.Type;
-export const PluginConfig = Schema.Struct({ brokerUrl: Schema.String, tokenFile: Schema.String, machineId: MachineId, stateDirectory: Schema.String, selectedRemote: Schema.optional(Schema.String), host: Schema.Literals(["omp", "pi"]) });
-export type PluginConfig = typeof PluginConfig.Type;
 export const ConnectHosts = Schema.Record(Schema.String, Schema.String);
+export const PluginConfig = Schema.Struct({ brokerUrl: Schema.String, tokenFile: Schema.String, machineId: MachineId, stateDirectory: Schema.String, selectedRemote: Schema.optional(Schema.String), host: Schema.Literals(["omp", "pi"]), connectHosts: Schema.optional(ConnectHosts) });
+export type PluginConfig = typeof PluginConfig.Type;
 
 export const Session = Schema.Struct({ sessionId: SessionId, incarnation: IncarnationId, machineId: MachineId, host: Schema.Literals(["pi", "omp"]), repo: Repo, workerId: Schema.optional(WorkerId) });
 export type Session = typeof Session.Type;
@@ -251,9 +251,8 @@ export const InstallCommand = Schema.Struct({ binary: Schema.String, args: Schem
 export type InstallCommand = typeof InstallCommand.Type;
 export const InstallPlan = Schema.Struct({
   dryRun: Schema.Boolean, mode: Schema.Literals(["plugin-only", "runner-only"]),
-  service: Schema.optional(Schema.String), launcher: Schema.optional(Schema.String),
+  service: Schema.optional(Schema.String), pluginConfig: Schema.optional(Schema.String),
   program: strings, operations: Schema.mutable(Schema.Array(InstallCommand)),
-  pluginEnvironment: Schema.optional(Schema.Struct({ COORDINATOR_CONFIG: Schema.String })),
   host: Schema.optional(Schema.Literals(["omp", "pi"])), package: Schema.String,
 });
 export type InstallPlan = typeof InstallPlan.Type;

@@ -77,10 +77,10 @@ const installHost = Effect.fnUntraced(function*(flags: CommandInput<"program.ins
     yield* installerPrivateFile(config.tokenFile);
     if ((yield* fs.stat(dirname(config.tokenFile))).mode & 0o077) return yield* new CommandError({ message: "Private token directory required" });
   }
-  const program = [runtime, "--import", loader, join(root, "src/main.ts"), "runner"];
+  const program = pluginOnly ? [binary] : [runtime, "--import", loader, join(root, "src/main.ts"), "runner"];
   const commands: InstallCommand[] = plugin ? [{ binary, args: host === "omp" ? ["plugin", "link", root] : ["install", root] }] : [];
-  const launcher = plugin ? join(yield* Config.String("HOME"), ".local/bin", `coordinator-${host}`) : undefined;
-  const wrapper = pluginPath ? `#!/bin/sh\nexport COORDINATOR_CONFIG=${shellQuote(pluginPath)}\nexec ${shellQuote(binary)} "$@"\n` : undefined;
+  const configDirectory = plugin ? yield* Config.option(Config.String("XDG_CONFIG_HOME")) : Option.none<string>();
+  const installedConfig = plugin ? join(Option.isSome(configDirectory) ? configDirectory.value : join(yield* Config.String("HOME"), ".config"), "coordinator", "plugin.json") : undefined;
   let service: string | undefined;
   let content = "";
   if (runner && runnerPath) {
@@ -156,16 +156,18 @@ await E.runPromise(E.gen(function*() {
       yield* fs.makeDirectory(dirname(service), { recursive: true, mode: 0o700 });
       yield* fs.writeFileString(service, content, { mode: 0o600 });
     }
-    if (launcher && wrapper) {
-      yield* fs.makeDirectory(dirname(launcher), { recursive: true, mode: 0o700 });
-      yield* fs.writeFileString(launcher, wrapper, { mode: 0o700 });
+    if (plugin && installedConfig) {
+      yield* fs.makeDirectory(dirname(installedConfig), { recursive: true, mode: 0o700 });
+      if ((yield* fs.stat(dirname(installedConfig))).mode & 0o077) return yield* new CommandError({ message: "Private plugin configuration directory required" });
+      if (yield* fs.exists(installedConfig)) yield* installerPrivateFile(installedConfig);
+      yield* fs.writeFileString(installedConfig, yield* Schema.encodeEffect(Schema.fromJsonString(PluginConfig))(plugin), { mode: 0o600 });
     }
     for (const command of commands) yield* platform.exec(ChildProcess.make(command.binary, command.args, { cwd: root })).pipe(
       Effect.mapError(() => new CommandError({ message: `Installer operation failed: ${command.binary}; subprocess output suppressed to protect secrets` })),
     );
   }
   // Print only paths and operation plans, never config contents, tokens, or host subprocess output.
-  const plan: InstallPlan = { dryRun: dry, mode: pluginOnly ? "plugin-only" : "runner-only", service, launcher, program, operations: commands, ...(pluginPath ? { pluginEnvironment: { COORDINATOR_CONFIG: pluginPath } } : {}), host, package: root };
+  const plan: InstallPlan = { dryRun: dry, mode: pluginOnly ? "plugin-only" : "runner-only", service, pluginConfig: installedConfig, program, operations: commands, host, package: root };
   yield* Console.log(Schema.encodeUnknownSync(Schema.fromJsonString(InstallPlan, { space: 2 }), { onExcessProperty: "error" })(plan));
   return plan;
 });

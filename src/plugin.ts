@@ -1,8 +1,8 @@
-import { Cause, Clock, Config, Context as EffectContext, Crypto, Effect, Exit, Layer, ManagedRuntime, Option, PlatformError, Schema, Scope, Semaphore, Stdio as EffectStdio, Stream } from "effect";
+import { Cause, Clock, Config, ConfigProvider, Context as EffectContext, Crypto, Effect, Exit, Layer, ManagedRuntime, Option, PlatformError, Schema, Scope, Semaphore, Stdio as EffectStdio, Stream } from "effect";
 import { Base64, Hex } from "effect/encoding";
 import { NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { Commands, CommandError, HttpError, PluginConfig, PluginDeclined, Json, SessionId, IncarnationId, WorkerId, Sha, JournalHandledKey, JournalReleaseKey } from "./contracts.ts";
+import { Commands, CommandError, ConnectHosts, HttpError, PluginConfig, PluginDeclined, Json, SessionId, IncarnationId, WorkerId, Sha, JournalHandledKey, JournalReleaseKey } from "./contracts.ts";
 import type { CommandCapabilities, CommandInput, Context, Host, McpToolName, Repo } from "./contracts.ts";
 import { NativeEventSequence, NativePluginConfig, NativeSubmissionId, nativeEventsUri } from "@samuelho/coordinator-native-control/contracts";
 import type { NativeLifecycleEvent } from "@samuelho/coordinator-native-control/contracts";
@@ -21,14 +21,25 @@ const display = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown, {
 const pluginCommands = Object.entries(Commands).filter((entry): entry is [string, Extract<(typeof Commands)[keyof typeof Commands], { target: "plugin" }>] => entry[1].target === "plugin");
 const makePlugin = Effect.fn("Plugin.make")(function*() {
   const platform = yield* Platform;
-  const mcp = yield* Mcp;
   const configuredPath = yield* Config.option(Config.String("COORDINATOR_CONFIG"));
-  if (Option.isNone(configuredPath)) return undefined;
-  const path = configuredPath.value;
-  if (!platform.path.isAbsolute(path)) return yield* Effect.fail(new CommandError({ message: "COORDINATOR_CONFIG must be absolute" }));
+  let path: string;
+  if (Option.isSome(configuredPath)) path = configuredPath.value;
+  else {
+    const configuredDirectory = yield* Config.option(Config.String("XDG_CONFIG_HOME"));
+    const directory = Option.isSome(configuredDirectory) ? configuredDirectory.value : platform.path.join(yield* Config.String("HOME"), ".config");
+    path = platform.path.join(directory, "coordinator", "plugin.json");
+  }
+  if (!platform.path.isAbsolute(path)) return yield* Effect.fail(new CommandError({ message: "Coordinator configuration path must be absolute" }));
+  if (Option.isNone(configuredPath) && !(yield* platform.fs.exists(path))) return undefined;
   const config = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(PluginConfig), { onExcessProperty: "error" })(yield* platform.privateFile(path));
   if (!platform.path.isAbsolute(config.stateDirectory) || !platform.path.isAbsolute(config.tokenFile) || !["omp", "pi"].includes(config.host) || !/^[a-zA-Z0-9_.:-]{1,160}$/.test(config.machineId)) return yield* Effect.fail(new CommandError({ message: "Invalid coordinator configuration" }));
   const token = yield* platform.privateFile(config.tokenFile);
+  const connectHosts = config.connectHosts === undefined
+    ? yield* Config.String("COORDINATOR_CONNECT_HOSTS_JSON").pipe(Config.withDefault("{}"))
+    : yield* Schema.encodeEffect(Schema.fromJsonString(ConnectHosts))(config.connectHosts);
+  const mcp = EffectContext.get(yield* Layer.build(Mcp.layer.pipe(Layer.provide(ConfigProvider.layer(
+    ConfigProvider.fromUnknown({ COORDINATOR_CONNECT_HOSTS_JSON: connectHosts }),
+  )))), Mcp);
   const stdio = yield* EffectStdio.Stdio;
   const terminal = yield* stdio.stdoutIsTerminal;
   const tui = (ctx: Context) => terminal && ctx.hasUI && ctx.mode === "tui" && ctx.agent?.kind !== "sub";
@@ -320,7 +331,7 @@ export class Plugin extends EffectContext.Service<Plugin>()("coordinator/Plugin"
 
 // Public extension callbacks are the only Promise/runtime boundary.
 export default async function coordinator(host: Host): Promise<void> {
-  const layer = Plugin.layer.pipe(Layer.provide(Layer.merge(Platform.layer, Mcp.layer)), Layer.provide(NodeServices.layer));
+  const layer = Plugin.layer.pipe(Layer.provide(Platform.layer), Layer.provide(NodeServices.layer));
   let runtime = ManagedRuntime.make(layer);
   try {
     const initial = await runtime.runPromise(Plugin);
