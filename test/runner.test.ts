@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { Clock, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
@@ -18,7 +19,7 @@ const common = Layer.merge(Platform.layer, Mcp.layer);
 const request = (method: string, params: unknown) => Schema.decodeUnknownSync(RunnerRequest, { onExcessProperty: "error" })({ method, params });
 const boundaryStatus = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(Effect.match({ onSuccess: () => 200, onFailure: (error) => error instanceof HttpError ? error.status : 500 }));
 
-async function fixture(slots = 1, hostMode = "complete") {
+async function fixture(slots = 1, hostMode = "complete", phase: (name: string) => void = () => {}) {
   const services = ManagedRuntime.make(common);
   const platform = await services.runPromise(Platform);
   const rpc = await services.runPromise(Mcp);
@@ -172,7 +173,7 @@ if (process.argv.includes("--version")) {
   async function open(input = config, servicesLayer = common) {
     const runtime = ManagedRuntime.make(Runner.layer(input).pipe(Layer.provide(servicesLayer))); runtimes.add(runtime);
     const service = await runtime.runPromise(Runner);
-    return { service, async close() { await runtime.dispose(); runtimes.delete(runtime); }, call(method: string, params: unknown, bearer = control) { return runtime.runPromise(service.handle(request(method, params), bearer)); }, status(method: string, params: unknown, bearer = control) { return runtime.runPromise(boundaryStatus(service.handle(request(method, params), bearer))); } };
+    return { service, async close() { phase("runner.dispose.start"); await runtime.dispose(); runtimes.delete(runtime); phase("runner.dispose.done"); }, call(method: string, params: unknown, bearer = control) { return runtime.runPromise(service.handle(request(method, params), bearer)); }, status(method: string, params: unknown, bearer = control) { return runtime.runPromise(boundaryStatus(service.handle(request(method, params), bearer))); } };
   }
   const ready = (runner: Runner["Service"], taskId = work.taskId) => run(Effect.gen(function*() {
     for (;;) {
@@ -193,15 +194,29 @@ if (process.argv.includes("--version")) {
     outage(value: boolean) { unavailable = value; },
     async fence() { gate = { reached: await run(Deferred.make<void>()), proceed: await run(Deferred.make<void>()) }; taskReads = 0; return gate; },
     async close() {
+      phase("fixture.gate.release.start");
       if (gate) await run(Deferred.succeed(gate.proceed, undefined));
+      phase("fixture.gate.release.done");
+      phase("fixture.runners.dispose.start");
       for (const runtime of runtimes) await runtime.dispose();
+      runtimes.clear();
+      phase("fixture.runners.dispose.done");
+      phase("fixture.proxy.dispose.start");
       await proxyRuntime.dispose();
+      phase("fixture.proxy.dispose.done");
+      phase("fixture.broker.dispose.start");
       await brokerRuntime.dispose();
+      phase("fixture.broker.dispose.done");
+      phase("fixture.root.remove.start");
       await run(fs.remove(root, { recursive: true, force: true }));
+      phase("fixture.root.remove.done");
+      phase("fixture.services.dispose.start");
       await services.dispose();
+      phase("fixture.services.dispose.done");
     }
   };
 }
+
 
 
 test("kernel ownership loss interrupts blocked startup before recovery can overwrite a replacement", async () => {
@@ -509,33 +524,58 @@ test("runner refuses overlapping child roots and model seeds containing session 
 
 test("native missing admission, resource gaps and transport loss hold durable intent without replay", async (t) => {
   for (const mode of ["missing-admission", "gap", "transport"]) await t.test(mode, async () => {
-    const f = await fixture(1, mode);
+    // Fixed, metadata-only boundaries remain visible even when disposal never resolves.
+    const phase = (name: string) => process.stderr.write(`[native-held:${mode}] ${name} ${Date.now()}\n`);
+    phase("fixture.open.start");
+    const f = await fixture(1, mode, phase);
+    phase("fixture.open.done");
     try {
       let runner = await f.open();
+      phase("runner.open.done");
+      phase("accept.start");
       await runner.call("acceptTask", f.work);
+      phase("accept.done");
+      phase("ready.start");
       const ready = await f.ready(runner.service);
+      phase("ready.done");
+      assert.ok(ready.pid, "READY owns a real native child");
       const address = Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(ready.address!);
       await f.save(f.work, { address, readback: address, confirmedRevision: address.revision, disposition: "ready" });
+      phase("release.start");
       await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
+      phase("release.rejected");
       const held = (await f.run(runner.service.row(f.work.taskId)))!;
       assert.equal(held.state, "HELD");
       assert.ok(held.promptId);
       assert.equal(held.result, null, "Unproven terminal work has no persisted result");
+      phase("duplicate.release.start");
       await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
+      phase("duplicate.release.rejected");
       assert.equal((await f.run(runner.service.row(f.work.taskId)))!.promptId, held.promptId);
       if (mode === "transport") await f.run(Effect.gen(function*() {
         for (;;) { if ((yield* runner.service.row(f.work.taskId))?.occupied === 0) return; yield* Effect.sleep("10 millis"); }
       }).pipe(Effect.timeout("15 seconds")));
       else assert.equal(held.occupied, 1, "A protocol failure is not physical process closure");
       await runner.close();
+      assert.throws(() => process.kill(ready.pid!, 0), { code: "ESRCH" }, "Disposal must reap the actual native child before restart");
+      phase("restart.start");
       runner = await f.open();
+      phase("restart.done");
       const recovered = (await f.run(runner.service.row(f.work.taskId)))!;
       assert.equal(recovered.state, "HELD");
       assert.equal(recovered.promptId, held.promptId);
       assert.equal(recovered.nativeBinding, held.nativeBinding);
       assert.equal(recovered.result, null);
+      assert.throws(() => process.kill(ready.pid!, 0), { code: "ESRCH" }, "Recovery must not replay the old native child");
+      phase("recovered.release.start");
       await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
-    } finally { await f.close(); }
+      phase("recovered.release.rejected");
+    } finally {
+      phase("fixture.close.start");
+      await f.close();
+      assert.equal(existsSync(f.root), false, "All fixture scopes close before the private root is removed");
+      phase("fixture.close.done");
+    }
   });
 });
 
