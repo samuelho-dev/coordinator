@@ -4,7 +4,7 @@ import { Clock, Deferred, Effect, Fiber, Layer, ManagedRuntime, Schema } from "e
 import { HttpClient, HttpClientResponse } from "effect/http";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { Broker } from "../src/broker.ts";
-import { Commands, HttpError, JsonValue, Task, Address, BrokerConfig, Work, Repo, Sha, TaskId, MessageId, RunnerId, SessionId, IncarnationId, MachineId, WorkerId, PrincipalId, OwnerId, ReportState, type ArchiveEntry, type ArchiveRow, type CommandInput } from "../src/contracts.ts";
+import { Commands, HttpError, JsonValue, Task, Address, BrokerConfig, Work, Repo, Sha, TaskId, MessageId, RunnerId, SessionId, IncarnationId, MachineId, WorkerId, PrincipalId, OwnerId, ReportState, type ArchiveEntry, type ArchiveRow, type CommandInput, type CommandOutput } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
 import { Mcp } from "../src/http.ts";
@@ -340,12 +340,14 @@ test("broker restart preserves RPC delivery, release fences and consented JSONL 
 
     await restart();
     assert.deepEqual(await setup.runPromise(mcp.call(url, coordinator, "task.get", { taskId: work.taskId })), beforeRestartTask);
+    assert.deepEqual((await setup.runPromise(mcp.call(url, peer, "session.list", {}))).sessions, [{ ...session, status: "stale", liveUntil: 0 }]);
     await reject(409, mcp.call(url, peer, "session.poll", key));
     await reject(409, mcp.call(url, coordinator, "peer.send", message));
     // Startup invalidates liveness, not incarnation; explicitly restore and poll the same binding.
     await setup.runPromise(mcp.call(url, peer, "session.heartbeat", session));
     const after = await setup.runPromise(mcp.call(url, peer, "session.poll", key));
     assert.deepEqual(after, { ...before, archiveEnabled: true });
+    assert.deepEqual((await setup.runPromise(mcp.call(url, peer, "session.list", {}))).sessions, [{ ...session, status: "live", liveUntil: now + 30000 }]);
     assert.deepEqual(await setup.runPromise(mcp.call(url, coordinator, "peer.send", message)), sent);
     await reject(409, mcp.call(url, coordinator, "peer.send", { ...message, payload: "conflicting replay" }));
     assert.deepEqual(await setup.runPromise(mcp.call(url, coordinator, "task.submit", work)), confirmed);
@@ -404,5 +406,87 @@ test("broker restart preserves RPC delivery, release fences and consented JSONL 
       try { await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true })); }
       finally { await setup.dispose(); }
     }
+  }
+});
+
+test("session discovery isolates owners and repositories, pages every participant, and reflects liveness", async () => {
+  const base = Layer.merge(Platform.layer, Mcp.layer);
+  const setup = ManagedRuntime.make(base);
+  const platform = await setup.runPromise(Platform);
+  const root = await setup.runPromise(platform.fs.makeTempDirectory({ prefix: "coordinator-sessions-" }));
+  const clock = await setup.runPromise(Clock.Clock);
+  let now = await setup.runPromise(Clock.currentTimeMillis);
+  const services = Layer.merge(base, Layer.succeed(Clock.Clock, {
+    currentTimeMillis: Effect.sync(() => now), currentTimeMillisUnsafe: () => now,
+    currentTimeNanos: clock.currentTimeNanos, currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
+    monotonicTimeNanos: clock.monotonicTimeNanos, monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+    sleep: (duration) => clock.sleep(duration),
+  }));
+  const hiddenRepo = Repo.make("github.com/test/private");
+  const config = Schema.decodeUnknownSync(BrokerConfig)({
+    database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0,
+    backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
+    repositoryIds: Object.fromEntries([[repo, 42], [hiddenRepo, 43]]),
+    principals: [
+      { id: "coordinator", owner: "owner", roles: ["coordinator"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(coordinator)) },
+      { id: "peer", owner: "owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(peer)) },
+      { id: "foreign", owner: "other-owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest("foreign")) },
+      { id: "restricted", owner: "owner", roles: ["session"], repos: [hiddenRepo], tokenHash: await setup.runPromise(platform.digest("restricted")) },
+      { id: "reviewer", owner: "owner", roles: ["reviewer"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(reviewer)) },
+    ],
+  });
+  const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provideMerge(services)));
+  try {
+    const broker = await runtime.runPromise(Broker);
+    const bound = broker.server.address;
+    if (bound._tag !== "InetAddressV4") throw new Error("Expected IPv4 TCP server");
+    const url = `http://127.0.0.1:${bound.port}`, mcp = await setup.runPromise(Mcp);
+    const principal = await runtime.runPromise(broker.authorize(peer));
+    const expected: CommandOutput<"plugin.sessions"> = [];
+    for (let index = 0; index < 110; index++) {
+      const session: CommandInput<"session.heartbeat"> = {
+        sessionId: SessionId.make(`session-${index.toString().padStart(3, "0")}-${"s".repeat(140)}`),
+        incarnation: IncarnationId.make("i".repeat(160)), machineId: MachineId.make(`machine-${index}-${"m".repeat(140)}`),
+        workerId: WorkerId.make(`worker-${index}-${"w".repeat(140)}`), host: index % 2 === 0 ? "omp" : "pi", repo,
+      };
+      await runtime.runPromise(broker.handle(principal, { method: "session.heartbeat", params: session }));
+      await runtime.runPromise(broker.handle(principal, { method: "session.poll", params: { sessionId: session.sessionId, incarnation: session.incarnation } }));
+      expected.push({ ...session, status: "live", liveUntil: now + 30000 });
+    }
+    const first = expected[0];
+    assert.ok(first);
+    for (const token of ["foreign", "restricted"]) {
+      await setup.runPromise(mcp.call(url, token, "session.heartbeat", {
+        sessionId: SessionId.make(token), incarnation: IncarnationId.make(token), machineId: MachineId.make(token),
+        host: "pi", repo: token === "restricted" ? hiddenRepo : repo,
+      }));
+    }
+    const listed: CommandOutput<"plugin.sessions"> = [];
+    let cursor: SessionId | undefined, pages = 0;
+    do {
+      const page = await setup.runPromise(mcp.call(url, coordinator, "session.list", cursor === undefined ? {} : { cursor }));
+      listed.push(...page.sessions);
+      cursor = page.nextCursor;
+      pages++;
+    } while (cursor !== undefined);
+    assert.ok(pages > 1, "A registry exceeding the MCP byte budget must be completely paginated");
+    assert.deepEqual(listed, expected, "Only authorized public session metadata may leave the broker");
+    assert.deepEqual((await setup.runPromise(mcp.call(url, "foreign", "session.list", {}))).sessions.map((session) => session.sessionId), ["foreign"]);
+    assert.deepEqual((await setup.runPromise(mcp.call(url, "restricted", "session.list", {}))).sessions.map((session) => session.sessionId), ["restricted"]);
+    assert.equal(await setup.runPromise(mcp.call(url, reviewer, "session.list", {}).pipe(Effect.catchTag("HttpError", (error) => Effect.succeed(error.status)))), 403);
+    now += 10001;
+    assert.equal((await setup.runPromise(mcp.call(url, peer, "session.list", {}))).sessions[0]?.status, "stale");
+    await setup.runPromise(mcp.call(url, peer, "session.heartbeat", {
+      sessionId: first.sessionId, incarnation: first.incarnation, machineId: first.machineId, host: first.host, repo: first.repo, workerId: first.workerId,
+    }));
+    assert.equal((await setup.runPromise(mcp.call(url, peer, "session.list", {}))).sessions[0]?.status, "stale", "Heartbeat alone must not imply active polling");
+    await setup.runPromise(mcp.call(url, peer, "session.poll", { sessionId: first.sessionId, incarnation: first.incarnation }));
+    assert.equal((await setup.runPromise(mcp.call(url, peer, "session.list", {}))).sessions[0]?.status, "live");
+    now += 30000;
+    assert.equal((await setup.runPromise(mcp.call(url, peer, "session.list", {}))).sessions[0]?.status, "stale");
+  } finally {
+    await runtime.dispose();
+    await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true }));
+    await setup.dispose();
   }
 });

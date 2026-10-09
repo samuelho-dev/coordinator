@@ -3,7 +3,7 @@ import { Base64, Hex } from "effect/encoding";
 import { NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
 import { Commands, CommandError, ConnectHosts, HttpError, PluginConfig, PluginDeclined, Json, SessionId, IncarnationId, WorkerId, Sha, JournalHandledKey, JournalReleaseKey } from "./contracts.ts";
-import type { CommandCapabilities, CommandInput, Context, Host, McpToolName, Repo } from "./contracts.ts";
+import type { CommandCapabilities, CommandInput, CommandOutput, Context, Host, McpToolName, Repo } from "./contracts.ts";
 import { NativeEventSequence, NativePluginConfig, NativeSubmissionId, nativeEventsUri } from "@samuelho/coordinator-native-control/contracts";
 import type { NativeLifecycleEvent } from "@samuelho/coordinator-native-control/contracts";
 import { makeNativeControl } from "./native-plugin.ts";
@@ -233,7 +233,7 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
       return yield* notify(ctx, pluginCommands.map(([id, entry]) => `${id.slice("plugin.".length)}: ${entry.description}`).join("\n"));
     }
     const entry = pluginCommands.find(([id]) => id === `plugin.${action}`)?.[1];
-    if (!entry) return yield* new CommandError({ message: "Unknown coordinator action; use /coordinator help" });
+    if (!entry) return yield* notify(ctx, "Unknown Coordinator action; use /coordinator help. Send free-form messages in normal chat.", "error");
     const data: unknown = split < 0 ? {} : yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Json), { onExcessProperty: "error" })(args.trim().slice(split + 1));
     const current = active;
     if (!current || current.parentSessionId !== ctx.sessionManager.getSessionId()) return yield* new CommandError({ message: "Session not enrolled" });
@@ -298,6 +298,16 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
       pluginEvidenceReview: (data) => call("evidence.review", data),
       pluginEvidenceDeployment: (data) => call("evidence.deployment", data),
       pluginStatus: (data) => call("task.get", data),
+      pluginSessions: () => Effect.gen(function*() {
+        const result: CommandOutput<"plugin.sessions"> = [];
+        let cursor: SessionId | undefined;
+        do {
+          const page = yield* call("session.list", cursor === undefined ? {} : { cursor });
+          result.push(...page.sessions);
+          cursor = page.nextCursor;
+        } while (cursor !== undefined);
+        return result;
+      }),
       pluginAttach: (data) => call("task.attach", data),
       pluginControl: (data) => Effect.gen(function*() {
         if (data.type !== "get_state") yield* approve("Approve sensitive native control", `${data.type === "abort" ? "Abort this native child; the task remains held for reconciliation" : "Read potentially sensitive native child messages"}?\n${display(data)}`);

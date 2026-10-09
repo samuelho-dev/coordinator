@@ -297,10 +297,13 @@ function command<const T extends CommandTarget, const K extends string, I extend
   };
 }
 const empty = Tool.EmptyParams;
+const sessionList = Schema.mutable(Schema.Array(Schema.Struct({ ...Session.fields, status: Schema.Literals(["live", "stale"]), liveUntil: Schema.Finite })));
+const sessionPage = Schema.Struct({ sessions: sessionList, nextCursor: Schema.optional(SessionId) });
 const pluginReadback = Schema.Struct({ ...RunnerPrepare.fields, reason: Schema.optional(Text), nextCheck: Schema.optional(Schema.Finite) });
 const absolutePath = Schema.String.check(Schema.isPattern(/^\/[^\r\n\u0000]*$/));
 export const Commands = {
   health: command("shared", "health", "Read authenticated service health.", empty, Health, { exposure: "internal" }),
+  "session.list": command("broker", "listSessions", "List owner- and repository-authorized enrolled sessions with current liveness in bounded pages.", Schema.Struct({ cursor: Schema.optional(SessionId) }), sessionPage, { exposure: "tool", transaction: "transaction" }),
   "session.heartbeat": command("broker", "heartbeatSession", "Renew the verified native session lease without replacing a live incarnation.", Session, Schema.Struct({ liveUntil: Schema.Finite }), { exposure: "internal", transaction: "transaction" }),
   "session.poll": command("broker", "pollSession", "Fetch owner- and incarnation-scoped peer messages, offers and releases.", SessionKey, Poll, { exposure: "internal", transaction: "transaction" }),
   "session.stop": command("broker", "stopSession", "Revoke the bound session and its peer deliveries.", SessionKey, Schema.Struct({ stopped: Schema.Literal(true) }), { exposure: "internal", transaction: "transaction" }),
@@ -361,6 +364,7 @@ export const Commands = {
   "plugin.control": command("plugin", "pluginControl", "Request child control; get_messages is sensitive and abort needs human approval.", RunnerCommand, NativeResponse, { exposure: "local", approval: "control" }),
   "plugin.archive": command("plugin", "pluginArchive", "Read sanitized archive rows with the active session injected.", Schema.Struct({ cursor: Schema.optional(Schema.Int) }), Schema.mutable(Schema.Array(ArchiveRow)), { exposure: "local" }),
   "plugin.inbox": command("plugin", "pluginInbox", "Read or explicitly clear the active session's durable local inbox.", Schema.Struct({ clear: Schema.optional(Schema.Boolean) }), Schema.Union([Inbox, Schema.Struct({ cleared: Schema.Literal(true) })]), { exposure: "local" }),
+  "plugin.sessions": command("plugin", "pluginSessions", "List all authorized Coordinator sessions across machines, including stale participants.", empty, sessionList, { exposure: "local" }),
   "plugin.identity": command("plugin", "pluginIdentity", "Read actual native session, worker and local repository identity.", empty, NativeIdentity, { exposure: "local" }),
   "program.broker": command("program", "runBroker", "Start the broker using COORDINATOR_CONFIG private file and remain serving.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" }),
   "program.runner": command("program", "runRunner", "Start the isolated runner using COORDINATOR_CONFIG private file and await failure.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" }),

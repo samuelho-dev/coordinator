@@ -39,11 +39,13 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
   let identity: { sessionId: string; incarnation: string; workerId?: string | undefined } | undefined;
   let task: Task | undefined;
   let attempts = 0;
+  let brokerRequests = 0;
   const reported = yield* Deferred.make<void>();
   const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
   yield* mcp.serve(server, { target: "broker",
     authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
     handle: (_principal, request) => Effect.gen(function*() {
+      brokerRequests++;
       const now = yield* Clock.currentTimeMillis;
       if (request.method === "session.heartbeat") {
         identity = request.params;
@@ -84,6 +86,9 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
     Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(true), stdout: () => Sink.forEach((chunk: string | Uint8Array) => Effect.sync(() => { if (typeof chunk === "string") terminalOutput.push(chunk); })) })),
   )), Plugin);
   assert.ok(service);
+  yield* service.command("hi", ctx);
+  assert.match(notifications.at(-1) ?? "", /\/coordinator help/, "Unknown actions must give a usable help command");
+  assert.equal(brokerRequests, 0, "Unknown actions must not reach the broker or enroll a session");
   yield* service.start(ctx);
   yield* Deferred.await(reported).pipe(Effect.timeout("15 seconds"));
   assert.ok(identity);

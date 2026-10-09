@@ -11,6 +11,7 @@ import { migrateBroker } from "./database.ts";
 
 const BrokerConfiguration = Context.Service<BrokerConfig>("coordinator/BrokerConfiguration");
 const pollResultText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands["session.poll"].structuredOutput)), { onExcessProperty: "error" });
+const sessionResultText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands["session.list"].structuredOutput)), { onExcessProperty: "error" });
 const taskResultText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands["task.get"].structuredOutput)), { onExcessProperty: "error" });
 const archiveResultText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands["archive.list"].structuredOutput)), { onExcessProperty: "error" });
 export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
@@ -226,6 +227,24 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         return task;
       });
       return {
+        listSessions: Effect.fn("Broker.listSessions")(function*({ cursor }: CommandInput<"session.list">): Effect.fn.Return<CommandOutput<"session.list">, unknown> {
+          yield* role(principal, "coordinator", "session");
+          const visible = [...sessions.values()].filter((session) => session.owner === principal.owner && principal.repos.includes(session.repo) && (cursor === undefined || session.sessionId > cursor))
+            .sort((a, b) => a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0);
+          const page: CommandOutput<"session.list"> = { sessions: [] };
+          for (const session of visible) {
+            const { sessionId, incarnation, machineId, host, repo, workerId, liveUntil } = session;
+            page.sessions.push({ sessionId, incarnation, machineId, host, repo, workerId, liveUntil,
+              status: session.verified && liveUntil > now && session.polledAt >= now - 10000 ? "live" : "stale" });
+            if (new TextEncoder().encode(sessionResultText({ result: { ...page, nextCursor: sessionId } })).byteLength > MCP_RESULT_LIMIT) {
+              page.sessions.pop();
+              const last = page.sessions.at(-1);
+              if (!last) return yield* new HttpError({ status: 413, message: "Session metadata exceeds delivery budget" });
+              return { sessions: page.sessions, nextCursor: last.sessionId };
+            }
+          }
+          return page;
+        }),
         heartbeatSession: Effect.fn("Broker.heartbeatSession")(function*(params: CommandInput<"session.heartbeat">): Effect.fn.Return<CommandOutput<"session.heartbeat">, unknown> {
           (yield* role(principal, "session")); const input = params; (yield* repo(principal, input.repo));
           const existing = sessions.get(input.sessionId);
