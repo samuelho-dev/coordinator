@@ -54,7 +54,7 @@ jobs:
                 if (pending.size < 128) pending.set(id, { id, trigger, callsite, stack, resource });
               },
               before(id) {
-                if (!observing && ["abort acknowledgement and idle snapshots cannot replace a missing whole-run terminal proof", "public-hook-only capabilities hold an inspectable child without creating prompt intent"].includes(tests.get(id)?.name)) {
+                if (!observing && ["native missing admission, resource gaps and transport loss hold durable intent without replay", "abort acknowledgement and idle snapshots cannot replace a missing whole-run terminal proof", "public-hook-only capabilities hold an inspectable child without creating prompt intent"].includes(tests.get(id)?.name)) {
                   observing = true;
                   Error.stackTraceLimit = 30;
                   process.stderr.write(`[CI-NATIVE-SPEC] start ${tests.get(id).name} ${Date.now()}\n`);
@@ -66,7 +66,108 @@ jobs:
             setInterval(() => {
               if (observing) process.stderr.write(`[CI-NATIVE-AWAIT] ${JSON.stringify({ pid: process.pid, at: Date.now(), pending: [...pending.values()].map(({ id, trigger, callsite, stack }) => ({ id, trigger, callsite, stack })) })}\n`);
             }, 10000).unref();
+            await import("./ci-native-primitive.mjs");
           }
+          JS
+          cat > ci-native-primitive.mjs <<'JS'
+          import { Context, Effect, Layer, Scope, Tracer } from "effect";
+          import { Session } from "node:inspector";
+          import { basename } from "node:path";
+          import { Platform } from "./src/platform.ts";
+          import { Mcp } from "./src/http.ts";
+          const observed = new Map();
+          let closing = 0;
+          const underlying = Tracer.nativeTracer;
+          const diagnostic = {
+            span: (options) => underlying.span(options),
+            context(primitive, fiber) {
+              if (closing === 0) return primitive["~effect/Effect/evaluate"](fiber);
+              let row = observed.get(fiber.id);
+              if (!row && observed.size < 128) {
+                row = { fiber, primitive };
+                observed.set(fiber.id, row);
+                fiber.addObserver(() => observed.delete(fiber.id));
+              }
+              if (row) row.primitive = primitive;
+              return primitive["~effect/Effect/evaluate"](fiber);
+            },
+          };
+          // Owned source service only; no SDK/default-tracer mutation or filesystem edits.
+          Platform.layer = Platform.layer.pipe(Layer.provideMerge(Layer.succeed(Tracer.Tracer, diagnostic)));
+          Mcp.layer = Mcp.layer.pipe(Layer.tap((context) => Effect.sync(() => {
+            const service = Context.get(context, Mcp);
+            const serve = service.serve;
+            service.serve = (server, options) => Effect.gen(function*() {
+              yield* Effect.addFinalizer(() => Effect.sync(() => {
+                closing--;
+                process.stderr.write(`[OWNED-MCP-SCOPE-DRAIN] ${JSON.stringify({ target: options.target, address: server.address, at: Date.now() })}\n`);
+              }));
+              yield* serve(server, options);
+              yield* Effect.addFinalizer(() => Effect.sync(() => {
+                closing++;
+                process.stderr.write(`[OWNED-MCP-SCOPE-CLOSE] ${JSON.stringify({ target: options.target, address: server.address, at: Date.now() })}\n`);
+              }));
+            }).pipe(Effect.provideService(Tracer.Tracer, diagnostic));
+          })));
+          const inspector = new Session();
+          inspector.connect();
+          const scripts = new Map();
+          inspector.on("Debugger.scriptParsed", ({ params }) => scripts.set(params.scriptId, params.url));
+          const send = (method, params) => new Promise((resolve, reject) => inspector.post(method, params, (error, value) => error ? reject(error) : resolve(value)));
+          await send("Debugger.enable", {});
+          const ids = new Map();
+          let nextId = 0;
+          const objectId = (id) => { if (!ids.has(id)) ids.set(id, ++nextId); return ids.get(id); };
+          globalThis.__ownedNativePrimitiveFrames = observed;
+          async function location(id) {
+            const props = await send("Runtime.getProperties", { objectId: id, ownProperties: true });
+            const source = props.internalProperties?.find((prop) => prop.name === "[[FunctionLocation]]")?.value?.value;
+            return source ? { file: basename(scripts.get(source.scriptId) ?? "unknown"), line: source.lineNumber + 1, column: source.columnNumber + 1 } : undefined;
+          }
+          async function snapshot() {
+            const rows = [];
+            for (const { fiber, primitive } of observed.values()) {
+              if (fiber.pollUnsafe() !== undefined || fiber._running || primitive["~effect/Effect/identifier"] !== "Async") continue;
+              const scope = Context.getOrUndefined(fiber.context, Scope.Scope);
+              const row = { id: fiber.id, operation: "Async", interruptible: fiber.interruptible, yielded: typeof fiber._yielded === "function", scope: scope?.state._tag, parent: fiber._parent?.id };
+              const evaluated = await send("Runtime.evaluate", { expression: `globalThis.__ownedNativePrimitiveFrames.get(${fiber.id})?.primitive.register`, objectGroup: "owned-native-metadata" });
+              if (evaluated.result.objectId) {
+                const props = await send("Runtime.getProperties", { objectId: evaluated.result.objectId, ownProperties: true });
+                row.callback = await location(evaluated.result.objectId);
+                const closures = props.internalProperties?.find((prop) => prop.name === "[[Scopes]]")?.value?.objectId;
+                row.targets = [];
+                if (closures) {
+                  const levels = await send("Runtime.getProperties", { objectId: closures, ownProperties: true });
+                  for (const level of levels.result.slice(0, 5)) {
+                    if (!level.value?.objectId) continue;
+                    const bindings = await send("Runtime.getProperties", { objectId: level.value.objectId, ownProperties: true });
+                    for (const binding of bindings.result) {
+                      if (!["self", "impl", "this", "ready"].includes(binding.name) || !binding.value?.objectId) continue;
+                      const target = { binding: binding.name, objectId: objectId(binding.value.objectId) };
+                      if (binding.value.type === "function") target.callback = await location(binding.value.objectId);
+                      else {
+                        const status = await send("Runtime.callFunctionOn", { objectId: binding.value.objectId, functionDeclaration: `function() { return { id: typeof this.id === "number" ? this.id : undefined, isOpen: typeof this.isOpen === "function" ? this.isOpen() : undefined, waiters: this.waiters?.length, scheduled: this.scheduled?.length, done: typeof this.pollUnsafe === "function" ? this.pollUnsafe() !== undefined : undefined, queueState: this.state?._tag, messages: this.messages?.length, capacity: this.capacity, deferredDone: typeof this.effect === "object" ? true : this.resumes ? false : undefined, resumes: this.resumes?.length }; }`, returnByValue: true });
+                        target.status = status.result.value;
+                      }
+                      row.targets.push(target);
+                    }
+                  }
+                }
+              }
+              rows.push(row);
+            }
+            await send("Runtime.releaseObjectGroup", { objectGroup: "owned-native-metadata" });
+            return { pid: process.pid, at: Date.now(), coverage: "actual public-layer tracer evaluated primitives", captured: observed.size, rows };
+          }
+          let capturing = false;
+          setInterval(async () => {
+            if (capturing || closing === 0) return;
+            capturing = true;
+            try { process.stderr.write(`[OWNED-NATIVE-PRIMITIVE] ${JSON.stringify(await snapshot())}\n`); }
+            catch (error) { process.stderr.write(`[OWNED-NATIVE-PRIMITIVE-ERROR] ${error.name}\n`); }
+            finally { capturing = false; }
+          }, 10000).unref();
+          process.once("beforeExit", () => inspector.disconnect());
           JS
           timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx --import ./ci-native-await.mjs --test --test-concurrency=1 test/*.test.ts
       - name: Run stock public controls and real broker plugin smoke
