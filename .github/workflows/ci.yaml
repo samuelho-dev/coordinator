@@ -36,7 +36,37 @@ jobs:
           mkdir -m 0700 "$TEST_ROOT/private-home"
           export HOME="$TEST_ROOT/private-home"
           cd "$TEST_ROOT"
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx --test --test-concurrency=1 test/*.test.ts
+          # Temporary await metadata; no test/SDK changes or disposal behavior.
+          cat > ci-native-await.mjs <<'JS'
+          import { createHook } from "node:async_hooks";
+          Error.stackTraceLimit = 30;
+          const pending = new Map();
+          createHook({
+            init(id, type, trigger) {
+              if (type !== "PROMISE") return;
+              const stack = new Error().stack;
+              if (!stack?.includes("/test/") || !stack.includes(".test.ts:") || stack.includes("Test.createSubtest")) return;
+              const callsite = stack.split("\n").find((line) => line.includes("/test/") && line.includes(".test.ts:"));
+              if (pending.size < 128) pending.set(id, { id, trigger, callsite, stack });
+            },
+            promiseResolve(id) { pending.delete(id); },
+            destroy(id) { pending.delete(id); },
+          }).enable();
+          setInterval(() => {
+            process.stderr.write(`[CI-NATIVE-AWAIT] ${JSON.stringify({ pid: process.pid, at: Date.now(), pending: [...pending.values()] })}\n`);
+          }, 30000).unref();
+          JS
+          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs /usr/bin/bash -ec '
+            for test_file in test/*.test.ts; do
+              printf "[CI-NATIVE-FILE] start %s\n" "$test_file"
+              if [ "$test_file" = "test/runner.test.ts" ]; then
+                node --import tsx --import ./ci-native-await.mjs --test --test-concurrency=1 "$test_file"
+              else
+                node --import tsx --test --test-concurrency=1 "$test_file"
+              fi
+              printf "[CI-NATIVE-FILE] done %s\n" "$test_file"
+            done
+          '
       - name: Run stock public controls and real broker plugin smoke
         run: |
           TEST_ROOT="$(mktemp -d /tmp/coordinator-hosts.XXXXXX)"
