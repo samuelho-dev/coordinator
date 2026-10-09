@@ -36,140 +36,121 @@ jobs:
           mkdir -m 0700 "$TEST_ROOT/private-home"
           export HOME="$TEST_ROOT/private-home"
           cd "$TEST_ROOT"
-          # Temporary await metadata; no test/SDK changes or disposal behavior.
-          cat > ci-native-await.mjs <<'JS'
-          import { createHook } from "node:async_hooks";
+          # Temporary readonly default-root close metadata; no test or SDK file changes.
+          cat > native-root-close-preload.mjs <<'JS'
           if (process.argv.some((arg) => arg.endsWith("/runner.test.ts") || arg === "test/runner.test.ts")) {
+            const { createHook } = await import("node:async_hooks");
             const tests = new Map();
-            const pending = new Map();
-            let observing = false;
             createHook({
-              init(id, type, trigger, resource) {
-                if (type === "Test") { tests.set(id, resource); return; }
-                if (!observing) return;
-                if (type !== "PROMISE") return;
-                const stack = new Error().stack;
-                if (!stack?.includes("/test/runner.test.ts:") || stack.includes("Test.createSubtest") || stack.includes("startSubtestAfterBootstrap") && !stack.includes("TestContext.<anonymous>")) return;
-                const callsite = stack.split("\n").find((line) => line.includes("/test/runner.test.ts:"));
-                if (pending.size < 128) pending.set(id, { id, trigger, callsite, stack, resource });
-              },
-              before(id) {
-                if (!observing && ["native missing admission, resource gaps and transport loss hold durable intent without replay", "abort acknowledgement and idle snapshots cannot replace a missing whole-run terminal proof", "public-hook-only capabilities hold an inspectable child without creating prompt intent"].includes(tests.get(id)?.name)) {
-                  observing = true;
-                  Error.stackTraceLimit = 30;
-                  process.stderr.write(`[CI-NATIVE-SPEC] start ${tests.get(id).name} ${Date.now()}\n`);
-                }
-              },
-              promiseResolve(id) { pending.delete(id); },
+              init(id, type, trigger, resource) { if (type === "Test") tests.set(id, resource); },
+              before(id) { const name = tests.get(id)?.name; if (name) process.stderr.write(`[OWNED-TEST-START] ${JSON.stringify({ name, at: Date.now() })}\n`); },
               destroy(id) { tests.delete(id); },
             }).enable();
-            setInterval(() => {
-              if (observing) process.stderr.write(`[CI-NATIVE-AWAIT] ${JSON.stringify({ pid: process.pid, at: Date.now(), pending: [...pending.values()].map(({ id, trigger, callsite, stack }) => ({ id, trigger, callsite, stack })) })}\n`);
-            }, 10000).unref();
-            await import("./ci-native-primitive.mjs");
+            const { Context, Effect, Layer } = await import("effect");
+            const { Mcp } = await import("./src/http.ts");
+            const { begin, end, close } = await import("./root-close-worker-observer.mjs");
+            const { after } = await import("node:test");
+            after(() => close());
+            // Observe the actual default-root disposal fiber; do not change SDK, test, request or disposal behavior.
+            Mcp.layer = Mcp.layer.pipe(Layer.tap((context) => Effect.sync(() => {
+              const service = Context.get(context, Mcp);
+              const serve = service.serve;
+              service.serve = (server, options) => Effect.gen(function*() {
+                yield* Effect.addFinalizer(() => end);
+                yield* serve(server, options);
+                yield* Effect.addFinalizer(() => begin({ target: options.target, address: server.address }));
+              });
+            })));
           }
           JS
-          cat > ci-native-primitive.mjs <<'JS'
-          import { Context, Effect, Layer, Scope, Tracer } from "effect";
+          cat > root-close-worker-observer.mjs <<'JS'
+          import { Effect } from "effect";
+          import { Worker } from "node:worker_threads";
+          const roots = new Map();
+          const acknowledgements = new Map();
+          let requestId = 0;
+          const request = (kind, remaining) => new Promise((resolve) => { const id = ++requestId; acknowledgements.set(id, resolve); worker.postMessage({ kind, remaining, id }); });
+          export const captured = [];
+          globalThis.__ownedRootCloseFibers = roots;
+          globalThis.__ownedRootAsyncEvaluate = Effect.callback(() => undefined)["~effect/Effect/evaluate"];
+          const env = { ...process.env };
+          delete env.NODE_TEST_CONTEXT;
+          const worker = new Worker(new URL("./root-close-debugger-worker.mjs", import.meta.url), { execArgv: [], env });
+          await new Promise((resolve, reject) => {
+            worker.once("error", reject);
+            worker.on("message", ({ marker, value }) => {
+              if (marker === "ready") { resolve(); return; }
+              if (marker === "ack") { acknowledgements.get(value.id)?.(); acknowledgements.delete(value.id); return; }
+              if (marker === "OWNED-ROOT-ASYNC") captured.push(value);
+              process.stderr.write(`[${marker}] ${JSON.stringify(value)}\n`);
+            });
+          });
+          worker.unref();
+          export const begin = (owner) => Effect.withFiber((fiber) => Effect.promise(async () => { roots.set(fiber.id, owner); await request("begin"); process.stderr.write(`[OWNED-ROOT-CLOSE-BEGIN] ${JSON.stringify({ id: fiber.id, owner })}\n`); }));
+          export const end = Effect.withFiber((fiber) => Effect.promise(async () => { roots.delete(fiber.id); await request("end", roots.size); process.stderr.write(`[OWNED-ROOT-CLOSE-END] ${JSON.stringify({ id: fiber.id })}\n`); }));
+          export async function close() { const exited = new Promise((resolve) => worker.once("exit", resolve)); worker.ref(); worker.postMessage("close"); await exited; }
+          process.once("beforeExit", () => worker.terminate());
+          JS
+          cat > root-close-debugger-worker.mjs <<'JS'
           import { Session } from "node:inspector";
           import { basename } from "node:path";
-          import { Platform } from "./src/platform.ts";
-          import { Mcp } from "./src/http.ts";
-          const observed = new Map();
-          let closing = 0;
-          const underlying = Tracer.nativeTracer;
-          const diagnostic = {
-            span: (options) => underlying.span(options),
-            context(primitive, fiber) {
-              if (closing === 0) return primitive["~effect/Effect/evaluate"](fiber);
-              let row = observed.get(fiber.id);
-              if (!row && observed.size < 128) {
-                row = { fiber, primitive };
-                observed.set(fiber.id, row);
-                fiber.addObserver(() => observed.delete(fiber.id));
-              }
-              if (row) row.primitive = primitive;
-              return primitive["~effect/Effect/evaluate"](fiber);
-            },
-          };
-          // Owned source service only; no SDK/default-tracer mutation or filesystem edits.
-          Platform.layer = Platform.layer.pipe(Layer.provideMerge(Layer.succeed(Tracer.Tracer, diagnostic)));
-          Mcp.layer = Mcp.layer.pipe(Layer.tap((context) => Effect.sync(() => {
-            const service = Context.get(context, Mcp);
-            const serve = service.serve;
-            service.serve = (server, options) => Effect.gen(function*() {
-              yield* Effect.addFinalizer(() => Effect.sync(() => {
-                closing--;
-                process.stderr.write(`[OWNED-MCP-SCOPE-DRAIN] ${JSON.stringify({ target: options.target, address: server.address, at: Date.now() })}\n`);
-              }));
-              yield* serve(server, options);
-              yield* Effect.addFinalizer(() => Effect.sync(() => {
-                closing++;
-                process.stderr.write(`[OWNED-MCP-SCOPE-CLOSE] ${JSON.stringify({ target: options.target, address: server.address, at: Date.now() })}\n`);
-              }));
-            }).pipe(Effect.provideService(Tracer.Tracer, diagnostic));
-          })));
+          import { parentPort } from "node:worker_threads";
           const inspector = new Session();
-          inspector.connect();
+          inspector.connectToMainThread();
           const scripts = new Map();
+          const registers = new Map();
+          const send = (method, params) => new Promise((resolve, reject) => inspector.post(method, params, (error, result) => error ? reject(error) : resolve(result)));
+          const report = (marker, value) => parentPort.postMessage({ marker, value });
           inspector.on("Debugger.scriptParsed", ({ params }) => scripts.set(params.scriptId, params.url));
-          const send = (method, params) => new Promise((resolve, reject) => inspector.post(method, params, (error, value) => error ? reject(error) : resolve(value)));
-          await send("Debugger.enable", {});
-          const ids = new Map();
-          let nextId = 0;
-          const objectId = (id) => { if (!ids.has(id)) ids.set(id, ++nextId); return ids.get(id); };
-          globalThis.__ownedNativePrimitiveFrames = observed;
-          async function location(id) {
-            const props = await send("Runtime.getProperties", { objectId: id, ownProperties: true });
-            const source = props.internalProperties?.find((prop) => prop.name === "[[FunctionLocation]]")?.value?.value;
-            return source ? { file: basename(scripts.get(source.scriptId) ?? "unknown"), line: source.lineNumber + 1, column: source.columnNumber + 1 } : undefined;
-          }
-          async function snapshot() {
-            const rows = [];
-            for (const { fiber, primitive } of observed.values()) {
-              if (fiber.pollUnsafe() !== undefined || fiber._running || primitive["~effect/Effect/identifier"] !== "Async") continue;
-              const scope = Context.getOrUndefined(fiber.context, Scope.Scope);
-              const row = { id: fiber.id, operation: "Async", interruptible: fiber.interruptible, yielded: typeof fiber._yielded === "function", scope: scope?.state._tag, parent: fiber._parent?.id };
-              const evaluated = await send("Runtime.evaluate", { expression: `globalThis.__ownedNativePrimitiveFrames.get(${fiber.id})?.primitive.register`, objectGroup: "owned-native-metadata" });
-              if (evaluated.result.objectId) {
-                const props = await send("Runtime.getProperties", { objectId: evaluated.result.objectId, ownProperties: true });
-                row.callback = await location(evaluated.result.objectId);
-                const closures = props.internalProperties?.find((prop) => prop.name === "[[Scopes]]")?.value?.objectId;
-                row.targets = [];
-                if (closures) {
-                  const levels = await send("Runtime.getProperties", { objectId: closures, ownProperties: true });
-                  for (const level of levels.result.slice(0, 5)) {
-                    if (!level.value?.objectId) continue;
-                    const bindings = await send("Runtime.getProperties", { objectId: level.value.objectId, ownProperties: true });
-                    for (const binding of bindings.result) {
-                      if (!["self", "impl", "this", "ready"].includes(binding.name) || !binding.value?.objectId) continue;
-                      const target = { binding: binding.name, objectId: objectId(binding.value.objectId) };
-                      if (binding.value.type === "function") target.callback = await location(binding.value.objectId);
-                      else {
-                        const status = await send("Runtime.callFunctionOn", { objectId: binding.value.objectId, functionDeclaration: `function() { return { id: typeof this.id === "number" ? this.id : undefined, isOpen: typeof this.isOpen === "function" ? this.isOpen() : undefined, waiters: this.waiters?.length, scheduled: this.scheduled?.length, done: typeof this.pollUnsafe === "function" ? this.pollUnsafe() !== undefined : undefined, queueState: this.state?._tag, messages: this.messages?.length, capacity: this.capacity, deferredDone: typeof this.effect === "object" ? true : this.resumes ? false : undefined, resumes: this.resumes?.length }; }`, returnByValue: true });
-                        target.status = status.result.value;
-                      }
-                      row.targets.push(target);
-                    }
-                  }
+          const state = `(object) => ({ id: typeof object?.id === "number" ? object.id : undefined, isOpen: typeof object?._isOpen === "boolean" ? object._isOpen : undefined, waiters: object?.waiters?.length, scheduled: object?.scheduled?.length, queueState: object?.state?._tag, messages: object?.messages?.length, capacity: object?.capacity, deferredDone: object && Object.hasOwn(object, "effect") ? object.effect !== undefined : undefined, resumes: object?.resumes?.length })`;
+          inspector.on("Debugger.paused", ({ params }) => {
+            void (async () => {
+              const frame = params.callFrames[0];
+              try {
+                const registered = params.hitBreakpoints?.map((id) => registers.get(id)).find(Boolean);
+                if (registered) {
+                  const target = await send("Debugger.evaluateOnCallFrame", { callFrameId: frame.callFrameId, expression: `({ lexicalThis: (${state})(this), self: typeof self === "object" ? (${state})(self) : undefined, impl: typeof impl === "object" ? (${state})(impl) : undefined })`, returnByValue: true });
+                  report("OWNED-ROOT-ASYNC", { ...registered, targets: target.result.value });
+                  for (const id of params.hitBreakpoints ?? []) if (registers.has(id)) { await send("Debugger.removeBreakpoint", { breakpointId: id }); registers.delete(id); }
+                  return;
                 }
+                const metadata = await send("Debugger.evaluateOnCallFrame", { callFrameId: frame.callFrameId, expression: `({ id: fiber.id, operation: this["~effect/Effect/identifier"], interruptible: fiber.interruptible, owner: globalThis.__ownedRootCloseFibers.get(fiber.id) })`, returnByValue: true });
+                const register = await send("Debugger.evaluateOnCallFrame", { callFrameId: frame.callFrameId, expression: "this.register" });
+                if (!register.result.objectId) return;
+                const properties = await send("Runtime.getProperties", { objectId: register.result.objectId, ownProperties: true });
+                const location = properties.internalProperties?.find((prop) => prop.name === "[[FunctionLocation]]")?.value?.value;
+                const breakpoint = await send("Debugger.setBreakpointOnFunctionCall", { objectId: register.result.objectId });
+                registers.set(breakpoint.breakpointId, { ...metadata.result.value, callback: location ? { file: basename(scripts.get(location.scriptId) ?? "unknown"), line: location.lineNumber + 1, column: location.columnNumber + 1 } : undefined });
+              } catch (error) {
+                report("OWNED-ROOT-ASYNC-ERROR", { name: error.name, message: error.message });
+              } finally {
+                await send("Debugger.resume", {}).catch(() => undefined);
               }
-              rows.push(row);
+            })();
+          });
+          let evaluatorBreakpoint;
+          parentPort.on("message", async (message) => {
+            if (message.kind === "begin") {
+              evaluatorBreakpoint ??= await send("Debugger.setBreakpointOnFunctionCall", { objectId: evaluator.result.objectId, condition: "globalThis.__ownedRootCloseFibers.has(fiber.id)" });
+              report("ack", { id: message.id });
+            } else if (message.kind === "end") {
+              if (message.remaining === 0 && evaluatorBreakpoint) {
+                await send("Debugger.removeBreakpoint", { breakpointId: evaluatorBreakpoint.breakpointId });
+                evaluatorBreakpoint = undefined;
+              }
+              report("ack", { id: message.id });
+            } else if (message === "close") {
+              if (evaluatorBreakpoint) await send("Debugger.removeBreakpoint", { breakpointId: evaluatorBreakpoint.breakpointId });
+              for (const breakpointId of registers.keys()) await send("Debugger.removeBreakpoint", { breakpointId });
+              inspector.disconnect();
+              parentPort.close();
             }
-            await send("Runtime.releaseObjectGroup", { objectGroup: "owned-native-metadata" });
-            return { pid: process.pid, at: Date.now(), coverage: "actual public-layer tracer evaluated primitives", captured: observed.size, rows };
-          }
-          let capturing = false;
-          setInterval(async () => {
-            if (capturing || closing === 0) return;
-            capturing = true;
-            try { process.stderr.write(`[OWNED-NATIVE-PRIMITIVE] ${JSON.stringify(await snapshot())}\n`); }
-            catch (error) { process.stderr.write(`[OWNED-NATIVE-PRIMITIVE-ERROR] ${error.name}\n`); }
-            finally { capturing = false; }
-          }, 10000).unref();
-          process.once("beforeExit", () => inspector.disconnect());
+          });
+          await send("Debugger.enable", {});
+          const evaluator = await send("Runtime.evaluate", { expression: "globalThis.__ownedRootAsyncEvaluate" });
+          report("ready", {});
           JS
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx --import ./ci-native-await.mjs --test --test-concurrency=1 test/*.test.ts
+          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx --import ./native-root-close-preload.mjs --test --test-concurrency=1 test/*.test.ts
       - name: Run stock public controls and real broker plugin smoke
         run: |
           TEST_ROOT="$(mktemp -d /tmp/coordinator-hosts.XXXXXX)"
