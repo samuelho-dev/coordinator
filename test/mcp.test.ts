@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
 import { Context, Effect, Layer, ManagedRuntime, Schema } from "effect";
 import { HttpServer } from "effect/http";
@@ -163,4 +163,58 @@ test("cancelled native MCP subscription releases its response and application sc
     await runtime.dispose();
   }
   assert.equal(nativeServer.listening, false);
+});
+
+test("aborted unread MCP body cannot hold HTTP server cleanup", { timeout: 5000 }, async () => {
+  const nativeServer = createServer({ requestTimeout: 15000 });
+  const incoming = Promise.withResolvers<IncomingMessage>();
+  const disconnected = Promise.withResolvers<void>();
+  const authorizing = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  nativeServer.once("request", (request, response) => {
+    incoming.resolve(request);
+    response.once("close", disconnected.resolve);
+  });
+  class Endpoint extends Context.Service<Endpoint>()("test/McpUnreadBodyShutdown", {
+    make: Effect.gen(function*() {
+      const mcp = yield* Mcp;
+      const server = yield* HttpServer.HttpServer;
+      yield* mcp.serve(server, {
+        target: "runner",
+        authorize: () => Effect.promise(async () => { authorizing.resolve(); await proceed.promise; return "caller"; }),
+        handle: () => Effect.fail(new HttpError({ status: 400, message: "Unexpected test command" })),
+      });
+      return { server };
+    }),
+  }) {}
+  const runtime = ManagedRuntime.make(Layer.effect(Endpoint, Endpoint.make).pipe(Layer.provide(Layer.merge(
+    Mcp.layer,
+    NodeHttpServer.layerServer(() => nativeServer, { host: "127.0.0.1", port: 0, gracefulShutdownTimeout: "1 second" }),
+  ))));
+  const { server } = await runtime.runPromise(Endpoint);
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+  const request = httpRequest(`${HttpServer.formatAddress(server.address)}/mcp`, {
+    method: "POST",
+    headers: { authorization: "Bearer caller", "content-type": "application/json", "content-length": Buffer.byteLength(body), accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-11-25" },
+  });
+  const clientError = Promise.withResolvers<Error>();
+  request.once("error", clientError.resolve);
+  try {
+    request.end(body);
+    await authorizing.promise;
+    const received = await incoming.promise;
+    while (!received.complete) await new Promise<void>((resolve) => setImmediate(resolve));
+    request.destroy(new Error("Client intentionally disconnected before body consumption"));
+    await clientError.promise;
+    await disconnected.promise;
+    assert.equal(received.destroyed, true);
+    assert.equal(received.readableEnded, false);
+    proceed.resolve();
+    await runtime.dispose();
+    assert.equal(nativeServer.listening, false);
+  } finally {
+    request.destroy();
+    proceed.resolve();
+    await runtime.dispose();
+  }
 });

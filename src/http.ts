@@ -238,7 +238,8 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         yield* authorize;
         if (request.url === "/healthz" && request.method === "GET") return yield* HttpServerResponse.schemaJson(Commands.health.output, { onExcessProperty: "error" })(yield* Schema.decodeUnknownEffect(Commands.health.output, { onExcessProperty: "error" })(yield* handle("health", {})).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" }))), { headers: { "cache-control": "no-store" } });
         if (Number(request.headers["content-length"] ?? 0) > LIMIT) return yield* new HttpError({ status: 413, message: "Request too large" });
-        const body = request.method === "POST" ? yield* request.json.pipe(Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT))) : undefined;
+        // Node masks handlers; client abort must also cancel the cached request-body reader.
+        const body = request.method === "POST" ? yield* request.json.pipe(Effect.interruptible, Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT))) : undefined;
         const method = body && typeof body === "object" && !Array.isArray(body) && "method" in body ? body.method : undefined;
         const response = yield* app.pipe(Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT)));
         return yield* boundedResponse(response, method === "server/discover" || method === "tools/list" ? 512 * 1024 : LIMIT);
