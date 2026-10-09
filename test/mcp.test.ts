@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Context, Effect, Layer, ManagedRuntime } from "effect";
+import { createServer } from "node:http";
+import { NodeHttpServer } from "@effect/platform-node";
+import { Context, Effect, Layer, ManagedRuntime, Schema } from "effect";
 import { HttpServer } from "effect/http";
 import { Acceptance, HttpError, TaskId, type CommandInput } from "../src/contracts.ts";
 import { Mcp, serverLayer } from "../src/http.ts";
@@ -57,8 +59,7 @@ test("native MCP authorizes each tool with its HTTP bearer, not session or model
 });
 
 test("native MCP proxy disposes after its downstream runner closes during a tool call", async () => {
-  let runnerEntered!: () => void;
-  const entered = new Promise<void>((resolve) => { runnerEntered = resolve; });
+  const entered = Promise.withResolvers<void>();
   let runnerFinalized = false;
   class RunnerEndpoint extends Context.Service<RunnerEndpoint>()("test/McpShutdownRunner", {
     make: Effect.gen(function*() {
@@ -67,7 +68,7 @@ test("native MCP proxy disposes after its downstream runner closes during a tool
       yield* mcp.serve(server, {
         target: "runner",
         authorize: () => Effect.succeed("caller"),
-        handle: () => Effect.sync(runnerEntered).pipe(
+        handle: () => Effect.sync(entered.resolve).pipe(
           Effect.andThen(Effect.never),
           Effect.ensuring(Effect.sync(() => { runnerFinalized = true; })),
         ),
@@ -96,7 +97,7 @@ test("native MCP proxy disposes after its downstream runner closes during a tool
   try {
     const { server, mcp } = await proxy.runPromise(ProxyEndpoint);
     const request = proxy.runPromise(mcp.call(HttpServer.formatAddress(server.address), "caller", "journal", { taskId: TaskId.make("closing-runner") }).pipe(Effect.exit));
-    await entered;
+    await entered.promise;
     await runner.dispose();
     assert.equal(runnerFinalized, true);
     assert.equal((await request)._tag, "Failure");
@@ -104,4 +105,62 @@ test("native MCP proxy disposes after its downstream runner closes during a tool
     await runner.dispose();
     await proxy.dispose();
   }
+});
+
+test("cancelled native MCP subscription releases its response and application scope", { timeout: 15000 }, async () => {
+  const nativeServer = createServer({ requestTimeout: 15000 });
+  const bodyReceived = Promise.withResolvers<void>();
+  nativeServer.once("request", (request) => { request.once("end", bodyReceived.resolve); });
+  class Endpoint extends Context.Service<Endpoint>()("test/McpSubscriptionShutdown", {
+    make: Effect.gen(function*() {
+      const mcp = yield* Mcp;
+      const server = yield* HttpServer.HttpServer;
+      yield* mcp.serve(server, {
+        target: "runner",
+        authorize: () => Effect.succeed("caller"),
+        handle: (_caller, request) => request.method === "journal"
+          ? Effect.succeed(Acceptance.make({ taskId: request.params.taskId, accepted: false, state: "absent" }))
+          : Effect.fail(new HttpError({ status: 400, message: "Unexpected test command" })),
+      });
+      return { server, mcp };
+    }),
+  }) {}
+  const runtime = ManagedRuntime.make(Layer.effect(Endpoint, Endpoint.make).pipe(Layer.provide(Layer.merge(
+    Mcp.layer,
+    NodeHttpServer.layerServer(() => nativeServer, { host: "127.0.0.1", port: 0, gracefulShutdownTimeout: "1 second" }),
+  ))));
+  const controller = new AbortController();
+  try {
+    const { server, mcp } = await runtime.runPromise(Endpoint);
+    const url = HttpServer.formatAddress(server.address);
+    const listening = fetch(`${url}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer caller", "content-type": "application/json", accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2026-07-28", "mcp-method": "subscriptions/listen",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 203, method: "subscriptions/listen",
+        params: {
+          _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} },
+          notifications: { toolsListChanged: true },
+        },
+      }),
+      signal: controller.signal,
+    }).then(() => "response", (error: unknown) => {
+      Schema.decodeUnknownSync(Schema.Struct({ name: Schema.Literal("AbortError") }))(error);
+      return "aborted";
+    });
+    await bodyReceived.promise;
+    // A subsequent real command fences request delivery without a sleep or invented subscription outcome.
+    const fenceId = TaskId.make("after-listen-admission");
+    const fence = await runtime.runPromise(mcp.call(url, "caller", "journal", { taskId: fenceId }));
+    assert.equal(fence.taskId, fenceId);
+    controller.abort();
+    assert.equal(await listening, "aborted");
+  } finally {
+    controller.abort();
+    await runtime.dispose();
+  }
+  assert.equal(nativeServer.listening, false);
 });

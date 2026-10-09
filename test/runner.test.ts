@@ -1,16 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { createServer } from "node:http";
-import { NodeHttpServer } from "@effect/platform-node";
-import { Clock, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema, Scope, Tracer } from "effect";
+import { Clock, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
 import { Reactivity } from "effect/reactivity";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { Runner } from "../src/runner.ts";
 import { Broker } from "../src/broker.ts";
-import { Mcp } from "../src/http.ts";
+import { Mcp, serverLayer } from "../src/http.ts";
 import { Platform } from "../src/platform.ts";
 import { Address, BrokerRequest, CommandError, HttpError, Json, JsonValue, RunnerEvent, RunnerResult, RunnerNativeState, RunnerRequest, RunnerRow, Task, TaskId, RunnerId, Repo, Hash, GitHubRepositoryId, Principal, RunnerConfig, Work } from "../src/contracts.ts";
 import { NativeMessagesPage } from "@samuelho/coordinator-native-control/contracts";
@@ -43,55 +41,10 @@ async function fixture(slots = 1, hostMode = "complete", phase: (name: string) =
   const broker = await brokerRuntime.runPromise(Broker);
   let unavailable = false, taskReads = 0;
   let gate: { reached: Deferred.Deferred<void>; proceed: Deferred.Deferred<void> } | undefined;
-  // One bounded, metadata-only observation; never replace or race the real disposal promise.
-  const proxyFibers = new Map<number, { fiber: Fiber.Fiber<unknown, unknown>; primitive: object }>();
-  const proxyRequests = new Map<number, { fiberId: number; scopeId: number | undefined }>();
-  const proxyIds = new WeakMap<object, number>();
-  let nextProxyId = 0, omittedProxyFiberObservations = 0, omittedProxyRequests = 0, proxySockets = 0;
-  const proxyId = (value: object) => {
-    let id = proxyIds.get(value);
-    if (id === undefined) { id = ++nextProxyId; proxyIds.set(value, id); }
-    return id;
-  };
-  const proxyScope = (scope: Scope.Scope) => {
-    const state = scope.state;
-    const finalizerIds: number[] = [];
-    if (state._tag === "Open") {
-      if (state.finalizers) {
-        for (const key of state.finalizers.keys()) { if (finalizerIds.length === 16) break; finalizerIds.push(proxyId(key)); }
-      } else if (state.finalizerKey) finalizerIds.push(proxyId(state.finalizerKey));
-    }
-    return { id: proxyId(scope), parentId: scope.parent ? proxyId(scope.parent) : undefined, state: state._tag, strategy: scope.strategy,
-      finalizerCount: state._tag === "Open" ? (state.finalizers?.size ?? (state.finalizerKey ? 1 : 0)) : 0, finalizerIds };
-  };
-  const originalTracer = await run(Effect.tracer);
-  const proxyTracer: Tracer.Tracer = {
-    span: (options) => originalTracer.span(options),
-    context(primitive, fiber) {
-      let observed = proxyFibers.get(fiber.id);
-      if (!observed && proxyFibers.size < 64) {
-        observed = { fiber, primitive };
-        proxyFibers.set(fiber.id, observed);
-        fiber.addObserver(() => { proxyFibers.delete(fiber.id); proxyRequests.delete(fiber.id); });
-      }
-      if (observed) observed.primitive = primitive;
-      else omittedProxyFiberObservations++;
-      return originalTracer.context ? originalTracer.context(primitive, fiber) : primitive["~effect/Effect/evaluate"](fiber);
-    }
-  };
-  const proxyNativeServer = createServer({ requestTimeout: 15000 });
-  let proxyPhysicalCloseAt: number | undefined, proxyApplicationScope: Scope.Scope | undefined;
-  proxyNativeServer.on("connection", (socket) => { proxySockets++; socket.once("close", () => proxySockets--); });
-  proxyNativeServer.once("close", () => { proxyPhysicalCloseAt = Date.now(); });
   class Proxy extends Context.Service<Proxy>()("runner-test/Proxy", {
     make: Effect.gen(function*() {
-      proxyApplicationScope = yield* Effect.scope;
       const server = yield* HttpServer.HttpServer;
       yield* rpc.serve(server, { target: "broker", authorize: broker.authorize, handle: (p, input) => Effect.gen(function*() {
-        const fiber = yield* Effect.withFiberSucceed((current) => current);
-        const scope = Context.getOrUndefined(fiber.context, Scope.Scope);
-        if (proxyFibers.has(fiber.id)) proxyRequests.set(fiber.id, { fiberId: fiber.id, scopeId: scope ? proxyId(scope) : undefined });
-        else omittedProxyRequests++;
         if (unavailable) return yield* new HttpError({ status: 503, message: "Transient broker outage" });
         if (input.method === "task.get" && gate && ++taskReads === 2) {
           yield* Deferred.succeed(gate.reached, undefined);
@@ -102,9 +55,7 @@ async function fixture(slots = 1, hostMode = "complete", phase: (name: string) =
       return { server };
     })
   }) {}
-  const proxyRuntime = ManagedRuntime.make(Layer.effect(Proxy, Proxy.make.pipe(Effect.provideService(Tracer.Tracer, proxyTracer))).pipe(
-    Layer.provide(NodeHttpServer.layerServer(() => proxyNativeServer, { host: "127.0.0.1", port: 0, gracefulShutdownTimeout: "1 second" }))
-  ));
+  const proxyRuntime = ManagedRuntime.make(Layer.effect(Proxy, Proxy.make).pipe(Layer.provide(serverLayer("127.0.0.1", 0))));
   const proxy = await proxyRuntime.runPromise(Proxy);
   const brokerUrl = HttpServer.formatAddress(proxy.server.address);
   const modelDirectory = join(root, "model"); await run(fs.makeDirectory(modelDirectory, { mode: 0o700 }));
@@ -251,35 +202,7 @@ if (process.argv.includes("--version")) {
       runtimes.clear();
       phase("fixture.runners.dispose.done");
       phase("fixture.proxy.dispose.start");
-      const proxyScopesBefore = [proxyScope(proxyRuntime.scope), ...(proxyApplicationScope ? [proxyScope(proxyApplicationScope)] : [])];
-      const disposePromise = proxyRuntime.dispose();
-      // Real platform integration: fake time cannot observe a stalled native HTTP/RPC scope close.
-      const pendingObservation = setTimeout(() => {
-        const resources = process.getActiveResourcesInfo();
-        const resourceCounts: Record<string, number> = {};
-        for (const kind of resources) resourceCounts[kind] = (resourceCounts[kind] ?? 0) + 1;
-        const fibers = [...proxyFibers.values()].map(({ fiber, primitive }) => {
-          const locations: string[] = [];
-          // Public trace frames are origins, not an await stack; never print source, payloads or full paths.
-          for (let frame = fiber.cache.stackFrame, depth = 0; frame && depth < 4; frame = frame.parent, depth++) {
-            const matches = frame.stack()?.matchAll(/(?:^|\/)((?:RpcServer|NodeHttpServer|http|runner\.test)\.(?:ts|js)):(\d+):(\d+)/g);
-            if (matches) for (const match of matches) { if (locations.length < 8) locations.push(`${match[1]}:${match[2]}:${match[3]}`); }
-          }
-          const scope = Context.getOrUndefined(fiber.context, Scope.Scope);
-          return { id: fiber.id, opCount: fiber.currentOpCount, completed: fiber.pollUnsafe() !== undefined,
-            primitiveId: proxyId(primitive), primitiveKind: primitive.constructor.name.slice(0, 64),
-            scope: scope ? proxyScope(scope) : undefined, traceOrigins: locations };
-        });
-        process.stderr.write(`[proxy-dispose-pending] ${JSON.stringify({
-          at: Date.now(), pid: process.pid, listening: proxyNativeServer.listening,
-          physicalCloseAt: proxyPhysicalCloseAt, sockets: proxySockets, resourceCounts,
-          scopesBefore: proxyScopesBefore,
-          scopesNow: [proxyScope(proxyRuntime.scope), ...(proxyApplicationScope ? [proxyScope(proxyApplicationScope)] : [])],
-          requests: [...proxyRequests.values()], fibers, omittedProxyFiberObservations, omittedProxyRequests,
-          coverage: "proxy-context primitives including inherited detached forks; trace origins are not await stacks"
-        })}\n`);
-      }, 2000);
-      try { await disposePromise; } finally { clearTimeout(pendingObservation); }
+      await proxyRuntime.dispose();
       phase("fixture.proxy.dispose.done");
       phase("fixture.broker.dispose.start");
       await brokerRuntime.dispose();

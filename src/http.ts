@@ -77,6 +77,8 @@ const boundedResponse = Effect.fnUntraced(function*(response: HttpServerResponse
       return size > limit ? Effect.fail(new HttpError({ status: 413, message: "MCP response exceeds bound" })) : Effect.succeed(chunk);
     }),
     Stream.runCollect,
+    // Node masks handlers; client disconnect must still release a pending MCP response stream.
+    Effect.interruptible,
     Effect.mapError((error) => error instanceof HttpError ? error : new HttpError({ status: 500, message: "MCP response unavailable" })),
   );
   const data = chunks.length === 1 ? chunks[0]! : new Uint8Array(size);
