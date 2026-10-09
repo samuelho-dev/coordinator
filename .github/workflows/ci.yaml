@@ -39,34 +39,36 @@ jobs:
           # Temporary await metadata; no test/SDK changes or disposal behavior.
           cat > ci-native-await.mjs <<'JS'
           import { createHook } from "node:async_hooks";
-          Error.stackTraceLimit = 30;
-          const pending = new Map();
-          createHook({
-            init(id, type, trigger) {
-              if (type !== "PROMISE") return;
-              const stack = new Error().stack;
-              if (!stack?.includes("/test/") || !stack.includes(".test.ts:") || stack.includes("Test.createSubtest")) return;
-              const callsite = stack.split("\n").find((line) => line.includes("/test/") && line.includes(".test.ts:"));
-              if (pending.size < 128) pending.set(id, { id, trigger, callsite, stack });
-            },
-            promiseResolve(id) { pending.delete(id); },
-            destroy(id) { pending.delete(id); },
-          }).enable();
-          setInterval(() => {
-            process.stderr.write(`[CI-NATIVE-AWAIT] ${JSON.stringify({ pid: process.pid, at: Date.now(), pending: [...pending.values()] })}\n`);
-          }, 30000).unref();
+          if (process.argv.some((arg) => arg.endsWith("/runner.test.ts") || arg === "test/runner.test.ts")) {
+            const tests = new Map();
+            const pending = new Map();
+            let observing = false;
+            createHook({
+              init(id, type, trigger, resource) {
+                if (type === "Test") { tests.set(id, resource); return; }
+                if (!observing) return;
+                if (type !== "PROMISE") return;
+                const stack = new Error().stack;
+                if (!stack?.includes("/test/runner.test.ts:") || stack.includes("Test.createSubtest") || stack.includes("startSubtestAfterBootstrap") && !stack.includes("TestContext.<anonymous>")) return;
+                const callsite = stack.split("\n").find((line) => line.includes("/test/runner.test.ts:"));
+                if (pending.size < 128) pending.set(id, { id, trigger, callsite, stack, resource });
+              },
+              before(id) {
+                if (!observing && ["abort acknowledgement and idle snapshots cannot replace a missing whole-run terminal proof", "public-hook-only capabilities hold an inspectable child without creating prompt intent"].includes(tests.get(id)?.name)) {
+                  observing = true;
+                  Error.stackTraceLimit = 30;
+                  process.stderr.write(`[CI-NATIVE-SPEC] start ${tests.get(id).name} ${Date.now()}\n`);
+                }
+              },
+              promiseResolve(id) { pending.delete(id); },
+              destroy(id) { tests.delete(id); },
+            }).enable();
+            setInterval(() => {
+              if (observing) process.stderr.write(`[CI-NATIVE-AWAIT] ${JSON.stringify({ pid: process.pid, at: Date.now(), pending: [...pending.values()].map(({ id, trigger, callsite, stack }) => ({ id, trigger, callsite, stack })) })}\n`);
+            }, 10000).unref();
+          }
           JS
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs /usr/bin/bash -ec '
-            for test_file in test/*.test.ts; do
-              printf "[CI-NATIVE-FILE] start %s\n" "$test_file"
-              if [ "$test_file" = "test/runner.test.ts" ]; then
-                node --import tsx --import ./ci-native-await.mjs --test --test-concurrency=1 "$test_file"
-              else
-                node --import tsx --test --test-concurrency=1 "$test_file"
-              fi
-              printf "[CI-NATIVE-FILE] done %s\n" "$test_file"
-            done
-          '
+          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx --import ./ci-native-await.mjs --test --test-concurrency=1 test/*.test.ts
       - name: Run stock public controls and real broker plugin smoke
         run: |
           TEST_ROOT="$(mktemp -d /tmp/coordinator-hosts.XXXXXX)"
