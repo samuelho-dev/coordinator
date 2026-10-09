@@ -2,7 +2,6 @@ import { Deferred, Effect, Option, Schema, SchemaGetter } from "effect";
 import { Tool } from "effect/ai";
 import { ChildProcessSpawner } from "effect/process";
 import { NativeBinding, NativeRunId, NativeSubmissionId, NativeEventSequence, NativeState, NativeGetMessagesInput, NativeMessagesPage, NativeAbortResult } from "@samuelho/coordinator-native-control/contracts";
-import type { Journal } from "./journal.ts";
 
 const identifierPattern = Schema.isPattern(/^[a-zA-Z0-9_.:-]{1,160}$/);
 const identifier = Schema.String.check(identifierPattern);
@@ -227,14 +226,11 @@ export const NativeResponse = Schema.Union([RunnerNativeState, NativeMessagesPag
 // Pi and omp expose this minimal structural subset; no runtime host dependency.
 export const Context = Schema.Struct({
   cwd: Schema.String, hasUI: Schema.Boolean,
+  model: Schema.optional(Schema.Struct({ provider: Schema.String, id: Schema.String })),
   mode: Schema.Literals(["tui", "rpc", "json", "print"]),
   agent: Schema.optional(Schema.Struct({ kind: Schema.Literals(["main", "sub"]) })),
-  isIdle: Schema.declare<() => boolean>((value): value is () => boolean => typeof value === "function"),
-  hasPendingMessages: Schema.declare<() => boolean>((value): value is () => boolean => typeof value === "function"),
-  signal: Schema.optional(Schema.declare<AbortSignal>((value): value is AbortSignal => value instanceof AbortSignal)),
   sessionManager: Schema.Struct({
     getSessionId: Schema.declare<() => string>((value): value is () => string => typeof value === "function"),
-    getSessionFile: Schema.declare<() => string | undefined>((value): value is () => string | undefined => typeof value === "function"),
   }),
   ui: Schema.Struct({
     notify: Schema.declare<(text: string, level?: "info" | "warning" | "error") => void>((value): value is (text: string, level?: "info" | "warning" | "error") => void => typeof value === "function"),
@@ -242,16 +238,13 @@ export const Context = Schema.Struct({
   }),
 });
 export type Context = typeof Context.Type;
-export const NativeEventName = Schema.Literals(["session_start", "session_shutdown", "session_switch", "agent_start", "agent_end", "agent_before_settle", "agent_settled", "ui_prompt_start", "ui_prompt_end", "session_stop", "auto_retry_start", "auto_retry_end", "auto_compaction_start", "auto_compaction_end", "tool_approval_requested", "tool_approval_resolved"]);
+export const NativeEventName = Schema.Literals(["session_start", "session_shutdown", "session_switch"]);
 export type NativeEventName = typeof NativeEventName.Type;
 export const Host = Schema.Struct({
   on: Schema.declare<(event: NativeEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown>((value): value is (event: NativeEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown => typeof value === "function"),
   registerCommand: Schema.declare<(name: string, options: { description: string; handler: (args: string, ctx: Context) => Promise<void> }) => void>((value): value is (name: string, options: { description: string; handler: (args: string, ctx: Context) => Promise<void> }) => void => typeof value === "function"),
-  sendUserMessage: Schema.declare<(text: string, options: { deliverAs: "steer" | "followUp" }) => void>((value): value is (text: string, options: { deliverAs: "steer" | "followUp" }) => void => typeof value === "function"),
 });
 export type Host = typeof Host.Type;
-export const PluginActive = Schema.Struct({ ctx: Context, sessionId: SessionId, workerId: WorkerId, incarnation: IncarnationId, journal: Schema.declare<Journal["Service"]>((value): value is Journal["Service"] => typeof value === "object" && value !== null && "state" in value && "receive" in value && "save" in value), repo: Schema.mutableKey(Repo), heartbeat: Schema.mutableKey(Schema.Finite) });
-export type PluginActive = typeof PluginActive.Type;
 export const Observation = Schema.Struct({ operation: Schema.String, observed: JsonValue });
 export type Observation = typeof Observation.Type;
 export const InstallCommand = Schema.Struct({ binary: Schema.String, args: Schema.mutable(Schema.Array(Schema.String)) });

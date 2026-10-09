@@ -56,5 +56,5 @@ jobs:
           export COORDINATOR_TEST_OMP_VERSION='omp/18.6.1'
           cd "$TEST_ROOT"
           timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_PI,COORDINATOR_TEST_OMP,COORDINATOR_TEST_PI_VERSION,COORDINATOR_TEST_OMP_VERSION /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx scripts/host-smoke.ts
-  # Stock controls and broker delivery do not admit whole-run prompt/outcome proof.
+  # Stock CLIs exercise plugin-owned SDK admission/outcomes against a private local provider.
   # Ghostty rendering and real keyboard input remain separate acceptance.

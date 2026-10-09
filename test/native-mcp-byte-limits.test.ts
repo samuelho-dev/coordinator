@@ -7,12 +7,12 @@ import { createServer } from "node:http";
 import { mkdtemp, realpath, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
-import nativeControl from "../src/native-plugin.js";
+import { makeNativeControl } from "../src/native-plugin.js";
+import { Platform } from "../src/platform.js";
 import { Client, ProtocolError, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { NodeCrypto, NodeHttpServer, NodeRuntime, NodeServices, NodeStdio } from "@effect/platform-node";
-import { Effect, Layer, Record, Schema } from "effect";
+import { Effect, Exit, Layer, ManagedRuntime, Record, Schema, Scope } from "effect";
 import { HttpRouter, HttpServer } from "effect/http";
 import { connectNativeClient } from "../packages/native-control/src/client.js";
 import { NativeBinding, NativeControlError, NativeMcpProtocolVersion, NativeMcpResultBytes, NativeMcpWireBytes, NativeTools, type NativeHost } from "../packages/native-control/src/contracts.js";
@@ -91,29 +91,23 @@ if (host !== undefined) {
   test("public transcript JSON serialization preserves data and fails closed at the real HTTP boundary", { timeout: 15000 }, async t => {
     const directory = await realpath(await mkdtemp(join(tmpdir(), "native-public-json-")));
     const token = "private-transcript-boundary-token-".repeat(2);
-    const tokenFile = join(directory, "token"), endpointFile = join(directory, "endpoint"), configFile = join(directory, "config");
+    const tokenFile = join(directory, "token"), endpointFile = join(directory, "endpoint"), agentDir = join(directory, "agent");
     await writeFile(tokenFile, token, { mode: 0o600 });
-    await writeFile(configFile, JSON.stringify({ host: "pi", tokenFile, endpointFile }), { mode: 0o600 });
-    const previousConfig = process.env.COORDINATOR_NATIVE_CONFIG;
-    process.env.COORDINATOR_NATIVE_CONFIG = configFile;
-    type PublicHost = Parameters<typeof nativeControl>[0];
-    const handlers = new Map<string, Parameters<PublicHost["on"]>[1]>();
-    const sessionManager = SessionManager.inMemory(directory);
-    const ctx: Parameters<Parameters<PublicHost["on"]>[1]>[1] = { cwd: directory, mode: "rpc", hasUI: false, sessionManager, model: undefined,
-      isIdle: () => true, hasPendingMessages: () => false, abort: () => {}, getSystemPrompt: () => "" };
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const runtime = ManagedRuntime.make(Layer.merge(Platform.layer, NodeServices.layer));
+    const scope = await runtime.runPromise(Scope.make());
     const client = new Client({ name: "public-transcript-consumer", version: "1" }, { supportedProtocolVersions: [NativeMcpProtocolVersion], versionNegotiation: { mode: "legacy" } });
     t.after(async () => {
       await client.close();
-      await handlers.get("session_shutdown")?.({}, ctx);
-      if (previousConfig === undefined) delete process.env.COORDINATOR_NATIVE_CONFIG;
-      else process.env.COORDINATOR_NATIVE_CONFIG = previousConfig;
+      await runtime.runPromise(Scope.close(scope, Exit.void));
+      await runtime.dispose();
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
       await rm(directory, { recursive: true, force: true });
     });
-    await nativeControl({ on(name, handler) { handlers.set(name, handler); }, sendUserMessage() {},
-      exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }) });
-    const start = handlers.get("session_start");
-    assert.ok(start);
-    await start({}, ctx);
+    const owner = await runtime.runPromise(makeNativeControl({ host: "pi", tokenFile, endpointFile }, { cwd: directory }).pipe(Effect.provideService(Scope.Scope, scope)));
+    const sessionManager = owner.manager;
     const endpoint = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Struct({ url: Schema.String, binding: NativeBinding })))(await readFile(endpointFile, "utf8"));
     await client.connect(new StreamableHTTPClientTransport(new URL(endpoint.url), { requestInit: { headers: { authorization: `Bearer ${token}` } } }));
     sessionManager.appendCustomEntry("optional-data");
@@ -123,21 +117,26 @@ if (host !== undefined) {
       details: { date: new Date("2026-02-03T04:05:06Z"), optional: undefined, retained: ["😀", 42] }, timestamp: 124 });
     const entries = await client.callTool({ name: "native.get_entries", arguments: { binding: endpoint.binding } });
     assert.equal(entries.isError, undefined);
-    assert.deepEqual(entries.structuredContent, { result: JSON.parse(JSON.stringify({ entries: sessionManager.getEntries(), leafId: sessionManager.getLeafId() })) });
+    const entryWire = Schema.decodeUnknownSync(Schema.Struct({ result: Schema.Struct({ entries: Schema.Array(Schema.Struct({ type: Schema.String, customType: Schema.optional(Schema.String), data: Schema.optional(Schema.Json) })) }) }))(entries.structuredContent);
+    assert.deepEqual(entryWire.result.entries.find(entry => entry.customType === "complete-data")?.data, { date: "2026-01-02T03:04:05.000Z", values: [null, "😀"], nested: { retained: true } });
     const messages = await client.callTool({ name: "native.get_messages", arguments: { binding: endpoint.binding } });
     assert.equal(messages.isError, undefined);
-    assert.deepEqual(messages.structuredContent, { result: JSON.parse(JSON.stringify({ binding: endpoint.binding, messages: sessionManager.getBranch().filter(entry => entry.type === "message").map(entry => entry.message), nextCursor: null, more: false })) });
+    const messageWire = Schema.decodeUnknownSync(Schema.Struct({ result: Schema.Struct({ messages: Schema.Array(Schema.Json) }) }))(messages.structuredContent);
+    assert.deepEqual(messageWire.result.messages, [
+      { role: "user", content: [{ type: "text", text: "raw public message 😀" }], timestamp: 123 },
+      { role: "custom", customType: "raw-details", content: "public custom message", display: false, details: { date: "2026-02-03T04:05:06.000Z", retained: ["😀", 42] }, timestamp: 124 },
+    ]);
     const since = sessionManager.getLeafId();
-    sessionManager.appendCustomEntry("nonserializable", { bigint: 1n });
+    assert.throws(() => sessionManager.appendCustomEntry("nonserializable", { bigint: 1n }), TypeError);
     const unrepresentable = await client.callTool({ name: "native.get_entries", arguments: { binding: endpoint.binding, since } });
     const failure = Schema.Struct({ error: NativeControlError });
     assert.equal(unrepresentable.isError, true);
-    assert.equal(Schema.decodeUnknownSync(failure)(unrepresentable.structuredContent).error.message, "Public transcript entry is not JSON serializable");
+    assert.equal(Schema.decodeUnknownSync(failure)(unrepresentable.structuredContent).error.code, "native_failure");
     const oversizedSince = sessionManager.getLeafId();
     sessionManager.appendCustomEntry("oversized", { text: "😀".repeat(17 * 1024 * 1024) });
     const oversized = await client.callTool({ name: "native.get_entries", arguments: { binding: endpoint.binding, since: oversizedSince } });
     assert.equal(oversized.isError, true);
-    assert.equal(Schema.decodeUnknownSync(failure)(oversized.structuredContent).error.message, "Public transcript entry exceeds the native contract");
+    assert.equal(Schema.decodeUnknownSync(failure)(oversized.structuredContent).error.code, "native_failure");
   });
 
   const profiles: ReadonlyArray<NativeHost> = ["pi", "omp"];

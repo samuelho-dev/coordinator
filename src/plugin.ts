@@ -1,8 +1,13 @@
-import { Cause, Clock, Config, Context as EffectContext, Effect, Exit, Layer, ManagedRuntime, Option, PlatformError, Schema, Scope, Semaphore, Stdio as EffectStdio, Stream } from "effect";
-import { Base64 } from "effect/encoding";
+import { Cause, Clock, Config, Context as EffectContext, Crypto, Effect, Exit, Layer, ManagedRuntime, Option, PlatformError, Schema, Scope, Semaphore, Stdio as EffectStdio, Stream } from "effect";
+import { Base64, Hex } from "effect/encoding";
 import { NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { Commands, CommandError, HttpError, PluginConfig, PluginDeclined, Json, SessionId, IncarnationId, WorkerId, Sha, JournalHandledKey, JournalReleaseKey, type CommandCapabilities, type CommandInput, type Context, type Host, type PluginActive, type McpToolName, type NativeEventName } from "./contracts.ts";
+import { Commands, CommandError, HttpError, PluginConfig, PluginDeclined, Json, SessionId, IncarnationId, WorkerId, Sha, JournalHandledKey, JournalReleaseKey } from "./contracts.ts";
+import type { CommandCapabilities, CommandInput, Context, Host, McpToolName, Repo } from "./contracts.ts";
+import { NativeEventSequence, NativePluginConfig, NativeSubmissionId, nativeEventsUri } from "@samuelho/coordinator-native-control/contracts";
+import type { NativeLifecycleEvent } from "@samuelho/coordinator-native-control/contracts";
+import { makeNativeControl } from "./native-plugin.ts";
+import type { NativeSession } from "./native-session.ts";
 import { Mcp } from "./http.ts";
 import { Platform } from "./platform.ts";
 import { Journal } from "./journal.ts";
@@ -14,7 +19,7 @@ const display = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown, {
   },
 }), { onExcessProperty: "error" });
 const pluginCommands = Object.entries(Commands).filter((entry): entry is [string, Extract<(typeof Commands)[keyof typeof Commands], { target: "plugin" }>] => entry[1].target === "plugin");
-const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
+const makePlugin = Effect.fn("Plugin.make")(function*() {
   const platform = yield* Platform;
   const mcp = yield* Mcp;
   const configuredPath = yield* Config.option(Config.String("COORDINATOR_CONFIG"));
@@ -27,22 +32,15 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
   const stdio = yield* EffectStdio.Stdio;
   const terminal = yield* stdio.stdoutIsTerminal;
   const tui = (ctx: Context) => terminal && ctx.hasUI && ctx.mode === "tui" && ctx.agent?.kind !== "sub";
-  let statusContext: Context | undefined;
-  let base: "unknown" | "idle" | "working" = "unknown";
+  let base: "unknown" | "idle" | "working" | "done" | "error" = "unknown";
   let session: string | undefined;
-  let healthy = false;
-  let running = false;
   const inputs = new Map<string, "approval" | "question">();
-  const promptKinds: string[] = [];
-  const prompt = Schema.Struct({ kind: Schema.Literals(["select", "confirm", "input", "editor", "custom"]) });
-  const approval = Schema.Struct({ sessionId: Schema.String, toolCallId: Schema.String });
   // Producer for the Program Status Protocol, not a host/transport workaround.
   // Spec: https://gist.github.com/mitchellh/7acae3abd8355c1c00287d67e96c913a
   // ponytail: one bounded root record; no IDs, progress, titles or heartbeat.
   const permissionMessage = Base64.encode("Waiting for permission");
   const questionMessage = Base64.encode("Waiting for an answer");
   const report = Effect.fn("Plugin.reportStatus")(function*(ctx: Context, clear = false) {
-    statusContext = ctx;
     if (!tui(ctx)) return;
     let permission = false;
     for (const input of inputs.values()) if (input === "approval") { permission = true; break; }
@@ -59,58 +57,36 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
     inputs.clear();
     yield* report(ctx, true);
   });
-  const native = Effect.fn("Plugin.publicStatus")(function*(name: NativeEventName, event: unknown, ctx: Context) {
-    const unknown = () => { base = "unknown"; healthy = false; running = false; inputs.clear(); promptKinds.length = 0; };
-    if (name === "session_start" || name === "session_switch") {
-      session = ctx.sessionManager.getSessionId();
-      inputs.clear(); promptKinds.length = 0;
-      running = false;
-      healthy = true; base = ctx.isIdle() && !ctx.hasPendingMessages() ? "idle" : "unknown";
-    } else if (name === "session_shutdown") unknown();
-    else if (!healthy || session !== ctx.sessionManager.getSessionId()) unknown();
-    else if (name === "agent_start") {
-      running = true;
-      base = "working";
-    } else if (name === "agent_settled" && config.host === "pi") {
-      // Stock Pi publishes settlement without an outcome. Pre-settle outcomes can
-      // be invalidated by late cancellation; clear rather than invent done/error.
-      if (!running || !ctx.isIdle() || ctx.hasPendingMessages() || inputs.size > 0) unknown();
-      else { running = false; base = "unknown"; }
-    } else if (name === "ui_prompt_start" || name === "ui_prompt_end") {
-      const decoded = yield* Schema.decodeUnknownEffect(prompt)(event).pipe(Effect.option);
-      if (Option.isNone(decoded)) unknown();
-      else if (name === "ui_prompt_start") {
-        promptKinds.push(decoded.value.kind);
-        inputs.set(`prompt:${promptKinds.length}`, "question");
-      } else if (promptKinds.at(-1) !== decoded.value.kind) unknown();
-      else { inputs.delete(`prompt:${promptKinds.length}`); promptKinds.pop(); }
-    } else if (name === "tool_approval_requested" || name === "tool_approval_resolved") {
-      const decoded = yield* Schema.decodeUnknownEffect(approval)(event).pipe(Effect.option);
-      if (Option.isNone(decoded) || decoded.value.sessionId !== session) unknown();
-      else {
-        const key = `approval:${decoded.value.toolCallId}`;
-        if (name === "tool_approval_requested") {
-          if (inputs.has(key)) unknown(); else inputs.set(key, "approval");
-        } else if (!inputs.delete(key)) unknown();
-      }
-    } else if (name === "agent_end" || name === "session_stop") {
-      // OMP's stock end/stop hooks precede possible continuation/async settlement.
-      // ponytail: clear uncertain authority; no polling or invented completion hook.
-      if (config.host === "omp") base = "unknown";
-    } else {
-      if (running) base = "working";
+  const native = Effect.fn("Plugin.ownedStatus")(function*(event: NativeLifecycleEvent, ctx: Context) {
+    if (!active || nativeEventsUri(event.binding) !== nativeEventsUri(active.owner.binding)) return;
+    if (event.kind === "session_started") { session = event.binding.sessionId; base = "idle"; inputs.clear(); }
+    else if (session !== event.binding.sessionId) { base = "unknown"; inputs.clear(); }
+    else if (event.kind === "session_retired") { base = "unknown"; inputs.clear(); }
+    else if (event.kind === "run_started") base = "working";
+    else if (event.kind === "input_requested") inputs.set(event.inputId, event.inputKind === "approval" ? "approval" : "question");
+    else if (event.kind === "input_resolved") {
+      if (!inputs.delete(event.inputId)) base = "unknown";
+    } else if (event.kind === "run_settled") {
+      base = inputs.size > 0 ? "unknown" : event.outcome === "completed" ? "done" : event.outcome === "error" ? "error" : "idle";
     }
     yield* report(ctx);
   });
   const semaphore = yield* Semaphore.make(1);
-  let active: PluginActive | undefined;
+  let active: { ctx: Context; parentSessionId: string; sessionId: SessionId; incarnation: IncarnationId; workerId: WorkerId;
+    owner: NativeSession; scope: Scope.Closeable; journal: Journal["Service"]; repo: Repo; heartbeat: number; dispatching: boolean } | undefined;
   let sessionScope: Scope.Closeable | undefined;
   const serial = <A, E, R>(effect: Effect.Effect<A, E, R>) => semaphore.withPermits(1)(effect);
   const call = <const M extends McpToolName>(method: M, params: CommandInput<M>) => mcp.call(config.brokerUrl, token, method, params);
   const notify = (ctx: Context, text: string, level: "info" | "warning" | "error" = "info") => Effect.sync(() => ctx.ui.notify(text, level));
-  const confirm = (ctx: Context, title: string, text: string) => Effect.tryPromise({
-    try: () => ctx.ui.confirm(title, text),
-    catch: () => new CommandError({ message: "Coordinator approval UI unavailable" }),
+  const confirm = (ctx: Context, title: string, text: string) => Effect.gen(function*() {
+    inputs.set("coordinator-approval", "approval");
+    return yield* Effect.gen(function*() {
+      yield* report(ctx);
+      return yield* Effect.tryPromise({ try: () => ctx.ui.confirm(title, text), catch: () => new CommandError({ message: "Coordinator approval UI unavailable" }) });
+    }).pipe(Effect.ensuring(Effect.gen(function*() {
+      inputs.delete("coordinator-approval");
+      yield* report(ctx);
+    }).pipe(Effect.orDie)));
   });
   const local = Effect.fn("Plugin.local")(function*(ctx: Context) {
     return { repo: yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote),
@@ -121,7 +97,7 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
     const current = active;
     if (!current) return;
     const { ctx, sessionId, incarnation, workerId, journal } = current;
-    if (ctx.sessionManager.getSessionId() !== sessionId) return;
+    if (ctx.sessionManager.getSessionId() !== current.parentSessionId) return;
     current.repo = (yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote));
     if ((yield* Clock.currentTimeMillis) - current.heartbeat >= 10000) {
       yield* call("session.heartbeat", { sessionId, incarnation, machineId: config.machineId, host: config.host, repo: current.repo, workerId });
@@ -146,7 +122,9 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
       if (!address || task.confirmedRevision !== address.revision || task.disposition !== "ready" || !task.readback || (yield* platform.fingerprint(task.readback)) !== (yield* platform.fingerprint(address)) || address.sessionId !== sessionId || address.incarnation !== incarnation) continue;
       const approvedAddress = task.instruction?.address;
       if (address.deadline <= (yield* Clock.currentTimeMillis) || address.repo !== task.request.repo || (approvedAddress ? (yield* platform.fingerprint(address)) !== (yield* platform.fingerprint(approvedAddress)) : address.ref !== task.request.ref || address.sha !== task.request.sha) || address.workerId !== workerId) continue;
-      if (!ctx.isIdle() || ctx.hasPendingMessages()) continue;
+      if (current.dispatching || current.owner.pendingSubmissions > 0 || current.owner.session.isStreaming || current.owner.session.isCompacting ||
+        (current.owner.backend.host === "pi" ? current.owner.backend.session.pendingMessageCount > 0 :
+          current.owner.backend.session.queuedMessageCount > 0 || current.owner.backend.session.hasPendingAsyncWork())) continue;
       const actual = yield* local(ctx);
       if (actual.repo !== address.repo || actual.ref !== address.ref || actual.sha !== address.sha) {
         yield* call("task.readback", { taskId: task.taskId, address, disposition: "hold", reason: "Local repository/ref/SHA changed", nextCheck: (yield* Clock.currentTimeMillis) + 60000 });
@@ -160,36 +138,81 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
         continue;
       }
       if (!(yield* journal.releaseIntent(key))) continue;
-      // Durable intent precedes the host call. A crash/throw is held, never retried.
-      yield* Effect.sync(() => host.sendUserMessage(task.instruction?.prompt ?? task.request.prompt, { deliverAs: "followUp" }));
-      yield* journal.releaseSent(key);
-      yield* call("task.report", { taskId: task.taskId, sessionId, incarnation, state: "HELD", result: { revision: address.revision, deliveryAttempted: true, evidenceVerified: false, reason: "Public extension send does not acknowledge admission; explicit outcome required, never replay" } });
+      const submissionId = NativeSubmissionId.make(yield* platform.crypto.randomUUIDv4);
+      current.dispatching = true;
+      // Durable intent precedes SDK admission. No response/connection failure can replay this revision.
+      yield* current.owner.prompt({ binding: current.owner.binding, submissionId, message: task.instruction?.prompt ?? task.request.prompt },
+        (admission) => Effect.runPromise(Effect.gen(function*() {
+          yield* journal.releaseSent(key);
+          if (admission.disposition !== "handled") yield* call("task.report", { taskId: task.taskId, sessionId, incarnation, state: "RUNNING",
+            result: { revision: address.revision, admission, evidenceVerified: false } });
+        }))).pipe(
+        Effect.flatMap((result) => call("task.report", { taskId: task.taskId, sessionId, incarnation,
+          state: result.disposition === "handled" || result.final.outcome === "aborted" ? "HELD" : result.final.outcome === "error" ? "FAILED" : "SUCCEEDED",
+          result: { revision: address.revision, admission: result.admission, ...(result.disposition === "settled" ? { final: result.final } : {}),
+            evidenceVerified: false, reason: "SDK execution outcome; deliverable evidence remains separate" } })),
+        Effect.catchCause(() => call("task.report", { taskId: task.taskId, sessionId, incarnation, state: "HELD",
+          result: { revision: address.revision, reason: "SDK delivery or outcome could not be proven; explicit new addressed revision required" } })),
+        Effect.ensuring(Effect.sync(() => { current.dispatching = false; })),
+        Effect.tapCause(() => notify(ctx, "Coordinator SDK outcome report unavailable; reconcile this revision explicitly.", "warning")),
+        Effect.forkIn(current.scope),
+      );
     }
-    yield* journal.scan(ctx.sessionManager.getSessionFile());
+    yield* journal.scan(current.owner.manager.getSessionFile());
     yield* journal.upload((entry) => call("archive.append", { sessionId, ...entry }), 1);
   });
   const stop = Effect.fn("Plugin.stop")(function*() {
-    const previous = active;
+    const previous = active, scope = sessionScope;
     active = undefined;
-    if (sessionScope) { yield* Scope.close(sessionScope, Exit.void); sessionScope = undefined; }
-    if (previous) yield* call("session.stop", { sessionId: previous.sessionId, incarnation: previous.incarnation }).pipe(
-      Effect.catchCause(() => notify(previous.ctx, "Coordinator stop unavailable; prior enrollment expires by heartbeat lease.", "warning"))
-    );
+    sessionScope = undefined;
+    yield* (previous ? clearStatus(previous.ctx) : Effect.void).pipe(Effect.ensuring(Effect.gen(function*() {
+      if (scope) yield* Scope.close(scope, Exit.void);
+      if (previous) yield* call("session.stop", { sessionId: previous.sessionId, incarnation: previous.incarnation }).pipe(
+        Effect.catchCause(() => notify(previous.ctx, "Coordinator stop unavailable; prior enrollment expires by heartbeat lease.", "warning")));
+    }).pipe(Effect.orDie)));
   });
-  yield* Effect.addFinalizer(() => Effect.gen(function*() {
-    yield* (statusContext ? clearStatus(statusContext) : Effect.void).pipe(Effect.ensuring(serial(stop())), Effect.orDie);
-  }));
+  yield* Effect.addFinalizer(() => serial(stop()).pipe(Effect.orDie));
   const start = Effect.fn("Plugin.start")((ctx: Context) => serial(Effect.gen(function*() {
     yield* stop();
-    const sessionId = yield* Schema.decodeUnknownEffect(SessionId, { onExcessProperty: "error" })(ctx.sessionManager.getSessionId());
-    const workerId = WorkerId.make(sessionId);
-    sessionScope = yield* Scope.make();
-    const context = yield* Layer.buildWithScope(Journal.layer(config.stateDirectory, sessionId).pipe(Layer.provide(Layer.succeed(Platform, platform))), sessionScope);
-    active = { ctx, sessionId, workerId, incarnation: IncarnationId.make(yield* platform.crypto.randomUUIDv4), repo: yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote), journal: EffectContext.get(context, Journal), heartbeat: 0 };
+    const parentSessionId = ctx.sessionManager.getSessionId();
+    const scope = yield* Scope.make();
+    sessionScope = scope;
+    yield* platform.fs.makeDirectory(config.stateDirectory, { recursive: true, mode: 0o700 });
+    const configuredNative = yield* Config.option(Config.String("COORDINATOR_NATIVE_CONFIG"));
+    const nativeConfig = yield* Effect.gen(function*() {
+      if (Option.isSome(configuredNative)) {
+        if (!platform.path.isAbsolute(configuredNative.value)) return yield* new CommandError({ message: "Absolute native configuration path required" });
+        const value = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(NativePluginConfig), { onExcessProperty: "error" })(yield* platform.privateFile(configuredNative.value));
+        if (value.host !== config.host) return yield* new CommandError({ message: "Native owner host mismatch" });
+        return value;
+      }
+      const directory = platform.path.join(config.stateDirectory, `native-${yield* platform.digest(parentSessionId)}`);
+      yield* platform.fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
+      const tokenFile = platform.path.join(directory, "control.token");
+      if (!(yield* platform.fs.exists(tokenFile))) yield* platform.fs.writeFileString(tokenFile, Hex.encode(yield* platform.crypto.randomBytes(32)), { flag: "wx", mode: 0o600 });
+      return { host: config.host, endpointFile: platform.path.join(directory, "endpoint.json"), tokenFile };
+    });
+    const owner = yield* makeNativeControl(nativeConfig, ctx).pipe(Effect.provideService(Scope.Scope, scope),
+      Effect.provideService(Platform, platform), Effect.provideService(Crypto.Crypto, platform.crypto),
+      Effect.onExit((exit) => exit._tag === "Failure" ? Scope.close(scope, exit) : Effect.void));
+    const sessionId = SessionId.make(owner.binding.sessionId), workerId = WorkerId.make(sessionId);
+    const context = yield* Layer.buildWithScope(Journal.layer(config.stateDirectory, sessionId).pipe(Layer.provide(Layer.succeed(Platform, platform))), scope);
+    active = { ctx, parentSessionId, sessionId, workerId, incarnation: IncarnationId.make(owner.binding.incarnation), owner, scope,
+      repo: yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote), journal: EffectContext.get(context, Journal), heartbeat: 0, dispatching: false };
+    let updates = Promise.resolve();
+    const unsubscribe = owner.journal.subscribe((event) => {
+      updates = updates.then(() => Effect.runPromise(native(event, ctx))).catch((cause: unknown) => {
+        base = "unknown";
+        console.error("Coordinator owned SDK status unavailable", cause);
+        ctx.ui.notify("Coordinator owned SDK status unavailable; displayed status may be stale.", "warning");
+      });
+    });
+    yield* Effect.addFinalizer(() => Effect.promise(async () => { unsubscribe(); await updates; })).pipe(Effect.provideService(Scope.Scope, scope));
+    for (const event of owner.journal.read(owner.binding, NativeEventSequence.make(0)).entries) yield* native(event, ctx);
     yield* Effect.gen(function*() {
       yield* Effect.sleep("1 second");
       yield* serial(tick()).pipe(Effect.catchCause(() => notify(ctx, "Coordinator connection or journal unavailable; dispatch held.", "warning")));
-    }).pipe(Effect.forever, Effect.forkIn(sessionScope));
+    }).pipe(Effect.forever, Effect.forkIn(scope));
     yield* tick();
   })));
   const command = Effect.fn("Plugin.command")((args: string, ctx: Context) => serial(Effect.gen(function*() {
@@ -202,7 +225,7 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
     if (!entry) return yield* new CommandError({ message: "Unknown coordinator action; use /coordinator help" });
     const data: unknown = split < 0 ? {} : yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Json), { onExcessProperty: "error" })(args.trim().slice(split + 1));
     const current = active;
-    if (!current || current.sessionId !== ctx.sessionManager.getSessionId()) return yield* new CommandError({ message: "Session not enrolled" });
+    if (!current || current.parentSessionId !== ctx.sessionManager.getSessionId()) return yield* new CommandError({ message: "Session not enrolled" });
     const { sessionId, incarnation, workerId, journal } = current;
     const approve = Effect.fn("Plugin.approve")(function*(title: string, text: string) {
       if (!ctx.hasUI || !(yield* confirm(ctx, title, text))) return yield* Effect.fail(new PluginDeclined({ message: "Human approval declined or unavailable" }));
@@ -292,12 +315,12 @@ const makePlugin = Effect.fn("Plugin.make")(function*(host: Host) {
 });
 
 export class Plugin extends EffectContext.Service<Plugin>()("coordinator/Plugin", { make: makePlugin }) {
-  static layer(host: Host) { return Layer.effect(this, this.make(host)); }
+  static readonly layer = Layer.effect(this, this.make());
 }
 
 // Public extension callbacks are the only Promise/runtime boundary.
 export default async function coordinator(host: Host): Promise<void> {
-  const layer = Plugin.layer(host).pipe(Layer.provide(Layer.merge(Platform.layer, Mcp.layer)), Layer.provide(NodeServices.layer));
+  const layer = Plugin.layer.pipe(Layer.provide(Layer.merge(Platform.layer, Mcp.layer)), Layer.provide(NodeServices.layer));
   let runtime = ManagedRuntime.make(layer);
   try {
     const initial = await runtime.runPromise(Plugin);
@@ -306,25 +329,10 @@ export default async function coordinator(host: Host): Promise<void> {
     const start = async (_event: unknown, ctx: Context): Promise<void> => {
       if (ctx.agent?.kind === "sub") return;
       if (disposed) { runtime = ManagedRuntime.make(layer); disposed = false; }
-      await runtime.runPromise(Plugin.use((plugin) => plugin ? plugin.native("session_start", _event, ctx) : Effect.void));
       await runtime.runPromise(Plugin.use((plugin) => plugin ? plugin.start(ctx) : Effect.void));
     };
     host.on("session_start", start);
     if (initial.config.host === "omp") host.on("session_switch", start);
-    const observe = (name: NativeEventName) => host.on(name, async (event, ctx): Promise<void> => {
-      if (ctx.agent?.kind === "sub") return;
-      if (!disposed) await runtime.runPromise(Plugin.use((plugin) => plugin ? plugin.native(name, event, ctx) : Effect.void));
-    });
-    observe("agent_start");
-    observe("agent_end");
-    if (initial.config.host === "pi") {
-      observe("agent_settled");
-      observe("ui_prompt_start");
-      observe("ui_prompt_end");
-    } else {
-      const hooks: NativeEventName[] = ["session_stop", "auto_retry_start", "auto_retry_end", "auto_compaction_start", "auto_compaction_end", "tool_approval_requested", "tool_approval_resolved"];
-      for (const name of hooks) observe(name);
-    }
     host.on("session_shutdown", async () => { await runtime.dispose(); disposed = true; });
     host.registerCommand("coordinator", { description: "Coordinator: explicit addressed dispatch, status, consent and runner-owned control (JSON arguments)", handler: (args, ctx) => runtime.runPromise(Plugin.use((plugin) => plugin ? plugin.command(args, ctx) : Effect.void).pipe(
       Effect.catchCause(() => Effect.fail(new CommandError({ message: "Coordinator command failed; no automatic retry" }))),
