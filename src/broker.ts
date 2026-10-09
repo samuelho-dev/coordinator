@@ -1,18 +1,18 @@
-import { Clock, Config, Context, Effect, Layer, Option, Schedule, Semaphore } from "effect";
+import { Clock, Config, Context, Effect, Layer, Option, Schedule, Schema, Semaphore } from "effect";
 import * as PersistedQueue from "effect/persistence/PersistedQueue";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { HttpClient, HttpServer } from "effect/http";
 import { Commands, Address, Work, TaskId, SessionId, RunnerId, WorkerId, Repo, Sha, Hash, BrokerConfig, Task, LiveSession, ArchivePayload, ArchiveEntry, ArchiveRow, JournalState, Json, JsonValue, Poll, Delivery, EvidenceObservation, HttpError, type CommandCapabilities, type CommandInput, type CommandOutput, type BrokerRequest, type Principal, type Role, type SessionKey, type LiveRunner } from "./contracts.ts";
 import { Platform } from "./platform.ts";
-import { Mcp, serverLayer, decode, decodeEffect, decodeJson, encodeJson, mcpResultSizer, MCP_RESULT_LIMIT } from "./http.ts";
+import { Mcp, serverLayer, MCP_RESULT_LIMIT } from "./http.ts";
 import { pollCi } from "./evidence.ts";
 import { SnapshotStore } from "./backup.ts";
 import { migrateBroker } from "./database.ts";
 
 const BrokerConfiguration = Context.Service<BrokerConfig>("coordinator/BrokerConfiguration");
-const pollResultSize = mcpResultSizer(Commands["session.poll"].structuredOutput);
-const taskResultSize = mcpResultSizer(Commands["task.get"].structuredOutput);
-const archiveResultSize = mcpResultSizer(Commands["archive.list"].structuredOutput);
+const pollResultText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands["session.poll"].structuredOutput)), { onExcessProperty: "error" });
+const taskResultText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands["task.get"].structuredOutput)), { onExcessProperty: "error" });
+const archiveResultText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands["archive.list"].structuredOutput)), { onExcessProperty: "error" });
 export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
   make: Effect.gen(function*() {
     const config = yield* BrokerConfiguration;
@@ -41,7 +41,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     const runners = new Map<RunnerId, LiveRunner>();
     const versions = new WeakMap<Task, string>();
     for (const row of yield* sql.unsafe<Json>("SELECT data FROM sessions")) {
-      const value = decodeJson(LiveSession, String(row.data));
+      const value = Schema.decodeUnknownSync(Schema.fromJsonString(LiveSession), { onExcessProperty: "error" })(String(row.data));
       value.verified = false; value.liveUntil = 0; value.polledAt = 0;
       sessions.set(value.sessionId, value);
     }
@@ -90,32 +90,32 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     });
     const role = Effect.fn("Broker.role")(function*(principal: Principal, ...roles: Role[]) {
     if (!roles.some((role) => principal.roles.includes(role))) return yield* new HttpError({ status: 403, message: "Operation not authorized" });
-  
+
     });
     const repo = Effect.fn("Broker.repo")(function*(principal: Principal, repo: typeof Repo.Type) {
     if (!principal.repos.includes(repo)) return yield* new HttpError({ status: 403, message: "Repository not authorized" });
-  
+
     });
     const loadTask = Effect.fn("Broker.task")(function*(principal: Principal, id: TaskId) {
     const row = (yield* sql.unsafe<Json>("SELECT data FROM tasks WHERE id=?", [id]))[0];
     if (!row) return yield* new HttpError({ status: 404, message: "Task not found" });
-    const task = decodeJson(Task, String(row.data));
+    const task = Schema.decodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(String(row.data));
     versions.set(task, String(row.data));
     if (task.owner !== principal.owner) return yield* new HttpError({ status: 403, message: "Owner mismatch" });
     (yield* repo(principal, task.request.repo));
     return task;
-  
+
     });
     const tasks = Effect.fn("Broker.tasks")(function*() {
       return (yield* sql.unsafe<Json>("SELECT data FROM tasks")).map((r) => {
-        const value = decodeJson(Task, String(r.data));
+        const value = Schema.decodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(String(r.data));
         versions.set(value, String(r.data));
         return value;
       });
     });
     const save = Effect.fn("Broker.save")(function*(task: Task) {
       task.updatedAt = yield* Clock.currentTimeMillis;
-      const data = encodeJson(Task, task);
+      const data = Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(task);
       const previous = versions.get(task);
       const changed = previous === undefined
         ? yield* sql.unsafe("INSERT INTO tasks VALUES (?,?) ON CONFLICT(id) DO NOTHING RETURNING id", [task.taskId, data])
@@ -124,7 +124,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       versions.set(task, data);
     });
     const saveReturnedTask = Effect.fn("Broker.saveReturnedTask")(function*(task: Task) {
-      if (taskResultSize({ result: task }) > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Task exceeds delivery budget" });
+      if (new TextEncoder().encode(taskResultText({ result: task })).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Task exceeds delivery budget" });
       yield* save(task);
       return task;
     });
@@ -134,7 +134,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     if (!session || session.principal !== principal.id || session.owner !== principal.owner || session.incarnation !== key.incarnation) return yield* new HttpError({ status: 403, message: "Session binding mismatch" });
     if (live && (!session.verified || session.liveUntil <= now)) return yield* new HttpError({ status: 409, message: "Recipient is not verified live" });
     return session;
-  
+
     });
     const recipient = Effect.fn("Broker.recipient")(function*(principal: Principal, key: SessionKey) {
     const now = yield* Clock.currentTimeMillis;
@@ -142,7 +142,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     if (!session || session.owner !== principal.owner || session.incarnation !== key.incarnation || !session.verified || session.liveUntil <= now || session.polledAt < now - 10000) return yield* new HttpError({ status: 409, message: "Recipient is not verified live" });
     (yield* repo(principal, session.repo));
     return session;
-  
+
     });
     const offer = Effect.fn("Broker.offer")(function*(task: Task) {
     const now = yield* Clock.currentTimeMillis;
@@ -150,7 +150,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     if (task.offerDecision === "pending" && (task.offerExpires ?? 0) > now) return;
     if (task.offerDecision === "pending") { task.offerDecision = "expired"; (yield* save(task)); }
     yield* queue.offer(task.taskId, { id: task.taskId });
-  
+
     });
     const runnerPrincipal = (task: Task) => { return config.principals.find((p) => p.roles.includes("runner") && RunnerId.make(p.id) === task.runnerId && p.owner === task.owner); };
     const assign = Effect.fn("Broker.assign")(function*(id: TaskId) {
@@ -202,7 +202,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       yield* Effect.sleep(500);
     }
 
-  
+
     });
     const runnerToken = Effect.fn("Broker.runnerToken")(function*(principal: Principal) {
     // Outbound secrets are separate files, never in the ledger/config/response or process arguments.
@@ -211,12 +211,12 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     const token = (yield* platform.privateFile(platform.path.join(directory, principal.id)));
     if (!principal.controlTokenHash || !(yield* platform.checkToken(token, principal.controlTokenHash))) return yield* new HttpError({ status: 500, message: "Runner control credential rotation mismatch" });
     return token;
-  
+
     });
     const appendEvidence = Effect.fn("Broker.appendEvidence")(function*(task: Task, principal: Principal, kind: string, sha: typeof Sha.Type, data: Json) {
     const now = yield* Clock.currentTimeMillis;
-    (yield* sql.unsafe("INSERT INTO evidence(task,kind,sha,principal,data,observed) VALUES (?,?,?,?,?,?)", [task.taskId, kind, sha, principal.id, encodeJson(Json, data), now]));
-  
+    (yield* sql.unsafe("INSERT INTO evidence(task,kind,sha,principal,data,observed) VALUES (?,?,?,?,?,?)", [task.taskId, kind, sha, principal.id, Schema.encodeUnknownSync(Schema.fromJsonString(Json), { onExcessProperty: "error" })(data), now]));
+
     });
     const bindCommandCapabilities = (principal: Principal, now: number): CommandCapabilities<"broker"> => {
       const readableTask = Effect.fn("Broker.readableTask")(function*(taskId: TaskId) {
@@ -233,19 +233,19 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           if (existing && existing.incarnation !== input.incarnation && existing.verified && existing.liveUntil > now) return yield* new HttpError({ status: 409, message: "Prior session incarnation still live" });
           const session: LiveSession = { ...input, owner: principal.owner, principal: principal.id, verified: true, liveUntil: now + 30000, polledAt: existing?.incarnation === input.incarnation ? existing.polledAt : 0 };
           sessions.set(input.sessionId, session);
-          (yield* sql.unsafe("INSERT INTO sessions VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", [input.sessionId, encodeJson(LiveSession, session)]));
+          (yield* sql.unsafe("INSERT INTO sessions VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", [input.sessionId, Schema.encodeUnknownSync(Schema.fromJsonString(LiveSession), { onExcessProperty: "error" })(session)]));
           return { liveUntil: session.liveUntil };
         }),
         pollSession: Effect.fn("Broker.pollSession")(function*(params: CommandInput<"session.poll">): Effect.fn.Return<CommandOutput<"session.poll">, unknown> {
           (yield* role(principal, "session")); const input = params; const session = (yield* boundSession(principal, input)); session.polledAt = now;
-          const messages: Delivery[] = (yield* sql.unsafe<Json>("SELECT id,incarnation,payload,expires FROM peers WHERE owner=? AND session=? AND incarnation=? AND expires>? ORDER BY expires LIMIT 8", [principal.owner, input.sessionId, input.incarnation, now])).map((r) => decode(Delivery, { messageId: r.id, incarnation: r.incarnation, payload: decodeJson(JsonValue, String(r.payload)), expiresAt: r.expires }));
+          const messages: Delivery[] = (yield* sql.unsafe<Json>("SELECT id,incarnation,payload,expires FROM peers WHERE owner=? AND session=? AND incarnation=? AND expires>? ORDER BY expires LIMIT 8", [principal.owner, input.sessionId, input.incarnation, now])).map((r) => Schema.decodeUnknownSync(Delivery, { onExcessProperty: "error" })({ messageId: r.id, incarnation: r.incarnation, payload: Schema.decodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(String(r.payload)), expiresAt: r.expires }));
           const bound = (yield* tasks()).filter((task) => task.owner === principal.owner && task.peerSession === input.sessionId && task.peerIncarnation === input.incarnation);
           const result: Poll = { messages: [], offers: [], releases: [], archiveEnabled: Boolean((yield* sql.unsafe<Json>("SELECT enabled FROM consents WHERE owner=? AND session=?", [principal.owner, input.sessionId]))[0]?.enabled) };
-          for (const message of messages) { const next = { ...result, messages: [...result.messages, message] }; if (pollResultSize({ result: next }) < 60000) result.messages.push(message); }
+          for (const message of messages) { const next = { ...result, messages: [...result.messages, message] }; if (new TextEncoder().encode(pollResultText({ result: next })).byteLength < 60000) result.messages.push(message); }
           for (const task of bound) {
             const key = !task.runnerId && task.offerDecision === "pending" && (task.offerExpires ?? 0) > now ? "offers"
               : !task.runnerId && task.offerDecision === "accepted" && task.address && session.workerId === task.address.workerId && session.repo === task.address.repo && task.address.deadline > now && task.confirmedRevision === task.address.revision && task.disposition === "ready" && task.state === "ACCEPTED" ? "releases" : undefined;
-            if (key && pollResultSize({ result: { ...result, [key]: [...result[key], task] } }) < 60000) result[key].push(task);
+            if (key && new TextEncoder().encode(pollResultText({ result: { ...result, [key]: [...result[key], task] } })).byteLength < 60000) result[key].push(task);
           }
           return result;
         }),
@@ -257,10 +257,10 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         sendPeer: Effect.fn("Broker.sendPeer")(function*(params: CommandInput<"peer.send">): Effect.fn.Return<CommandOutput<"peer.send">, unknown> {
           (yield* role(principal, "session", "coordinator")); const input = params;
           (yield* recipient(principal, input));
-          if (new TextEncoder().encode(encodeJson(JsonValue, input.payload)).byteLength > 8000) return yield* new HttpError({ status: 413, message: "Peer payload too large" });
+          if (new TextEncoder().encode(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(input.payload)).byteLength > 8000) return yield* new HttpError({ status: 413, message: "Peer payload too large" });
           const hash = (yield* platform.fingerprint({ ...input, owner: principal.owner, sender: principal.id })); const prior = (yield* sql.unsafe<Json>("SELECT fingerprint FROM peers WHERE id=?", [input.messageId]))[0];
-          if (prior && decode(Hash, prior.fingerprint) !== hash) return yield* new HttpError({ status: 409, message: "Message ID conflict" });
-          if (!prior) (yield* sql.unsafe("INSERT INTO peers VALUES (?,?,?,?,?,?,?,?)", [input.messageId, principal.owner, principal.id, input.sessionId, input.incarnation, encodeJson(JsonValue, input.payload), hash, now + input.ttlMs]));
+          if (prior && Schema.decodeUnknownSync(Hash, { onExcessProperty: "error" })(prior.fingerprint) !== hash) return yield* new HttpError({ status: 409, message: "Message ID conflict" });
+          if (!prior) (yield* sql.unsafe("INSERT INTO peers VALUES (?,?,?,?,?,?,?,?)", [input.messageId, principal.owner, principal.id, input.sessionId, input.incarnation, Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(input.payload), hash, now + input.ttlMs]));
           return { delivered: false, committed: true, messageId: input.messageId };
         }),
         acknowledgePeer: Effect.fn("Broker.acknowledgePeer")(function*(params: CommandInput<"peer.ack">): Effect.fn.Return<CommandOutput<"peer.ack">, unknown> {
@@ -276,7 +276,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         }),
         submitTask: Effect.fn("Broker.submitTask")(function*(params: CommandInput<"task.submit">): Effect.fn.Return<CommandOutput<"task.submit">, unknown> {
           (yield* role(principal, "coordinator")); const work = params; (yield* repo(principal, work.repo));
-          if (new TextEncoder().encode(encodeJson(Work, work)).byteLength > 28000) return yield* new HttpError({ status: 413, message: "Approved work exceeds delivery budget" });
+          if (new TextEncoder().encode(Schema.encodeUnknownSync(Schema.fromJsonString(Work), { onExcessProperty: "error" })(work)).byteLength > 28000) return yield* new HttpError({ status: 413, message: "Approved work exceeds delivery budget" });
           const prior = (yield* sql.unsafe<Json>("SELECT data FROM tasks WHERE id=?", [work.taskId]))[0];
           if (prior) { const task = (yield* loadTask(principal, work.taskId)); if (task.fingerprint !== (yield* platform.fingerprint(work))) return yield* new HttpError({ status: 409, message: "Task ID fingerprint conflict" }); return task; }
           if (work.deadline <= now || !work.prompt || !work.ref || !work.scope || !work.requiredLanes.length) return yield* new HttpError({ status: 400, message: "Approved bounded scope, deadline, ref and explicit CI lanes required" });
@@ -290,11 +290,11 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           const target = task.evidenceTarget ?? task.request;
           const policy = (yield* platform.fingerprint({ ref: target.ref, requiredLanes: [...target.requiredLanes].sort() }));
           const observations = (yield* sql.unsafe<Json>("SELECT kind,sha,principal,data,observed FROM evidence WHERE id IN (SELECT MAX(id) FROM evidence WHERE task=? GROUP BY kind) ORDER BY id DESC", [task.taskId])).map((row) => {
-            const data = decodeJson(Json, String(row.data));
-            return decode(EvidenceObservation, { kind: row.kind, sha: row.sha, principal: row.principal, data, observedAt: row.observed, stale: row.sha !== target.sha || (row.kind === "ci" && data.policy !== policy) });
+            const data = Schema.decodeUnknownSync(Schema.fromJsonString(Json), { onExcessProperty: "error" })(String(row.data));
+            return Schema.decodeUnknownSync(EvidenceObservation, { onExcessProperty: "error" })({ kind: row.kind, sha: row.sha, principal: row.principal, data, observedAt: row.observed, stale: row.sha !== target.sha || (row.kind === "ci" && data.policy !== policy) });
           });
           const evidence: EvidenceObservation[] = [];
-          for (const observation of observations) if (taskResultSize({ result: { ...task, evidence: [...evidence, observation] } }) < 60000) evidence.push(observation);
+          for (const observation of observations) if (new TextEncoder().encode(taskResultText({ result: { ...task, evidence: [...evidence, observation] } })).byteLength < 60000) evidence.push(observation);
           return { ...task, evidence };
         }),
         attachTask: Effect.fn("Broker.attachTask")(function*(params: CommandInput<"task.attach">): Effect.fn.Return<CommandOutput<"task.attach">, unknown> {
@@ -322,7 +322,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           (yield* recipient(principal, input.address));
           task.instruction = { prompt: input.prompt, address: input.address }; task.address = input.address;
           delete task.readback; delete task.confirmedRevision; task.disposition = "hold"; task.reason = "Later instruction awaits new readback"; task.state = "ACCEPTED";
-          if (taskResultSize({ result: task }) > 50000) return yield* new HttpError({ status: 413, message: "Addressed task exceeds delivery budget" });
+          if (new TextEncoder().encode(taskResultText({ result: task })).byteLength > 50000) return yield* new HttpError({ status: 413, message: "Addressed task exceeds delivery budget" });
           return yield* saveReturnedTask(task);
         }),
         addressTask: Effect.fn("Broker.addressTask")(function*(params: CommandInput<"task.address">): Effect.fn.Return<CommandOutput<"task.address">, unknown> {
@@ -340,7 +340,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           if (!task.runnerId && task.peerSession && (input.address.sessionId !== task.peerSession || input.address.incarnation !== task.peerIncarnation)) return yield* new HttpError({ status: 409, message: "Peer address mismatch" });
           task.address = input.address; delete task.readback; delete task.confirmedRevision; task.disposition = "hold"; task.reason = "Awaiting matching readback";
           if (task.instruction) task.instruction.address = input.address;
-          if (taskResultSize({ result: task.runnerId ? { ...task, readback: input.address, disposition: "ready", reason: undefined } : task }) > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Task exceeds delivery budget" });
+          if (new TextEncoder().encode(taskResultText({ result: task.runnerId ? { ...task, readback: input.address, disposition: "ready", reason: undefined } : task })).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Task exceeds delivery budget" });
           if (task.runnerId) {
             yield* save(task);
             const runner = runnerPrincipal(task);
@@ -465,7 +465,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           (yield* repo(principal, session.repo));
           if (!input.enabled && principal.owner !== input.owner) {
             const consent = (yield* sql.unsafe<Json>("SELECT participants FROM consents WHERE owner=? AND session=?", [input.owner, input.sessionId]))[0];
-            if (!consent || !decodeJson(JournalState.fields.participants, String(consent.participants)).includes(principal.id)) return yield* new HttpError({ status: 403, message: "Not an enrolled archive participant" });
+            if (!consent || !Schema.decodeUnknownSync(Schema.fromJsonString(JournalState.fields.participants), { onExcessProperty: "error" })(String(consent.participants)).includes(principal.id)) return yield* new HttpError({ status: 403, message: "Not an enrolled archive participant" });
           }
 
             (yield* sql.unsafe("INSERT INTO participant_consents VALUES (?,?,?,?) ON CONFLICT(owner,session,participant) DO UPDATE SET enabled=excluded.enabled", [input.owner, input.sessionId, principal.id, input.enabled ? 1 : 0]));
@@ -483,24 +483,24 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           for (const participant of input.participants) {
             if (participant !== principal.id && input.enabled && !(yield* sql.unsafe<Json>("SELECT enabled FROM participant_consents WHERE owner=? AND session=? AND participant=?", [principal.owner, input.sessionId, participant]))[0]?.enabled) return yield* new HttpError({ status: 403, message: "Each participant must explicitly consent using their own enrolled credential" });
           }
-          (yield* sql.unsafe("INSERT INTO consents VALUES (?,?,?,?) ON CONFLICT(owner,session) DO UPDATE SET enabled=excluded.enabled,participants=excluded.participants", [principal.owner, input.sessionId, input.enabled ? 1 : 0, encodeJson(JournalState.fields.participants, input.participants)])); return { enabled: input.enabled };
+          (yield* sql.unsafe("INSERT INTO consents VALUES (?,?,?,?) ON CONFLICT(owner,session) DO UPDATE SET enabled=excluded.enabled,participants=excluded.participants", [principal.owner, input.sessionId, input.enabled ? 1 : 0, Schema.encodeUnknownSync(Schema.fromJsonString(JournalState.fields.participants), { onExcessProperty: "error" })(input.participants)])); return { enabled: input.enabled };
         }),
         appendArchive: Effect.fn("Broker.appendArchive")(function*(params: CommandInput<"archive.append">): Effect.fn.Return<CommandOutput<"archive.append">, unknown> {
           (yield* role(principal, "session", "archive-writer")); const input = params;
           const consent = (yield* sql.unsafe<Json>("SELECT enabled FROM consents WHERE owner=? AND session=?", [principal.owner, input.sessionId]))[0]; if (!consent?.enabled) return yield* new HttpError({ status: 403, message: "Archive enrollment revoked or absent" });
           if (principal.roles.includes("session")) { const session = sessions.get(input.sessionId); if (session?.principal !== principal.id || session.owner !== principal.owner) return yield* new HttpError({ status: 403, message: "Archive session mismatch" }); }
-          const payload = encodeJson(ArchivePayload, input.payload); if (new TextEncoder().encode(payload).byteLength > 16000) return yield* new HttpError({ status: 413, message: "Archive entry too large" });
+          const payload = Schema.encodeUnknownSync(Schema.fromJsonString(ArchivePayload), { onExcessProperty: "error" })(input.payload); if (new TextEncoder().encode(payload).byteLength > 16000) return yield* new HttpError({ status: 413, message: "Archive entry too large" });
           if ((yield* platform.fingerprint(input.payload)) !== input.digest) return yield* new HttpError({ status: 409, message: "Archive digest mismatch" });
           const prior = (yield* sql.unsafe<Json>("SELECT digest FROM archive WHERE owner=? AND session=? AND entry=?", [principal.owner, input.sessionId, input.entryId]));
-          const gaps = prior.some((row) => decode(Hash, row.digest) !== input.digest) ? [...input.gaps, "entry-rewrite"] : input.gaps;
-          (yield* sql.unsafe("INSERT OR IGNORE INTO archive(owner,session,entry,digest,payload,gaps,created) VALUES (?,?,?,?,?,?,?)", [principal.owner, input.sessionId, input.entryId, input.digest, payload, encodeJson(ArchiveEntry.fields.gaps, gaps), now])); return { appended: true, digest: input.digest };
+          const gaps = prior.some((row) => Schema.decodeUnknownSync(Hash, { onExcessProperty: "error" })(row.digest) !== input.digest) ? [...input.gaps, "entry-rewrite"] : input.gaps;
+          (yield* sql.unsafe("INSERT OR IGNORE INTO archive(owner,session,entry,digest,payload,gaps,created) VALUES (?,?,?,?,?,?,?)", [principal.owner, input.sessionId, input.entryId, input.digest, payload, Schema.encodeUnknownSync(Schema.fromJsonString(ArchiveEntry.fields.gaps), { onExcessProperty: "error" })(gaps), now])); return { appended: true, digest: input.digest };
         }),
         listArchive: Effect.fn("Broker.listArchive")(function*(params: CommandInput<"archive.list">): Effect.fn.Return<CommandOutput<"archive.list">, unknown> {
           (yield* role(principal, "session", "coordinator")); const input = params; if (principal.roles.includes("session") && !principal.roles.includes("coordinator") && sessions.get(input.sessionId)?.principal !== principal.id) return yield* new HttpError({ status: 403, message: "Archive session mismatch" });
-          const rows = (yield* sql.unsafe<Json>("SELECT sequence,entry,digest,payload,gaps,created FROM archive WHERE owner=? AND session=? AND sequence>? ORDER BY sequence LIMIT 2", [principal.owner, input.sessionId, input.cursor ?? 0])).map((row) => decode(ArchiveRow, { sequence: row.sequence, entryId: row.entry, digest: row.digest, payload: decodeJson(ArchivePayload, String(row.payload)), gaps: decodeJson(ArchiveEntry.fields.gaps, String(row.gaps)), createdAt: row.created }));
+          const rows = (yield* sql.unsafe<Json>("SELECT sequence,entry,digest,payload,gaps,created FROM archive WHERE owner=? AND session=? AND sequence>? ORDER BY sequence LIMIT 2", [principal.owner, input.sessionId, input.cursor ?? 0])).map((row) => Schema.decodeUnknownSync(ArchiveRow, { onExcessProperty: "error" })({ sequence: row.sequence, entryId: row.entry, digest: row.digest, payload: Schema.decodeUnknownSync(Schema.fromJsonString(ArchivePayload), { onExcessProperty: "error" })(String(row.payload)), gaps: Schema.decodeUnknownSync(Schema.fromJsonString(ArchiveEntry.fields.gaps), { onExcessProperty: "error" })(String(row.gaps)), createdAt: row.created }));
           const page: ArchiveRow[] = [];
           for (const row of rows) {
-            if (archiveResultSize({ result: [...page, row] }) > MCP_RESULT_LIMIT) {
+            if (new TextEncoder().encode(archiveResultText({ result: [...page, row] })).byteLength > MCP_RESULT_LIMIT) {
               if (!page.length) return yield* new HttpError({ status: 413, message: "Archive row exceeds delivery budget" });
               break;
             }
@@ -528,18 +528,18 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       const path = platform.path.join(config.backupDirectory, file);
       if (file.endsWith(".sqlite") && Option.getOrThrow((((yield* platform.fs.stat(path)))).mtime).getTime() < now - config.backupRetentionMs) ((yield* platform.fs.remove(path)));
     }
-  
+
     });
     const handle = Effect.fn("Broker.handle")(function*(principal: Principal, request: BrokerRequest) {
       // Network operations commit their fences before awaiting a runner, which may call task.get.
       const command = Commands[request.method];
       const execution = Effect.gen(function*() {
         const capabilities = bindCommandCapabilities(principal, yield* Clock.currentTimeMillis);
-        return yield* command.executeDecoded(capabilities, request.params, decodeEffect);
+        return yield* command.executeDecoded(capabilities, request.params);
       });
       const value = yield* (command.transaction === "remote" ? execution : sql.withTransaction(execution));
       if (command.offer) {
-        const { taskId } = yield* decodeEffect(Task, value);
+        const { taskId } = yield* Schema.decodeUnknownEffect(Task, { onExcessProperty: "error" })(value).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
         yield* offer(yield* loadTask(principal, taskId));
       }
       return value;

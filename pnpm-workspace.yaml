@@ -1,5 +1,11 @@
 packages:
   - .
+  - packages/native-control
+overrides:
+  effect: https://pkg.pr.new/Effect-TS/effect/effect@d6082a25a3779f7e2abba2787323d5d9c7e1d24a
+  '@effect/platform-node': 4.0.2
+  '@effect/platform-node-shared': 4.0.2
+  '@effect/sql-sqlite-node': 4.0.2
 allowBuilds:
   '@google/genai': false
   esbuild: true
@@ -14,7 +20,9 @@ minimumReleaseAgeExclude:
   - '@earendil-works/pi-mcp@1.0.4'
   - '@earendil-works/pi-telemetry@1.0.4'
   - '@earendil-works/pi-tui@1.0.4'
-  - '@effect/platform-node@4.0.1'
+  - '@effect/platform-node@4.0.2'
+  - '@effect/platform-node-shared@4.0.2'
+  - '@effect/sql-sqlite-node@4.0.2'
   - '@effect/tsgo-darwin-arm64@0.49.0'
   - '@effect/tsgo-darwin-x64@0.49.0'
   - '@effect/tsgo-linux-arm64@0.49.0'

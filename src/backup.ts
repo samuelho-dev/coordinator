@@ -1,8 +1,8 @@
-import { Clock, Context, Effect, FileSystem, Layer, Stream } from "effect";
+import { Clock, Context, Effect, FileSystem, Layer, Schema, Stream } from "effect";
 import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientRequest, type HttpClientResponse } from "effect/http";
 import { BackupError, ObjectBackupConfig, SnapshotKey } from "./contracts.ts";
-import { decode, decodeSnapshotList } from "./http.ts";
+import { decodeSnapshotList } from "./http.ts";
 import { Platform } from "./platform.ts";
 
 const utf8 = new TextEncoder();
@@ -20,7 +20,7 @@ const contentLength = (response: HttpClientResponse.HttpClientResponse) => check
 const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig) {
   const platform = yield* Platform;
   const client = HttpClient.withScope(yield* HttpClient.HttpClient);
-  const config = yield* checked(() => decode(ObjectBackupConfig, input));
+  const config = yield* checked(() => Schema.decodeUnknownSync(ObjectBackupConfig, { onExcessProperty: "error" })(input));
   const endpoint = yield* checked(() => {
     const url = new URL(config.endpoint);
     if (!/^https?:\/\/[^/?#@]+\/?$/i.test(config.endpoint)) throw failure();
@@ -81,7 +81,7 @@ const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig)
   });
 
   const put = Effect.fnUntraced(function*(file: string) {
-    const key = yield* checked(() => decode(SnapshotKey, `sanitized/${platform.path.basename(file)}`));
+    const key = yield* checked(() => Schema.decodeUnknownSync(SnapshotKey, { onExcessProperty: "error" })(`sanitized/${platform.path.basename(file)}`));
     const request = yield* signed("PUT", key);
     // ponytail: the caller owns the immutable, sanitized file; stream it rather than copy SQLite into RAM.
     const body = yield* HttpClientRequest.bodyFile(request, file, { contentType: "application/vnd.sqlite3" }).pipe(Effect.provideService(FileSystem.FileSystem, platform.fs));
@@ -91,7 +91,7 @@ const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig)
   }, (effect) => Effect.scoped(effect).pipe(Effect.mapError(failure)));
 
   const restore = Effect.fnUntraced(function*(inputKey: SnapshotKey, destination: string) {
-    const key = yield* checked(() => decode(SnapshotKey, inputKey));
+    const key = yield* checked(() => Schema.decodeUnknownSync(SnapshotKey, { onExcessProperty: "error" })(inputKey));
     const response = yield* client.execute(yield* signed("GET", key));
     if (response.status !== 200) return yield* failure();
     const expected = yield* contentLength(response);

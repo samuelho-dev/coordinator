@@ -1,14 +1,21 @@
-import { Cause, Clock, Config, Context, Deferred, Effect, Exit, Layer, Option, Queue, Scope, Semaphore, Stream } from "effect";
+import { Cause, Clock, Config, Context, Deferred, Effect, Exit, Layer, Option, Scope, Schema, Semaphore } from "effect";
+import { Hex } from "effect/encoding";
+import { fileURLToPath } from "node:url";
 import { ChildProcess } from "effect/process";
 import { HttpServer } from "effect/http";
 import { Reactivity } from "effect/reactivity";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
-import { Address, Work, RunnerConfig, RunnerRow, Json, JsonValue, RunnerEvent, RunnerResult, RunnerInspection, NativeFrame, NativeState, NativeRequestId, TaskId, MessageId, IncarnationId, WorkerId, UserId, NativeResponse, Acceptance, HttpError, CommandError, Commands, type CommandCapabilities, type CommandInput, type CommandNames, type RunnerReleased, type RunnerRelease, type RunnerRequest, type NativeChild, type RunnerAdmission, type Task } from "./contracts.ts";
+import { Address, Work, RunnerConfig, RunnerRow, Json, JsonValue, RunnerEvent, RunnerResult, RunnerInspection, RunnerNativeState, TaskId, MessageId, SessionId, IncarnationId, WorkerId, UserId, Acceptance, HttpError, CommandError, Commands, type CommandCapabilities, type CommandInput, type RunnerReleased, type RunnerRelease, type RunnerRequest, type RunnerAdmission, type Task } from "./contracts.ts";
 import { Platform } from "./platform.ts";
-import { Mcp, serverLayer, decode, decodeEffect, decodeJson, encodeJson, canonicalJson, LIMIT, MCP_RESULT_LIMIT, mcpResultSizer } from "./http.ts";
+import { Mcp, serverLayer, LIMIT, MCP_RESULT_LIMIT } from "./http.ts";
 import { migrateRunner } from "./database.ts";
+import { connectNativeClient, type NativeClient } from "@samuelho/coordinator-native-control/client";
+import { NativeBinding, NativePluginConfig, NativeSubmissionId, NativeEventSequence, NativeState, type NativeLifecycleEvent, type NativePromptAdmission, type NativePromptResult } from "@samuelho/coordinator-native-control/contracts";
 
-const FRAME_LIMIT = 4 * 1024 * 1024;
+type OwnedNativeChild = { client: NativeClient; scope: Scope.Closeable; lost: boolean };
+const bindingText = Schema.encodeUnknownSync(Schema.fromJsonString(NativeBinding), { onExcessProperty: "error" });
+const sameBinding = (left: NativeBinding, right: NativeBinding) => left.host === right.host && left.sessionId === right.sessionId && left.incarnation === right.incarnation && left.generation === right.generation;
+
 const RETAIN_EVENTS = 128;
 const Terminal: Record<string, true> = { SUCCEEDED: true, FAILED: true };
 function record(value: unknown): value is Json { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -67,46 +74,26 @@ export const requireIsolation = Effect.fn("Runner.requireIsolation")(function*(c
   });
   yield* checkSeed(config.modelDirectory);
   yield* Effect.gen(function*() {
-    const status = yield* platform.exec(ChildProcess.make("/usr/bin/setpriv", [...isolationArgs(CHILD_UID_BASE), "/usr/bin/cat", "/proc/self/status"], { env: yield* childEnvironment(), extendEnv: false }), 10000);
+    const status = yield* platform.exec(ChildProcess.make("/usr/bin/setpriv", [...isolationArgs(CHILD_UID_BASE), "/usr/bin/cat", "/proc/self/status"], { env: yield* childEnvironment(), extendEnv: false }), 10000).pipe(Effect.withSpan("Runner.requireIsolation.kernel"));
     const fields = Object.fromEntries(status.split("\n").map((line) => { const colon = line.indexOf(":"); return [line.slice(0, colon), line.slice(colon + 1).trim()]; }));
     if (fields.Uid !== "1000000\t1000000\t1000000\t1000000" || fields.Gid !== "1000000\t1000000\t1000000\t1000000" || fields.Groups !== "" ||
       ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"].some((key) => fields[key] !== "0000000000000000") || fields.NoNewPrivs !== "1") return yield* Effect.fail(new CommandError({ message: "Kernel isolation proof failed" }));
-    for (const launcher of Object.values(config.launchers)) yield* platform.exec(ChildProcess.make("/usr/bin/setpriv", [...isolationArgs(CHILD_UID_BASE), launcher, "--version"], { env: yield* childEnvironment("/tmp"), extendEnv: false }), 10000);
-  }).pipe(Effect.mapError(() => new CommandError({ message: "OS child UID/capability isolation unavailable; runner enrollment/launch blocked" })));
+    for (const launcher of Object.values(config.launchers)) yield* platform.exec(ChildProcess.make("/usr/bin/setpriv", [...isolationArgs(CHILD_UID_BASE), launcher, "--version"], { env: yield* childEnvironment("/tmp"), extendEnv: false }), 10000).pipe(Effect.withSpan("Runner.requireIsolation.launcherVersion"));
+  }).pipe(Effect.withSpan("Runner.requireIsolation.proof"), Effect.mapError(() => new CommandError({ message: "OS child UID/capability isolation unavailable; runner enrollment/launch blocked" })));
 });
-/** LF wire framing accepts optional CRLF; invalid UTF-8 and incomplete frames are errors. */
-export class LfFrames {
-  private pending = new Uint8Array(0);
-  push(chunk: Uint8Array): unknown[] {
-    const bytes = new Uint8Array(this.pending.length + chunk.length);
-    bytes.set(this.pending); bytes.set(chunk, this.pending.length);
-    const frames: unknown[] = []; let start = 0;
-    for (let end = bytes.indexOf(10); end !== -1; end = bytes.indexOf(10, start)) {
-      if (end - start > FRAME_LIMIT) throw new Error("RPC frame overflow");
-      const line = bytes.subarray(start, bytes[end - 1] === 13 ? end - 1 : end);
-      if (line.length === 0) throw new Error("Invalid LF frame");
-      frames.push(decodeJson(JsonValue, new TextDecoder("utf-8", { fatal: true }).decode(line)));
-      start = end + 1;
-    }
-    this.pending = bytes.slice(start);
-    if (this.pending.length > FRAME_LIMIT) throw new Error("RPC frame overflow");
-    return frames;
-  }
-  end(): void { if (this.pending.length) throw new Error("Incomplete RPC frame"); }
-}
 
 const byteLength = (value: string) => new TextEncoder().encode(value).byteLength;
-const inspectionSize = mcpResultSizer(Commands.inspect.structuredOutput);
-const nativeResponseSize = mcpResultSizer(Commands.command.structuredOutput);
+const inspectionText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands.inspect.structuredOutput)), { onExcessProperty: "error" });
+const nativeResponseText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(Commands.command.structuredOutput)), { onExcessProperty: "error" });
 
 class RunnerConfiguration extends Context.Service<RunnerConfiguration, RunnerConfig>()("coordinator/RunnerConfiguration") {}
 
 const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
   const platform = yield* Platform, rpc = yield* Mcp;
-  const config = decode(RunnerConfig, input);
+  const config = Schema.decodeUnknownSync(RunnerConfig, { onExcessProperty: "error" })(input);
   const { fs: fileSystem, path: paths } = platform;
   const nativeEnvironment = yield* childEnvironment();
-  const { dirname, isAbsolute, join, relative, resolve, sep } = paths;
+  const { isAbsolute, join, relative, resolve, sep } = paths;
   const inside = (root: string, path: string) => { const r = relative(root, path); return r !== ".." && !r.startsWith(`..${sep}`) && !isAbsolute(r); };
   const git = Effect.fnUntraced(function*(cwd: string, args: string[]) { return (yield* platform.exec(ChildProcess.make("git", args, { cwd, env: nativeEnvironment, extendEnv: false }))).trim(); });
   if (!isAbsolute(config.stateDirectory) || !isAbsolute(config.tokenFile)) return yield* Effect.fail(new CommandError({ message: "Absolute private paths required" }));
@@ -132,21 +119,20 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
   const fork = Effect.fnUntraced(function*(effect: Effect.Effect<unknown, unknown>) {
     yield* effect.pipe(Effect.catchCause(() => Effect.void), Effect.forkScoped, Effect.provideService(Scope.Scope, ownerScope));
   });
-  const children = new Map<TaskId, NativeChild>(), admissions = new Map<TaskId, RunnerAdmission>();
+  const children = new Map<TaskId, OwnedNativeChild>(), admissions = new Map<TaskId, RunnerAdmission>();
   const reportLock = yield* Semaphore.make(1);
+  const lifecycleLock = yield* Semaphore.make(1);
   const fatal = yield* Deferred.make<never, CommandError>();
   let closed = false, ownershipLost = false, heartbeatBusy = false, reportsBusy = false;
   const owned = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.suspend<A, E | CommandError, R>(() =>
     ownershipLost ? Deferred.await(fatal) : effect.pipe(Effect.raceFirst(Deferred.await(fatal))));
-  const ownership = yield* platform.acquireJournalOwnership(join(config.stateDirectory, "runner.lock"));
+  const ownership = yield* platform.acquireJournalOwnership(join(config.stateDirectory, "runner.lock")).pipe(Effect.withSpan("Runner.acquireJournalOwnership"));
   yield* ownership.exitCode.pipe(Effect.catch(() => Effect.succeed(undefined)), Effect.andThen(Effect.gen(function*() {
     closed = true; ownershipLost = true;
     const error = new CommandError({ message: "Kernel journal ownership lost" });
     for (const child of children.values()) child.lost = true;
     yield* Deferred.fail(fatal, error);
     for (const child of children.values()) {
-      for (const pending of child.pending.values()) yield* Deferred.fail(pending.response, error);
-      child.pending.clear();
       yield* Scope.close(child.scope, Exit.void);
     }
   })), Effect.catchCause(() => Effect.void), Effect.forkScoped({ startImmediately: true }), Effect.provideService(Scope.Scope, ownerScope));
@@ -159,23 +145,26 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       ]) yield* sql.unsafe(statement);
       yield* migrateRunner(sql);
       yield* sql.unsafe("PRAGMA secure_delete=ON");
-      if (((yield* sql.unsafe<Json>("PRAGMA user_version"))[0])?.user_version === 0) {
-        // One-time scrub of legacy raw journals, including deleted SQLite/WAL pages.
+      if (Number(((yield* sql.unsafe<Json>("PRAGMA user_version"))[0])?.user_version) < 2) {
+        // Scrub legacy raw journals and obsolete frame metadata, including deleted SQLite/WAL pages.
         (yield* sql.unsafe("UPDATE tasks SET reason='historical diagnostic omitted' WHERE reason IS NOT NULL"));
         for (const event of (yield* sql.unsafe<Json>("SELECT seq,payload FROM events"))) {
           if (typeof event.seq !== "number") return yield* Effect.fail(new CommandError({ message: "Invalid journal event identity" }));
-          (yield* sql.unsafe("UPDATE events SET payload=? WHERE seq=?", [encodeJson(RunnerEvent, eventMetadata(decodeJson(JsonValue, String(event.payload)))), event.seq]));
+          (yield* sql.unsafe("UPDATE events SET payload=? WHERE seq=?", [Schema.encodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(eventMetadata(Schema.decodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(String(event.payload)))), event.seq]));
         }
         for (const row of (yield* sql.unsafe<Json>("SELECT taskId,result FROM tasks WHERE result IS NOT NULL"))) {
-          const taskId = yield* decodeEffect(TaskId, row.taskId);
-          (yield* sql.unsafe("UPDATE tasks SET result=? WHERE taskId=?", [encodeJson(RunnerResult, resultMetadata(decodeJson(JsonValue, String(row.result)))), taskId]));
+          const taskId = yield* Schema.decodeUnknownEffect(TaskId, { onExcessProperty: "error" })(row.taskId).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
+          const result = resultMetadata(Schema.decodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(String(row.result)));
+          (yield* sql.unsafe("UPDATE tasks SET result=? WHERE taskId=?", [result === null ? null : Schema.encodeUnknownSync(Schema.fromJsonString(RunnerResult), { onExcessProperty: "error" })(result), taskId]));
         }
-        for (const statement of ["VACUUM", "PRAGMA wal_checkpoint(TRUNCATE)", "PRAGMA user_version=1"]) yield* sql.unsafe(statement);
+        for (const statement of ["VACUUM", "PRAGMA wal_checkpoint(TRUNCATE)", "PRAGMA user_version=2"]) yield* sql.unsafe(statement);
       }
+      // Absence is SQL NULL, including journals written before the canonical absence fix.
+      yield* sql.unsafe("UPDATE tasks SET result=NULL WHERE result='null'");
       // ponytail: no stdio reattachment exists; uncertain owned children reserve their slot until operator reconciliation.
       (yield* sql.unsafe("UPDATE tasks SET state='HELD',reason='restart: launch or prompt outcome unknown' WHERE occupied=1 AND state!='ACCEPTED'"));
       for (const value of (yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE occupied=1 AND pid IS NOT NULL", [config.childUidBase]))) {
-        const row = decode(RunnerRow, value);
+        const row = Schema.decodeUnknownSync(RunnerRow, { onExcessProperty: "error" })(value);
         // Effect ChildProcessSpawner can inspect owned handles only; no arbitrary recorded-PID liveness API exists.
         try { process.kill(row.pid!, 0); }
         catch (error) {
@@ -183,12 +172,12 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
         }
       }
   });
-  const getRow = Effect.fn("Runner.row")(function*(taskId: TaskId): Effect.fn.Return<RunnerRow | undefined, unknown> { const value = ((yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE taskId=?", [config.childUidBase, taskId]))[0]); return value ? decode(RunnerRow, value) : undefined; });
+  const getRow = Effect.fn("Runner.row")(function*(taskId: TaskId): Effect.fn.Return<RunnerRow | undefined, unknown> { const value = ((yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE taskId=?", [config.childUidBase, taskId]))[0]); return value ? Schema.decodeUnknownSync(RunnerRow, { onExcessProperty: "error" })(value) : undefined; });
   const requireRow = Effect.fn("Runner.requireRow")(function*(taskId: TaskId): Effect.fn.Return<RunnerRow, unknown> { const row = (yield* getRow(taskId)); if (!row) return yield* new HttpError({ status: 404, message: "Task not accepted" }); return row; });
-  const taskWork = (row: RunnerRow): Work => { return decodeJson(Work, row.work); };
+  const taskWork = (row: RunnerRow): Work => { return Schema.decodeUnknownSync(Schema.fromJsonString(Work), { onExcessProperty: "error" })(row.work); };
   const acceptance = (row: RunnerRow): Acceptance => {
     return { taskId: row.taskId, accepted: true, state: row.state, worktree: row.worktree,
-      ...(row.address ? { address: decodeJson(Address, row.address) } : {}), ...(row.reason ? { reason: row.reason } : {}) };
+      ...(row.address ? { address: Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(row.address) } : {}), ...(row.reason ? { reason: row.reason } : {}) };
   };
   const load = Effect.fn("Runner.load")(function*(): Effect.fn.Return<number, unknown> { return Number(((yield* sql.unsafe<Json>("SELECT count(*) AS count FROM tasks WHERE occupied=1"))[0])!.count); });
   const resultMetadata = (value: unknown): RunnerResult => {
@@ -197,28 +186,33 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     for (const key of ["launched", "hostSettled", "evidenceVerified"]) if (typeof value[key] === "boolean") result[key] = value[key];
     if (typeof value.exitCode === "number" && Number.isSafeInteger(value.exitCode)) result.exitCode = value.exitCode;
     if (typeof value.signal === "string" && /^SIG[A-Z0-9]{1,16}$/.test(value.signal)) result.signal = value.signal;
-    return decode(RunnerResult, result);
+    return Schema.decodeUnknownSync(RunnerResult, { onExcessProperty: "error" })(result);
   };
   const eventMetadata = (value: unknown): RunnerEvent => {
     if (!record(value)) return { type: "host_event", contentOmitted: true };
     const type = typeof value.type === "string" && /^[a-z_]{1,40}$/.test(value.type) ? value.type : "host_event";
     const result: Json = { type, contentOmitted: true };
-    if (type === "readback") result.address = decode(Address, value.address);
+    if (type === "readback") result.address = Schema.decodeUnknownSync(Address, { onExcessProperty: "error" })(value.address);
     if (typeof value.state === "string" && ["ACCEPTED", "LAUNCHING", "READY", "PROMPT_INTENT", "RUNNING", "SUCCEEDED", "FAILED", "HELD"].includes(value.state)) result.state = value.state;
-    if (typeof value.success === "boolean") result.success = value.success;
     if (typeof value.status === "string" && ["completed", "failed", "aborted", "error"].includes(value.status)) result.status = value.status;
-    if (typeof value.command === "string" && ["get_state", "get_messages", "bash", "prompt", "abort"].includes(value.command)) result.command = value.command;
     for (const key of ["fingerprint", "digest"]) if (typeof value[key] === "string" && /^[a-f0-9]{64}$/.test(value[key])) result[key] = value[key];
     if (typeof value.id === "string" && /^[a-f0-9-]{36}$/.test(value.id)) result.id = value.id;
-    return decode(RunnerEvent, result);
+    if (type === "native_lifecycle") {
+      result.binding = Schema.decodeUnknownSync(NativeBinding, { onExcessProperty: "error" })(value.binding);
+      if (value.runId !== undefined) result.runId = value.runId;
+      if (value.nativeCursor !== undefined) result.nativeCursor = value.nativeCursor;
+      if (value.kind !== undefined) result.kind = value.kind;
+    }
+    return Schema.decodeUnknownSync(RunnerEvent, { onExcessProperty: "error" })(result);
   };
   const event = Effect.fn("Runner.event")(function*(taskId: TaskId, value: unknown): Effect.fn.Return<void, unknown> {
-    const payload = encodeJson(RunnerEvent, eventMetadata(value));
+    const payload = Schema.encodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(eventMetadata(value));
     (yield* sql.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", [taskId, payload]));
     (yield* sql.unsafe("DELETE FROM events WHERE taskId=? AND seq NOT IN (SELECT seq FROM events WHERE taskId=? ORDER BY seq DESC LIMIT ?)", [taskId, taskId, RETAIN_EVENTS]));
   }, owned);
   const state = Effect.fn("Runner.state")(function*(taskId: TaskId, state: string, reason: string | null = null, result: unknown = null): Effect.fn.Return<void, unknown> {
-    (yield* sql.unsafe("UPDATE tasks SET state=?,reason=?,result=? WHERE taskId=?", [state, reason, encodeJson(RunnerResult, resultMetadata(result)), taskId]));
+    const metadata = resultMetadata(result);
+    (yield* sql.unsafe("UPDATE tasks SET state=?,reason=?,result=? WHERE taskId=?", [state, reason, metadata === null ? null : Schema.encodeUnknownSync(Schema.fromJsonString(RunnerResult), { onExcessProperty: "error" })(metadata), taskId]));
     (yield* event(taskId, { type: "runner_state", state, reason }));
   }, owned);
   const handle = Effect.fn("Runner.handle")(function*(request: RunnerRequest, controlToken: string): Effect.fn.Return<unknown, unknown> {
@@ -239,34 +233,46 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
         let nextCursor = cursor;
         if (typeof oldest === "number" && cursor < oldest - 1) events.push({ type: "gap", reason: "retention or cursor gap", before: oldest });
         for (const event of rows) {
-          const value = decodeJson(RunnerEvent, String(event.payload));
+          const value = Schema.decodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(String(event.payload));
           events.push(value); nextCursor = Number(event.seq);
-          if (inspectionSize({ result: { ...acceptance(row), events, nextCursor } }) > MCP_RESULT_LIMIT) {
+          if (new TextEncoder().encode(inspectionText({ result: { ...acceptance(row), events, nextCursor } })).byteLength > MCP_RESULT_LIMIT) {
             events.pop(); events.push({ type: "gap", reason: "event exceeds remaining response bound", seq: Number(event.seq) }); break;
           }
         }
         return { ...acceptance(row), events, nextCursor };
       }),
-      commandTask: Effect.fnUntraced(function*({ taskId, type }: CommandInput<"command">) {
+      commandTask: Effect.fnUntraced(function*(input: CommandInput<"command">) {
+        const { taskId, type } = input;
         yield* requireRow(taskId);
-        const response = yield* nativeRequest(taskId, { type });
-        if (type === "abort") yield* state(taskId, "HELD", "operator requested abort; await host outcome");
-        return boundedResponse(response);
+        const child = yield* requireChild(taskId);
+        const response = type === "get_state"
+          ? projectState(yield* child.client.call("native.get_state", { binding: child.client.binding }, { timeoutMs: 30000 }))
+          : type === "get_messages"
+            ? yield* child.client.call("native.get_messages", { binding: child.client.binding, ...(input.type === "get_messages" && input.cursor !== undefined ? { cursor: input.cursor } : {}), ...(input.type === "get_messages" && input.limit !== undefined ? { limit: input.limit } : {}) }, { timeoutMs: 30000 })
+            : yield* child.client.call("native.abort", { binding: child.client.binding }, { timeoutMs: 30000 });
+        if (!sameBinding(response.binding, child.client.binding)) {
+          child.lost = true;
+          yield* hold(taskId, "native control response owner generation changed");
+          return yield* new CommandError({ message: "Native control response binding mismatch" });
+        }
+        if (type === "abort") yield* hold(taskId, "operator requested abort; await host outcome");
+        return byteLength(nativeResponseText({ result: response })) <= MCP_RESULT_LIMIT ? response : { type: "gap" as const, reason: "native response exceeds endpoint bound" };
       }),
       prepareTask: Effect.fnUntraced(function*(input: CommandInput<"prepare">) {
         const row = yield* requireRow(input.taskId);
         if (row.state !== "READY" || row.promptId || !row.address) return yield* new HttpError({ status: 409, message: "Corrected readback requires unprompted live owned child" });
-        const prior = decodeJson(Address, row.address);
+        const prior = Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(row.address);
         if (input.address.revision <= prior.revision || input.address.sessionId !== prior.sessionId || input.address.incarnation !== prior.incarnation) return yield* new HttpError({ status: 409, message: "Correction revision or child binding mismatch" });
-        const actual = yield* readback(row, yield* nativeRequest(row.taskId, { type: "get_state" }), input.address);
+        const child = yield* requireChild(row.taskId);
+        const actual = yield* readback(row, yield* child.client.call("native.get_state", { binding: child.client.binding }, { timeoutMs: 30000 }), input.address);
         if ((yield* platform.fingerprint(actual)) !== (yield* platform.fingerprint(input.address))) return yield* new HttpError({ status: 409, message: "Corrected consequential readback mismatch" });
         if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
-        yield* owned(sql.unsafe("UPDATE tasks SET address=? WHERE taskId=? AND state='READY' AND promptId IS NULL", [encodeJson(Address, actual), row.taskId]));
+        yield* owned(sql.unsafe("UPDATE tasks SET address=? WHERE taskId=? AND state='READY' AND promptId IS NULL", [Schema.encodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(actual), row.taskId]));
         yield* event(row.taskId, { type: "readback", address: actual }); return actual;
       }),
       releaseTask: release,
     };
-    return yield* Commands[request.method].executeDecoded(capabilities, request.params, decodeEffect);
+    return yield* Commands[request.method].executeDecoded(capabilities, request.params);
   }, Effect.catch((error) => Effect.fail(error instanceof HttpError ? error : new HttpError({ status: 400, message: "Invalid request or unavailable owned child" }))));
   const brokerTask = Effect.fn("Runner.brokerTask")(function*(work: Work, address?: Address): Effect.fn.Return<Task, unknown> {
     const task = yield* rpc.call(config.brokerUrl, token, "task.get", { taskId: work.taskId });
@@ -276,7 +282,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     return task;
   });
   const accept = Effect.fn("Runner.accept")(function*(work: Work): Effect.fn.Return<Acceptance, unknown> {
-    if (byteLength(encodeJson(Work, work)) > LIMIT - 1024) return yield* new HttpError({ status: 413, message: "Work too large" });
+    if (byteLength(Schema.encodeUnknownSync(Schema.fromJsonString(Work), { onExcessProperty: "error" })(work)) > LIMIT - 1024) return yield* new HttpError({ status: 413, message: "Work too large" });
     const existing = (yield* getRow(work.taskId)); const hash = (yield* platform.fingerprint(work));
     if (existing) { if (existing.fingerprint !== hash) return yield* new HttpError({ status: 409, message: "Task fingerprint conflict" }); return acceptance(existing); }
     if ((yield* load()) >= config.slots) return { taskId: work.taskId, accepted: false, state: "full", reason: "full" };
@@ -302,7 +308,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       }
       if ((yield* load()) >= config.slots) return { taskId: work.taskId, accepted: false, state: "full", reason: "full" };
       if (work.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Assignment expired before durable acceptance" });
-      yield* sql.unsafe("INSERT INTO tasks(taskId,fingerprint,work,worktree,state,occupied,incarnation) VALUES (?,?,?,?,'ACCEPTED',1,?)", [work.taskId, hash, encodeJson(Work, work), worktree, incarnation]);
+      yield* sql.unsafe("INSERT INTO tasks(taskId,fingerprint,work,worktree,state,occupied,incarnation) VALUES (?,?,?,?,'ACCEPTED',1,?)", [work.taskId, hash, Schema.encodeUnknownSync(Schema.fromJsonString(Work), { onExcessProperty: "error" })(work), worktree, incarnation]);
       return acceptance(yield* requireRow(work.taskId));
     })));
     if (!reserved.accepted) return reserved;
@@ -317,69 +323,49 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     const inspect = Effect.fnUntraced(function*(args: string[]) { return (yield* platform.exec(ChildProcess.make("/usr/bin/env", [`--chdir=${row.worktree}`, "/usr/bin/setpriv", ...isolationArgs(row.childUid), "git", ...args], { env: nativeEnvironment, extendEnv: false }))).trim(); });
     if ((yield* inspect(["remote"])) !== "origin" || platform.canonicalRemote(yield* inspect(["remote", "get-url", "--all", "origin"])) !== work.repo || (yield* inspect(["rev-parse", "HEAD"])) !== work.sha || (yield* inspect(["rev-parse", "--verify", `${work.ref}^{commit}`])) !== work.sha) return yield* Effect.fail(new CommandError({ message: "Checkout identity mismatch" }));
   });
-  const readback = Effect.fn("Runner.readback")(function*(row: RunnerRow, response: NativeFrame, template?: Address): Effect.fn.Return<Address, unknown> {
-    const work = taskWork(row);
-    if (response.success !== true) return yield* Effect.fail(new CommandError({ message: "Unverified durable host identity" }));
-    const data = yield* decodeEffect(NativeState, response.data);
-    if (typeof data.sessionFile !== "string" || data.isStreaming !== false) return yield* Effect.fail(new CommandError({ message: "Unverified durable host identity" }));
-    const sessions = yield* (fileSystem.realPath(join(config.childDirectory, (yield* platform.digest(row.taskId)), "sessions")));
-    if (!isAbsolute(data.sessionFile) || !inside(sessions, resolve(data.sessionFile))) return yield* Effect.fail(new CommandError({ message: "Unexpected session path" }));
-    const cwdResponse = yield* nativeRequest(row.taskId, { type: "bash", command: "pwd -P" });
-    const cwdData = cwdResponse.data;
-    if (!record(cwdData) || cwdData.exitCode !== 0 || typeof cwdData.output !== "string" || cwdData.output.trim() !== row.worktree) return yield* Effect.fail(new CommandError({ message: "Host cwd mismatch" }));
+  const requireChild = Effect.fnUntraced(function*(taskId: TaskId) {
+    const child = children.get(taskId);
+    if (!child || child.lost) return yield* new CommandError({ message: "Owned native MCP connection unavailable" });
+    const row = yield* requireRow(taskId);
+    if (row.nativeBinding === null || row.nativeBinding !== bindingText(child.client.binding)) return yield* new CommandError({ message: "Native owner generation changed" });
+    return child;
+  });
+  const readback = Effect.fn("Runner.readback")(function*(row: RunnerRow, data: NativeState, template?: Address): Effect.fn.Return<Address, unknown> {
+    const work = taskWork(row), child = yield* requireChild(row.taskId);
+    if (!sameBinding(data.binding, child.client.binding) || data.binding.host !== work.launcher || typeof data.sessionFile !== "string" || data.cwd !== row.worktree ||
+      data.currentRunId !== null || data.isStreaming || data.isCompacting !== false || data.pendingMessageCount !== 0 || data.pendingAsyncWorkCount !== 0) return yield* new CommandError({ message: "Unverified idle durable native identity" });
+    const sessions = yield* fileSystem.realPath(join(config.childDirectory, (yield* platform.digest(row.taskId)), "sessions"));
+    if (!isAbsolute(data.sessionFile) || !inside(sessions, resolve(data.sessionFile)) || (yield* fileSystem.realPath(data.sessionFile)) !== data.sessionFile) return yield* new CommandError({ message: "Unexpected session path" });
+    const shell = yield* child.client.call("native.bash", { binding: child.client.binding, command: "pwd -P && git remote && git remote get-url --all origin && git rev-parse HEAD && git rev-parse --verify " + "'" + work.ref.replaceAll("'", "'\\''") + "^{commit}'" }, { timeoutMs: 30000 });
+    const lines = shell.output.trim().split("\n");
+    if (!sameBinding(shell.binding, data.binding) || shell.exitCode !== 0 || shell.truncated || shell.killed || lines.length !== 5 || lines[0] !== row.worktree || lines[1] !== "origin" || platform.canonicalRemote(lines[2]!) !== work.repo || lines[3] !== work.sha || lines[4] !== work.sha) return yield* new CommandError({ message: "Native cwd or checkout identity mismatch" });
     yield* verifyCheckout(row);
-    // Native session identity is the actual addressable root worker, not a fabricated requested ID.
-    return decode(Address, { messageId: template?.messageId ?? MessageId.make(row.taskId), revision: template?.revision ?? 1, workerId: WorkerId.make(data.sessionId), sessionId: data.sessionId,
+    return Schema.decodeUnknownSync(Address, { onExcessProperty: "error" })({ messageId: template?.messageId ?? MessageId.make(row.taskId), revision: template?.revision ?? 1, workerId: WorkerId.make(data.binding.sessionId), sessionId: SessionId.make(data.binding.sessionId),
       incarnation: row.incarnation, repo: work.repo, ref: work.ref, sha: work.sha,
       scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline });
   });
-  const boundedResponse = (response: NativeFrame): NativeResponse => {
-    const projected = response.command === "get_state" && record(response.data)
-      ? decodeJson(NativeResponse, canonicalJson({ type: "response", id: response.id, command: "get_state", success: response.success,
-        data: { sessionId: response.data.sessionId, sessionFile: response.data.sessionFile, isStreaming: response.data.isStreaming, isCompacting: response.data.isCompacting,
-          isSettled: response.data.isSettled, messageCount: response.data.messageCount, pendingMessageCount: response.data.pendingMessageCount, queuedMessageCount: response.data.queuedMessageCount } }))
-      : decode(NativeResponse, response);
-    return nativeResponseSize({ result: projected }) <= MCP_RESULT_LIMIT ? projected : decode(NativeResponse, { type: "gap", reason: "host response exceeds endpoint bound", command: response.command });
-  };
-  const frame = Effect.fn("Runner.frame")(function*(taskId: TaskId, child: NativeChild | undefined, value: unknown): Effect.fn.Return<void, unknown> {
-    if (!record(value) || typeof value.type !== "string") return yield* Effect.fail(new CommandError({ message: "Malformed RPC object" }));
-    if (value.type === "rpc_chunk") return yield* Effect.fail(new CommandError({ message: "Unnegotiated chunk protocol" }));
-    if (value.type === "response") {
-      if (typeof value.id !== "string" || typeof value.command !== "string" || typeof value.success !== "boolean") return yield* Effect.fail(new CommandError({ message: "Malformed response" }));
-      const response = yield* decodeEffect(NativeFrame, value);
-      const id = yield* decodeEffect(NativeRequestId, response.id);
-      const pending = child?.pending.get(id);
-      if (pending) {
-        if (pending.type !== response.command) return yield* Effect.fail(new CommandError({ message: "Response command mismatch" }));
-        child!.pending.delete(id);
-        if (response.success) yield* Deferred.succeed(pending.response, response); else yield* Deferred.fail(pending.response, new CommandError({ message: "Host command rejected" }));
-      }
-      (yield* event(taskId, { type: "host_response", id, command: response.command, success: response.success })); return;
-    }
-    (yield* event(taskId, { type: value.type === "readback" ? "host_event" : value.type, status: value.status }));
-    const row = (yield* requireRow(taskId)); if (!row.promptId || !child || child.lost) return;
-    if (value.type === "agent_start") child.started = true;
-    if (value.type === "message_end" && record(value.message) && ["error", "aborted"].includes(String(value.message.stopReason))) child.failed = true;
-    if (taskWork(row).launcher === "omp") {
-      if (value.type === "prompt_result" && decode(NativeRequestId, value.id) === row.promptId) {
-        if (value.status !== "completed") child.failed = true;
-        if (value.sessionSettled === true) yield* fork(finish(taskId, child));
-      } else if (value.type === "session_settled" && child.started) yield* fork(finish(taskId, child));
-    } else if ((value.type === "agent_end" || value.type === "agent_settled") && child.started) yield* fork(finish(taskId, child));
+  const projectState = (data: NativeState): typeof RunnerNativeState.Type => ({
+    binding: data.binding, ...(data.sessionFile === undefined ? {} : { sessionFile: data.sessionFile }), cwd: data.cwd,
+    currentRunId: data.currentRunId, isStreaming: data.isStreaming, isCompacting: data.isCompacting,
+    pendingMessageCount: data.pendingMessageCount, pendingAsyncWorkCount: data.pendingAsyncWorkCount, messageCount: data.messageCount,
   });
-  const finish = Effect.fn("Runner.finish")(function*(taskId: TaskId, child: NativeChild): Effect.fn.Return<void, unknown> {
-    if (child.completing || child.lost) return; child.completing = true;
-      const response = yield* nativeRequest(taskId, { type: "get_state" }); const data = yield* decodeEffect(NativeState, response.data);
-      if (data.isStreaming !== false || data.isCompacting !== false || data.hasPendingAsyncWork === true || data.isSettled === false || Number(data.pendingMessageCount ?? data.queuedMessageCount ?? 0) !== 0) { child.completing = false; return; }
-      const row = (yield* requireRow(taskId));
-      if (!row.address || data.sessionId !== decodeJson(Address, row.address).sessionId) return yield* Effect.fail(new CommandError({ message: "Host identity changed" }));
-      (yield* state(taskId, child.failed ? "FAILED" : "SUCCEEDED", null, { hostSettled: true, evidenceVerified: false }));
-      yield* Queue.end(child.input); yield* fork(heartbeat());
-
-  }, (effect, taskId) => effect.pipe(Effect.catch(() => hold(taskId, "completion identity/outcome uncertain"))));
+  const lifecycle = Effect.fn("Runner.lifecycle")(function*(taskId: TaskId, child: OwnedNativeChild, value: NativeLifecycleEvent): Effect.fn.Return<void, unknown> {
+    const row = yield* requireRow(taskId);
+    if (child.lost || closed || row.nativeBinding !== bindingText(value.binding) || !sameBinding(value.binding, child.client.binding)) return yield* new CommandError({ message: "Stale native lifecycle owner" });
+    if (value.seq <= row.nativeCursor) return;
+    if (value.seq !== row.nativeCursor + 1) return yield* new CommandError({ message: "Native lifecycle cursor gap" });
+    yield* owned(sql.withTransaction(Effect.gen(function*() {
+      yield* sql.unsafe("UPDATE tasks SET nativeCursor=? WHERE taskId=? AND nativeBinding=? AND nativeCursor=?", [value.seq, taskId, row.nativeBinding, row.nativeCursor]);
+      yield* event(taskId, { type: "native_lifecycle", binding: value.binding, runId: value.runId, nativeCursor: value.seq, kind: value.kind, ...(value.kind === "run_settled" ? { status: value.outcome } : {}) });
+    })));
+    if (value.kind === "session_retired") {
+      child.lost = true;
+      if (!Terminal[row.state]) yield* hold(taskId, "native owner generation retired; no replay");
+    }
+  }, (effect) => lifecycleLock.withPermit(effect));
   const release = Effect.fn("Runner.release")(function*(input: RunnerRelease): Effect.fn.Return<RunnerReleased, unknown> {
     const row = (yield* requireRow(input.taskId)); const work = taskWork(row);
-    if (!row.address || (yield* platform.fingerprint(input.address)) !== (yield* platform.fingerprint(decodeJson(Address, row.address))) || input.prompt !== work.prompt) return yield* new HttpError({ status: 409, message: "Release address or approved prompt mismatch" });
+    if (!row.address || (yield* platform.fingerprint(input.address)) !== (yield* platform.fingerprint(Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(row.address))) || input.prompt !== work.prompt) return yield* new HttpError({ status: 409, message: "Release address or approved prompt mismatch" });
     if (row.promptId) {
       if (row.state === "RUNNING" || Terminal[row.state]) return { released: true };
       return yield* new HttpError({ status: 409, message: "Prompt delivery uncertain; never replay" });
@@ -387,12 +373,14 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     if (row.state !== "READY") return yield* new HttpError({ status: 409, message: "Child not ready" });
     if (row.detached) return yield* new HttpError({ status: 403, message: "Task no longer assigned" });
     yield* brokerTask(work, input.address);
-    const response = yield* nativeRequest(row.taskId, { type: "get_state" }); const actual = yield* readback((yield* requireRow(row.taskId)), response, decodeJson(Address, row.address));
+    const child = yield* requireChild(row.taskId);
+    const response = yield* child.client.call("native.get_state", { binding: child.client.binding }, { timeoutMs: 30000 });
+    const actual = yield* readback(yield* requireRow(row.taskId), response, Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(row.address));
     if ((yield* platform.fingerprint(actual)) !== (yield* platform.fingerprint(input.address))) return yield* new HttpError({ status: 409, message: "Actual child address changed" });
     // Native readback awaited RPCs; recheck the ledger immediately before reserving prompt intent.
     yield* brokerTask(work, input.address);
     if (input.address.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
-    const promptId = NativeRequestId.make(yield* platform.crypto.randomUUIDv4);
+    const promptId = NativeSubmissionId.make(yield* platform.crypto.randomUUIDv4);
     yield* owned(sql.withTransaction(Effect.gen(function*() {
       if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
       if (input.address.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
@@ -400,12 +388,57 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       if (reserved.length !== 1) return yield* new HttpError({ status: 409, message: "Prompt already reserved" });
       yield* event(row.taskId, { type: "prompt_intent", id: promptId, digest: yield* platform.digest(work.prompt) });
     })));
-    yield* nativeRequest(row.taskId, { type: "prompt", message: work.prompt }, 60000, promptId, input.address.deadline).pipe(Effect.catch(() => Effect.gen(function*() {
-      yield* hold(row.taskId, "prompt send/admission uncertain; never replay");
-      return yield* new HttpError({ status: 409, message: "Prompt send uncertain; held" });
+    const admitted = yield* Deferred.make<void, CommandError>();
+    const proof: { admission?: Extract<NativeLifecycleEvent, { kind: "submission_admitted" }>; terminal?: Extract<NativeLifecycleEvent, { kind: "run_settled" }> } = {};
+    const cursor = (yield* requireRow(row.taskId)).nativeCursor;
+    const request = Effect.gen(function*() {
+      const remaining = input.address.deadline - (yield* Clock.currentTimeMillis);
+      if (remaining <= 0 || child.lost || closed) return yield* new CommandError({ message: "Approved deadline or native ownership unavailable before send" });
+      const result: NativePromptResult = yield* child.client.prompt({ binding: child.client.binding, submissionId: promptId, message: work.prompt }, {
+        timeoutMs: remaining, after: cursor,
+        onLifecycle: async (value) => {
+          if (value.kind === "submission_admitted" && value.submissionId === promptId) proof.admission = value;
+          if (value.kind === "run_settled") proof.terminal = value;
+          await Effect.runPromise(lifecycle(row.taskId, child, value));
+        },
+        onAdmission: async (value: NativePromptAdmission) => {
+          await Effect.runPromise(owned(sql.withTransaction(Effect.gen(function*() {
+            const observed = proof.admission;
+            if (!observed || child.lost || closed || input.address.deadline <= (yield* Clock.currentTimeMillis) || !sameBinding(value.binding, child.client.binding) || value.submissionId !== promptId || value.runId === null ||
+              observed.seq !== value.seq || observed.runId !== value.runId || observed.disposition !== value.disposition || !sameBinding(observed.binding, value.binding)) return yield* new CommandError({ message: "Whole run admission not proven by native lifecycle" });
+            const changed = yield* sql.unsafe("UPDATE tasks SET state='RUNNING',nativeRunId=?,nativeCursor=max(nativeCursor,?) WHERE taskId=? AND state='PROMPT_INTENT' AND promptId=? AND nativeBinding=? RETURNING taskId", [value.runId, value.seq, row.taskId, promptId, bindingText(value.binding)]);
+            if (changed.length !== 1) return yield* new CommandError({ message: "Durable native prompt admission fence changed" });
+          }))));
+          await Effect.runPromise(Deferred.succeed(admitted, undefined));
+        },
+      });
+      yield* owned(sql.withTransaction(Effect.gen(function*() {
+        const current = yield* requireRow(row.taskId), terminal = proof.terminal, admission = proof.admission;
+        if (child.lost || closed || current.state !== "RUNNING" || current.promptId !== promptId || current.nativeBinding !== bindingText(child.client.binding) || current.address !== row.address || current.incarnation !== row.incarnation ||
+          result.disposition !== "settled" || !terminal || !admission || !sameBinding(result.final.binding, child.client.binding) || !sameBinding(terminal.binding, result.final.binding) ||
+          terminal.runId !== current.nativeRunId || result.final.runId !== current.nativeRunId || terminal.outcome !== result.final.outcome ||
+          !sameBinding(result.admission.binding, admission.binding) || result.admission.seq !== admission.seq || result.admission.disposition !== admission.disposition ||
+          result.admission.submissionId !== promptId || result.admission.runId !== current.nativeRunId || terminal.seq <= result.admission.seq || terminal.seq > current.nativeCursor) return yield* new CommandError({ message: "Whole run terminal result or durable generation fence unproven" });
+        const nextState = terminal.outcome === "completed" ? "SUCCEEDED" : terminal.outcome === "error" ? "FAILED" : "HELD";
+        const changed = yield* sql.unsafe("UPDATE tasks SET state=?,reason=?,result=? WHERE taskId=? AND state='RUNNING' AND promptId=? AND nativeBinding=? AND nativeRunId=? AND address=? AND incarnation=? RETURNING taskId", [
+          nextState, terminal.outcome === "aborted" ? "native run aborted; not completed" : null,
+          Schema.encodeUnknownSync(Schema.fromJsonString(RunnerResult))({ hostSettled: true, evidenceVerified: false }),
+          row.taskId, promptId, bindingText(child.client.binding), terminal.runId, row.address, row.incarnation,
+        ]);
+        if (changed.length !== 1) return yield* new CommandError({ message: "Whole run terminal journal fence changed" });
+        yield* event(row.taskId, { type: "runner_state", state: nextState });
+      })));
+      yield* fork(heartbeat());
+      yield* fork(Scope.close(child.scope, Exit.void));
+    }).pipe(Effect.catchCause(() => Effect.gen(function*() {
+      yield* hold(row.taskId, "prompt admission or whole run outcome uncertain; never replay");
+      yield* Deferred.fail(admitted, new CommandError({ message: "Prompt admission uncertain; held" }));
     })));
-    if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
-    yield* owned(sql.unsafe("UPDATE tasks SET state='RUNNING' WHERE taskId=? AND state='PROMPT_INTENT'", [row.taskId]));
+    yield* request.pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, child.scope));
+    yield* Deferred.await(admitted).pipe(Effect.timeout(Math.min(30000, input.address.deadline - (yield* Clock.currentTimeMillis))), Effect.catch(() => Effect.gen(function*() {
+      yield* hold(row.taskId, "prompt admission deadline exceeded or uncertain; never replay");
+      return yield* new HttpError({ status: 409, message: "Prompt admission uncertain; held" });
+    })));
     yield* fork(heartbeat());
     return { released: true };
   });
@@ -413,9 +446,9 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     if (closed || heartbeatBusy) return;
     heartbeatBusy = true;
     yield* Effect.gen(function*() {
-      const rows = (yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE detached=0 ORDER BY taskId", [config.childUidBase])).map((value) => decode(RunnerRow, value));
+      const rows = (yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE detached=0 ORDER BY taskId", [config.childUidBase])).map((value) => Schema.decodeUnknownSync(RunnerRow, { onExcessProperty: "error" })(value));
       const journal: Acceptance[] = []; let size = 1024;
-      for (const row of rows) { const item = acceptance(row); const bytes = byteLength(encodeJson(Acceptance, item)); if (size + bytes > LIMIT - 1024) break; journal.push(item); size += bytes; }
+      for (const row of rows) { const item = acceptance(row); const bytes = byteLength(Schema.encodeUnknownSync(Schema.fromJsonString(Acceptance), { onExcessProperty: "error" })(item)); if (size + bytes > LIMIT - 1024) break; journal.push(item); size += bytes; }
       yield* rpc.call(config.brokerUrl, token, "runner.heartbeat", { runnerId: config.id, slots: config.slots, load: yield* load(), journal }, 4000);
       if (!reportsBusy) yield* fork(reports(rows));
     }).pipe(Effect.catch(() => Effect.void), Effect.ensuring(Effect.sync(() => { heartbeatBusy = false; })));
@@ -427,8 +460,8 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       const row = yield* getRow(value.taskId);
       if (!row || row.detached) return;
       yield* Effect.gen(function*() {
-        if (row.address && row.state === "READY") yield* rpc.call(config.brokerUrl, token, "runner.readback", { runnerId: config.id, taskId: row.taskId, address: decodeJson(Address, row.address) });
-        if (row.state === "RUNNING" || row.state === "SUCCEEDED" || row.state === "FAILED" || row.state === "HELD") yield* rpc.call(config.brokerUrl, token, "runner.report", { runnerId: config.id, taskId: row.taskId, state: row.state, result: row.result ? decodeJson(JsonValue, row.result) : {} });
+        if (row.address && row.state === "READY") yield* rpc.call(config.brokerUrl, token, "runner.readback", { runnerId: config.id, taskId: row.taskId, address: Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(row.address) });
+        if (row.state === "RUNNING" || row.state === "SUCCEEDED" || row.state === "FAILED" || row.state === "HELD") yield* rpc.call(config.brokerUrl, token, "runner.report", { runnerId: config.id, taskId: row.taskId, state: row.state, result: row.result ? Schema.decodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(row.result) : {} });
       }).pipe(Effect.catch((error) => Effect.gen(function*() {
         if (!(error instanceof HttpError) || error.status !== 403) return;
         // Read the typed error rather than treating a network failure or report conflict as stale ownership.
@@ -440,39 +473,10 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     })).pipe(Effect.asVoid, Effect.ensuring(Effect.sync(() => { reportsBusy = false; })));
   }, (effect) => reportLock.withPermit(effect));
 
-  const hold = Effect.fn("Runner.hold")(function*(taskId: TaskId, reason: string) {
-    yield* state(taskId, "HELD", reason);
-    const child = children.get(taskId);
-    if (child) {
-      child.lost = true;
-      for (const pending of child.pending.values()) yield* Deferred.fail(pending.response, new CommandError({ message: "Child RPC unavailable" }));
-      child.pending.clear();
-    }
-  });
-  const nativeRequest = Effect.fn("Runner.request")(function*(taskId: TaskId, params: { type: CommandInput<CommandNames<"native">>["type"]; command?: string; message?: string }, timeout = 30000, forcedId?: NativeRequestId, approvedDeadline?: number): Effect.fn.Return<NativeFrame, unknown> {
-    const id = forcedId ?? NativeRequestId.make(yield* platform.crypto.randomUUIDv4);
-    const send = Effect.fnUntraced(function*(frame: NativeFrame): Effect.fn.Return<NativeFrame, unknown> {
-      const child = children.get(taskId);
-      if (!child || child.lost) return yield* Effect.fail(new CommandError({ message: "Owned child stdio unavailable" }));
-      const response = yield* Deferred.make<NativeFrame, unknown>();
-      child.pending.set(id, { type: frame.type, response });
-      return yield* Effect.gen(function*() {
-        if (frame.type === "prompt" && (approvedDeadline === undefined || approvedDeadline <= (yield* Clock.currentTimeMillis))) {
-          yield* hold(taskId, "Approved deadline elapsed before prompt enqueue; never replay");
-          return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
-        }
-        yield* Queue.offer(child.input, new TextEncoder().encode(`${encodeJson(NativeFrame, frame)}\n`));
-        return yield* Deferred.await(response);
-      }).pipe(Effect.timeout(timeout), Effect.ensuring(Effect.sync(() => child.pending.delete(id))));
-    });
-    const capabilities: CommandCapabilities<"native"> = {
-      nativeGetState: send,
-      nativeGetMessages: send,
-      nativeBash: send,
-      nativePrompt: send,
-      nativeAbort: send,
-    };
-    return yield* Commands[`native.${params.type}`].executeDecoded(capabilities, { id, ...params }, decodeEffect);
+  const hold = Effect.fn("Runner.hold")(function*(taskId: TaskId, reason: string): Effect.fn.Return<void, unknown> {
+    // A close/abort race must not erase an already proven whole-run terminal result.
+    const changed = yield* owned(sql.unsafe("UPDATE tasks SET state='HELD',reason=?,result=NULL WHERE taskId=? AND state NOT IN ('SUCCEEDED','FAILED') RETURNING taskId", [reason, taskId]));
+    if (changed.length) yield* event(taskId, { type: "runner_state", state: "HELD" });
   });
   const admit = Effect.fn("Runner.admit")(function*(work: Work): Effect.fn.Return<Acceptance, unknown> {
     const hash = yield* platform.fingerprint(work);
@@ -503,69 +507,98 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
         yield* fork(heartbeat()); return;
       }
       const childRoot = join(config.childDirectory, yield* platform.digest(taskId));
-      yield* fileSystem.makeDirectory(childRoot, { recursive: true, mode: 0o700 });
+      yield* fileSystem.makeDirectory(childRoot, { recursive: true, mode: 0o700 }).pipe(Effect.withSpan("Runner.launch.childRoot"));
       if (Option.isNone(yield* Effect.option(fileSystem.stat(join(row.worktree, ".git"))))) {
-        yield* git(repo, ["clone", "--no-hardlinks", "--no-checkout", repo, row.worktree]);
-        yield* git(row.worktree, ["remote", "set-url", "origin", yield* git(repo, ["remote", "get-url", "origin"])]);
-        yield* git(row.worktree, ["checkout", "--detach", work.sha]);
-        yield* git(row.worktree, ["fetch", "--no-tags", repo, "+refs/heads/*:refs/heads/*"]);
+        yield* git(repo, ["clone", "--no-hardlinks", "--no-checkout", repo, row.worktree]).pipe(Effect.withSpan("Runner.launch.clone"));
+        yield* git(row.worktree, ["remote", "set-url", "origin", yield* git(repo, ["remote", "get-url", "origin"])]).pipe(Effect.withSpan("Runner.launch.remote"));
+        yield* git(row.worktree, ["checkout", "--detach", work.sha]).pipe(Effect.withSpan("Runner.launch.checkout"));
+        yield* git(row.worktree, ["fetch", "--no-tags", repo, "+refs/heads/*:refs/heads/*"]).pipe(Effect.withSpan("Runner.launch.fetch"));
       }
-      yield* fileSystem.chmod(row.worktree, 0o700);
+      yield* fileSystem.chmod(row.worktree, 0o700).pipe(Effect.withSpan("Runner.launch.worktreeMode"));
       const sessions = join(childRoot, "sessions"), home = join(childRoot, "home");
-      yield* fileSystem.makeDirectory(sessions, { recursive: true, mode: 0o700 });
-      yield* fileSystem.makeDirectory(home, { recursive: true, mode: 0o700 });
-      yield* fileSystem.copy(config.modelDirectory, home, { overwrite: true });
+      yield* fileSystem.makeDirectory(sessions, { recursive: true, mode: 0o700 }).pipe(Effect.withSpan("Runner.launch.sessions"));
+      yield* fileSystem.makeDirectory(home, { recursive: true, mode: 0o700 }).pipe(Effect.withSpan("Runner.launch.home"));
+      yield* fileSystem.copy(config.modelDirectory, home, { overwrite: true }).pipe(Effect.withSpan("Runner.launch.modelSeed"));
       yield* ownChildDirectory(childRoot, row.childUid).pipe(Effect.provideService(Platform, platform));
       yield* verifyCheckout(row);
-      yield* state(taskId, "LAUNCHING"); // Persisted intent precedes spawn; an uncertain launch is never replayed.
+      yield* state(taskId, "LAUNCHING").pipe(Effect.withSpan("Runner.launch.intent")); // Persisted intent precedes spawn; an uncertain launch is never replayed.
       launchIntent = true;
-      childScope = yield* Scope.fork(ownerScope);
-      const input = yield* Queue.make<Uint8Array, Cause.Done>({ capacity: 32 });
-      const process = yield* platform.spawner.spawn(ChildProcess.make("/usr/bin/env", [`--chdir=${row.worktree}`, "/usr/bin/setpriv", ...isolationArgs(row.childUid), config.launchers[work.launcher]!, "--mode", "rpc", "--session-dir", sessions, "--no-extensions"], {
-        env: { ...nativeEnvironment, HOME: home }, extendEnv: false, detached: true, killSignal: "SIGTERM", forceKillAfter: "5 seconds"
-      })).pipe(Effect.provideService(Scope.Scope, childScope));
+      childScope = yield* Scope.fork(ownerScope).pipe(Effect.withSpan("Runner.launch.scope"));
+      const nativeConfig = join(childRoot, "native-plugin.json"), endpointFile = join(childRoot, "native-endpoint.json"), nativeTokenFile = join(childRoot, "native.token");
+      const nativeToken = Hex.encode(yield* platform.crypto.randomBytes(32));
+      yield* fileSystem.writeFileString(nativeTokenFile, nativeToken, { flag: "wx", mode: 0o600 });
+      yield* fileSystem.writeFileString(nativeConfig, Schema.encodeSync(Schema.fromJsonString(NativePluginConfig))({ host: work.launcher, endpointFile, tokenFile: nativeTokenFile }), { flag: "wx", mode: 0o600 });
+      const env: Record<string, string> = { HOME: home, COORDINATOR_NATIVE_CONFIG: nativeConfig };
+      for (const [key, value] of Object.entries(nativeEnvironment)) if (value !== undefined) env[key] = value;
+      yield* fileSystem.chown(nativeTokenFile, row.childUid, row.childUid);
+      yield* fileSystem.chown(nativeConfig, row.childUid, row.childUid);
+      const client = yield* connectNativeClient({
+        host: work.launcher, command: "/usr/bin/env",
+        args: [`--chdir=${row.worktree}`, "/usr/bin/setpriv", ...isolationArgs(row.childUid), config.launchers[work.launcher]!, "--mode", "rpc", "--session-dir", sessions, "--no-extensions", "-e", fileURLToPath(new URL("../dist/plugins/native-plugin.js", import.meta.url))],
+        env, cwd: config.stateDirectory, connectTimeoutMs: 60000, plugin: { endpointFile, token: nativeToken },
+      }).pipe(Effect.provideService(Scope.Scope, childScope), Effect.withSpan("Runner.launch.connect"));
+      const child: OwnedNativeChild = { client, scope: childScope, lost: false };
+      children.set(taskId, child);
+      yield* owned(sql.unsafe("UPDATE tasks SET pid=?,nativeBinding=?,nativeCursor=0 WHERE taskId=? AND state='LAUNCHING'", [client.pid, bindingText(client.binding), taskId])).pipe(Effect.withSpan("Runner.launch.persistBinding"));
       if (closed || ownershipLost) {
         yield* Scope.close(childScope, Exit.void);
-        return yield* Effect.fail(new CommandError({ message: "Runner journal ownership unavailable" }));
+        return yield* new CommandError({ message: "Runner journal ownership unavailable" });
       }
-      const child: NativeChild = { process, scope: childScope, input, pending: new Map(), lost: false, completing: false, started: false, failed: false };
-      children.set(taskId, child);
-      yield* owned(sql.unsafe("UPDATE tasks SET pid=? WHERE taskId=?", [process.pid, taskId]));
       yield* Scope.addFinalizer(child.scope, Effect.gen(function*() {
         const row = yield* getRow(taskId);
         if (row && !Terminal[row.state]) yield* hold(taskId, "child scope closed: outcome unknown; no replay");
       }).pipe(Effect.catchCause(() => Effect.void)));
-      const childFork = Effect.fnUntraced(function*(effect: Effect.Effect<unknown, unknown>) {
-        yield* effect.pipe(Effect.catch(() => hold(taskId, "invalid, truncated, or oversized host RPC output")), Effect.forkScoped, Effect.provideService(Scope.Scope, child.scope));
-      });
-      const frames = new LfFrames();
-      yield* childFork(Stream.fromQueue(input).pipe(Stream.run(process.stdin)));
-      yield* childFork(process.stdout.pipe(Stream.runForEach((chunk) => Effect.gen(function*() {
-        const values = yield* Effect.try(() => frames.push(chunk));
-        for (const value of values) yield* frame(taskId, child, value);
-      })), Effect.andThen(Effect.try(() => frames.end())), Effect.andThen(Effect.suspend(() => child.completing ? Effect.void : hold(taskId, "host stdio disconnected")))));
-      // Drain provider diagnostics without exposing or persisting credentials/transcript.
-      yield* childFork(Stream.runDrain(process.stderr));
+      // Only an observed physical SDK process close releases the ownership slot.
       yield* fork(Effect.gen(function*() {
-        const exitCode = yield* process.exitCode;
-        for (const pending of child.pending.values()) yield* Deferred.fail(pending.response, new CommandError({ message: "Child exited" }));
-        child.pending.clear();
+        yield* client.observedProcessClosed.pipe(Effect.withSpan("Runner.launch.observeProcessClosed"));
         if (ownershipLost) return;
         const current = yield* requireRow(taskId);
-        if (!Terminal[current.state]) yield* state(taskId, "FAILED", "owned child exited before confirmed completion", { exitCode: Number(exitCode) });
-        yield* owned(sql.unsafe("UPDATE tasks SET occupied=0 WHERE taskId=?", [taskId]));
+        if (!Terminal[current.state]) yield* hold(taskId, "owned native child closed before confirmed whole run completion");
+        yield* owned(sql.unsafe("UPDATE tasks SET occupied=0 WHERE taskId=? AND pid=?", [taskId, client.pid]));
         children.delete(taskId);
-        yield* Scope.close(child.scope, Exit.void);
+        yield* Scope.close(child.scope, Exit.void).pipe(Effect.withSpan("Runner.launch.closePhysicalScope"));
         yield* heartbeat();
-      }).pipe(Effect.catch(() => hold(taskId, "child exit outcome uncertain"))));
-      const response = yield* nativeRequest(taskId, { type: "get_state" }, 60000);
-      const address = yield* readback(yield* requireRow(taskId), response);
+      }).pipe(Effect.catch(() => hold(taskId, "physical child close outcome uncertain"))));
+      const watch = yield* client.watchLifecycle({ binding: client.binding, after: NativeEventSequence.make(0) }, (value) => Effect.runPromise(lifecycle(taskId, child, value))).pipe(Effect.provideService(Scope.Scope, child.scope), Effect.withSpan("Runner.launch.watchLifecycle"));
+      // Registered after acquisition: consume typed observer loss durably before the SDK fallback finalizer.
+      yield* Scope.addFinalizer(child.scope, watch.close.pipe(
+        Effect.catch((error) => hold(taskId, `native MCP lifecycle observer close failed (${error.code}); physical child ownership retained`)),
+        Effect.orDie,
+      ));
+      yield* watch.connectionClosed.pipe(Effect.catch((failure) => Effect.gen(function*() {
+        child.lost = true;
+        // Own the failed observer's typed close before its scoped fallback can turn it into a defect.
+        // This releases the subscription only; the process and occupied slot remain owned.
+        yield* watch.close.pipe(Effect.matchEffect({
+          onFailure: (error) => hold(taskId, `native MCP lifecycle observer close failed (${error.code}); physical child ownership retained`),
+          onSuccess: () => hold(taskId, `native MCP lifecycle connection lost (${failure.code}); physical child ownership retained`),
+        }));
+      })), Effect.forkScoped, Effect.provideService(Scope.Scope, child.scope));
+      const response = yield* client.call("native.get_state", { binding: client.binding }, { timeoutMs: 60000 }).pipe(Effect.withSpan("Runner.launch.getState"));
+      if (!client.capabilities.includes("native.prompt")) {
+        yield* hold(taskId, `${work.launcher} public extension hooks cannot prove prompt admission and final outcome; no prompt sent`);
+        yield* fork(heartbeat());
+        return;
+      }
+      const address = yield* readback(yield* requireRow(taskId), response).pipe(Effect.withSpan("Runner.launch.readback"));
       if (closed) return yield* Effect.fail(new CommandError({ message: "Runner journal ownership unavailable" }));
-      yield* owned(sql.unsafe("UPDATE tasks SET address=?,state='READY',reason=NULL WHERE taskId=? AND state='LAUNCHING'", [encodeJson(Address, address), taskId]));
+      yield* owned(sql.unsafe("UPDATE tasks SET address=?,state='READY',reason=NULL WHERE taskId=? AND state='LAUNCHING'", [Schema.encodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(address), taskId])).pipe(Effect.withSpan("Runner.launch.ready"));
       yield* event(taskId, { type: "readback", address });
       yield* fork(heartbeat());
-    }).pipe(Effect.catchCause((cause) => Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.gen(function*() {
-      if (launchIntent) yield* hold(taskId, "launch/readback uncertain; no automatic relaunch");
+    }).pipe(Effect.withSpan("Runner.launch.acquire"), Effect.catchCause((cause) => Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.gen(function*() {
+      // Fixed ownership metadata only; retain the failed acquisition span before holding uncertain intent.
+      yield* Effect.annotateCurrentSpan({ launchIntent, ownershipLost, closed, hasChildScope: childScope !== undefined, hasOwnedChild: children.has(taskId) });
+      if (launchIntent) {
+        yield* hold(taskId, "launch/readback uncertain; no automatic relaunch");
+        if (childScope && !children.has(taskId)) {
+          // Failed discovery has no registered observer; scoped SDK cleanup still owns physical closure.
+          const closure = yield* Scope.close(childScope, Exit.void).pipe(Effect.exit);
+          if (closure._tag === "Success" && !ownershipLost) {
+            yield* owned(sql.unsafe("UPDATE tasks SET occupied=0 WHERE taskId=? AND state='HELD' AND pid IS NULL", [taskId]));
+            yield* fork(heartbeat());
+          } else if (closure._tag === "Failure") yield* hold(taskId, "native MCP acquisition cleanup failed; physical child ownership retained");
+        }
+      }
       else {
         if (childScope) yield* Scope.close(childScope, Exit.void);
         yield* state(taskId, "FAILED", "allowlisted checkout preparation failed");
@@ -579,13 +612,11 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     closed = true;
     for (const [taskId, child] of children) {
       child.lost = true;
-      for (const pending of child.pending.values()) yield* Deferred.fail(pending.response, new CommandError({ message: "Runner child RPC unavailable" }));
-      child.pending.clear();
       if (!ownershipLost) {
         const row = yield* getRow(taskId);
         if (row && !Terminal[row.state]) yield* hold(taskId, "runner shutdown: child outcome unknown; no replay");
       }
-      yield* Scope.close(child.scope, Exit.void);
+      yield* Scope.close(child.scope, Exit.void).pipe(Effect.withSpan("Runner.shutdown.closeChildScope"));
     }
     // Do not clear uncertain prompt IDs/slots; restart reconciles recorded PIDs without replay.
     children.clear();
@@ -600,11 +631,11 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
   });
   yield* owned(rpc.serve(server, { target: "runner", authorize, handle: (bearer, request) => handle(request, bearer) }));
   yield* owned(Effect.gen(function*() {
-    for (const value of yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE state='ACCEPTED' AND occupied=1 AND detached=0", [config.childUidBase])) yield* schedule(decode(RunnerRow, value).taskId);
+    for (const value of yield* sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks WHERE state='ACCEPTED' AND occupied=1 AND detached=0", [config.childUidBase])) yield* schedule(Schema.decodeUnknownSync(RunnerRow, { onExcessProperty: "error" })(value).taskId);
     yield* fork(Effect.forever(heartbeat().pipe(Effect.andThen(Effect.sleep("5 seconds")))));
   }));
   if (ownershipLost) return yield* Deferred.await(fatal);
-  return { config, sql, server, failure: Deferred.await(fatal), authorize, handle, row: getRow, state, event, frame, reports, heartbeat, launch };
+  return { config, sql, server, failure: Deferred.await(fatal), authorize, handle, row: getRow, state, event, reports, heartbeat, launch };
 });
 
 export class Runner extends Context.Service<Runner>()("coordinator/Runner", {

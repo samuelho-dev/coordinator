@@ -2,17 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { NodeHttpClient } from "@effect/platform-node";
-import { Clock, Effect, Fiber, Layer, ManagedRuntime } from "effect";
+import { Clock, Effect, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { pollCi } from "../src/evidence.ts";
 import { JsonValue, Work, Sha } from "../src/contracts.ts";
-import { decode, encodeJson } from "../src/http.ts";
 
-function response(value: JsonValue): Response { return new Response(encodeJson(JsonValue, value), { headers: { "content-type": "application/json" } }); }
+function response(value: JsonValue): Response { return new Response(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(value), { headers: { "content-type": "application/json" } }); }
 
 const sha = Sha.make("1".repeat(40));
-const work = decode(Work, { taskId: "evidence-task", repo: "github.com/owner/repo", ref: "main", sha, launcher: "omp", prompt: "approved", scope: "scope", restrictions: "no merge", expectedEvidence: ["CI/verify"], deadline: (await Effect.runPromise(Clock.currentTimeMillis)) + 60000, workerId: "worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: true, approved: true });
+const work = Schema.decodeUnknownSync(Work, { onExcessProperty: "error" })({ taskId: "evidence-task", repo: "github.com/owner/repo", ref: "main", sha, launcher: "omp", prompt: "approved", scope: "scope", restrictions: "no merge", expectedEvidence: ["CI/verify"], deadline: (await Effect.runPromise(Clock.currentTimeMillis)) + 60000, workerId: "worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: true, approved: true });
 
 test("exact-SHA latest-attempt CI refuses prior green, missing/skipped/cancelled lanes and polling races", async () => {
   let respond = (_url: string): Response => response({});

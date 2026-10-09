@@ -5,7 +5,6 @@ import { Reactivity } from "effect/reactivity";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { migrateBroker, migrateRunner } from "../src/database.ts";
 import { Platform } from "../src/platform.ts";
-import type { Json } from "../src/contracts.ts";
 
 test("legacy SQLite rows survive baseline adoption and repeated detached evolution", () => Effect.runPromise(
   Effect.scoped(Effect.gen(function*() {
@@ -55,14 +54,21 @@ test("legacy SQLite rows survive baseline adoption and repeated detached evoluti
       assert.deepEqual(yield* runner.unsafe("SELECT taskId,detached FROM tasks").values, [["legacy", 0]]);
       assert.deepEqual(yield* runner.unsafe("SELECT * FROM events"), events);
       assert.deepEqual(yield* runner.unsafe("SELECT name FROM sqlite_master WHERE type='table' AND name='owner'"), []);
-      assert.equal((yield* runner.unsafe<Json>("PRAGMA user_version"))[0]?.user_version, 0);
-      yield* runner.unsafe("UPDATE tasks SET detached=1 WHERE taskId='legacy'");
+      assert.deepEqual(yield* runner.unsafe("SELECT nativeBinding,nativeRunId,nativeCursor FROM tasks").values, [[null, null, 0]]);
+      const binding = JSON.stringify({ host: "omp", sessionId: "native-session", incarnation: "native-incarnation", generation: 2 });
+      yield* runner.unsafe("UPDATE tasks SET detached=1,nativeBinding=?,nativeRunId='run-1',nativeCursor=7 WHERE taskId='legacy'", [binding]);
+      const rollback = yield* runner.withTransaction(Effect.gen(function*() {
+        yield* runner.unsafe("UPDATE tasks SET nativeRunId='uncertain',nativeCursor=8,occupied=0 WHERE taskId='legacy'");
+        return yield* Effect.fail("rollback");
+      })).pipe(Effect.result);
+      assert.equal(rollback._tag, "Failure");
+      assert.deepEqual(yield* runner.unsafe("SELECT nativeBinding,nativeRunId,nativeCursor,occupied FROM tasks").values, [[binding, "run-1", 7, 1]]);
     }));
     const runner = yield* SqliteClient.make({ filename });
     yield* migrateRunner(runner);
     yield* migrateRunner(runner);
     assert.deepEqual(yield* runner.unsafe("SELECT taskId,fingerprint,work,worktree,state,occupied,pid,incarnation,address,promptId,reason,result,detached FROM tasks").values, [["legacy", "fingerprint", "work", "worktree", "HELD", 1, 123, "incarnation", "address", "prompt", "diagnostic", "result", 1]]);
     assert.deepEqual(yield* runner.unsafe("SELECT seq,taskId,payload FROM events").values, [[1, "legacy", "metadata"]]);
-    assert.equal((yield* runner.unsafe<Json>("PRAGMA user_version"))[0]?.user_version, 0);
+    assert.deepEqual(yield* runner.unsafe("SELECT nativeBinding,nativeRunId,nativeCursor FROM tasks").values, [[JSON.stringify({ host: "omp", sessionId: "native-session", incarnation: "native-incarnation", generation: 2 }), "run-1", 7]]);
   })).pipe(Effect.provide(Layer.merge(Reactivity.layer, Platform.layer)))
 ));

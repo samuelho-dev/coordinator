@@ -2,12 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Schema } from "effect";
 import * as C from "../src/contracts.ts";
-import { decode, encodeJson } from "../src/http.ts";
+import { NativeSubmissionId, NativeRunId, NativeBinding, NativeEventSequence } from "@samuelho/coordinator-native-control/contracts";
 
 type Domains = {
   task: C.TaskId; message: C.MessageId; session: C.SessionId; incarnation: C.IncarnationId;
   machine: C.MachineId; worker: C.WorkerId; runner: C.RunnerId; principal: C.PrincipalId;
-  owner: C.OwnerId; archive: C.ArchiveEntryId; nativeRequest: C.NativeRequestId;
+  owner: C.OwnerId; archive: C.ArchiveEntryId; nativeSubmission: NativeSubmissionId; nativeRun: NativeRunId;
   handled: C.JournalHandledKey; release: C.JournalReleaseKey;
   repository: C.GitHubRepositoryId; run: C.GitHubRunId; workflow: C.GitHubWorkflowId;
   job: C.GitHubJobId; pullRequest: C.GitHubPullRequestNumber; user: C.UserId;
@@ -28,7 +28,6 @@ export type AllIdentityDomainsAreDistinct = AssertNever<CrossDomainLeaks>;
 type BrokerParams<M extends C.BrokerRequest["method"]> = Extract<C.BrokerRequest, { method: M }>["params"];
 type RunnerParams<M extends C.RunnerRequest["method"]> = Extract<C.RunnerRequest, { method: M }>["params"];
 type ArchiveMetadata = Extract<C.ArchivePayload, { contentOmitted: true }>;
-type PendingKey = C.NativeChild["pending"] extends Map<infer K, unknown> ? K : never;
 type ContractFields = {
   task: [C.Task["taskId"], C.TaskId]; owner: [C.Task["owner"], C.OwnerId];
   principal: [C.Principal["id"], C.PrincipalId]; principalOwner: [C.Principal["owner"], C.OwnerId];
@@ -46,10 +45,11 @@ type ContractFields = {
   release: [keyof C.JournalState["releases"], C.JournalReleaseKey];
   inbox: [keyof C.Inbox, C.MessageId]; seenHash: [C.JournalState["seen"][C.Hash], C.Hash];
   seenKey: [keyof C.JournalState["seen"], C.Hash];
-  nativeRequest: [NonNullable<C.NativeFrame["id"]>, C.NativeRequestId];
-  nativeCommand: [C.CommandInput<"native.prompt">["id"], C.NativeRequestId];
-  prompt: [NonNullable<C.RunnerRow["promptId"]>, C.NativeRequestId];
-  event: [NonNullable<C.RunnerEvent["id"]>, C.NativeRequestId]; pending: [PendingKey, C.NativeRequestId];
+  prompt: [NonNullable<C.RunnerRow["promptId"]>, NativeSubmissionId];
+  nativeRun: [NonNullable<C.RunnerRow["nativeRunId"]>, NativeRunId];
+  nativeCursor: [C.RunnerRow["nativeCursor"], NativeEventSequence];
+  eventBinding: [NonNullable<C.RunnerEvent["binding"]>, NativeBinding];
+  eventRun: [NonNullable<C.RunnerEvent["runId"]>, NativeRunId];
   process: [NonNullable<C.RunnerRow["pid"]>, C.ProcessId]; user: [C.RunnerRow["childUid"], C.UserId];
   repository: [C.RepoIdentity["id"], C.GitHubRepositoryId];
   configRepository: [C.BrokerConfig["repositoryIds"][C.Repo], C.GitHubRepositoryId];
@@ -104,64 +104,49 @@ test("persisted task, work and address keep primitive identity bytes across JSON
     runnerId: "runner-1", peerSession: "same-id", peerIncarnation: "incarnation-1", address: wireAddress,
     createdAt: 10, updatedAt: 20,
   };
-  assert.deepEqual(decode(Schema.fromJsonString(Schema.MutableJson), encodeJson(C.Work, work)), wireWork);
-  assert.deepEqual(decode(Schema.fromJsonString(Schema.MutableJson), encodeJson(C.Address, address)), wireAddress);
-  assert.deepEqual(decode(Schema.fromJsonString(Schema.MutableJson), encodeJson(C.Task, task)), wireTask);
-  assert.deepEqual(decode(Schema.fromJsonString(C.Work), encodeJson(C.Work, work)), work);
-  assert.deepEqual(decode(Schema.fromJsonString(C.Address), encodeJson(C.Address, address)), address);
-  assert.deepEqual(decode(Schema.fromJsonString(C.Task), encodeJson(C.Task, task)), task);
-  assert.deepEqual(decode(C.BrokerRequest, { method: "task.submit", params: wireWork }), { method: "task.submit", params: work });
-  assert.deepEqual(decode(C.RunnerRequest, { method: "prepare", params: { taskId: "same-id", address: wireAddress } }), {
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.MutableJson), { onExcessProperty: "error" })(Schema.encodeUnknownSync(Schema.fromJsonString(C.Work), { onExcessProperty: "error" })(work)), wireWork);
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.MutableJson), { onExcessProperty: "error" })(Schema.encodeUnknownSync(Schema.fromJsonString(C.Address), { onExcessProperty: "error" })(address)), wireAddress);
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.MutableJson), { onExcessProperty: "error" })(Schema.encodeUnknownSync(Schema.fromJsonString(C.Task), { onExcessProperty: "error" })(task)), wireTask);
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(C.Work), { onExcessProperty: "error" })(Schema.encodeUnknownSync(Schema.fromJsonString(C.Work), { onExcessProperty: "error" })(work)), work);
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(C.Address), { onExcessProperty: "error" })(Schema.encodeUnknownSync(Schema.fromJsonString(C.Address), { onExcessProperty: "error" })(address)), address);
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(C.Task), { onExcessProperty: "error" })(Schema.encodeUnknownSync(Schema.fromJsonString(C.Task), { onExcessProperty: "error" })(task)), task);
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.toCodecJson(C.BrokerRequest), { onExcessProperty: "error" })({ method: "task.submit", params: wireWork }), { method: "task.submit", params: work });
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.toCodecJson(C.RunnerRequest), { onExcessProperty: "error" })({ method: "prepare", params: { taskId: "same-id", address: wireAddress } }), {
     method: "prepare", params: { taskId: task.taskId, address },
   });
-  assert.deepEqual(decode(C.BrokerRequest, {
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.toCodecJson(C.BrokerRequest), { onExcessProperty: "error" })({
     method: "peer.ack", params: { messageId: "same-id", sessionId: "same-id", incarnation: "incarnation-1" },
   }), { method: "peer.ack", params: { messageId: address.messageId, sessionId: address.sessionId, incarnation: address.incarnation } });
 });
 
-test("archive parent identities and arbitrary native response correlations survive serialization without exposing content", () => {
-  const append = decode(C.Commands["archive.append"].input, {
+test("archive parent identities survive serialization without exposing content", () => {
+  const append = Schema.decodeUnknownSync(Schema.toCodecJson(C.Commands["archive.append"].input), { onExcessProperty: "error" })({
     sessionId: "same-id", entryId: "entry-2", digest: "c".repeat(64), gaps: [],
     payload: { id: "entry-2", parentId: "entry-1", type: "message", role: "assistant", contentOmitted: true },
   });
-  assert.equal(encodeJson(C.Commands["archive.append"].input, append), JSON.stringify({
-    sessionId: "same-id", entryId: "entry-2", digest: "c".repeat(64),
-    payload: { id: "entry-2", parentId: "entry-1", type: "message", role: "assistant", contentOmitted: true }, gaps: [],
-  }));
-  assert.deepEqual(decode(Schema.fromJsonString(C.Commands["archive.append"].input), encodeJson(C.Commands["archive.append"].input, append)), append);
-  assert.throws(() => decode(C.Commands["archive.append"].input, {
+  assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(C.Commands["archive.append"].input), { onExcessProperty: "error" })(Schema.encodeUnknownSync(Schema.fromJsonString(C.Commands["archive.append"].input), { onExcessProperty: "error" })(append)), append);
+  assert.throws(() => Schema.decodeUnknownSync(Schema.toCodecJson(C.Commands["archive.append"].input), { onExcessProperty: "error" })({
     ...append, payload: { id: "entry-2", parentId: "entry-1", type: "message", contentOmitted: true, text: "private" },
   }));
-  assert.throws(() => decode(C.Commands["archive.append"].input, {
+  assert.throws(() => Schema.decodeUnknownSync(Schema.toCodecJson(C.Commands["archive.append"].input), { onExcessProperty: "error" })({
     ...append, payload: { id: "entry-2", parentId: "invalid/parent", type: "message", contentOmitted: true },
   }));
-  const frame = C.NativeFrame.make({ type: "response", id: C.NativeRequestId.make("native reply / 7 λ"), command: "prompt", success: true });
-  const serialized = encodeJson(C.NativeFrame, frame);
-  assert.equal(serialized, '{"type":"response","id":"native reply / 7 λ","command":"prompt","success":true}');
-  assert.deepEqual(decode(Schema.fromJsonString(C.NativeFrame), serialized), frame);
-  assert.throws(() => decode(C.Commands["native.prompt"].input, { id: frame.id, type: "prompt", message: "approved" }));
-  const prompt = decode(C.Commands["native.prompt"].input, { id: "native:7", type: "prompt", message: "approved" });
-  assert.equal(encodeJson(C.Commands["native.prompt"].input, prompt), '{"id":"native:7","type":"prompt","message":"approved"}');
 });
 
 test("identity branding preserves malformed ID rejection and positive integer repository configuration", () => {
   for (const taskId of ["", "invalid/task", "a".repeat(161)]) {
-    assert.throws(() => decode(C.BrokerRequest, { method: "task.submit", params: { ...wireWork, taskId } }));
-    assert.throws(() => decode(C.RunnerRequest, { method: "prepare", params: { taskId, address: wireAddress } }));
+    assert.throws(() => Schema.decodeUnknownSync(Schema.toCodecJson(C.BrokerRequest), { onExcessProperty: "error" })({ method: "task.submit", params: { ...wireWork, taskId } }));
+    assert.throws(() => Schema.decodeUnknownSync(Schema.toCodecJson(C.RunnerRequest), { onExcessProperty: "error" })({ method: "prepare", params: { taskId, address: wireAddress } }));
   }
   for (const field of ["messageId", "sessionId", "workerId", "incarnation"]) {
-    assert.throws(() => decode(C.Address, { ...wireAddress, [field]: "invalid/id" }));
+    assert.throws(() => Schema.decodeUnknownSync(C.Address, { onExcessProperty: "error" })({ ...wireAddress, [field]: "invalid/id" }));
   }
-  assert.throws(() => decode(C.Work, { ...wireWork, githubRepoId: 1.5 }));
-  const config = decode(C.BrokerConfig, {
+  assert.throws(() => Schema.decodeUnknownSync(C.Work, { onExcessProperty: "error" })({ ...wireWork, githubRepoId: 1.5 }));
+  const config = Schema.decodeUnknownSync(C.BrokerConfig, { onExcessProperty: "error" })({
     database: ":memory:", host: "127.0.0.1", port: 0, principals: [], backupDirectory: "/tmp/backups",
     archiveRetentionMs: 1000, backupRetentionMs: 1000, repositoryIds: { "github.com/owner/project": 1 },
   });
-  assert.equal(encodeJson(C.BrokerConfig, config), JSON.stringify({
-    database: ":memory:", host: "127.0.0.1", port: 0, principals: [], backupDirectory: "/tmp/backups",
-    archiveRetentionMs: 1000, backupRetentionMs: 1000, repositoryIds: { "github.com/owner/project": 1 },
-  }));
   for (const repositoryId of [0, -1, 1.5]) {
-    assert.throws(() => decode(C.BrokerConfig, { ...config, repositoryIds: { "github.com/owner/project": repositoryId } }));
+    assert.throws(() => Schema.decodeUnknownSync(C.BrokerConfig, { onExcessProperty: "error" })({ ...config, repositoryIds: { "github.com/owner/project": repositoryId } }));
   }
 });

@@ -6,35 +6,10 @@ import { lookup } from "node:dns";
 import type { LookupFunction } from "node:net";
 import { McpProtocol, McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { BackupError, SnapshotList, BrokerRequest, RunnerRequest, ConnectHosts, HttpError, CommandError, BoundaryError, Json, McpToolName, Commands, McpCommandName, type CommandInput, type McpEndpoint } from "./contracts.ts";
+import { BackupError, SnapshotList, BrokerRequest, RunnerRequest, ConnectHosts, HttpError, CommandError, BoundaryError, Json, Commands, McpCommandName, type CommandInput, type McpEndpoint } from "./contracts.ts";
 
 export const LIMIT = 64 * 1024;
 export const MCP_RESULT_LIMIT = LIMIT - 1024;
-export function mcpResultSizer<S extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>>(schema: S) {
-  const encode = Schema.encodeUnknownSync(Schema.toCodecJson(schema), { onExcessProperty: "error" });
-  return (value: unknown) => bytes(JSON.stringify(encode(value)));
-}
-export function decode<S extends Schema.ConstraintDecoder<unknown>>(schema: S, value: unknown): S["Type"] {
-  return Schema.decodeUnknownSync(schema, { onExcessProperty: "error" })(value);
-}
-export function decodeEffect<S extends Schema.Constraint>(schema: S, value: unknown): Effect.Effect<S["Type"], HttpError, S["DecodingServices"]> {
-  return Schema.decodeUnknownEffect(schema, { onExcessProperty: "error" })(value).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
-}
-export function decodeJson<S extends Schema.ConstraintDecoder<unknown> & Schema.ConstraintEncoder<unknown>>(schema: S, text: string): S["Type"] {
-  return decode(Schema.fromJsonString(Schema.toCodecJson(schema)), text);
-}
-export function encodeJson<S extends Schema.ConstraintDecoder<unknown> & Schema.ConstraintEncoder<unknown>>(schema: S, value: S["Type"], space?: number | string): string {
-  // Storage keeps omitted optional fields; only MCP's object wire uses canonical JSON nulls.
-  return Schema.encodeUnknownSync(Schema.fromJsonString(schema, { space }), { onExcessProperty: "error" })(value);
-}
-export function canonicalJson(value: unknown): string {
-  const text = JSON.stringify(value, (_, item: unknown) => {
-    if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
-    return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)));
-  });
-  if (text === undefined) throw new Error("JSON value required");
-  return text;
-}
 export function decodeSnapshotList(text: string): SnapshotList {
   // ponytail: S3's fixed ASCII snapshot names only; reject entities and foreign keys instead of adding a general XML parser.
   if (text.includes("<!") || !/^\s*(?:<\?xml\s[^<>]*\?>\s*)?<ListBucketResult(?:\s[^>]*)?>[\s\S]*<\/ListBucketResult>\s*$/.test(text)) throw new BackupError({ message: "Invalid S3 snapshot listing" });
@@ -61,24 +36,12 @@ export function decodeSnapshotList(text: string): SnapshotList {
   const next = [...text.matchAll(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/g)];
   const count = [...text.matchAll(/<KeyCount>([0-9]+)<\/KeyCount>/g)], maximum = [...text.matchAll(/<MaxKeys>([0-9]+)<\/MaxKeys>/g)];
   if ((text.match(/<\/?Key\b/g)?.length ?? 0) !== contents.length * 2 || (text.match(/<\/?Contents\b/g)?.length ?? 0) !== contents.length * 2 || truncated.length !== 1 || next.length !== (truncated[0]![1] === "true" ? 1 : 0) || count.length !== 1 || Number(count[0]![1]) !== keys.length || maximum.length !== 1 || !Number.isSafeInteger(Number(maximum[0]![1])) || Number(maximum[0]![1]) < keys.length) throw new BackupError({ message: "Incomplete S3 snapshot listing" });
-  return decode(SnapshotList, { keys, ...(next.length ? { next: next[0]![1]! } : {}) });
-}
-function operation(method: unknown, target?: "broker" | "runner") {
-  if (typeof method !== "string" || !Object.hasOwn(Commands, method) || method === "health") throw new HttpError({ status: 404, message: "Unknown operation" });
-  const descriptor = Commands[decode(McpToolName, method)];
-  if (target !== undefined && descriptor.target !== target) throw new HttpError({ status: 404, message: "Unknown operation" });
-  return descriptor;
-}
-export function decodeRequest(target: "broker", method: unknown, params: unknown): BrokerRequest;
-export function decodeRequest(target: "runner", method: unknown, params: unknown): RunnerRequest;
-export function decodeRequest(target: "broker" | "runner", method: unknown, params: unknown): BrokerRequest | RunnerRequest {
-  operation(method, target);
-  return target === "broker" ? decode(BrokerRequest, { method, params }) : decode(RunnerRequest, { method, params });
+  return Schema.decodeUnknownSync(SnapshotList, { onExcessProperty: "error" })({ keys, ...(next.length ? { next: next[0]![1]! } : {}) });
 }
 
 const clientLayer = Layer.unwrap(Effect.gen(function*() {
   const configuredHosts = yield* Config.String("COORDINATOR_CONNECT_HOSTS_JSON").pipe(Config.withDefault("{}"));
-  const hosts = yield* Effect.try(() => decodeJson(ConnectHosts, configuredHosts));
+  const hosts = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectHosts), { onExcessProperty: "error" })(configuredHosts);
   // The Node agent requires a DNS callback; Effect has no DNS service. The socket override leaves TLS hostname verification intact.
   const connectLookup: LookupFunction = (hostname, options, callback) => lookup(hosts[hostname] ?? hostname, options, callback);
   return NodeHttpClient.layerNodeHttpNoAgent.pipe(Layer.provide(NodeHttpClient.layerAgentOptions({ lookup: connectLookup })));
@@ -99,7 +62,6 @@ const boundaryFailure = (cause: Cause.Cause<unknown>) => {
   const error = Cause.squash(cause);
   return new HttpError({ status: error instanceof HttpError ? error.status : 400, message: error instanceof HttpError ? error.message.slice(0, 512) : "Invalid request or unavailable operation" });
 };
-const bytes = (text: string) => new TextEncoder().encode(text).byteLength;
 const boundedResponse = Effect.fnUntraced(function*(response: HttpServerResponse.HttpServerResponse, limit: number) {
   const body = response.body;
   if (body._tag === "Empty") return response;
@@ -147,10 +109,10 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
   make: Effect.gen(function*() {
     const http = yield* HttpClient.HttpClient;
     // Each call owns its SDK connection: bearer contexts never share state or an authenticated session.
-    const call = <const M extends McpCommandName>(url: string, token: string, method: M, params: CommandInput<M>, timeoutMs = 10000): Effect.Effect<(typeof Commands)[M]["output"]["Type"], unknown> => Effect.scoped(Effect.gen(function*() {
+    const call = <const M extends McpCommandName>(url: string, token: string, method: M, params: CommandInput<M>, timeoutMs = 10000): Effect.Effect<(typeof Commands)[M]["output"]["Type"], HttpError | CommandError | Cause.TimeoutError> => Effect.scoped(Effect.gen(function*() {
       const descriptor = Commands[method];
-      const input = yield* decodeEffect(descriptor.input, params);
-      const endpoint = yield* Effect.try(() => new URL("/mcp", url));
+      const input = yield* Schema.decodeUnknownEffect(descriptor.input, { onExcessProperty: "error" })(params).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
+      const endpoint = yield* Effect.try({ try: () => new URL("/mcp", url), catch: () => new HttpError({ status: 400, message: "Invalid MCP endpoint" }) });
       if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname))) return yield* new HttpError({ status: 400, message: "TLS required except loopback" });
       const sdkFetch: typeof globalThis.fetch = async (input, init) => {
         const request = new Request(input, init);
@@ -172,7 +134,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
           }));
           body += decoder.decode();
           // Discovery contains the full catalog; command responses keep the existing 64 KiB bound.
-          const method = body ? decodeJson(Json, body).method : undefined;
+          const method = body ? (yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Json), { onExcessProperty: "error" })(body)).method : undefined;
           const discovery = method === "server/discover" || method === "tools/list";
           const text = yield* boundedText(response, discovery ? 512 * 1024 : LIMIT);
           if (response.status < 200 || response.status >= 300) return yield* new HttpError({ status: response.status, message: "MCP request rejected" });
@@ -181,19 +143,17 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
       };
       const client = yield* Effect.acquireRelease(
         Effect.sync(() => new Client({ name: "coordinator", version: "0.1.0" })),
-        (client) => Effect.tryPromise(() => client.close()).pipe(Effect.catchCause(() => Effect.void)),
+        (client) => Effect.tryPromise({ try: () => client.close(), catch: () => new CommandError({ message: "MCP connection cleanup failed" }) }).pipe(Effect.orDie),
       );
-      yield* Effect.tryPromise({ try: (signal) => client.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: { token: async () => token }, fetch: (input, init) => sdkFetch(input, { ...init, signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal }), requestInit: { redirect: "error" } })), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: error instanceof Error ? error.message : String(error) }) });
-      const result = yield* Effect.tryPromise({ try: (signal) => client.callTool({ name: descriptor.method ?? method, arguments: decode(Schema.Record(Schema.String, Schema.Unknown), Schema.encodeUnknownSync(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(input)) }, { signal, timeout: timeoutMs }), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: error instanceof Error ? error.message : String(error) }) });
+      yield* Effect.tryPromise({ try: (signal) => client.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: { token: async () => token }, fetch: (input, init) => sdkFetch(input, { ...init, signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal }), requestInit: { redirect: "error" } })), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: "MCP connection unavailable" }) });
+      const encoded = yield* Schema.encodeUnknownEffect(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(input).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
+      const arguments_ = yield* Schema.decodeUnknownEffect(Schema.Record(Schema.String, Schema.Unknown), { onExcessProperty: "error" })(encoded).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
+      const result = yield* Effect.tryPromise({ try: (signal) => client.callTool({ name: descriptor.method ?? method, arguments: arguments_ }, { signal, timeout: timeoutMs }), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: "MCP operation unavailable" }) });
       if (result.isError) {
-        const failure = result.structuredContent ?? (yield* Effect.try(() => {
-          const text = result.content.find((item) => item.type === "text");
-          return text?.type === "text" ? JSON.parse(text.text) : undefined;
-        }));
-        const decoded = yield* decodeEffect(Schema.toCodecJson(ToolFailure), failure);
+        const decoded = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(ToolFailure), { onExcessProperty: "error" })(result.structuredContent).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
         return yield* decoded.error;
       }
-      const output = yield* decodeEffect<Schema.toCodecJson<(typeof Commands)[M]["structuredOutput"]>>(Schema.toCodecJson(descriptor.structuredOutput), result.structuredContent);
+      const output = yield* Schema.decodeUnknownEffect<Schema.toCodecJson<(typeof Commands)[M]["structuredOutput"]>>(Schema.toCodecJson(descriptor.structuredOutput), { onExcessProperty: "error" })(result.structuredContent).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
       return output.result;
     })).pipe(Effect.timeout(timeoutMs));
 
@@ -214,45 +174,52 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         if (name === "health") return yield* Commands.health.execute({ health: () => Effect.succeed({ status: "ok" as const }) }, {});
         if (options.target === "broker") {
           const principal = yield* options.authorize(token);
-          return yield* options.handle(principal, yield* decodeEffect(BrokerRequest, { method: name, params }));
+          return yield* options.handle(principal, yield* Schema.decodeUnknownEffect(BrokerRequest, { onExcessProperty: "error" })({ method: name, params }).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" }))));
         }
         const principal = yield* options.authorize(token);
-        return yield* options.handle(principal, yield* decodeEffect(RunnerRequest, { method: name, params }));
+        return yield* options.handle(principal, yield* Schema.decodeUnknownEffect(RunnerRequest, { onExcessProperty: "error" })({ method: name, params }).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" }))));
       });
       const tools = Object.entries(Commands).filter(([, descriptor]) => descriptor.target === options.target || descriptor.target === "shared").map(([id, descriptor]) => {
-        const commandName = decode(McpCommandName, id);
+        const commandName = Schema.decodeUnknownSync(McpCommandName, { onExcessProperty: "error" })(id);
         // Runtime schemas remain context-free; the domain decodes its discriminated request.
         const makeTool = (name: string, input: Schema.Top & Schema.ConstraintCodec<unknown, unknown>, output: Schema.Top & Schema.ConstraintCodec<unknown, unknown>, description: string) => {
           const failureCodec = Schema.toCodecJson(ToolFailure);
-          const resultSize = mcpResultSizer(output);
-          const tool = Tool.make(name, { parameters: Schema.toCodecJson(input), success: Schema.toCodecJson(output), failure: failureCodec, description }).annotate(Tool.Strict, true);
+          const resultText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(output)), { onExcessProperty: "error" });
+          const tool = Tool.make(name, { parameters: Schema.toCodecJson(input), success: Schema.toCodecJson(output), failure: failureCodec, failureMode: "return", description }).annotate(Tool.Strict, true);
           const toolkit = Toolkit.make(tool);
           const registration = Layer.effectDiscard(Effect.gen(function*() {
             const registry = yield* McpServer.McpServer;
+            const built = yield* toolkit;
             yield* McpServer.registerToolkit(toolkit).pipe(Effect.provideService(McpServer.McpServer, {
               ...registry,
               addTool: (registration) => registry.addTool({
                 ...registration,
-                handle: (payload) => registration.handle(payload).pipe(Effect.flatMap((result) => {
-                  // ponytail: structured clients only; duplicating JSON text breaks the fixed wire bound.
-                  if (!("isError" in result) || !result.isError) return Effect.succeed(new McpSchema.CallToolResult({ ...result, content: [] }));
-                  const text = result.content.find((item) => item.type === "text");
-                  return Effect.try(() => text?.type === "text" ? decodeJson(ToolFailure, text.text) : undefined).pipe(
-                    Effect.catchCause(() => Effect.succeed(undefined)),
-                    Effect.map((failure) => failure === undefined ? result : new McpSchema.CallToolResult({
-                      ...result,
-                      structuredContent: Schema.encodeUnknownSync(failureCodec)(failure),
-                    })),
-                  );
-                })),
+                handle: (payload) => built.handle(name, payload ?? {}, undefined, { onExcessProperty: "error", errors: "all" }).pipe(
+                  Stream.unwrap,
+                  Stream.runLast,
+                  Effect.flatMap(Effect.fromOption),
+                  Effect.flatMap((result) => {
+                    if (result.isFailure && result.failureOrigin !== "handler") return Effect.fail(new HttpError({ status: 400, message: "Invalid command input or output" }));
+                    return Effect.succeed(new McpSchema.CallToolResult({
+                      isError: result.isFailure,
+                      content: [],
+                      structuredContent: result.encodedResult,
+                    }));
+                  }),
+                  Effect.catchCause((cause) => Effect.sync(() => new McpSchema.CallToolResult({
+                    isError: true,
+                    content: [],
+                    structuredContent: Schema.encodeUnknownSync(failureCodec, { onExcessProperty: "error" })({ error: boundaryFailure(cause) }),
+                  }))),
+                ),
               }),
             }));
           }));
           return registration.pipe(Layer.provide(toolkit.toLayer({
             [name]: (params: unknown) => Effect.gen(function*() {
               const result = yield* handle(commandName, params);
-              const value = yield* decodeEffect(output, { result });
-              if (resultSize(value) > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Result too large; use cursor pagination" });
+              const value = yield* Schema.decodeUnknownEffect(output, { onExcessProperty: "error" })({ result }).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
+              if (new TextEncoder().encode(resultText(value)).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Result too large; use cursor pagination" });
               return value;
             }).pipe(Effect.catchCause((cause) => Effect.fail({ error: boundaryFailure(cause) }))),
           })));
@@ -267,7 +234,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
       return yield* server.serve(Effect.gen(function*() {
         const request = yield* HttpServerRequest.HttpServerRequest;
         yield* authorize;
-        if (request.url === "/healthz" && request.method === "GET") return HttpServerResponse.text(encodeJson(Commands.health.output, yield* decodeEffect(Commands.health.output, yield* handle("health", {}))), { contentType: "application/json", headers: { "cache-control": "no-store" } });
+        if (request.url === "/healthz" && request.method === "GET") return yield* HttpServerResponse.schemaJson(Commands.health.output, { onExcessProperty: "error" })(yield* Schema.decodeUnknownEffect(Commands.health.output, { onExcessProperty: "error" })(yield* handle("health", {})).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" }))), { headers: { "cache-control": "no-store" } });
         if (Number(request.headers["content-length"] ?? 0) > LIMIT) return yield* new HttpError({ status: 413, message: "Request too large" });
         const body = request.method === "POST" ? yield* request.json.pipe(Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT))) : undefined;
         const method = body && typeof body === "object" && !Array.isArray(body) && "method" in body ? body.method : undefined;
@@ -278,7 +245,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
           return HttpServerError.causeResponse(cause).pipe(Effect.map(([response]) => HttpServerResponse.setHeader(response, "cache-control", "no-store")));
         }
         const error = boundaryFailure(cause);
-        return Effect.succeed(HttpServerResponse.text(encodeJson(BoundaryError, { error: error.message }), { status: error.status, contentType: "application/json", headers: { "cache-control": "no-store" } }));
+        return HttpServerResponse.schemaJson(BoundaryError, { onExcessProperty: "error" })({ error: error.message }, { status: error.status, headers: { "cache-control": "no-store" } });
       })));
     }).pipe(Effect.orDie);
     return { call, serve };

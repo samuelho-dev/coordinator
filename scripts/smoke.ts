@@ -1,16 +1,18 @@
 // Node assert has no Effect equivalent; assertions intentionally remain synchronous.
 import assert from "node:assert/strict";
-import { Cause, Clock, Config, Context, Deferred, Effect, Exit, Layer, Queue, Stdio, Stream } from "effect";
+import { Cause, Clock, Config, Context, Effect, Exit, Layer, Schema, Scope, Stdio, Stream } from "effect";
 import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { NodeRuntime, NodeStdio } from "@effect/platform-node";
 import { SqliteClient } from "@effect/sql-sqlite-node";
-import { BrokerConfig, RunnerConfig, ModelProfile, NativeFrame, NativeRequestId, TaskId, MessageId, SessionId, IncarnationId, MachineId, WorkerId, RunnerId, PrincipalId, OwnerId, ArchiveEntryId, GitHubRepositoryId, UserId, ProcessId, Repo, Sha, Json, JsonValue, HttpError, Commands, CommandError, type CommandInput, type FramePending, type Work, type Address, type SessionKey } from "../src/contracts.ts";
+import { BrokerConfig, RunnerConfig, RunnerNativeState, ModelProfile, TaskId, MessageId, SessionId, IncarnationId, MachineId, WorkerId, RunnerId, PrincipalId, OwnerId, ArchiveEntryId, GitHubRepositoryId, UserId, ProcessId, Repo, Sha, Json, JsonValue, HttpError, Commands, CommandError, type CommandInput, type Work, type Address, type SessionKey } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { inspectGithubRepository } from "../src/evidence.ts";
-import { Mcp, serverLayer, decode, decodeJson, decodeEffect, encodeJson } from "../src/http.ts";
-import { CHILD_UID_BASE, LfFrames, requireIsolation, isolationArgs, childEnvironment, ownChildDirectory } from "../src/runner.ts";
+import { Mcp, serverLayer } from "../src/http.ts";
+import { CHILD_UID_BASE, requireIsolation, isolationArgs, childEnvironment, ownChildDirectory } from "../src/runner.ts";
+import { connectNativeClient } from "@samuelho/coordinator-native-control/client";
+import { NativeMessagesPage, NativePluginConfig } from "@samuelho/coordinator-native-control/contracts";
 
 // Effect has no executable-path, runtime-version or own-PID service; process is used only for these boundary facts.
 const runSmoke = (flags: CommandInput<"program.smoke">) => Effect.gen(function*() {
@@ -63,70 +65,59 @@ const runSmoke = (flags: CommandInput<"program.smoke">) => Effect.gen(function*(
     const token = join(credentials, "runner.token"), controlPath = join(credentials, "control.token"), ledger = join(directory, "runner.sqlite");
     for (const path of [token, controlPath, ledger, join(sibling, "private")]) yield* fileSystem.writeFileString(path, "ISOLATION_SECRET", { mode: 0o600 });
     yield* fileSystem.makeDirectory(join(home, ".omp/agent"), { recursive: true, mode: 0o700 });
-    yield* fileSystem.writeFileString(join(home, ".omp/agent/config.yml"), encodeJson(ModelProfile, { modelRoles: { default: yield* setting("COORDINATOR_MODEL", "openai-codex/gpt-6.1-sol:xhigh") } }), { mode: 0o600 });
+    yield* fileSystem.writeFileString(join(home, ".omp/agent/config.yml"), Schema.encodeUnknownSync(Schema.fromJsonString(ModelProfile), { onExcessProperty: "error" })({ modelRoles: { default: yield* setting("COORDINATOR_MODEL", "openai-codex/gpt-6.1-sol:xhigh") } }), { mode: 0o600 });
+    yield* fileSystem.writeFileString(join(home, ".omp/agent/auth.json"), "{}", { mode: 0o600 });
+    yield* fileSystem.makeDirectory(join(model, ".omp/agent"), { recursive: true, mode: 0o700 });
+    const parentProfile = join(model, ".omp/agent/auth.json");
+    yield* fileSystem.writeFileString(parentProfile, "ISOLATION_SECRET", { mode: 0o600 });
     const launcher = yield* setting("COORDINATOR_TEST_OMP", "/usr/local/bin/omp");
     const config: RunnerConfig = { id: RunnerId.make("isolation-probe"), brokerUrl: "http://127.0.0.1", tokenFile: token, controlTokenHash: yield* digest("control"),
       stateDirectory: join(directory, "state"), host: "127.0.0.1", port: 0, slots: 1, repositories: {}, launchers: { omp: launcher },
       modelDirectory: model, childDirectory: children, childUidBase: UserId.make(CHILD_UID_BASE) };
     yield* requireIsolation(config);
     const ownUid = UserId.make(CHILD_UID_BASE + 1), siblingUid = UserId.make(CHILD_UID_BASE + 2);
+    const nativeConfig = join(ownRoot, "native-plugin.json"), endpointFile = join(ownRoot, "native-endpoint.json"), nativeTokenFile = join(ownRoot, "native.token");
+    const nativeToken = yield* secret();
+    yield* fileSystem.writeFileString(nativeTokenFile, nativeToken, { flag: "wx", mode: 0o600 });
+    yield* fileSystem.writeFileString(nativeConfig, Schema.encodeSync(Schema.fromJsonString(NativePluginConfig))({ host: "omp", endpointFile, tokenFile: nativeTokenFile }), { flag: "wx", mode: 0o600 });
     yield* ownChildDirectory(ownRoot, ownUid); yield* ownChildDirectory(sibling, siblingUid);
-    const input = yield* Queue.make<Uint8Array, Cause.Done>();
-    yield* Effect.addFinalizer(() => Queue.end(input));
-    // env chdir uses effective supervisor capabilities; Effect's cwd preflight uses real-UID access.
-    const child = yield* spawner.spawn(ChildProcess.make("/usr/bin/env", [`--chdir=${own}`, "/usr/bin/setpriv", ...isolationArgs(ownUid), launcher, "--mode", "rpc", "--session-dir", sessions, "--no-extensions"],
-      // Actual omp requires a discoverable provider even for idle RPC. This deliberately unusable fixture key enables model discovery, not inference.
-      // The isolation proof sends only get_state, get_messages and bash; it never submits a model prompt or needs real provider credentials.
-      { env: { ...(yield* childEnvironment(home)), OPENAI_API_KEY: "coordinator-isolation-no-model-call" }, extendEnv: false, stdin: Stream.fromQueue(input), forceKillAfter: "1 second" }));
-    const nativeDeadline = (yield* Clock.currentTimeMillis) + 60000;
-    const frames = new LfFrames(), pending = new Map<NativeRequestId, FramePending>();
-    const failPending = (error: unknown) => Effect.forEach(pending.values(), (request) => Deferred.fail(request, error instanceof CommandError ? error : new CommandError({ message: error instanceof Error ? error.message : String(error) })), { discard: true });
-    yield* Effect.forkScoped(Stream.runDrain(child.stderr));
-    yield* Effect.forkScoped(child.stdout.pipe(Stream.runForEach((chunk) => Effect.gen(function*() {
-      for (const frame of frames.push(chunk)) {
-        if (typeof frame === "object" && frame !== null && "id" in frame && typeof frame.id === "string") {
-          const parsed = decode(NativeFrame, frame);
-          const request = parsed.id ? pending.get(parsed.id) : undefined;
-          if (request && parsed.id) { yield* Deferred.succeed(request, parsed); pending.delete(parsed.id); }
-        }
-      }
-    })), Effect.catchCause((cause) => failPending(Cause.squash(cause)))));
-    yield* Effect.forkScoped(child.exitCode.pipe(Effect.matchEffect({
-      onFailure: failPending, onSuccess: () => failPending(new CommandError({ message: "Native isolation probe exited" })),
-    })));
-    const request = Effect.fnUntraced(function*(type: string, message?: string) {
-      const id = NativeRequestId.make(yield* uuid), result = yield* Deferred.make<NativeFrame, CommandError>();
-      pending.set(id, result);
-      return yield* Effect.gen(function*() {
-        yield* Queue.offer(input, new TextEncoder().encode(`${encodeJson(JsonValue, { id, type, ...(message ? type === "bash" ? { command: message } : { message } : {}) })}\n`));
-        return yield* Deferred.await(result).pipe(Effect.timeout(Math.max(1, nativeDeadline - (yield* Clock.currentTimeMillis))));
-      }).pipe(Effect.ensuring(Effect.sync(() => { pending.delete(id); })));
-    });
-    assert.equal((yield* request("get_state")).success, true);
-    assert.equal((yield* request("get_messages")).success, true);
+    const nativeScope = yield* Scope.fork(yield* Effect.scope);
+    // Stock RPC stdio remains private; the extension owns its separate MCP endpoint.
+    const native = yield* connectNativeClient({
+      host: "omp", command: "/usr/bin/env",
+      args: [`--chdir=${own}`, "/usr/bin/setpriv", ...isolationArgs(ownUid), launcher, "--mode", "rpc", "--session-dir", sessions, "--no-extensions", "-e", resolve(import.meta.dirname, "../dist/plugins/native-plugin.js")],
+      cwd: directory, env: { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", HOME: home, COORDINATOR_NATIVE_CONFIG: nativeConfig }, connectTimeoutMs: 60000,
+      plugin: { endpointFile, token: nativeToken },
+    }).pipe(Effect.provideService(Scope.Scope, nativeScope));
+    assert.ok(native.pid > 0);
+    const nativeState = yield* native.call("native.get_state", { binding: native.binding }, { timeoutMs: 60000 });
+    assert.equal(nativeState.cwd, own);
+    const nativeMessages = yield* native.call("native.get_messages", { binding: native.binding, limit: 256 }, { timeoutMs: 60000 });
+    assert.deepEqual(nativeMessages.messages, []);
     const quote = (path: string) => `'${path.replace(/'/g, "'\\''")}'`;
     // Effect cannot inspect another process's environ; /proc access itself is the isolation proof.
-    const denied = [token, controlPath, ledger, join(sibling, "private"), `/proc/${process.pid}/environ`];
+    const denied = [token, controlPath, ledger, parentProfile, join(sibling, "private"), `/proc/${process.pid}/environ`];
     const command = `set -eu; ${denied.map((path) => `if cat ${quote(path)} >/dev/null 2>&1; then exit 41; fi`).join("; ")}; ` +
-      `test -z "\${GITHUB_PAT-}\${GITHUB_TOKEN-}\${GH_TOKEN-}\${OP_SERVICE_ACCOUNT_TOKEN-}\${COORDINATOR_CONFIG-}"; ` +
-      `test "$(id -u)" = "${CHILD_UID_BASE + 1}"; test "$PWD" = ${quote(own)}; ` +
-      `touch approved-write; test -r "$HOME/.omp/agent/config.yml"; touch ${quote(join(sessions, "approved-session-write"))}; ` +
+      `test -z "\${GITHUB_PAT-}\${GITHUB_TOKEN-}\${GH_TOKEN-}\${OP_SERVICE_ACCOUNT_TOKEN-}\${COORDINATOR_CONFIG-}\${OPENAI_API_KEY-}\${ANTHROPIC_API_KEY-}\${GEMINI_API_KEY-}\${OMP_AUTH_BROKER_TOKEN-}"; ` +
+      `test "$(id -u)" = "${CHILD_UID_BASE + 1}"; test "$PWD" = ${quote(own)}; test "$(stat -c %a "$HOME")" = 700; ` +
+      `touch approved-write; test -r "$HOME/.omp/agent/config.yml"; test -r "$HOME/.omp/agent/auth.json"; test "$(stat -c %a "$HOME/.omp/agent/auth.json")" = 600; touch ${quote(join(sessions, "approved-session-write"))}; ` +
       `checked=0; while IFS=: read -r key value; do set -- $value; case "$key" in Groups) test "$#" = 0; checked=$((checked+1));; CapInh|CapPrm|CapEff|CapBnd|CapAmb) test "$1" = 0000000000000000; checked=$((checked+1));; NoNewPrivs) test "$1" = 1; checked=$((checked+1));; esac; done </proc/self/status; test "$checked" = 7; printf ISOLATION_OK`;
-    const response = yield* request("bash", command);
-    assert.equal(response.success, true);
-    assert.ok(typeof response.data === "object" && response.data !== null && "exitCode" in response.data && response.data.exitCode === 0);
-    yield* child.kill({ killSignal: "SIGKILL" });
-    yield* until(() => child.isRunning, (running) => !running, 3000);
-    yield* print(encodeJson(JsonValue, { scenario: "real-native-os-isolation", childUid: CHILD_UID_BASE + 1, forbiddenPathsDenied: denied.length,
-      ownWorkspaceAndSessionWritable: true, modelProfileReadable: true, parentEnvironDenied: true, siblingUidDistinct: true,
-      capabilitiesZero: true, supplementalGroupsEmpty: true, noNewPrivileges: true, nativeStateAndMessagesUsable: true, forbiddenEnvironmentAbsent: true, supervisorTerminationProved: true }));
+    const response = yield* native.call("native.bash", { binding: native.binding, command }, { timeoutMs: 60000 });
+    assert.equal(response.exitCode, 0);
+    assert.equal(response.killed, false);
+    assert.ok(response.output.includes("ISOLATION_OK"));
+    yield* Scope.close(nativeScope, Exit.void);
+    yield* native.observedProcessClosed.pipe(Effect.timeout(10000));
+    yield* print(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })({ scenario: "real-native-os-isolation", childUid: CHILD_UID_BASE + 1, forbiddenPathsDenied: denied.length,
+      ownWorkspaceAndSessionWritable: true, modelProfileReadable: true, privateAuthProfileReadable: true, privateHomeMode: "0700", parentProfileDenied: true, parentEnvironDenied: true, siblingUidDistinct: true,
+      capabilitiesZero: true, supplementalGroupsEmpty: true, noNewPrivileges: true, nativeStateAndMessagesUsable: true, forbiddenEnvironmentAbsent: true, sdkPid: native.pid, physicalScopedCloseProved: true }));
     return;
   }
 const root = resolve(import.meta.dirname, "..");
 const state = (yield* setting("COORDINATOR_SMOKE_DIRECTORY", "")) || (yield* fileSystem.makeTempDirectory({ prefix: "coordinator-sockets-" }));
 yield* (fileSystem.makeDirectory(state, { recursive: true, mode: 0o711 })); yield* (fileSystem.chmod(state, 0o711));
 const repo = Repo.make("github.com/samuelho-dev/coordinator");
-const sha = decode(Sha, (yield* exec(ChildProcess.make("git", ["rev-parse", "HEAD"], { cwd: root }))).trim());
+const sha = Schema.decodeUnknownSync(Sha, { onExcessProperty: "error" })((yield* exec(ChildProcess.make("git", ["rev-parse", "HEAD"], { cwd: root }))).trim());
 const identity = yield* inspectGithubRepository(repo, yield* Config.String("GITHUB_READ_TOKEN"));
 const coordinator = (yield* secret()), recipient = (yield* secret()), runnerToken = (yield* secret()), runnerControl = (yield* secret()), reviewer = (yield* secret()), writer = (yield* secret()), outsider = (yield* secret());
 const tokenDirectory = join(state, "tokens"); yield* (fileSystem.makeDirectory(tokenDirectory, { mode: 0o700 }));
@@ -161,11 +152,11 @@ const runnerConfig: RunnerConfig = { id: RunnerId.make("homelab-runner"), broker
   stateDirectory: join(state, "runner"), slots: 1, repositories: { [repo]: root }, launchers: { omp: launcher }, controlTokenHash: (yield* digest(runnerControl)),
   modelDirectory: yield* setting("COORDINATOR_MODEL_DIRECTORY", "/work/home"), childDirectory: join(state, "children"), childUidBase: UserId.make(1000000) };
 const brokerPath = join(state, "broker.json"), runnerPath = join(state, "runner.json");
-yield* (fileSystem.writeFileString(brokerPath, encodeJson(BrokerConfig, brokerConfig), { mode: 0o600 })); yield* (fileSystem.writeFileString(runnerPath, encodeJson(RunnerConfig, runnerConfig), { mode: 0o600 }));
+yield* (fileSystem.writeFileString(brokerPath, Schema.encodeUnknownSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(brokerConfig), { mode: 0o600 })); yield* (fileSystem.writeFileString(runnerPath, Schema.encodeUnknownSync(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(runnerConfig), { mode: 0o600 }));
 const alternateConfig: RunnerConfig = { ...runnerConfig, id: RunnerId.make("alternate-runner"), port: alternatePort, tokenFile: alternateEnrollmentPath, stateDirectory: join(state, "alternate-runner"), childDirectory: join(state, "alternate-children"), childUidBase: UserId.make(2000000), controlTokenHash: (yield* digest(alternateControl)) };
-const alternatePath = join(state, "alternate.json"); yield* (fileSystem.writeFileString(alternatePath, encodeJson(RunnerConfig, alternateConfig), { mode: 0o600 }));
+const alternatePath = join(state, "alternate.json"); yield* (fileSystem.writeFileString(alternatePath, Schema.encodeUnknownSync(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(alternateConfig), { mode: 0o600 }));
 const transcript: JsonValue[] = [];
-const evidence = Effect.fnUntraced(function*(scenario: string, observed: unknown) { const entry = decode(JsonValue, { scenario, observed, time: new Date(yield* Clock.currentTimeMillis).toISOString() }); transcript.push(entry); yield* print(encodeJson(JsonValue, entry)); });
+const evidence = Effect.fnUntraced(function*(scenario: string, observed: unknown) { const entry = Schema.decodeUnknownSync(JsonValue, { onExcessProperty: "error" })({ scenario, observed, time: new Date(yield* Clock.currentTimeMillis).toISOString() }); transcript.push(entry); yield* print(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(entry)); });
 const processFor = Effect.fnUntraced(function*(mode: "broker" | "runner", config: string) {
   const env = { ...(yield* childEnvironment(yield* setting("HOME", "/tmp"))), COORDINATOR_CONFIG: config, COORDINATOR_RUNNER_TOKEN_DIRECTORY: tokenDirectory };
   const readToken = yield* setting("GITHUB_READ_TOKEN", "");
@@ -260,22 +251,22 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   const unsafeResponse = yield* client.execute(HttpClientRequest.post(new URL("/mcp", brokerUrl)).pipe(
     HttpClientRequest.setHeaders({ authorization: `Bearer ${writer}`, accept: "application/json, text/event-stream",
       "mcp-protocol-version": "2026-07-28", "mcp-method": "tools/call", "mcp-name": archiveMethod }),
-    HttpClientRequest.bodyText(encodeJson(JsonValue, { jsonrpc: "2.0", id: "unsafe-archive", method: "tools/call",
+    HttpClientRequest.bodyText(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })({ jsonrpc: "2.0", id: "unsafe-archive", method: "tools/call",
       params: { name: archiveMethod, arguments: { ...archive, entryId: "unsafe", payload: unsafePayload, digest: yield* fingerprint(unsafePayload) },
         _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} } } }), "application/json"),
   ));
   assert.equal(unsafeResponse.status, 200);
   const unsafeText = yield* unsafeResponse.text;
-  const unsafeMessage = decodeJson(Json, unsafeResponse.headers["content-type"]?.includes("text/event-stream")
+  const unsafeMessage = Schema.decodeUnknownSync(Schema.fromJsonString(Json), { onExcessProperty: "error" })(unsafeResponse.headers["content-type"]?.includes("text/event-stream")
     ? unsafeText.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n")
     : unsafeText);
   assert.ok(typeof unsafeMessage === "object" && unsafeMessage !== null && "result" in unsafeMessage);
-  const unsafeResult = decode(Json, unsafeMessage.result);
+  const unsafeResult = Schema.decodeUnknownSync(Json, { onExcessProperty: "error" })(unsafeMessage.result);
   assert.ok(typeof unsafeResult === "object" && unsafeResult !== null && "isError" in unsafeResult);
   assert.equal(unsafeResult.isError, true);
   const archived = yield* rpc(brokerUrl, coordinator, "archive.list", { sessionId: session.sessionId });
   assert.equal(archived.length, 1);
-  assert.equal(encodeJson(JsonValue, archived).includes(unsafePayload.text), false);
+  assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(archived).includes(unsafePayload.text), false);
   assert.equal((yield* sqlRows(brokerConfig.database, "SELECT count(*) AS count FROM archive WHERE payload LIKE ?", [`%${unsafePayload.text}%`]))[0]?.count, 0);
   yield* rejects(rpc(brokerUrl, writer, "archive.delete", { sessionId: session.sessionId }), 403);
   assert.deepEqual(yield* rpc(brokerUrl, outsider, "archive.list", { sessionId: session.sessionId }), []);
@@ -283,7 +274,7 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   const snapshotName = yield* until(() => fileSystem.readDirectory(brokerConfig.backupDirectory).pipe(Effect.map((names) => names.find((name) => name.endsWith(".sqlite") && !snapshotNames.has(name)))), (name) => Boolean(name), 75000);
   const snapshot = join(brokerConfig.backupDirectory, snapshotName!);
   for (const table of ["archive", "consents", "participant_consents"]) assert.equal((yield* sqlRows(snapshot, `SELECT count(*) AS count FROM ${table}`))[0]?.count, 0);
-  assert.ok((yield* sqlRows(snapshot, "SELECT id FROM tasks WHERE id=?", [work.taskId]))[0]); 
+  assert.ok((yield* sqlRows(snapshot, "SELECT id FROM tasks WHERE id=?", [work.taskId]))[0]);
   assert.equal((yield* rpc(brokerUrl, coordinator, "archive.list", { sessionId: session.sessionId })).length, 1);
   yield* rejects(rpc(brokerUrl, outsider, "archive.participantConsent", { owner: OwnerId.make("owner"), sessionId: session.sessionId, enabled: false }), 403);
   yield* rpc(brokerUrl, outsider, "archive.participantConsent", { owner: OwnerId.make("owner"), sessionId: session.sessionId, enabled: true });
@@ -306,7 +297,7 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   const accepted = yield* until(() => rpc(brokerUrl, coordinator, "task.get", { taskId: worker.taskId }), (task) => Boolean(task.readback), 120000);
   assert.equal(accepted.address?.sha, sha); assert.equal(accepted.runnerId, "homelab-runner");
   const runnerDb = join(runnerConfig.stateDirectory, "runner.sqlite");
-  const row = (yield* sqlRows(runnerDb, "SELECT pid FROM tasks WHERE taskId=?", [worker.taskId]))[0]; workerPid = decode(ProcessId, row?.pid);
+  const row = (yield* sqlRows(runnerDb, "SELECT pid FROM tasks WHERE taskId=?", [worker.taskId]))[0]; workerPid = Schema.decodeUnknownSync(ProcessId, { onExcessProperty: "error" })(row?.pid);
   assert.ok(workerPid > 0);
   yield* rejects(rpc(runnerUrl, runnerToken, "acceptTask", worker), 401);
   assert.equal((yield* rpc(runnerUrl, runnerControl, "acceptTask", worker)).taskId, worker.taskId);
@@ -320,16 +311,27 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   yield* exit(broker, "SIGKILL"); broker = yield* processFor("broker", brokerPath); yield* ready(brokerUrl);
   const attached = yield* rpc(brokerUrl, coordinator, "task.attach", { taskId: worker.taskId }); assert.equal(attached.taskId, worker.taskId); // Effect has no arbitrary-PID liveness API; this PID is owned by the runner process.
   yield* Effect.try(() => process.kill(workerPid!, 0));
-  const history = yield* rpc(brokerUrl, coordinator, "task.control", { taskId: worker.taskId, type: "get_messages" });
-  assert.ok("data" in history && history.data !== undefined);
-  const historyData = decode(Json, history.data); assert.ok(Array.isArray(historyData.messages));
-  assert.equal(encodeJson(JsonValue, historyData.messages).includes(worker.prompt), false);
+  const controlledState = Schema.decodeUnknownSync(RunnerNativeState, { onExcessProperty: "error" })(yield* rpc(brokerUrl, coordinator, "task.control", { taskId: worker.taskId, type: "get_state" }));
+  assert.equal(controlledState.binding.sessionId, accepted.address!.sessionId);
+  assert.equal(controlledState.isStreaming, false);
+  assert.equal(controlledState.currentRunId, null);
+  const historyMessages: Schema.Json[] = [];
+  let historyCursor: string | undefined;
+  for (;;) {
+    const history = Schema.decodeUnknownSync(NativeMessagesPage, { onExcessProperty: "error" })(yield* rpc(brokerUrl, coordinator, "task.control", { taskId: worker.taskId, type: "get_messages", ...(historyCursor ? { cursor: historyCursor } : {}), limit: 256 }));
+    assert.deepEqual(history.binding, controlledState.binding);
+    historyMessages.push(...history.messages);
+    if (!history.more) break;
+    assert.ok(history.nextCursor && history.nextCursor !== historyCursor);
+    historyCursor = history.nextCursor;
+  }
+  assert.equal(Schema.encodeSync(Schema.fromJsonString(Schema.Json), { onExcessProperty: "error" })(historyMessages).includes(worker.prompt), false);
   yield* rpc(brokerUrl, coordinator, "task.confirm", { taskId: worker.taskId, revision: 2 });
   const finished = yield* until(() => rpc(brokerUrl, coordinator, "task.get", { taskId: worker.taskId }), (task) => ["SUCCEEDED", "FAILED", "HELD"].includes(task.state), 180000);
-  assert.equal(finished.state, "SUCCEEDED", `Real host final state ${finished.state}: ${encodeJson(JsonValue, finished.result ?? null)}`);
+  assert.equal(finished.state, "SUCCEEDED", `Real host final state ${finished.state}: ${Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(finished.result ?? null)}`);
   const finalDb = join(runnerConfig.stateDirectory, "runner.sqlite");
   const one = (yield* sqlRows(finalDb, "SELECT count(*) AS count FROM tasks WHERE taskId=?", [worker.taskId]))[0]; const launches = (yield* sqlRows(finalDb, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.state')='LAUNCHING'", [worker.taskId]))[0]; assert.equal(one?.count, 1); assert.equal(launches?.count, 1);
-  assert.equal(encodeJson(JsonValue, decode(JsonValue, (yield* sqlRows(finalDb, "SELECT payload FROM events WHERE taskId=?", [worker.taskId])))).includes("COORDINATOR_SMOKE_OK"), false); 
+  assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(Schema.decodeUnknownSync(JsonValue, { onExcessProperty: "error" })((yield* sqlRows(finalDb, "SELECT payload FROM events WHERE taskId=?", [worker.taskId])))).includes("COORDINATOR_SMOKE_OK"), false);
   yield* evidence("real-owned-omp-child-duplicate-full-and-coordinator-exit", { sha, workerPid, nativeSession: accepted.address!.sessionId, duplicateConflict: true, fullSlotsRejectedWithoutAcceptance: true, brokerCrashAttachPreserved: true, finalState: finished.state, acceptanceRows: 1, launchEvents: 1, evidenceVerified: false });
   yield* rpc(brokerUrl, coordinator, "evidence.local", { taskId: worker.taskId, sha, commands: ["real socket smoke"], passed: true });
   yield* rpc(brokerUrl, coordinator, "evidence.deployment", { taskId: worker.taskId, sha: Sha.make("a".repeat(40)), environment: "independent-demo-environment", url: "https://example.invalid", observedState: "not deployed", provenance: "smoke distinct negative observation" });
@@ -350,20 +352,20 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   assert.equal(ambiguous.runnerId, "homelab-runner");
   yield* Effect.sleep(1500);
   const alternateDb = join(alternateConfig.stateDirectory, "runner.sqlite");
-  assert.equal((yield* sqlRows(alternateDb, "SELECT count(*) AS count FROM tasks WHERE taskId=?", [uncertainWork.taskId]))[0]?.count, 0); 
+  assert.equal((yield* sqlRows(alternateDb, "SELECT count(*) AS count FROM tasks WHERE taskId=?", [uncertainWork.taskId]))[0]?.count, 0);
   obstructJournal = false;
   const reconciled = yield* until(() => rpc(brokerUrl, coordinator, "task.get", { taskId: uncertainWork.taskId }), (task) => task.state === "ACCEPTED" && Boolean(task.readback), 90000);
   assert.equal(reconciled.runnerId, "homelab-runner");
   const journal = join(runnerConfig.stateDirectory, "runner.sqlite");
-  uncertainPid = decode(ProcessId, (yield* sqlRows(journal, "SELECT pid FROM tasks WHERE taskId=?", [uncertainWork.taskId]))[0]?.pid); assert.ok(uncertainPid > 0);
+  uncertainPid = Schema.decodeUnknownSync(ProcessId, { onExcessProperty: "error" })((yield* sqlRows(journal, "SELECT pid FROM tasks WHERE taskId=?", [uncertainWork.taskId]))[0]?.pid); assert.ok(uncertainPid > 0);
   assert.equal((yield* sqlRows(journal, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.state')='LAUNCHING'", [uncertainWork.taskId]))[0]?.count, 1);
-  assert.equal((yield* sqlRows(journal, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.type')='prompt_intent'", [uncertainWork.taskId]))[0]?.count, 0); 
+  assert.equal((yield* sqlRows(journal, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.type')='prompt_intent'", [uncertainWork.taskId]))[0]?.count, 0);
   yield* exit(runner!, "SIGKILL"); runner = yield* processFor("runner", runnerPath); yield* ready(runnerUrl);
   const recovered = yield* rpc(runnerUrl, runnerControl, "journal", { taskId: uncertainWork.taskId }); assert.equal(recovered.state, "HELD");
   const restarted = join(runnerConfig.stateDirectory, "runner.sqlite");
-  assert.equal((yield* sqlRows(restarted, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.state')='LAUNCHING'", [uncertainWork.taskId]))[0]?.count, 1); 
+  assert.equal((yield* sqlRows(restarted, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.state')='LAUNCHING'", [uncertainWork.taskId]))[0]?.count, 1);
   yield* evidence("ambiguous-socket-acceptance-and-runner-crash", { acceptanceCommittedBeforeReplyTimeout: true, journalOutageHeldSameRunner: true, freeAlternateHadNoAcceptance: true, reconciledOriginalAcceptance: true, launchEvents: 1, promptIntents: 0, restartState: recovered.state, automaticRelaunch: false });
-  yield* (fileSystem.writeFileString(join(state, "transcript.json"), encodeJson(JsonValue, { brokerRuntime: process.version, host: (yield* exec(ChildProcess.make(launcher, ["--version"]))).trim(), privateRepository: identity.private, repositoryId: identity.id, sha, scenarios: transcript }), { mode: 0o600 }));
+  yield* (fileSystem.writeFileString(join(state, "transcript.json"), Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })({ brokerRuntime: process.version, host: (yield* exec(ChildProcess.make(launcher, ["--version"]))).trim(), privateRepository: identity.private, repositoryId: identity.id, sha, scenarios: transcript }), { mode: 0o600 }));
   yield* print(`Evidence: ${join(state, "transcript.json")}`);
  });
 const runIsolationSmoke = () => runSmoke({ "--runner-isolation-only": true });
@@ -372,9 +374,7 @@ const program = Effect.gen(function*() {
   if (args.length === 1 && args[0] === "--runner-isolation-only") {
     return yield* Commands["program.smoke:isolation"].execute({ runIsolationSmoke }, {});
   }
-  return yield* Commands["program.smoke"].executeDecoded(
-    { runSmoke }, Object.fromEntries(args.map(flag => [flag, true])), decodeEffect,
-  );
+  return yield* Commands["program.smoke"].executeDecoded({ runSmoke }, Object.fromEntries(args.map(flag => [flag, true])));
 });
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.provide(Layer.mergeAll(Platform.layer, Mcp.layer, NodeStdio.layer))));
 function sessionKey(session: SessionKey): SessionKey { return { sessionId: session.sessionId, incarnation: session.incarnation }; }

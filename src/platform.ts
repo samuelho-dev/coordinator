@@ -1,9 +1,8 @@
-import { Context, Crypto, Effect, FileSystem, Layer, Option, Path, Result, Stream } from "effect";
+import { Context, Crypto, Effect, FileSystem, Layer, Option, Path, Result, Schema, Stream } from "effect";
 import { Hex } from "effect/encoding";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { NodeServices } from "@effect/platform-node";
 import { CommandError, Hash, Repo } from "./contracts.ts";
-import { canonicalJson, decode } from "./http.ts";
 
 const utf8 = new TextEncoder();
 // WebCrypto requires ArrayBuffer-backed, exact-range views; never copy or expose the rest of a backing buffer.
@@ -17,7 +16,7 @@ export function canonicalRemote(remote: string): Repo {
   if (!["https:", "ssh:", "git:"].includes(url.protocol) || url.search || url.hash) throw new Error("Unsupported remote");
   const parts = url.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "").split("/");
   if (parts.length !== 2 || parts.some((part) => !part || part === "." || part === "..")) throw new Error("Noncanonical remote");
-  return decode(Repo, `${url.hostname.toLowerCase()}/${parts.join("/").toLowerCase()}`);
+  return Schema.decodeUnknownSync(Repo, { onExcessProperty: "error" })(`${url.hostname.toLowerCase()}/${parts.join("/").toLowerCase()}`);
 }
 
 export class Platform extends Context.Service<Platform>()("@samuelho/coordinator/Platform", {
@@ -27,10 +26,15 @@ export class Platform extends Context.Service<Platform>()("@samuelho/coordinator
     const crypto = yield* Crypto.Crypto;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const digest = Effect.fnUntraced(function*(value: string) {
-      return Hash.make(Hex.encode(yield* crypto.digest("SHA-256", utf8.encode(value))));
+      return Schema.decodeUnknownSync(Hash, { onExcessProperty: "error" })(Hex.encode(yield* crypto.digest("SHA-256", utf8.encode(value))));
     });
     const fingerprint = Effect.fnUntraced(function*(value: unknown) {
-      return yield* digest(canonicalJson(value));
+      return yield* digest(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown, {
+        replacer: (_, item: unknown) => {
+          if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
+          return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)));
+        },
+      }), { onExcessProperty: "error" })(value));
     });
     // Effect 4.0.1 has no HMAC API. Only MAC operations use captured standard WebCrypto.
     const subtle = yield* Effect.try({

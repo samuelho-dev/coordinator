@@ -1,9 +1,8 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { Context, Effect, Layer } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 import { Journal } from "../src/journal.ts";
 import { Platform } from "../src/platform.ts";
-import { canonicalJson } from "../src/http.ts";
 import { CommandError, SessionId, PrincipalId, MessageId, JournalHandledKey, JournalReleaseKey } from "../src/contracts.ts";
 
 test("complete host lines across branches, metadata-only consent spool, durable delivery intent and coverage", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -13,7 +12,7 @@ test("complete host lines across branches, metadata-only consent spool, durable 
     const file = platform.path.join(directory, "host.jsonl");
     const first = { id: "a", type: "message", parentId: null, message: { role: "user", content: "TOKEN=supersecret" } };
     const branch = { id: "b", type: "message", parentId: "a", message: { role: "assistant", content: [{ type: "thinking", thinking: "private" }] } };
-    yield* fileSystem.writeFileString(file, `${canonicalJson(first)}\n${canonicalJson(branch)}`);
+    yield* fileSystem.writeFileString(file, `${Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(first)}\n${Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(branch)}`);
     const journal = Context.get(yield* Layer.build(Journal.layer(directory, SessionId.make("session"))), Journal);
     yield* journal.scan(file);
     assert.equal(journal.state.spool.length, 0);
@@ -21,7 +20,7 @@ test("complete host lines across branches, metadata-only consent spool, durable 
     yield* journal.scan(file);
     assert.equal(journal.state.spool.filter((item) => item.entryId === "a").length, 1);
     assert.equal(journal.state.spool.filter((item) => item.entryId === "b").length, 0);
-    yield* fileSystem.writeFileString(file, `${canonicalJson(first)}\n${canonicalJson(branch)}\n`);
+    yield* fileSystem.writeFileString(file, `${Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(first)}\n${Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(branch)}\n`);
     yield* journal.scan(file);
     assert.equal(journal.state.spool.filter((item) => item.entryId === "b").length, 1);
     const persisted = yield* fileSystem.readFileString(journal.path);
@@ -34,7 +33,7 @@ test("complete host lines across branches, metadata-only consent spool, durable 
     assert.equal((yield* resumed.handled(JournalHandledKey.make("peer:message"))), true);
     assert.equal(yield* resumed.releaseIntent(JournalReleaseKey.make("task:1")), false);
     assert.equal((yield* Effect.exit(resumed.upload(() => Effect.fail(new CommandError({ message: "offline" })))))._tag, "Failure");
-    yield* fileSystem.writeFileString(file, `${canonicalJson(branch)}\n`);
+    yield* fileSystem.writeFileString(file, `${Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(branch)}\n`);
     yield* resumed.scan(file);
     assert.ok(resumed.state.gaps.includes("rewrite"));
     yield* resumed.scan(undefined);
@@ -46,6 +45,28 @@ test("complete host lines across branches, metadata-only consent spool, durable 
     assert.equal(optedOut.state.consent, false);
     assert.equal(yield* optedOut.releaseIntent(JournalReleaseKey.make("task:1")), false);
     assert.deepEqual(optedOut.state.seen, {});
+})).pipe(Effect.provide(Platform.layer))));
+
+test("capture marks missing parents but resolves complete out-of-order branch metadata without content", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+  const platform = yield* Platform;
+  const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-branch-coverage-" });
+  const file = platform.path.join(directory, "host.jsonl");
+  const child = { id: "child", parentId: "parent", type: "message", message: { role: "assistant", content: "private branch content" } };
+  const parent = { id: "parent", parentId: null, type: "message", message: { role: "user", content: "private root content" } };
+  const line = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+  yield* platform.fs.writeFileString(file, `${line(child)}\n`);
+  const missing = Context.get(yield* Layer.build(Journal.layer(directory, SessionId.make("missing-parent"))), Journal);
+  yield* missing.consent([PrincipalId.make("participant")]);
+  yield* missing.scan(file);
+  assert.ok(missing.state.spool.find(entry => entry.entryId === "child")?.gaps.includes("unlinked"), "A syntactically valid parent ID is not proof that its complete entry exists");
+  yield* platform.fs.writeFileString(file, `${line(child)}\n${line(parent)}\n`);
+  const complete = Context.get(yield* Layer.build(Journal.layer(directory, SessionId.make("complete-branch"))), Journal);
+  yield* complete.consent([PrincipalId.make("participant")]);
+  yield* complete.scan(file);
+  const captured = complete.state.spool.find(entry => entry.entryId === "child");
+  assert.deepEqual(captured?.payload, { id: "child", parentId: "parent", type: "message", role: "assistant", contentOmitted: true });
+  assert.equal(captured?.gaps.includes("unlinked"), false, "Parent resolution covers all complete lines, not just earlier lines");
+  assert.equal((yield* platform.fs.readFileString(complete.path)).includes("private"), false);
 })).pipe(Effect.provide(Platform.layer))));
 
 test("concurrent inbox delivery persists exactly once before acknowledgement and rejects conflicting payloads", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {

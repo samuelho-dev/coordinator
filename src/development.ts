@@ -3,7 +3,6 @@ import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import getExePath from "@effect/tsgo/lib/getExePath";
 import { Commands, CommandError, type CommandCapabilities } from "./contracts.ts";
-import { decodeEffect } from "./http.ts";
 import { Platform } from "./platform.ts";
 
 NodeRuntime.runMain(Effect.gen(function*() {
@@ -25,5 +24,5 @@ NodeRuntime.runMain(Effect.gen(function*() {
       yield* run(process.execPath, ["--import", "tsx", "--test", "--test-concurrency=1", ...files.map((name) => platform.path.join(root, "test", name))]);
     }),
   } satisfies CommandCapabilities<"development">;
-  yield* Commands[`development.${mode}`].executeDecoded(capabilities, {}, decodeEffect);
+  yield* Commands[`development.${mode}`].executeDecoded(capabilities, {});
 }).pipe(Effect.provide(Layer.merge(Platform.layer, NodeServices.layer))));

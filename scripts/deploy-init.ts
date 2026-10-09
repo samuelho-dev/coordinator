@@ -1,9 +1,8 @@
-import { Config, Console, Effect, Layer, Option, Stdio } from "effect";
+import { Config, Console, Effect, Layer, Option, Schema, Stdio } from "effect";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { BrokerConfig, RunnerConfig, ModelProfile, Commands, CommandError, Hash, ObjectBackupConfig, Repo, Sha, UserId } from "../src/contracts.ts";
+import { BrokerConfig, RunnerConfig, ModelProfile, Commands, CommandError, HttpError, Hash, ObjectBackupConfig, Repo, Sha, UserId } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
-import { decodeEffect, encodeJson } from "../src/http.ts";
 import { ownChildDirectory } from "../src/runner.ts";
 
 NodeRuntime.runMain(Effect.gen(function*() {
@@ -41,14 +40,14 @@ NodeRuntime.runMain(Effect.gen(function*() {
     if (!runnerUrl.startsWith("https://") || !macUrl.startsWith("https://")) return yield* new CommandError({ message: "Private TLS runner URLs required" });
     const backupEndpoint = yield* Config.String("COORDINATOR_BACKUP_ENDPOINT").pipe(Config.option);
     const objectBackup = Option.isSome(backupEndpoint) ? {
-      endpoint: backupEndpoint.value, region: yield* decodeEffect(ObjectBackupConfig.fields.region, yield* Config.String("COORDINATOR_BACKUP_REGION")), bucket: yield* Config.String("COORDINATOR_BACKUP_BUCKET"),
+      endpoint: backupEndpoint.value, region: yield* Schema.decodeUnknownEffect(ObjectBackupConfig.fields.region, { onExcessProperty: "error" })(yield* Config.String("COORDINATOR_BACKUP_REGION")).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" }))), bucket: yield* Config.String("COORDINATOR_BACKUP_BUCKET"),
       accessKeyFile: "/config/backup-access-key", secretKeyFile: "/config/backup-secret-key",
     } : undefined;
     if (objectBackup) {
       yield* file(objectBackup.accessKeyFile, yield* Config.String("COORDINATOR_BACKUP_ACCESS_KEY"));
       yield* file(objectBackup.secretKeyFile, yield* Config.String("COORDINATOR_BACKUP_SECRET_KEY"));
     }
-    const config = yield* decodeEffect(BrokerConfig, {
+    const config = yield* Schema.decodeUnknownEffect(BrokerConfig, { onExcessProperty: "error" })({
       database: "/data/ledger.sqlite", host: "0.0.0.0", port: 8787, backupDirectory: "/backups",
       archiveRetentionMs: 30 * 86400000, backupRetentionMs: 3 * 86400000,
       ...(objectBackup ? { objectBackup } : {}),
@@ -60,10 +59,10 @@ NodeRuntime.runMain(Effect.gen(function*() {
         { id: "archive-writer", owner: "samuelho-dev", roles: ["archive-writer"], repos: [repo], tokenHash: yield* platform.digest(yield* credential("ARCHIVE_WRITER_TOKEN")) },
         { id: "mac-runner", owner: "samuelho-dev", roles: ["runner"], repos: [repo], tokenHash: yield* platform.digest(yield* credential("MAC_RUNNER_TOKEN")), controlTokenHash: yield* platform.digest(yield* credential("MAC_RUNNER_CONTROL_TOKEN")), runnerUrl: macUrl },
       ],
-    });
+    }).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
     yield* file("/config/tokens/mac-runner", yield* credential("MAC_RUNNER_CONTROL_TOKEN"));
     yield* file("/config/tokens/homelab-runner", control);
-    yield* file("/config/broker.json", encodeJson(BrokerConfig, config));
+    yield* file("/config/broker.json", Schema.encodeUnknownSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(config));
     yield* file("/config/health.header", `authorization: Bearer ${runner}`);
   });
   const initializeRunnerDeployment = Effect.fnUntraced(function*() {
@@ -89,18 +88,18 @@ NodeRuntime.runMain(Effect.gen(function*() {
     yield* directory("/work/home/.omp");
     yield* directory("/work/home/.omp/agent");
     const profile = "/work/home/.omp/agent/config.yml";
-    if (!(yield* platform.fs.exists(profile))) yield* file(profile, encodeJson(ModelProfile, { modelRoles: { default: yield* Config.String("COORDINATOR_MODEL").pipe(Config.withDefault("openai-codex/gpt-6.1-sol:xhigh")) } }));
+    if (!(yield* platform.fs.exists(profile))) yield* file(profile, Schema.encodeUnknownSync(Schema.fromJsonString(ModelProfile), { onExcessProperty: "error" })({ modelRoles: { default: yield* Config.String("COORDINATOR_MODEL").pipe(Config.withDefault("openai-codex/gpt-6.1-sol:xhigh")) } }));
     const runner = yield* credential("HOMELAB_RUNNER_TOKEN");
-    const controlTokenHash = yield* decodeEffect(Hash, yield* credential("HOMELAB_RUNNER_CONTROL_HASH"));
+    const controlTokenHash = yield* Schema.decodeUnknownEffect(Hash, { onExcessProperty: "error" })(yield* credential("HOMELAB_RUNNER_CONTROL_HASH")).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
     yield* file("/config/runner.token", runner);
     yield* file("/config/health.header", `authorization: Bearer ${runner}`);
-    const config = yield* decodeEffect(RunnerConfig, {
+    const config = yield* Schema.decodeUnknownEffect(RunnerConfig, { onExcessProperty: "error" })({
       id: "homelab-runner", brokerUrl, tokenFile: "/config/runner.token", host: "0.0.0.0", port: 8788,
       stateDirectory: "/work/runner", slots: 1, repositories: { [repo]: checkout }, launchers: { omp: "/usr/local/bin/omp" }, controlTokenHash,
       modelDirectory: "/work/home", childDirectory: "/work/children", childUidBase: UserId.make(1000000),
-    });
-    yield* file("/config/runner.json", encodeJson(RunnerConfig, config));
+    }).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
+    yield* file("/config/runner.json", Schema.encodeUnknownSync(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(config));
   });
-  yield* Commands[`program.deploy-init.${mode}`].executeDecoded({ initializeBrokerDeployment, initializeRunnerDeployment }, {}, decodeEffect);
+  yield* Commands[`program.deploy-init.${mode}`].executeDecoded({ initializeBrokerDeployment, initializeRunnerDeployment }, {});
   yield* Console.log(`coordinator ${mode} enrollment initialized`);
 }).pipe(Effect.provide(Layer.merge(Platform.layer, NodeServices.layer))));

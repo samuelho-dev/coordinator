@@ -1,19 +1,9 @@
-import { ByteSize, Clock, Context, Effect, Layer, Option, Schema, Semaphore } from "effect";
-import { ArchiveEntry, ArchiveEntryId, CommandError, JournalHandledKey, JournalReleaseKey, JournalState, JsonValue, type Hash, type MessageId, type PrincipalId, type SessionId, type ObservedFile, type SafeEntry } from "./contracts.ts";
-import { canonicalJson, decode, decodeJson, encodeJson, LIMIT } from "./http.ts";
+import { ByteSize, Clock, Context, Effect, Graph, Layer, Option, Schema, Semaphore } from "effect";
+import { ArchiveEntry, ArchiveEntryId, CommandError, HostJournalEntry, JournalHandledKey, JournalReleaseKey, JournalState, type JsonValue, type Hash, type MessageId, type PrincipalId, type SessionId, type ObservedFile } from "./contracts.ts";
+import { LIMIT } from "./http.ts";
 import { Platform } from "./platform.ts";
 
-// Archive graph metadata only; no native message content crosses this boundary.
-export function safeEntry(value: unknown): SafeEntry | undefined {
-  if (!value || typeof value !== "object" || !("id" in value)) return;
-  const id = Schema.decodeUnknownOption(ArchiveEntryId)(value.id);
-  if (Option.isNone(id)) return;
-  const type = "type" in value && typeof value.type === "string" && /^[a-z_]{1,40}$/.test(value.type) ? value.type : "omitted";
-  const parentId = Option.getOrNull(Schema.decodeUnknownOption(ArchiveEntryId)("parentId" in value ? value.parentId : null));
-  const message = "message" in value && value.message && typeof value.message === "object" ? value.message : undefined;
-  const role = message && "role" in message && (message.role === "user" || message.role === "assistant" || message.role === "toolResult") ? message.role : undefined;
-  return { id: id.value, linked: parentId !== null, payload: { id: id.value, parentId, type, ...(role ? { role } : {}), contentOmitted: true } };
-}
+const parseHostEntry = Schema.decodeEffect(Schema.fromJsonString(HostJournalEntry));
 
 const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessionId: SessionId) {
   const platform = yield* Platform;
@@ -23,7 +13,7 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
   if (((yield* fs.stat(directory)).mode & 0o077) !== 0) return yield* Effect.fail(new CommandError({ message: "Private journal directory required" }));
   const exists = yield* fs.exists(path);
   if (exists && ((yield* fs.stat(path)).mode & 0o077) !== 0) return yield* Effect.fail(new CommandError({ message: "Private journal file required" }));
-  const state: JournalState = exists ? decodeJson(JournalState, yield* fs.readFileString(path)) : {
+  const state: JournalState = exists ? Schema.decodeUnknownSync(Schema.fromJsonString(JournalState), { onExcessProperty: "error" })(yield* fs.readFileString(path)) : {
     handled: {}, releases: {}, consent: false, participants: [], seen: {}, spool: [], gaps: [], inbox: {},
   };
   const semaphore = yield* Semaphore.make(1);
@@ -34,7 +24,7 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
     yield* file.sync;
   }));
   const persist = Effect.fn("Journal.persist")(function*() {
-    const text = encodeJson(JournalState, state);
+    const text = Schema.encodeUnknownSync(Schema.fromJsonString(JournalState), { onExcessProperty: "error" })(state);
     const temporary = `${path}.tmp`;
     yield* Effect.scoped(Effect.gen(function*() {
       const file = yield* fs.open(temporary, { flag: "w", mode: 0o600 });
@@ -45,7 +35,7 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
     yield* fs.rename(temporary, path);
     yield* syncDirectory;
   }, Effect.onError(() => Effect.sync(() => { writeFailed = true; })));
-  const serial = <A, E>(operation: Effect.Effect<A, E>) => semaphore.withPermits(1)(Effect.suspend<A, E | CommandError, never>(() =>
+  const serial = <A, E, R>(operation: Effect.Effect<A, E, R>) => semaphore.withPermits(1)(Effect.suspend<A, E | CommandError, R>(() =>
     writeFailed ? Effect.fail(new CommandError({ message: "Journal durability unavailable; reopen required" })) : operation
   ).pipe(Effect.uninterruptible));
   const handled = Effect.fn("Journal.handled")(function*(id: JournalHandledKey) { return state.handled[id] === true; });
@@ -62,7 +52,7 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
     const handledKey = JournalHandledKey.make(`peer:${messageId}`);
     if (state.handled[handledKey]) return false;
     const entry = { payload, digest: hash, receivedAt: yield* Clock.currentTimeMillis };
-    if (new TextEncoder().encode(canonicalJson({ ...state.inbox, [messageId]: entry })).length > 128 * 1024) return yield* Effect.fail(new CommandError({ message: "Local inbox full; handling acknowledgement withheld" }));
+    if (new TextEncoder().encode(Schema.encodeUnknownSync(Schema.fromJsonString(JournalState.fields.inbox), { onExcessProperty: "error" })({ ...state.inbox, [messageId]: entry })).length > 128 * 1024) return yield* Effect.fail(new CommandError({ message: "Local inbox full; handling acknowledgement withheld" }));
     state.inbox[messageId] = entry;
     state.handled[handledKey] = true;
     yield* persist();
@@ -110,27 +100,33 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
     const text = yield* fs.readFileString(file);
     const lines = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean);
     const present = new Set<Hash>();
+    const graph = Graph.beginMutation(Graph.directed<{ entry: HostJournalEntry; digest: Hash }, undefined>());
+    const nodes = new Map<ArchiveEntryId, Graph.NodeIndex>();
     for (const line of lines) {
       if (new TextEncoder().encode(line).length > LIMIT) { gap("overflow"); continue; }
-      let raw: JsonValue;
-      try { raw = decodeJson(JsonValue, line); } catch { gap("invalid-line"); continue; }
-      const safe = safeEntry(raw);
-      if (!safe) continue;
+      const decoded = yield* parseHostEntry(line).pipe(Effect.option);
+      if (Option.isNone(decoded)) { gap("invalid-line"); continue; }
+      nodes.set(decoded.value.id, Graph.addNode(graph, { entry: decoded.value, digest: yield* platform.digest(line) }));
+    }
+    for (const [index, { entry }] of graph) {
+      const parent = entry.parentId === null ? undefined : nodes.get(entry.parentId);
+      if (parent !== undefined) Graph.addEdge(graph, parent, index, undefined);
+    }
+    for (const [index, { entry: safe, digest: originalDigest }] of graph) {
       const entryKey = yield* platform.digest(safe.id);
       present.add(entryKey);
-      const originalDigest = yield* platform.digest(line);
       if (state.seen[entryKey] === originalDigest) continue;
       if (state.seen[entryKey]) gap("rewrite");
-      if (!safe.linked) gap("unlinked");
-      const item = { entryId: safe.id, digest: yield* platform.fingerprint(safe.payload), payload: safe.payload, gaps: [...state.gaps] };
-      if (new TextEncoder().encode(canonicalJson([...state.spool, item])).length > 510 * 1024) { gap("overflow"); break; }
+      if (Graph.inDegree(graph, index) === 0) gap("unlinked");
+      const item = { entryId: safe.id, digest: yield* platform.fingerprint(safe), payload: safe, gaps: [...state.gaps] };
+      if (new TextEncoder().encode(Schema.encodeUnknownSync(Schema.fromJsonString(JournalState.fields.spool), { onExcessProperty: "error" })([...state.spool, item])).length > 510 * 1024) { gap("overflow"); break; }
       state.seen[entryKey] = originalDigest; state.spool.push(item);
     }
-    if (Object.keys(state.seen).some((id) => !present.has(decode(JournalState.fields.seen.schema.key, id)))) gap("rewrite");
+    if (Object.keys(state.seen).some((id) => !present.has(Schema.decodeUnknownSync(JournalState.fields.seen.schema.key, { onExcessProperty: "error" })(id)))) gap("rewrite");
     yield* coverage(); yield* persist();
     observedFile = mtimeMs === undefined ? undefined : { path: file, size, mtimeMs };
   })));
-  const upload = Effect.fn("Journal.upload")((send: (entry: ArchiveEntry) => Effect.Effect<unknown, unknown>, maximum = 8) => serial(Effect.gen(function*() {
+  const upload = Effect.fn("Journal.upload")(<A, E, R>(send: (entry: ArchiveEntry) => Effect.Effect<A, E, R>, maximum = 8) => serial(Effect.gen(function*() {
     for (let count = 0; count < maximum && state.consent && state.spool.length; count++) { yield* send(state.spool[0]!); state.spool.shift(); yield* persist(); }
   })));
   return { path, state, save, handled, handle, clearInbox, receive, releaseIntent, releaseSent, consent, erase, scan, upload };

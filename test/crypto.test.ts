@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Effect } from "effect";
+import { Effect, Schema } from "effect";
 import { Hex } from "effect/encoding";
 import { Platform } from "../src/platform.ts";
 import { Hash } from "../src/contracts.ts";
-import { decode } from "../src/http.ts";
 
 test("RFC 4231 HMAC uses exact key views and stored SHA-256 credentials stay unchanged", () => Effect.runPromise(Effect.gen(function*() {
   const platform = yield* Platform;
@@ -23,6 +22,6 @@ test("RFC 4231 HMAC uses exact key views and stored SHA-256 credentials stay unc
   assert.equal(yield* platform.checkToken("", hash), false);
   assert.equal(yield* platform.checkToken("abc", hash), true);
   for (const malformed of ["", hash.slice(1), `${hash}0`, `${hash}\n`, hash.toUpperCase(), "g".repeat(64)]) {
-    assert.throws(() => decode(Hash, malformed));
+    assert.throws(() => Schema.decodeUnknownSync(Hash, { onExcessProperty: "error" })(malformed));
   }
 }).pipe(Effect.provide(Platform.layer))));

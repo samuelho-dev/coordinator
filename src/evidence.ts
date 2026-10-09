@@ -1,8 +1,7 @@
-import { Clock, Effect } from "effect";
+import { Clock, Effect, Schema } from "effect";
 import { HttpClient } from "effect/http";
 import { HttpError } from "./contracts.ts";
 import { Repo, GitHubWorkflowId, GitHubPullRequestNumber, RepoIdentity, Job, Run, MergeRef, JsonValue, type Json, type Work, type CiEvidence, type CiSeen } from "./contracts.ts";
-import { decode, decodeJson } from "./http.ts";
 // GitHub adds fields; decode its selected fields rather than disabling strict product-boundary decoding.
 function select(input: JsonValue | undefined, names: string[]): Json {
   if (typeof input !== "object" || input === null || Array.isArray(input)) throw new Error("Malformed GitHub response");
@@ -11,7 +10,7 @@ function select(input: JsonValue | undefined, names: string[]): Json {
 function decodeRun(input: JsonValue): Run {
   const fields = select(input, ["id", "workflow_id", "name", "head_sha", "head_branch", "pull_requests", "run_attempt", "status", "conclusion", "html_url", "created_at"]);
   if (fields.pull_requests !== undefined) fields.pull_requests = array(input, "pull_requests").map((pr) => select(pr, ["number"]));
-  return decode(Run, fields);
+  return Schema.decodeUnknownSync(Run, { onExcessProperty: "error" })(fields);
 }
 const github = Effect.fn("GitHub.request")(function*(path: string, token?: string) {
   return yield* Effect.scoped(Effect.gen(function*() {
@@ -20,8 +19,7 @@ const github = Effect.fn("GitHub.request")(function*(path: string, token?: strin
       headers: { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", ...(token ? { authorization: `Bearer ${token}` } : {}) },
     });
     if (response.status < 200 || response.status >= 300) return yield* new HttpError({ status: 502, message: `GitHub unavailable (${response.status})` });
-    const text = yield* response.text;
-    return yield* Effect.try(() => decodeJson(JsonValue, text));
+    return yield* response.json.pipe(Effect.flatMap(Schema.decodeUnknownEffect(JsonValue, { onExcessProperty: "error" })));
   })).pipe(Effect.timeout("15 seconds"));
 });
 function array(input: JsonValue, key: string): JsonValue[] {
@@ -33,7 +31,7 @@ export const inspectGithubRepository = Effect.fn("GitHub.inspectRepository")(fun
   const parts = repo.split("/");
   if (parts[0] !== "github.com" || parts.length !== 3) return yield* new HttpError({ status: 502, message: "GitHub evidence requires a GitHub repository" });
   const value = yield* github(`/repos/${parts[1]}/${parts[2]}`, token);
-  return (yield* Effect.try(() => decode(RepoIdentity, select(value, ["id", "full_name", "private"]))));
+  return (yield* Effect.try(() => Schema.decodeUnknownSync(RepoIdentity, { onExcessProperty: "error" })(select(value, ["id", "full_name", "private"]))));
 });
 export const pollCi = Effect.fn("GitHub.pollCi")(function*(work: Work, token?: string) {
   const evidence: CiEvidence = { sha: work.sha, repositoryId: work.githubRepoId, ref: work.ref,
@@ -41,7 +39,7 @@ export const pollCi = Effect.fn("GitHub.pollCi")(function*(work: Work, token?: s
   return yield* Effect.gen(function*() {
     const pull = /^refs\/pull\/([1-9]\d*)\/merge$/.exec(work.ref);
     if (pull && !token) return yield* new HttpError({ status: 502, message: "PR merge-ref evidence requires authenticated GitHub metadata" });
-    const pullNumber = pull ? yield* Effect.try(() => decode(GitHubPullRequestNumber, Number(pull[1]))) : undefined;
+    const pullNumber = pull ? yield* Effect.try(() => Schema.decodeUnknownSync(GitHubPullRequestNumber, { onExcessProperty: "error" })(Number(pull[1]))) : undefined;
     const identity = yield* inspectGithubRepository(work.repo, token);
     if (identity.id !== work.githubRepoId) return yield* new HttpError({ status: 502, message: "Repository identity mismatch" });
     const base = `/repos/${identity.full_name}`;
@@ -51,7 +49,7 @@ export const pollCi = Effect.fn("GitHub.pollCi")(function*(work: Work, token?: s
       const value = yield* github(mergeRefPath, token);
       const fields = (yield* Effect.try(() => select(value, ["ref", "object"])));
       fields.object = (yield* Effect.try(() => select(fields.object, ["type", "sha"])));
-      const current = (yield* Effect.try(() => decode(MergeRef, fields)));
+      const current = (yield* Effect.try(() => Schema.decodeUnknownSync(MergeRef, { onExcessProperty: "error" })(fields)));
       if (current.ref !== work.ref || current.object.sha !== work.sha) return yield* new HttpError({ status: 502, message: "Current PR merge-ref SHA mismatch" });
     });
     yield* checkMergeRef();
@@ -85,7 +83,7 @@ export const pollCi = Effect.fn("GitHub.pollCi")(function*(work: Work, token?: s
       for (let page = 1; page <= 10; page++) {
         const response = yield* github(`${base}/actions/runs/${run.id}/attempts/${run.run_attempt}/jobs?per_page=100&page=${page}`, token);
         const entries = yield* Effect.try(() => array(response, "jobs"));
-        jobs.push(...(yield* Effect.try(() => entries.map((entry) => decode(Job, select(entry, ["id", "name", "status", "conclusion", "started_at", "completed_at"]))))));
+        jobs.push(...(yield* Effect.try(() => entries.map((entry) => Schema.decodeUnknownSync(Job, { onExcessProperty: "error" })(select(entry, ["id", "name", "status", "conclusion", "started_at", "completed_at"]))))));
         if (entries.length < 100) break;
         if (page === 10) return yield* new HttpError({ status: 502, message: "Jobs truncated" });
       }

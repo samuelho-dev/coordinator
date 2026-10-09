@@ -1,24 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Clock, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect";
+import { Clock, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
 import { Reactivity } from "effect/reactivity";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
-import { LfFrames, Runner } from "../src/runner.ts";
+import { Runner } from "../src/runner.ts";
 import { Broker } from "../src/broker.ts";
-import { Mcp, canonicalJson, decode, decodeJson, encodeJson, serverLayer } from "../src/http.ts";
+import { Mcp, serverLayer } from "../src/http.ts";
 import { Platform } from "../src/platform.ts";
-import { Address, BrokerRequest, CommandError, HttpError, Json, JsonValue, NativeFrame, RunnerEvent, RunnerResult, RunnerRequest, RunnerRow, Task, TaskId, RunnerId, Repo, Hash, GitHubRepositoryId, Principal, RunnerConfig, Work } from "../src/contracts.ts";
+import { Address, BrokerRequest, CommandError, HttpError, Json, JsonValue, RunnerEvent, RunnerResult, RunnerNativeState, RunnerRequest, RunnerRow, Task, TaskId, RunnerId, Repo, Hash, GitHubRepositoryId, Principal, RunnerConfig, Work } from "../src/contracts.ts";
+import { NativeMessagesPage } from "@samuelho/coordinator-native-control/contracts";
 
 const enrollment = "regression-only-enrollment-000000000000";
 const control = "regression-only-control-000000000000000";
 const common = Layer.merge(Platform.layer, Mcp.layer);
-const request = (method: string, params: unknown) => decode(RunnerRequest, { method, params });
-const bytes = (text: string) => new TextEncoder().encode(text);
+const request = (method: string, params: unknown) => Schema.decodeUnknownSync(RunnerRequest, { onExcessProperty: "error" })({ method, params });
 const boundaryStatus = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(Effect.match({ onSuccess: () => 200, onFailure: (error) => error instanceof HttpError ? error.status : 500 }));
 
-async function fixture(slots = 1) {
+async function fixture(slots = 1, hostMode = "complete") {
   const services = ManagedRuntime.make(common);
   const platform = await services.runPromise(Platform);
   const rpc = await services.runPromise(Mcp);
@@ -34,7 +34,7 @@ async function fixture(slots = 1) {
   await run(fs.writeFileString(join(repo, "tracked"), "acceptance invariant\n")); await git("add", "tracked"); await git("commit", "-m", "initial");
   const credentials = join(root, "credentials"); await run(fs.makeDirectory(credentials, { mode: 0o700 }));
   const tokenFile = join(credentials, "token"); await run(fs.writeFileString(tokenFile, enrollment, { mode: 0o600 }));
-  const principal = decode(Principal, { id: "runner-test", owner: "owner", roles: ["runner"], repos: ["github.com/test/runner"], tokenHash: await run(platform.digest(enrollment)), controlTokenHash: await run(platform.digest(control)) });
+  const principal = Schema.decodeUnknownSync(Principal, { onExcessProperty: "error" })({ id: "runner-test", owner: "owner", roles: ["runner"], repos: ["github.com/test/runner"], tokenHash: await run(platform.digest(enrollment)), controlTokenHash: await run(platform.digest(control)) });
   const brokerRuntime = ManagedRuntime.make(Broker.layer({ database: join(root, "broker", "broker.sqlite"), backupDirectory: join(root, "backups"), host: "127.0.0.1", port: 0,
     archiveRetentionMs: 60000, backupRetentionMs: 60000, repositoryIds: { [Repo.make("github.com/test/runner")]: GitHubRepositoryId.make(1) }, principals: [principal] }).pipe(Layer.provide(common)));
   const broker = await brokerRuntime.runPromise(Broker);
@@ -49,7 +49,7 @@ async function fixture(slots = 1) {
           yield* Deferred.succeed(gate.reached, undefined);
           yield* Deferred.await(gate.proceed);
         }
-        return yield* broker.handle(p, decode(BrokerRequest, input));
+        return yield* broker.handle(p, Schema.decodeUnknownSync(BrokerRequest, { onExcessProperty: "error" })(input));
       }) });
       return { server };
     })
@@ -60,54 +60,112 @@ async function fixture(slots = 1) {
   const modelDirectory = join(root, "model"); await run(fs.makeDirectory(modelDirectory, { mode: 0o700 }));
   const launcher = join(root, "host.mjs");
   const workspace = platform.path.dirname(platform.path.dirname(await run(platform.path.fromFileUrl(new URL(import.meta.url)))));
-  const moduleUrl = async (relative: string) => encodeJson(JsonValue, (await run(platform.path.toFileUrl(join(workspace, relative)))).href);
+  const moduleUrl = async (relative: string) => Schema.encodeUnknownSync(Schema.fromJsonString(Schema.String))((await run(platform.path.toFileUrl(join(workspace, relative)))).href);
   // Node exposes no Effect executable-path API; use the observed binary, never assume /usr/bin/node.
   await run(fs.writeFileString(launcher, `#!${process.execPath}
 import * as Effect from ${await moduleUrl("node_modules/effect/dist/Effect.js")};
 import * as Layer from ${await moduleUrl("node_modules/effect/dist/Layer.js")};
-import * as Stream from ${await moduleUrl("node_modules/effect/dist/Stream.js")};
-import * as Stdio from ${await moduleUrl("node_modules/effect/dist/Stdio.js")};
-import * as ChildProcess from ${await moduleUrl("node_modules/effect/dist/process/ChildProcess.js")};
-import * as NodeStdio from ${await moduleUrl("node_modules/@effect/platform-node/dist/NodeStdio.js")};
+import * as Schema from ${await moduleUrl("node_modules/effect/dist/Schema.js")};
+import * as NodeServices from ${await moduleUrl("node_modules/@effect/platform-node/dist/NodeServices.js")};
+import * as NodeHttpServer from ${await moduleUrl("node_modules/@effect/platform-node/dist/NodeHttpServer.js")};
+import * as HttpRouter from ${await moduleUrl("node_modules/effect/dist/http/HttpRouter.js")};
+import * as HttpServerRequest from ${await moduleUrl("node_modules/effect/dist/http/HttpServerRequest.js")};
+import * as HttpServerResponse from ${await moduleUrl("node_modules/effect/dist/http/HttpServerResponse.js")};
 import * as NodeRuntime from ${await moduleUrl("node_modules/@effect/platform-node/dist/NodeRuntime.js")};
-import { LfFrames } from ${await moduleUrl("src/runner.ts")};
-import { Platform } from ${await moduleUrl("src/platform.ts")};
-import { CommandError, NativeFrame } from ${await moduleUrl("src/contracts.ts")};
-import { decode, encodeJson } from ${await moduleUrl("src/http.ts")};
-NodeRuntime.runMain(Effect.gen(function*() {
-  const stdio = yield* Stdio.Stdio;
-  const platform = yield* Platform;
-  const args = yield* stdio.args;
-  if (args.includes("--version")) {
-    yield* Stream.succeed("fixture-host\\n").pipe(Stream.run(stdio.stdout({ endOnDone: false })));
-    return;
-  }
-  const sessions = args[args.indexOf("--session-dir") + 1];
-  if (!sessions) return yield* Effect.fail(new CommandError({ message: "Session directory required" }));
-  const frames = new LfFrames();
-  yield* stdio.stdin.pipe(Stream.runForEach((chunk) => Effect.gen(function*() {
-    const values = yield* Effect.try(() => frames.push(chunk));
-    for (const value of values) {
-      const input = decode(NativeFrame, value);
-      const data = input.type === "get_state"
-        ? { sessionId: "real-session", sessionFile: sessions + "/real.jsonl", isStreaming: false, isCompacting: false, isSettled: true, messageCount: 0, pendingMessageCount: 0 }
-        : input.type === "bash"
-          ? { exitCode: 0, output: yield* platform.exec(ChildProcess.make("/usr/bin/pwd", ["-P"], { env: { PATH: "/usr/local/bin:/usr/bin:/bin" }, extendEnv: false })) }
-          : {};
-      yield* Stream.succeed(encodeJson(NativeFrame, { type: "response", id: input.id, command: input.type, success: true, data }) + "\\n").pipe(Stream.run(stdio.stdout({ endOnDone: false })));
-    }
-  })), Effect.andThen(Effect.try(() => frames.end())));
-}).pipe(Effect.provide(Layer.merge(Platform.layer, NodeStdio.layer))));
+import { NativeBinding, NativeControlError, NativePluginConfig, NativeTools, NativePromptResult, nativeEventsUri } from ${JSON.stringify(import.meta.resolve("@samuelho/coordinator-native-control/contracts"))};
+import { NativeLifecycleJournal } from ${JSON.stringify(import.meta.resolve("@samuelho/coordinator-native-control/lifecycle"))};
+import { nativeControlHttpLayer, nativeTool } from ${JSON.stringify(import.meta.resolve("@samuelho/coordinator-native-control/server"))};
+import { createNativePresentation } from ${JSON.stringify(import.meta.resolve("@samuelho/coordinator-native-control/interaction"))};
+import { realpathSync, writeFileSync, readFileSync, renameSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+if (process.argv.includes("--version")) {
+  process.stdout.write("fixture-host\\n");
+} else {
+  const sessions = realpathSync(process.argv[process.argv.indexOf("--session-dir") + 1]);
+  const sessionFile = sessions + "/real.jsonl";
+  writeFileSync(sessionFile, "", { mode: 0o600 });
+  const status = readFileSync("/proc/self/status", "utf8");
+  // Node getgroups includes the effective GID; kernel Groups records supplementary groups only.
+  if (process.getuid() < 1000000 || process.getuid() !== process.geteuid() ||
+      ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"].some(key => !new RegExp("^" + key + ":\\\\s+0+$", "m").test(status)) || !/^NoNewPrivs:\\s+1$/m.test(status) || !/^Groups:[\\t ]*$/m.test(status) ||
+      (statSync(process.env.HOME).mode & 0o777) !== 0o700 || statSync(process.env.HOME).uid !== process.getuid() ||
+      Object.keys(process.env).some(key => !["HOME", "PATH", "LANG", "COORDINATOR_NATIVE_CONFIG", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OMP_AUTH_BROKER_URL", "OMP_AUTH_BROKER_TOKEN"].includes(key))) throw new Error("Child privilege boundary failed");
+  if (${JSON.stringify(hostMode)} === "acquisition-discovery") writeFileSync(process.env.HOME + "/acquisition.pid", JSON.stringify(process.pid), { mode: 0o600 });
+  const binding = Schema.decodeUnknownSync(NativeBinding)({ host: "omp", sessionId: randomUUID(), incarnation: randomUUID(), generation: 0 });
+  const journal = new NativeLifecycleJournal({ retention: ${hostMode === "gap" ? 1 : 1024} });
+  const secret = "native-secret-provider-token-DO-NOT-STORE";
+  const messages = [{ role: "assistant", content: [{ type: "thinking", thinking: secret }, { type: "toolCall", arguments: { token: secret } }] }, { role: "user", content: "λ ✓", fixtureIdentity: { uid: process.getuid(), effectiveUid: process.geteuid(), cwd: realpathSync(process.cwd()), capabilityEffective: status.match(/^CapEff:\\s+(.*)$/m)[1], noNewPrivileges: status.match(/^NoNewPrivs:\\s+(.*)$/m)[1], environmentKeys: Object.keys(process.env) } }];
+  const privateState = { systemPrompt: [secret], dumpTools: [{ name: "fixture-tool", description: secret, parameters: { type: "object", properties: { token: { type: "string", description: secret } } }, examples: [{ call: { token: secret } }] }], todoPhases: [{ name: "fixture-phase", tasks: [{ content: secret, status: "pending" }] }], queuedMessages: { steering: [], followUp: [] }, autoCompactionEnabled: false, interruptMode: "immediate", fastModeEnabled: false, fastModeActive: false, slowModeSupported: false, slowModeEnabled: false, tokensPerSecond: null, goal: null };
+  let currentRunId = null;
+  const emit = (kind, fields = {}) => journal.append({ type: "native_lifecycle", binding, runId: currentRunId, at: Date.now(), kind, ...fields });
+  const presentation = createNativePresentation(() => ({
+    nativeBinding: binding,
+    nativeRunId: currentRunId,
+    emitNativeInput: (kind, inputKind, inputId, runId, owner = binding) => journal.append({ type: "native_lifecycle", binding: owner, runId, at: Date.now(), kind, inputKind, inputId }),
+  }));
+  const validate = input => {
+    if (input.binding && JSON.stringify(input.binding) !== JSON.stringify(binding)) throw new NativeControlError({ code: "binding_mismatch", message: "Stale fixture binding" });
+  };
+  const handlers = {
+    "native.get_state": input => Effect.sync(() => {
+      validate(input);
+      if (${JSON.stringify(hostMode)} === "stale" && input.binding) return { binding: { ...binding, generation: binding.generation + 1 }, ...privateState, cwd: realpathSync(process.cwd()), sessionFile: realpathSync(sessionFile), model: null, currentRunId, isStreaming: false, isCompacting: false, pendingMessageCount: 0, pendingAsyncWorkCount: 0, messageCount: messages.length, steeringMode: "all", followUpMode: "all" };
+      return { binding, ...privateState, cwd: realpathSync(process.cwd()), sessionFile: realpathSync(sessionFile), model: null, currentRunId, isStreaming: currentRunId !== null, isCompacting: false, pendingMessageCount: 0, pendingAsyncWorkCount: 0, messageCount: messages.length, steeringMode: "all", followUpMode: "all" };
+    }),
+    "native.bash": input => Effect.try({
+      try: () => { validate(input); return { binding, exitCode: 0, output: execFileSync("/bin/sh", ["-c", input.command], { cwd: process.cwd(), env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: process.env.HOME }, encoding: "utf8" }), truncated: false, killed: false }; },
+      catch: error => error instanceof NativeControlError ? error : new NativeControlError({ code: "native_failure", message: "Actual fixture shell failed" }),
+    }),
+    "native.get_messages": input => Effect.sync(() => {
+      validate(input);
+      const start = input.cursor === undefined ? 0 : Number(input.cursor);
+      if (!Number.isSafeInteger(start) || start < 0 || start > messages.length) throw new NativeControlError({ code: "invalid_input", message: "Invalid message cursor" });
+      const end = Math.min(messages.length, start + (input.limit ?? 256));
+      return { binding, messages: messages.slice(start, end), nextCursor: end < messages.length ? String(end) : null, more: end < messages.length };
+    }),
+    "native.abort": input => Effect.sync(() => { validate(input); return { binding, runId: currentRunId, disposition: currentRunId === null ? "already_settled" : "requested" }; }),
+    "native.prompt": input => Effect.sync(() => {
+      validate(input);
+      if (${JSON.stringify(hostMode)} === "transport") process.exit(23);
+      currentRunId = randomUUID();
+      const seq = ${JSON.stringify(hostMode)} === "missing-admission" ? journal.highWater : emit("submission_admitted", { submissionId: input.submissionId, disposition: "started" }).seq;
+      const admission = { binding, submissionId: input.submissionId, runId: currentRunId, disposition: "started", eventsUri: nativeEventsUri(binding), seq };
+      emit("run_started");
+      if (${JSON.stringify(hostMode)} !== "missing-terminal") emit("run_settled", { outcome: "completed" });
+      const result = Schema.decodeUnknownSync(NativePromptResult)({ admission, disposition: "settled", final: { binding, runId: currentRunId, outcome: "completed" } });
+      currentRunId = null;
+      writeFileSync(sessionFile, JSON.stringify(messages) + "\\n", { mode: 0o600 });
+      return result;
+    }),
+  };
+  const tools = Object.entries(NativeTools).filter(([name, descriptor]) => descriptor.hosts.includes("omp") && (${JSON.stringify(hostMode)} !== "acquisition-discovery" || name !== "native.get_state") && (${JSON.stringify(hostMode)} !== "public-hooks" || name !== "native.prompt")).map(([name]) => nativeTool(name, handlers[name] ?? (() => Effect.fail(new NativeControlError({ code: "unsupported_operation", message: "Fixture operation is not implemented" })))));
+  NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
+    const config = Schema.decodeUnknownSync(NativePluginConfig)(JSON.parse(readFileSync(process.env.COORDINATOR_NATIVE_CONFIG, "utf8")));
+    const token = readFileSync(config.tokenFile, "utf8");
+    const app = yield* HttpRouter.toHttpEffect(nativeControlHttpLayer({ host: "omp", binding, journal, tools, presentation, name: "isolated-runner-fixture", version: "1" }));
+    const server = yield* NodeHttpServer.make(() => createServer(), { host: "127.0.0.1", port: 0, gracefulShutdownTimeout: "1 second" });
+    yield* server.serve(Effect.gen(function*() {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      return request.headers.authorization === "Bearer " + token ? yield* app : HttpServerResponse.empty({ status: 401 });
+    }));
+    if (server.address._tag !== "InetAddressV4") throw new Error("Expected fixture loopback address");
+    writeFileSync(config.endpointFile + ".pending", JSON.stringify({ binding, url: "http://127.0.0.1:" + server.address.port + "/mcp" }), { mode: 0o600 });
+    renameSync(config.endpointFile + ".pending", config.endpointFile);
+    yield* Effect.never;
+  }).pipe(Effect.provide(NodeServices.layer))));
+}
 `, { mode: 0o755 }));
   await run(fs.chmod(launcher, 0o755));
   const runnerId = RunnerId.make(principal.id);
-  const config = decode(RunnerConfig, { id: runnerId, brokerUrl, tokenFile, controlTokenHash: principal.controlTokenHash!, host: "127.0.0.1", port: 0,
+  const config = Schema.decodeUnknownSync(RunnerConfig, { onExcessProperty: "error" })({ id: runnerId, brokerUrl, tokenFile, controlTokenHash: principal.controlTokenHash!, host: "127.0.0.1", port: 0,
     stateDirectory: join(root, "state"), slots, repositories: { "github.com/test/runner": repo }, launchers: { omp: launcher }, modelDirectory, childDirectory: join(root, "children"), childUidBase: 1000000 });
-  const work = decode(Work, { taskId: "one", repo: "github.com/test/runner", ref: "HEAD", sha: await git("rev-parse", "HEAD"), launcher: "omp", prompt: "approved prompt", scope: "scope", restrictions: "no deployment", expectedEvidence: ["checks"], deadline: await run(Clock.currentTimeMillis) + 60000,
+  const work = Schema.decodeUnknownSync(Work, { onExcessProperty: "error" })({ taskId: "one", repo: "github.com/test/runner", ref: "HEAD", sha: await git("rev-parse", "HEAD"), launcher: "omp", prompt: "approved prompt", scope: "scope", restrictions: "no deployment", expectedEvidence: ["checks"], deadline: await run(Clock.currentTimeMillis) + 60000,
     workerId: "native-worker", githubRepoId: 1, requiredLanes: [], bypassPeer: false, approved: true });
   async function save(work: Work, overrides: Partial<Task> = {}) {
     const task: Task = { taskId: work.taskId, owner: principal.owner, fingerprint: await run(platform.fingerprint(work)), request: work, state: "ACCEPTED", runnerId, createdAt: 1, updatedAt: 1, ...overrides };
-    await run(broker.sql.unsafe("INSERT OR REPLACE INTO tasks(id,data) VALUES (?,?)", [task.taskId, encodeJson(Task, task)])); return task;
+    await run(broker.sql.unsafe("INSERT OR REPLACE INTO tasks(id,data) VALUES (?,?)", [task.taskId, Schema.encodeUnknownSync(Schema.fromJsonString(Task))(task)])); return task;
   }
   await save(work);
   const runtimes = new Set<ManagedRuntime.ManagedRuntime<Runner, unknown>>();
@@ -117,7 +175,14 @@ NodeRuntime.runMain(Effect.gen(function*() {
     return { service, async close() { await runtime.dispose(); runtimes.delete(runtime); }, call(method: string, params: unknown, bearer = control) { return runtime.runPromise(service.handle(request(method, params), bearer)); }, status(method: string, params: unknown, bearer = control) { return runtime.runPromise(boundaryStatus(service.handle(request(method, params), bearer))); } };
   }
   const ready = (runner: Runner["Service"], taskId = work.taskId) => run(Effect.gen(function*() {
-    for (;;) { const row = yield* runner.row(taskId); if (row?.state === "READY") return row; if (row?.state === "FAILED" || row?.state === "HELD") return yield* Effect.fail(new CommandError({ message: `Native fixture did not become READY: ${row.reason}` })); yield* Effect.sleep("10 millis"); }
+    for (;;) {
+      const row = yield* runner.row(taskId);
+      if (row?.state === "READY") return row;
+      if (row?.state === "FAILED" || row?.state === "HELD") {
+        return yield* Effect.fail(new CommandError({ message: `Native fixture did not become READY: ${row.reason}` }));
+      }
+      yield* Effect.sleep("10 millis");
+    }
   }).pipe(Effect.timeout("15 seconds")));
   const seed = (directory: string, action: (sql: SqliteClient.SqliteClient) => Effect.Effect<void, unknown>) => run(Effect.gen(function*() {
     yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
@@ -127,17 +192,17 @@ NodeRuntime.runMain(Effect.gen(function*() {
   return { root, broker, config, work, save, open, ready, seed, run, fs, platform, rpc, client, join,
     outage(value: boolean) { unavailable = value; },
     async fence() { gate = { reached: await run(Deferred.make<void>()), proceed: await run(Deferred.make<void>()) }; taskReads = 0; return gate; },
-    async close() { if (gate) await run(Deferred.succeed(gate.proceed, undefined)); for (const runtime of runtimes) await runtime.dispose(); await proxyRuntime.dispose(); await brokerRuntime.dispose(); await run(fs.remove(root, { recursive: true, force: true })); await services.dispose(); }
+    async close() {
+      if (gate) await run(Deferred.succeed(gate.proceed, undefined));
+      for (const runtime of runtimes) await runtime.dispose();
+      await proxyRuntime.dispose();
+      await brokerRuntime.dispose();
+      await run(fs.remove(root, { recursive: true, force: true }));
+      await services.dispose();
+    }
   };
 }
 
-test("host JSONL accepts LF and CRLF, rejects invalid UTF-8 and bounded unfinished output", () => {
-  const frames = new LfFrames(); assert.deepEqual(frames.push(bytes('{"type":"response","data":"')), []);
-  assert.deepEqual(frames.push(bytes('✓"}\r\n{"type":"agent_end"}\n')), [{ type: "response", data: "✓" }, { type: "agent_end" }]); frames.end();
-  assert.throws(() => new LfFrames().push(new Uint8Array([123, 34, 120, 34, 58, 34, 255, 34, 125, 10])));
-  assert.throws(() => new LfFrames().push(new Uint8Array(4 * 1024 * 1024 + 1).fill(120)));
-  const unfinished = new LfFrames(); unfinished.push(bytes("{}")); assert.throws(() => unfinished.end());
-});
 
 test("kernel ownership loss interrupts blocked startup before recovery can overwrite a replacement", async () => {
   const f = await fixture();
@@ -208,13 +273,50 @@ test("real broker-bound SQLite acceptance is unique, conflict-safe and reserves 
     runner = await f.open({ ...f.config, stateDirectory: f.join(f.root, "expired-state") });
     await assert.rejects(runner.call("acceptTask", expired));
     assert.equal((await f.run(runner.service.sql.unsafe<Json>("SELECT count(*) AS count FROM tasks")))[0]!.count, 0);
-    await f.run(runner.service.sql.unsafe("INSERT INTO tasks(taskId,fingerprint,work,worktree,state,occupied,incarnation) VALUES (?,?,?,?,'ACCEPTED',1,?)", [expired.taskId, await f.run(f.platform.fingerprint(expired)), encodeJson(Task.fields.request, expired), f.join(f.config.childDirectory, "expired", "repo"), "expired-incarnation"]));
+    await f.run(runner.service.sql.unsafe("INSERT INTO tasks(taskId,fingerprint,work,worktree,state,occupied,incarnation) VALUES (?,?,?,?,'ACCEPTED',1,?)", [expired.taskId, await f.run(f.platform.fingerprint(expired)), Schema.encodeUnknownSync(Schema.fromJsonString(Task.fields.request))(expired), f.join(f.config.childDirectory, "expired", "repo"), "expired-incarnation"]));
     await runner.close(); runner = await f.open({ ...f.config, stateDirectory: f.join(f.root, "expired-state") });
     await f.run(Effect.gen(function*() {
       for (;;) { const row = yield* runner.service.row(expired.taskId); if (row?.state === "FAILED") return; yield* Effect.sleep("10 millis"); }
     }).pipe(Effect.timeout("10 seconds")));
     assert.equal((await f.run(runner.service.row(expired.taskId)))!.pid, null);
   } finally { await f.close(); }
+});
+
+test("failed SDK discovery drains its child before releasing capacity and remains held without replay after restart", async () => {
+  const f = await fixture(1, "acquisition-discovery");
+  try {
+    let runner = await f.open();
+    const waitForHeldCapacityRelease = (taskId: TaskId) => f.run(Effect.gen(function*() {
+      for (;;) {
+        const row = yield* runner.service.row(taskId);
+        if (row?.state === "HELD" && row.occupied === 0) return row;
+        yield* Effect.sleep("10 millis");
+      }
+    }).pipe(Effect.timeout("10 seconds")));
+    await runner.call("acceptTask", f.work);
+    const original = await waitForHeldCapacityRelease(f.work.taskId);
+    assert.equal(original.pid, null);
+    assert.equal(original.nativeBinding, null);
+    assert.equal(original.promptId, null);
+    const marker = f.join(f.config.childDirectory, await f.run(f.platform.digest(f.work.taskId)), "home", "acquisition.pid");
+    const observedPid = await f.run(f.fs.readFileString(marker));
+    const pid = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Int))(observedPid);
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+    await runner.close();
+    runner = await f.open();
+    assert.equal((await f.run(runner.service.row(f.work.taskId)))?.state, "HELD");
+    assert.equal((await f.run(runner.service.row(f.work.taskId)))?.occupied, 0);
+    const receipt = await runner.call("journal", { taskId: f.work.taskId });
+    assert.deepEqual(await runner.call("acceptTask", f.work), receipt);
+    const next = { ...f.work, taskId: TaskId.make("after-failed-discovery") };
+    await f.save(next);
+    assert.partialDeepStrictEqual(await runner.call("acceptTask", next), { accepted: true });
+    await waitForHeldCapacityRelease(next.taskId);
+    assert.equal(await f.run(f.fs.readFileString(marker)), observedPid, "Held launch intent must not be replayed");
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  } finally {
+    await f.close();
+  }
 });
 
 test("deadline expiry during owned SQL admission and prompt transactions never dispatches expired work", async (t) => {
@@ -230,7 +332,7 @@ test("deadline expiry during owned SQL admission and prompt transactions never d
       let address: Address | undefined;
       if (phase !== "admission") {
         await runner.call("acceptTask", f.work);
-        address = decodeJson(Address, (await f.ready(runner.service)).address!);
+        address = Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })((await f.ready(runner.service)).address!);
         await f.save(f.work, { address, readback: address, confirmedRevision: address.revision, disposition: "ready" });
       }
       const clock = await f.run(Clock.Clock);
@@ -286,9 +388,9 @@ test("enrollment bearer is health-only and control bearer cannot invent broker w
     const runner = await f.open();
     await assert.rejects(f.open({ ...f.config, controlTokenHash: await f.run(f.platform.digest(enrollment)) }));
     const url = HttpServer.formatAddress(runner.service.server.address);
-    assert.equal(await f.run(f.client.execute(HttpClientRequest.post(`${url}/mcp`).pipe(HttpClientRequest.bodyText(encodeJson(JsonValue, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "journal", arguments: { taskId: "one" } } }), "application/json"), HttpClientRequest.setHeader("accept", "application/json, text/event-stream"))).pipe(Effect.map((response) => response.status), Effect.scoped)), 401);
+    assert.equal(await f.run(f.client.execute(HttpClientRequest.post(`${url}/mcp`).pipe(HttpClientRequest.bodyText(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue))({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "journal", arguments: { taskId: "one" } } }), "application/json"), HttpClientRequest.setHeader("accept", "application/json, text/event-stream"))).pipe(Effect.map((response) => response.status), Effect.scoped)), 401);
     assert.equal(await f.run(boundaryStatus(f.rpc.call(url, "not-an-enrolled-bearer", "journal", { taskId: f.work.taskId }))), 401);
-    const address = decode(Address, { messageId: "one", revision: 1, workerId: f.work.workerId, sessionId: "session", incarnation: "incarnation", repo: f.work.repo, ref: f.work.ref, sha: f.work.sha,
+    const address = Schema.decodeUnknownSync(Address, { onExcessProperty: "error" })({ messageId: "one", revision: 1, workerId: f.work.workerId, sessionId: "session", incarnation: "incarnation", repo: f.work.repo, ref: f.work.ref, sha: f.work.sha,
       scope: f.work.scope, restrictions: f.work.restrictions, expectedEvidence: f.work.expectedEvidence, deadline: f.work.deadline });
     for (const input of [request("acceptTask", f.work), request("prepare", { taskId: "one", address }), request("release", { taskId: "one", address, prompt: f.work.prompt }), request("inspect", { taskId: "one" }), request("command", { taskId: "one", type: "get_state" }), request("journal", { taskId: "one" })]) {
       assert.equal(await f.run(boundaryStatus(f.rpc.call(url, enrollment, input.method, input.params))), 401);
@@ -298,7 +400,7 @@ test("enrollment bearer is health-only and control bearer cannot invent broker w
     await f.save(f.work, { runnerId: RunnerId.make("other-runner") }); assert.equal(await runner.status("acceptTask", f.work), 403);
     await f.save(f.work, { fingerprint: Hash.make("0".repeat(64)) }); await assert.rejects(runner.call("acceptTask", f.work));
     await f.save(f.work, { request: { ...f.work, prompt: "unapproved ledger prompt" } }); await assert.rejects(runner.call("acceptTask", f.work));
-    await f.save(f.work); await runner.call("acceptTask", f.work); const owned = await f.ready(runner.service); const actual = decodeJson(Address, owned.address!);
+    await f.save(f.work); await runner.call("acceptTask", f.work); const owned = await f.ready(runner.service); const actual = Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(owned.address!);
     f.outage(true);
     await f.run(runner.service.heartbeat());
     assert.equal((await f.run(runner.service.row(f.work.taskId)))!.state, "READY");
@@ -317,19 +419,39 @@ test("native event and result projection omits secret content from durable journ
   try {
     let runner = await f.open(); await runner.call("acceptTask", f.work); await f.ready(runner.service);
     const secret = "native-secret-provider-token-DO-NOT-STORE";
-    const frames = new LfFrames().push(bytes(`${encodeJson(NativeFrame, { type: "message_end", message: { content: [{ type: "thinking", thinking: secret }, { type: "toolCall", arguments: { token: secret } }], stopReason: "stop" } })}\n${encodeJson(NativeFrame, { type: "tool_execution_end", result: { content: secret }, credentials: secret })}\n`));
-    for (const frame of frames) await f.run(runner.service.frame(f.work.taskId, undefined, frame));
-    await f.run(runner.service.state(f.work.taskId, "SUCCEEDED", null, { hostSettled: true, evidenceVerified: false, message: secret, toolResult: secret, credentials: secret }));
+    const row = (await f.run(runner.service.row(f.work.taskId)))!;
+    const address = Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(row.address!);
+    await f.save(f.work, { address, readback: address, confirmedRevision: address.revision, disposition: "ready" });
+    const privateMessages = Schema.decodeUnknownSync(NativeMessagesPage, { onExcessProperty: "error" })(await runner.call("command", { taskId: "one", type: "get_messages", limit: 1 }));
+    assert.equal(JSON.stringify(privateMessages).includes(secret), true);
+    assert.equal(privateMessages.messages.length, 1);
+    assert.equal(privateMessages.more, true);
+    assert.equal(privateMessages.nextCursor, "1");
+    assert.ok(typeof privateMessages.nextCursor === "string");
+    const identityPage = Schema.decodeUnknownSync(NativeMessagesPage, { onExcessProperty: "error" })(await runner.call("command", { taskId: "one", type: "get_messages", cursor: privateMessages.nextCursor, limit: 1 }));
+    assert.deepEqual(identityPage.binding, privateMessages.binding);
+    assert.equal(identityPage.messages.length, 1);
+    assert.partialDeepStrictEqual(identityPage.messages[0], { content: "λ ✓", fixtureIdentity: { uid: row.childUid, effectiveUid: row.childUid, cwd: row.worktree, capabilityEffective: "0000000000000000", noNewPrivileges: "1" } });
+    assert.equal(identityPage.more, false);
+    assert.equal(identityPage.nextCursor, null);
+    await assert.rejects(runner.call("command", { taskId: "one", type: "get_messages", cursor: "not-a-cursor" }));
+    assert.throws(() => request("command", { taskId: "one", type: "get_messages", limit: 257 }));
+    assert.throws(() => request("command", { taskId: "one", type: "get_state", message: "private" }));
+    await runner.call("release", { taskId: "one", address, prompt: f.work.prompt });
+    await f.run(Effect.gen(function*() {
+      for (;;) { const current = yield* runner.service.row(f.work.taskId); if (current?.state === "SUCCEEDED") return; if (current?.state === "HELD" || current?.state === "FAILED") return yield* Effect.fail(new CommandError({ message: "Fixture prompt did not settle" })); yield* Effect.sleep("10 millis"); }
+    }).pipe(Effect.timeout("15 seconds")));
     const events = await f.run(runner.service.sql.unsafe<Json>("SELECT payload FROM events"));
-    assert.ok(events.some((event) => decodeJson(RunnerEvent, String(event.payload)).type === "message_end")); assert.equal(canonicalJson(events).includes(secret), false);
-    assert.deepEqual(decodeJson(RunnerResult, (await f.run(runner.service.row(f.work.taskId)))!.result!), { hostSettled: true, evidenceVerified: false });
-    assert.equal(canonicalJson(await runner.call("inspect", { taskId: "one" })).includes(secret), false);
-    await f.run(runner.service.sql.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", [f.work.taskId, encodeJson(Json, { type: "message_end", message: secret })]));
-    await f.run(runner.service.sql.unsafe("UPDATE tasks SET result=?,reason=? WHERE taskId='one'", [encodeJson(Json, { hostSettled: true, credentials: secret }), secret]));
+    assert.ok(events.some((event) => Schema.decodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(String(event.payload)).kind === "run_settled"));
+    assert.equal(JSON.stringify(events).includes(secret), false);
+    assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(RunnerResult), { onExcessProperty: "error" })((await f.run(runner.service.row(f.work.taskId)))!.result!), { hostSettled: true, evidenceVerified: false });
+    assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await runner.call("inspect", { taskId: "one" })).includes(secret), false);
+    await f.run(runner.service.sql.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", [f.work.taskId, Schema.encodeUnknownSync(Schema.fromJsonString(Json))({ type: "message_end", message: secret })]));
+    await f.run(runner.service.sql.unsafe("UPDATE tasks SET result=?,reason=? WHERE taskId='one'", [Schema.encodeUnknownSync(Schema.fromJsonString(Json))({ hostSettled: true, credentials: secret }), secret]));
     await f.run(runner.service.sql.unsafe("PRAGMA user_version=0"));
     await runner.close(); runner = await f.open();
-    assert.equal(canonicalJson(await f.run(runner.service.sql.unsafe("SELECT payload FROM events"))).includes(secret), false);
-    assert.equal(canonicalJson(await f.run(runner.service.sql.unsafe("SELECT result,reason FROM tasks"))).includes(secret), false);
+    assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await f.run(runner.service.sql.unsafe("SELECT payload FROM events"))).includes(secret), false);
+    assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await f.run(runner.service.sql.unsafe("SELECT result,reason FROM tasks"))).includes(secret), false);
     const database = await f.run(f.fs.readFile(f.join(f.config.stateDirectory, "runner.sqlite")));
     assert.equal(new TextDecoder().decode(database).includes(secret), false);
   } finally { await f.close(); }
@@ -343,11 +465,11 @@ test("obsolete handed-off report reconciles durably without starving later live 
     await f.run(runner.service.sql.unsafe("UPDATE tasks SET state='RUNNING',promptId='reserved',pid=? WHERE taskId='one'", [process.pid]));
     await f.run(runner.service.sql.unsafe("UPDATE tasks SET state='SUCCEEDED',occupied=0,result='{}' WHERE taskId='two'"));
     await f.save(f.work, { runnerId: undefined });
-    const rows = (await f.run(runner.service.sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks ORDER BY taskId", [f.config.childUidBase]))).map((row) => decode(RunnerRow, row));
+    const rows = (await f.run(runner.service.sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks ORDER BY taskId", [f.config.childUidBase]))).map((row) => Schema.decodeUnknownSync(RunnerRow, { onExcessProperty: "error" })(row));
     await f.run(runner.service.reports(rows));
     const obsolete = (await f.run(runner.service.sql.unsafe<Json>("SELECT state,detached,occupied,promptId FROM tasks WHERE taskId='one'")))[0]!;
     assert.deepEqual({ ...obsolete }, { state: "HELD", detached: 1, occupied: 1, promptId: "reserved" });
-    assert.equal(decodeJson(Task, String((await f.run(f.broker.sql.unsafe<Json>("SELECT data FROM tasks WHERE id='two'")))[0]!.data)).state, "SUCCEEDED");
+    assert.equal(Schema.decodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(String((await f.run(f.broker.sql.unsafe<Json>("SELECT data FROM tasks WHERE id='two'")))[0]!.data)).state, "SUCCEEDED");
     await runner.close(); runner = await f.open(); assert.equal((await f.run(runner.service.row(f.work.taskId)))!.detached, 1); assert.equal((await f.run(runner.service.row(f.work.taskId)))!.occupied, 1);
     await f.save(live, { state: "FAILED" }); await f.run(runner.service.reports([(await f.run(runner.service.row(live.taskId)))!])); assert.equal((await f.run(runner.service.row(live.taskId)))!.detached, 0);
     f.outage(true); await f.run(runner.service.reports([(await f.run(runner.service.row(live.taskId)))!])); assert.equal((await f.run(runner.service.row(live.taskId)))!.detached, 0);
@@ -382,5 +504,124 @@ test("runner refuses overlapping child roots and model seeds containing session 
     await assert.rejects(f.open({ ...f.config, childDirectory: f.root }));
     await f.run(f.fs.writeFileString(f.join(f.config.modelDirectory, "history.db"), "sensitive history", { mode: 0o600 }));
     await assert.rejects(f.open());
+  } finally { await f.close(); }
+});
+
+test("native missing admission, resource gaps and transport loss hold durable intent without replay", async (t) => {
+  for (const mode of ["missing-admission", "gap", "transport"]) await t.test(mode, async () => {
+    const f = await fixture(1, mode);
+    try {
+      let runner = await f.open();
+      await runner.call("acceptTask", f.work);
+      const ready = await f.ready(runner.service);
+      const address = Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(ready.address!);
+      await f.save(f.work, { address, readback: address, confirmedRevision: address.revision, disposition: "ready" });
+      await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
+      const held = (await f.run(runner.service.row(f.work.taskId)))!;
+      assert.equal(held.state, "HELD");
+      assert.ok(held.promptId);
+      assert.equal(held.result, null, "Unproven terminal work has no persisted result");
+      await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
+      assert.equal((await f.run(runner.service.row(f.work.taskId)))!.promptId, held.promptId);
+      if (mode === "transport") await f.run(Effect.gen(function*() {
+        for (;;) { if ((yield* runner.service.row(f.work.taskId))?.occupied === 0) return; yield* Effect.sleep("10 millis"); }
+      }).pipe(Effect.timeout("15 seconds")));
+      else assert.equal(held.occupied, 1, "A protocol failure is not physical process closure");
+      await runner.close();
+      runner = await f.open();
+      const recovered = (await f.run(runner.service.row(f.work.taskId)))!;
+      assert.equal(recovered.state, "HELD");
+      assert.equal(recovered.promptId, held.promptId);
+      assert.equal(recovered.nativeBinding, held.nativeBinding);
+      assert.equal(recovered.result, null);
+      await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
+    } finally { await f.close(); }
+  });
+});
+
+test("stale native generation cannot establish broker readiness", async () => {
+  const f = await fixture(1, "stale");
+  try {
+    const runner = await f.open();
+    await runner.call("acceptTask", f.work);
+    await assert.rejects(f.ready(runner.service));
+    const row = (await f.run(runner.service.row(f.work.taskId)))!;
+    assert.equal(row.state, "HELD");
+    assert.equal(row.address, null);
+    assert.equal(row.promptId, null);
+  } finally { await f.close(); }
+});
+
+test("abort acknowledgement and idle snapshots cannot replace a missing whole-run terminal proof", async () => {
+  const f = await fixture(1, "missing-terminal");
+  try {
+    let runner = await f.open();
+    await runner.call("acceptTask", f.work);
+    const ready = await f.ready(runner.service);
+    const address = Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(ready.address!);
+    await f.save(f.work, { address, readback: address, confirmedRevision: address.revision, disposition: "ready" });
+    await runner.call("release", { taskId: "one", address, prompt: f.work.prompt });
+    const admitted = (await f.run(runner.service.row(f.work.taskId)))!;
+    assert.equal(admitted.state, "RUNNING");
+    assert.ok(admitted.nativeRunId);
+    const snapshot = await runner.call("command", { taskId: "one", type: "get_state" });
+    assert.partialDeepStrictEqual(snapshot, { currentRunId: null, isStreaming: false });
+    assert.equal((await f.run(runner.service.row(f.work.taskId)))!.state, "RUNNING");
+    const abort = await runner.call("command", { taskId: "one", type: "abort" });
+    assert.partialDeepStrictEqual(abort, { disposition: "already_settled", runId: null });
+    const held = (await f.run(runner.service.row(f.work.taskId)))!;
+    assert.equal(held.state, "HELD");
+    assert.equal(held.occupied, 1);
+    assert.equal(held.result, null);
+    assert.equal((await f.run(runner.service.sql.unsafe<{ absent: number }>("SELECT result IS NULL AS absent FROM tasks WHERE taskId=?", [f.work.taskId])))[0]!.absent, 1);
+    if (held.pid === null) assert.fail("Held physical ownership must retain the native child PID");
+    process.kill(held.pid, "SIGTERM");
+    await f.run(Effect.gen(function*() {
+      for (;;) { if ((yield* runner.service.row(f.work.taskId))?.occupied === 0) return; yield* Effect.sleep("10 millis"); }
+    }).pipe(Effect.timeout("15 seconds")));
+    const closed = (await f.run(runner.service.row(f.work.taskId)))!;
+    assert.equal(closed.state, "HELD");
+    assert.equal(closed.promptId, admitted.promptId);
+    assert.equal(closed.nativeRunId, admitted.nativeRunId);
+    await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
+    // Exercise readback of the old persisted JSON-null encoding without changing owned intent.
+    await f.run(runner.service.sql.unsafe("UPDATE tasks SET result='null' WHERE taskId=?", [f.work.taskId]));
+    await runner.close();
+    runner = await f.open();
+    const recovered = (await f.run(runner.service.row(f.work.taskId)))!;
+    assert.equal(recovered.result, null);
+    assert.equal(recovered.promptId, admitted.promptId);
+    assert.equal(recovered.nativeRunId, admitted.nativeRunId);
+    assert.equal(recovered.state, "HELD");
+    await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
+  } finally {
+    await f.close();
+  }
+});
+
+test("public-hook-only capabilities hold an inspectable child without creating prompt intent", async () => {
+  const f = await fixture(1, "public-hooks");
+  try {
+    const runner = await f.open();
+    await runner.call("acceptTask", f.work);
+    const held = await f.run(Effect.gen(function*() {
+      for (;;) {
+        const row = yield* runner.service.row(f.work.taskId);
+        if (row?.state === "HELD") return row;
+        yield* Effect.sleep("10 millis");
+      }
+    }).pipe(Effect.timeout("15 seconds")));
+    assert.equal(held.promptId, null);
+    assert.equal(held.nativeRunId, null);
+    assert.equal(held.address, null);
+    assert.equal(held.occupied, 1);
+    assert.equal(held.result, null);
+    const state = Schema.decodeUnknownSync(RunnerNativeState)(await runner.call("command", { taskId: f.work.taskId, type: "get_state" }));
+    assert.equal(state.binding.host, "omp");
+    const address = Schema.decodeUnknownSync(Address)({ messageId: f.work.taskId, revision: 1, workerId: f.work.workerId,
+      sessionId: state.binding.sessionId, incarnation: held.incarnation, repo: f.work.repo, ref: f.work.ref, sha: f.work.sha,
+      scope: f.work.scope, restrictions: f.work.restrictions, expectedEvidence: f.work.expectedEvidence, deadline: f.work.deadline });
+    assert.equal(await runner.status("release", { taskId: f.work.taskId, address, prompt: f.work.prompt }), 409);
+    assert.equal((await f.run(runner.service.row(f.work.taskId)))?.promptId, null);
   } finally { await f.close(); }
 });

@@ -1,6 +1,7 @@
-import { Deferred, Effect, Queue, Schema, type Cause, type Scope } from "effect";
+import { Deferred, Effect, Option, Schema, SchemaGetter } from "effect";
 import { Tool } from "effect/ai";
 import { ChildProcessSpawner } from "effect/process";
+import { NativeBinding, NativeRunId, NativeSubmissionId, NativeEventSequence, NativeState, NativeGetMessagesInput, NativeMessagesPage, NativeAbortResult } from "@samuelho/coordinator-native-control/contracts";
 import type { Journal } from "./journal.ts";
 
 const identifierPattern = Schema.isPattern(/^[a-zA-Z0-9_.:-]{1,160}$/);
@@ -25,9 +26,6 @@ export const OwnerId = identifier.pipe(Schema.brand("@samuelho/coordinator/Owner
 export type OwnerId = typeof OwnerId.Type;
 export const ArchiveEntryId = identifier.pipe(Schema.brand("@samuelho/coordinator/ArchiveEntryId"));
 export type ArchiveEntryId = typeof ArchiveEntryId.Type;
-export const NativeRequestId = Schema.String.pipe(Schema.brand("@samuelho/coordinator/NativeRequestId"));
-export type NativeRequestId = typeof NativeRequestId.Type;
-const nativeRequestId = NativeRequestId.check(identifierPattern);
 export const JournalHandledKey = Schema.String.pipe(Schema.brand("@samuelho/coordinator/JournalHandledKey"));
 export type JournalHandledKey = typeof JournalHandledKey.Type;
 export const JournalReleaseKey = Schema.String.pipe(Schema.brand("@samuelho/coordinator/JournalReleaseKey"));
@@ -160,8 +158,22 @@ export const JournalState = Schema.Struct({
   inbox: Schema.mutableKey(Inbox.pipe(Schema.withDecodingDefaultKey(Effect.sync(() => ({}))))),
 });
 export type JournalState = typeof JournalState.Type;
-export const SafeEntry = Schema.Struct({ id: ArchiveEntryId, payload: ArchivePayload, linked: Schema.Boolean });
-export type SafeEntry = typeof SafeEntry.Type;
+// One-way host journal boundary: unknown fields and message content never survive.
+export const HostJournalEntry = Schema.Struct({
+  id: ArchiveEntryId,
+  parentId: Schema.optional(ArchivePayload.members[0].fields.parentId).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(null)))),
+  type: Schema.optional(ArchivePayload.members[0].fields.type).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(undefined)))),
+  message: Schema.optional(Schema.Struct({
+    role: ArchivePayload.members[0].fields.role.pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(undefined)))),
+  })).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(undefined)))),
+}).pipe(Schema.decodeTo(ArchivePayload.members[0], {
+  decode: SchemaGetter.transform(entry => ({
+    id: entry.id, parentId: entry.parentId ?? null, type: entry.type ?? "omitted",
+    ...(entry.message?.role === undefined ? {} : { role: entry.message.role }), contentOmitted: true,
+  })),
+  encode: SchemaGetter.forbiddenEncoding,
+}));
+export type HostJournalEntry = typeof HostJournalEntry.Type;
 export const ObservedFile = Schema.Struct({ path: Schema.String, size: Schema.Finite, mtimeMs: Schema.Finite });
 export type ObservedFile = typeof ObservedFile.Type;
 
@@ -181,33 +193,21 @@ export type DeploymentEvidence = typeof DeploymentEvidence.Type;
 export const ReviewEvidence = Schema.Struct({ taskId: TaskId, sha: Sha, decision: Schema.Literals(["approved", "changes-requested"]), note: Text });
 export type ReviewEvidence = typeof ReviewEvidence.Type;
 
-export const RunnerRow = Schema.Struct({ taskId: TaskId, childUid: UserId, fingerprint: Hash, work: Schema.String, worktree: Schema.String, state: Schema.String, occupied: Schema.Int, pid: Schema.NullOr(ProcessId), incarnation: IncarnationId, address: Schema.NullOr(Schema.String), promptId: Schema.NullOr(NativeRequestId), reason: Schema.NullOr(Schema.String), result: Schema.NullOr(Schema.String), detached: Schema.Int });
+export const RunnerRow = Schema.Struct({ taskId: TaskId, childUid: UserId, fingerprint: Hash, work: Schema.String, worktree: Schema.String, state: Schema.String, occupied: Schema.Int, pid: Schema.NullOr(ProcessId), incarnation: IncarnationId, address: Schema.NullOr(Schema.String), promptId: Schema.NullOr(NativeSubmissionId), nativeBinding: Schema.NullOr(Schema.String), nativeRunId: Schema.NullOr(NativeRunId), nativeCursor: NativeEventSequence, reason: Schema.NullOr(Schema.String), result: Schema.NullOr(Schema.String), detached: Schema.Int });
 export type RunnerRow = typeof RunnerRow.Type;
-export const NativeState = Schema.StructWithRest(Schema.Struct({ sessionId: Schema.String.pipe(Schema.brand("@samuelho/coordinator/SessionId")), sessionFile: Schema.optional(Schema.String), isStreaming: Schema.Boolean, messageCount: Schema.Int, isCompacting: Schema.optional(Schema.Boolean), isSettled: Schema.optional(Schema.Boolean), hasPendingAsyncWork: Schema.optional(Schema.Boolean), pendingMessageCount: Schema.optional(Schema.Int), queuedMessageCount: Schema.optional(Schema.Int) }), [Schema.Record(Schema.String, Schema.UndefinedOr(JsonValue))]);
-export type NativeState = typeof NativeState.Type;
-export const NativeFrame = Schema.StructWithRest(Schema.Struct({ type: Schema.String, id: Schema.optional(NativeRequestId), command: Schema.optional(Schema.String), success: Schema.optional(Schema.Boolean), data: Schema.optional(JsonValue), method: Schema.optional(Schema.String), message: Schema.optional(JsonValue), title: Schema.optional(Schema.String), notifyType: Schema.optional(Schema.String), status: Schema.optional(Schema.String), sessionSettled: Schema.optional(Schema.Boolean) }), [Schema.Record(Schema.String, Schema.UndefinedOr(JsonValue))]);
-export type NativeFrame = typeof NativeFrame.Type;
 export const NativeIdentity = Schema.Struct({ sessionId: SessionId, incarnation: IncarnationId, machineId: MachineId, repo: Repo, ref: Text, sha: Sha, workerId: WorkerId, workerIdentitySource: Schema.Literal("native-session") });
 export type NativeIdentity = typeof NativeIdentity.Type;
-const nativeProcess = Schema.declare<ChildProcessSpawner.ChildProcessHandle>((value): value is ChildProcessSpawner.ChildProcessHandle => typeof value === "object" && value !== null && "pid" in value && "stdin" in value && "stdout" in value && "stderr" in value && "kill" in value);
-const closeableScope = Schema.declare<Scope.Closeable>((value): value is Scope.Closeable => typeof value === "object" && value !== null && "~effect/Scope/Closeable" in value);
-const processInput = Schema.declare<Queue.Queue<Uint8Array, Cause.Done>>(Queue.isQueue<Uint8Array, Cause.Done>);
-export const NativePending = Schema.Struct({ type: Schema.String, response: Schema.declare<Deferred.Deferred<NativeFrame, unknown>>(Deferred.isDeferred<NativeFrame, unknown>) });
-export type NativePending = typeof NativePending.Type;
-const isNativePending = Schema.is(NativePending);
-const isNativeRequestId = Schema.is(NativeRequestId);
-const nativePendingMap = Schema.declare<Map<NativeRequestId, NativePending>>((value): value is Map<NativeRequestId, NativePending> => {
-  if (!(value instanceof Map)) return false;
-  for (const [key, item] of value) if (!isNativeRequestId(key) || !isNativePending(item)) return false;
-  return true;
-});
-export const NativeChild = Schema.Struct({ process: nativeProcess, scope: closeableScope, input: processInput, pending: nativePendingMap, lost: Schema.mutableKey(Schema.Boolean), completing: Schema.mutableKey(Schema.Boolean), started: Schema.mutableKey(Schema.Boolean), failed: Schema.mutableKey(Schema.Boolean) });
-export type NativeChild = typeof NativeChild.Type;
 export const RunnerAdmission = Schema.Struct({ fingerprint: Hash, response: Schema.declare<Deferred.Deferred<Acceptance, unknown>>(Deferred.isDeferred<Acceptance, unknown>) });
 export type RunnerAdmission = typeof RunnerAdmission.Type;
 export const RunnerInspect = Schema.Struct({ ...TaskKey.fields, cursor: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))) });
 export type RunnerInspect = typeof RunnerInspect.Type;
-export const RunnerCommand = Schema.Struct({ ...TaskKey.fields, type: Schema.Literals(["get_state", "get_messages", "abort"]) });
+export const RunnerCommand = Schema.Struct({
+  ...TaskKey.fields,
+  type: Schema.Literals(["get_state", "get_messages", "abort"]),
+  cursor: NativeGetMessagesInput.fields.cursor,
+  limit: NativeGetMessagesInput.fields.limit,
+}).check(Schema.makeFilter(input => input.type !== "get_messages" && (input.cursor !== undefined || input.limit !== undefined)
+  ? "Only get_messages accepts cursor and limit" : undefined));
 export type RunnerCommand = typeof RunnerCommand.Type;
 export const RunnerPrepare = Schema.Struct({ ...TaskKey.fields, address: Address });
 export type RunnerPrepare = typeof RunnerPrepare.Type;
@@ -215,20 +215,23 @@ export const RunnerRelease = Schema.Struct({ ...RunnerPrepare.fields, prompt: Wo
 export type RunnerRelease = typeof RunnerRelease.Type;
 export const RunnerReleased = Schema.Struct({ released: Schema.Literal(true) });
 export type RunnerReleased = typeof RunnerReleased.Type;
-export const RunnerEvent = Schema.Struct({ type: Schema.String.check(Schema.isPattern(/^[a-z_]{1,40}$/)), contentOmitted: Schema.optional(Schema.Literal(true)), address: Schema.optional(Address), state: Schema.optional(Schema.Literals(["ACCEPTED", "LAUNCHING", "READY", "PROMPT_INTENT", "RUNNING", "SUCCEEDED", "FAILED", "HELD"])), success: Schema.optional(Schema.Boolean), status: Schema.optional(Schema.Literals(["completed", "failed", "aborted", "error"])), command: Schema.optional(Schema.Literals(["get_state", "get_messages", "bash", "prompt", "abort"])), fingerprint: Schema.optional(Hash), digest: Schema.optional(Hash), id: Schema.optional(NativeRequestId), reason: Schema.optional(Text), before: Schema.optional(Schema.Int), seq: Schema.optional(Schema.Int) });
+export const RunnerEvent = Schema.Struct({ type: Schema.String.check(Schema.isPattern(/^[a-z_]{1,40}$/)), contentOmitted: Schema.optional(Schema.Literal(true)), address: Schema.optional(Address), state: Schema.optional(Schema.Literals(["ACCEPTED", "LAUNCHING", "READY", "PROMPT_INTENT", "RUNNING", "SUCCEEDED", "FAILED", "HELD"])), status: Schema.optional(Schema.Literals(["completed", "failed", "aborted", "error"])), fingerprint: Schema.optional(Hash), digest: Schema.optional(Hash), id: Schema.optional(NativeSubmissionId), reason: Schema.optional(Text), before: Schema.optional(Schema.Int), seq: Schema.optional(Schema.Int), binding: Schema.optional(NativeBinding), runId: Schema.optional(Schema.NullOr(NativeRunId)), nativeCursor: Schema.optional(NativeEventSequence), kind: Schema.optional(Schema.Literals(["session_started", "session_retired", "submission_admitted", "run_started", "run_phase", "input_requested", "input_resolved", "run_settled"])) });
 export type RunnerEvent = typeof RunnerEvent.Type;
 export const RunnerResult = Schema.NullOr(Schema.Struct({ launched: Schema.optional(Schema.Boolean), hostSettled: Schema.optional(Schema.Boolean), evidenceVerified: Schema.optional(Schema.Boolean), exitCode: Schema.optional(Schema.Int), signal: Schema.optional(Schema.String.check(Schema.isPattern(/^SIG[A-Z0-9]{1,16}$/))) }));
 export type RunnerResult = typeof RunnerResult.Type;
 export const RunnerInspection = Schema.Struct({ ...Acceptance.fields, events: Schema.mutable(Schema.Array(RunnerEvent)), nextCursor: Schema.Int });
 export type RunnerInspection = typeof RunnerInspection.Type;
-export const NativeResponse = Schema.Union([NativeFrame, Schema.Struct({ type: Schema.Literal("gap"), reason: Text, command: Schema.optional(Schema.String) })]);
+export const RunnerNativeState = Schema.Struct({ binding: NativeBinding, sessionFile: NativeState.fields.sessionFile, cwd: NativeState.fields.cwd, currentRunId: NativeState.fields.currentRunId, isStreaming: NativeState.fields.isStreaming, isCompacting: NativeState.fields.isCompacting, pendingMessageCount: NativeState.fields.pendingMessageCount, pendingAsyncWorkCount: NativeState.fields.pendingAsyncWorkCount, messageCount: NativeState.fields.messageCount });
+export const NativeResponse = Schema.Union([RunnerNativeState, NativeMessagesPage, NativeAbortResult, Schema.Struct({ type: Schema.Literal("gap"), reason: Text })]);
 
 // Pi and omp expose this minimal structural subset; no runtime host dependency.
 export const Context = Schema.Struct({
   cwd: Schema.String, hasUI: Schema.Boolean,
   mode: Schema.Literals(["tui", "rpc", "json", "print"]),
+  agent: Schema.optional(Schema.Struct({ kind: Schema.Literals(["main", "sub"]) })),
   isIdle: Schema.declare<() => boolean>((value): value is () => boolean => typeof value === "function"),
   hasPendingMessages: Schema.declare<() => boolean>((value): value is () => boolean => typeof value === "function"),
+  signal: Schema.optional(Schema.declare<AbortSignal>((value): value is AbortSignal => value instanceof AbortSignal)),
   sessionManager: Schema.Struct({
     getSessionId: Schema.declare<() => string>((value): value is () => string => typeof value === "function"),
     getSessionFile: Schema.declare<() => string | undefined>((value): value is () => string | undefined => typeof value === "function"),
@@ -239,20 +242,18 @@ export const Context = Schema.Struct({
   }),
 });
 export type Context = typeof Context.Type;
-export const NativeEventName = Schema.Literals(["session_start", "session_shutdown", "session_switch", "input", "agent_start", "agent_end", "turn_end", "message_end", "agent_before_settle", "agent_settled", "auto_retry_end", "ui_prompt_start", "ui_prompt_end", "tool_approval_requested", "tool_approval_resolved"]);
+export const NativeEventName = Schema.Literals(["session_start", "session_shutdown", "session_switch", "agent_start", "agent_end", "agent_before_settle", "agent_settled", "ui_prompt_start", "ui_prompt_end", "session_stop", "auto_retry_start", "auto_retry_end", "auto_compaction_start", "auto_compaction_end", "tool_approval_requested", "tool_approval_resolved"]);
 export type NativeEventName = typeof NativeEventName.Type;
 export const Host = Schema.Struct({
   on: Schema.declare<(event: NativeEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown>((value): value is (event: NativeEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown => typeof value === "function"),
   registerCommand: Schema.declare<(name: string, options: { description: string; handler: (args: string, ctx: Context) => Promise<void> }) => void>((value): value is (name: string, options: { description: string; handler: (args: string, ctx: Context) => Promise<void> }) => void => typeof value === "function"),
-  sendUserMessage: Schema.declare<(text: string, options: { deliverAs: "followUp" }) => void>((value): value is (text: string, options: { deliverAs: "followUp" }) => void => typeof value === "function"),
+  sendUserMessage: Schema.declare<(text: string, options: { deliverAs: "steer" | "followUp" }) => void>((value): value is (text: string, options: { deliverAs: "steer" | "followUp" }) => void => typeof value === "function"),
 });
 export type Host = typeof Host.Type;
 export const PluginActive = Schema.Struct({ ctx: Context, sessionId: SessionId, workerId: WorkerId, incarnation: IncarnationId, journal: Schema.declare<Journal["Service"]>((value): value is Journal["Service"] => typeof value === "object" && value !== null && "state" in value && "receive" in value && "save" in value), repo: Schema.mutableKey(Repo), heartbeat: Schema.mutableKey(Schema.Finite) });
 export type PluginActive = typeof PluginActive.Type;
 export const Observation = Schema.Struct({ operation: Schema.String, observed: JsonValue });
 export type Observation = typeof Observation.Type;
-export const FramePending = Schema.declare<Deferred.Deferred<NativeFrame, CommandError>>(Deferred.isDeferred<NativeFrame, CommandError>);
-export type FramePending = typeof FramePending.Type;
 export const InstallCommand = Schema.Struct({ binary: Schema.String, args: Schema.mutable(Schema.Array(Schema.String)) });
 export type InstallCommand = typeof InstallCommand.Type;
 export const InstallPlan = Schema.Struct({
@@ -270,7 +271,7 @@ const ok = Schema.Struct({ ok: Schema.Literal(true) });
 const recorded = Schema.Struct({ recorded: Schema.Literal(true) });
 export const Health = Schema.Struct({ status: Schema.Literal("ok") });
 export type Health = typeof Health.Type;
-export type CommandTarget = "broker" | "runner" | "shared" | "plugin" | "native" | "program" | "development";
+export type CommandTarget = "broker" | "runner" | "shared" | "plugin" | "program" | "development";
 export type CommandExposure = "tool" | "internal" | "local" | "private";
 type CommandPolicy = {
   readonly exposure: CommandExposure;
@@ -292,12 +293,12 @@ function command<const T extends CommandTarget, const K extends string, I extend
     execute<E, R>(capabilities: Record<K, (params: I["Type"]) => Effect.Effect<O["Type"], E, R>>, params: I["Type"]) {
       return capabilities[capability](params);
     },
-    executeDecoded<E, R, D>(
+    executeDecoded<E, R>(
       capabilities: Record<K, (params: I["Type"]) => Effect.Effect<O["Type"], E, R>>,
       params: unknown,
-      decodeInput: (schema: I, value: unknown) => Effect.Effect<I["Type"], D>,
     ) {
-      return decodeInput(input, params).pipe(
+      return Schema.decodeUnknownEffect(input, { onExcessProperty: "error" })(params).pipe(
+        Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })),
         Effect.flatMap((decoded) => capabilities[capability](decoded)),
       );
     },
@@ -369,11 +370,6 @@ export const Commands = {
   "plugin.archive": command("plugin", "pluginArchive", "Read sanitized archive rows with the active session injected.", Schema.Struct({ cursor: Schema.optional(Schema.Int) }), Schema.mutable(Schema.Array(ArchiveRow)), { exposure: "local" }),
   "plugin.inbox": command("plugin", "pluginInbox", "Read or explicitly clear the active session's durable local inbox.", Schema.Struct({ clear: Schema.optional(Schema.Boolean) }), Schema.Union([Inbox, Schema.Struct({ cleared: Schema.Literal(true) })]), { exposure: "local" }),
   "plugin.identity": command("plugin", "pluginIdentity", "Read actual native session, worker and local repository identity.", empty, NativeIdentity, { exposure: "local" }),
-  "native.get_state": command("native", "nativeGetState", "Read private child state for actual readback and completion reconciliation.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("get_state") }), NativeFrame, { exposure: "private" }),
-  "native.get_messages": command("native", "nativeGetMessages", "Read private child messages; response may contain sensitive content.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("get_messages") }), NativeFrame, { exposure: "private" }),
-  "native.bash": command("native", "nativeBash", "Execute internal native-child readback or isolation proof shell commands.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("bash"), command: Text }), NativeFrame, { exposure: "private" }),
-  "native.prompt": command("native", "nativePrompt", "Deliver the private child prompt only after durable approved release intent.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("prompt"), message: Text }), NativeFrame, { exposure: "private" }),
-  "native.abort": command("native", "nativeAbort", "Abort the private native child under runner ownership control.", Schema.Struct({ id: nativeRequestId, type: Schema.Literal("abort") }), NativeFrame, { exposure: "private" }),
   "program.broker": command("program", "runBroker", "Start the broker using COORDINATOR_CONFIG private file and remain serving.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" }),
   "program.runner": command("program", "runRunner", "Start the isolated runner using COORDINATOR_CONFIG private file and await failure.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" }),
   "program.install:host": command("program", "installHost", "Install one native plugin or privileged runner; help returns usage, dry-run still validates isolation.", Schema.Struct({
@@ -401,7 +397,7 @@ export const Commands = {
   "program.deploy-init.runner": command("program", "initializeRunnerDeployment", "Initialize private runner configuration from pinned image and enrollment environment.", empty, Schema.Void, { exposure: "private" }),
   "program.smoke": command("program", "runSmoke", "Run the integration smoke with configured real host and GitHub read credential.", Schema.Struct({ "--runner-isolation-only": Schema.optional(Schema.Boolean).annotate({ description: "Run only the real Linux native-child isolation proof." }) }), Schema.Void, { exposure: "private" }),
   "program.smoke:isolation": command("program", "runIsolationSmoke", "Run only the real Linux setpriv and native-child isolation proof.", empty, Schema.Void, { exposure: "private" }),
-  "program.smoke:hosts": command("program", "runHostSmoke", "Exercise synthetic OMP and Pi sessions without a model turn.", empty, Schema.Void, { exposure: "private" }),
+  "program.smoke:hosts": command("program", "runHostSmoke", "Exercise installed Pi/OMP public-plugin control and report the whole-run admission/final-outcome blocker without a model turn.", empty, Schema.Void, { exposure: "private" }),
   "program.smoke:backup": command("program", "runBackupSmoke", "Exercise real object backup using private proof config restricted to loopback and the proof bucket.", empty, Schema.Void, { exposure: "private" }),
   "development.check": command("development", "checkTypes", "Run the repository TypeScript no-emit check.", empty, Schema.Void, { exposure: "private" }),
   "development.test": command("development", "runTests", "Run repository tests serially with the installed tsx test runner.", empty, Schema.Void, { exposure: "private" }),

@@ -31,6 +31,12 @@ const runnerMigrations = Migrator.fromRecord({
     const columns = yield* sql.unsafe<{ name: string }>("PRAGMA table_info(tasks)");
     if (!columns.some((column) => column.name === "detached")) yield* sql.unsafe("ALTER TABLE tasks ADD COLUMN detached INTEGER NOT NULL DEFAULT 0");
     yield* sql.unsafe("DROP TABLE IF EXISTS owner");
+  }),
+  "0002_native_mcp_binding": Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql.unsafe("ALTER TABLE tasks ADD COLUMN nativeBinding TEXT");
+    yield* sql.unsafe("ALTER TABLE tasks ADD COLUMN nativeRunId TEXT");
+    yield* sql.unsafe("ALTER TABLE tasks ADD COLUMN nativeCursor INTEGER NOT NULL DEFAULT 0");
   })
 });
 
