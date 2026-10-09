@@ -55,3 +55,53 @@ test("native MCP authorizes each tool with its HTTP bearer, not session or model
     await runtime.dispose();
   }
 });
+
+test("native MCP proxy disposes after its downstream runner closes during a tool call", async () => {
+  let runnerEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { runnerEntered = resolve; });
+  let runnerFinalized = false;
+  class RunnerEndpoint extends Context.Service<RunnerEndpoint>()("test/McpShutdownRunner", {
+    make: Effect.gen(function*() {
+      const mcp = yield* Mcp;
+      const server = yield* HttpServer.HttpServer;
+      yield* mcp.serve(server, {
+        target: "runner",
+        authorize: () => Effect.succeed("caller"),
+        handle: () => Effect.sync(runnerEntered).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Effect.sync(() => { runnerFinalized = true; })),
+        ),
+      });
+      return { server };
+    }),
+  }) {}
+  const runner = ManagedRuntime.make(Layer.effect(RunnerEndpoint, RunnerEndpoint.make).pipe(Layer.provide(Layer.merge(Mcp.layer, serverLayer("127.0.0.1", 0)))));
+  const { server: runnerServer } = await runner.runPromise(RunnerEndpoint);
+  const runnerUrl = HttpServer.formatAddress(runnerServer.address);
+  class ProxyEndpoint extends Context.Service<ProxyEndpoint>()("test/McpShutdownProxy", {
+    make: Effect.gen(function*() {
+      const mcp = yield* Mcp;
+      const server = yield* HttpServer.HttpServer;
+      yield* mcp.serve(server, {
+        target: "runner",
+        authorize: () => Effect.succeed("caller"),
+        handle: (_caller, request) => request.method === "journal"
+          ? mcp.call(runnerUrl, "caller", "journal", request.params)
+          : Effect.fail(new HttpError({ status: 400, message: "Unexpected test command" })),
+      });
+      return { server, mcp };
+    }),
+  }) {}
+  const proxy = ManagedRuntime.make(Layer.effect(ProxyEndpoint, ProxyEndpoint.make).pipe(Layer.provide(Layer.merge(Mcp.layer, serverLayer("127.0.0.1", 0)))));
+  try {
+    const { server, mcp } = await proxy.runPromise(ProxyEndpoint);
+    const request = proxy.runPromise(mcp.call(HttpServer.formatAddress(server.address), "caller", "journal", { taskId: TaskId.make("closing-runner") }).pipe(Effect.exit));
+    await entered;
+    await runner.dispose();
+    assert.equal(runnerFinalized, true);
+    assert.equal((await request)._tag, "Failure");
+  } finally {
+    await runner.dispose();
+    await proxy.dispose();
+  }
+});
