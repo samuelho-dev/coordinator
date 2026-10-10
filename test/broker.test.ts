@@ -409,7 +409,7 @@ test("broker restart preserves RPC delivery, release fences and consented JSONL 
   }
 });
 
-test("session discovery isolates owners and repositories, pages every participant, and reflects liveness", async () => {
+test("session discovery admits unlinked repositories, isolates owners, and pages live and stale participants", async () => {
   const base = Layer.merge(Platform.layer, Mcp.layer);
   const setup = ManagedRuntime.make(base);
   const platform = await setup.runPromise(Platform);
@@ -422,16 +422,16 @@ test("session discovery isolates owners and repositories, pages every participan
     monotonicTimeNanos: clock.monotonicTimeNanos, monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
     sleep: (duration) => clock.sleep(duration),
   }));
-  const hiddenRepo = Repo.make("github.com/test/private");
+  const unlinkedRepo = Repo.make("github.com/test/private");
   const config = Schema.decodeUnknownSync(BrokerConfig)({
     database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0,
     backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
-    repositoryIds: Object.fromEntries([[repo, 42], [hiddenRepo, 43]]),
+    repositoryIds: { [repo]: 42 },
     principals: [
       { id: "coordinator", owner: "owner", roles: ["coordinator"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(coordinator)) },
       { id: "peer", owner: "owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(peer)) },
       { id: "foreign", owner: "other-owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest("foreign")) },
-      { id: "restricted", owner: "owner", roles: ["session"], repos: [hiddenRepo], tokenHash: await setup.runPromise(platform.digest("restricted")) },
+      { id: "unlinked", owner: "owner", roles: ["session", "coordinator"], repos: [], tokenHash: await setup.runPromise(platform.digest("unlinked")) },
       { id: "reviewer", owner: "owner", roles: ["reviewer"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(reviewer)) },
     ],
   });
@@ -455,12 +455,17 @@ test("session discovery isolates owners and repositories, pages every participan
     }
     const first = expected[0];
     assert.ok(first);
-    for (const token of ["foreign", "restricted"]) {
-      await setup.runPromise(mcp.call(url, token, "session.heartbeat", {
-        sessionId: SessionId.make(token), incarnation: IncarnationId.make(token), machineId: MachineId.make(token),
-        host: "pi", repo: token === "restricted" ? hiddenRepo : repo,
-      }));
-    }
+    const discovered: CommandInput<"session.heartbeat"> = {
+      sessionId: SessionId.make("unlinked"), incarnation: IncarnationId.make("unlinked"), machineId: MachineId.make("unlinked"),
+      host: "pi", repo: unlinkedRepo, workerId: WorkerId.make("unlinked-worker"),
+    };
+    await setup.runPromise(mcp.call(url, "unlinked", "session.heartbeat", discovered));
+    await setup.runPromise(mcp.call(url, "unlinked", "session.poll", { sessionId: discovered.sessionId, incarnation: discovered.incarnation }));
+    expected.push({ ...discovered, status: "live", liveUntil: now + 30000 });
+    await setup.runPromise(mcp.call(url, "foreign", "session.heartbeat", {
+      sessionId: SessionId.make("foreign"), incarnation: IncarnationId.make("foreign"), machineId: MachineId.make("foreign"),
+      host: "pi", repo: unlinkedRepo,
+    }));
     const listed: CommandOutput<"plugin.sessions"> = [];
     let cursor: SessionId | undefined, pages = 0;
     do {
@@ -470,9 +475,15 @@ test("session discovery isolates owners and repositories, pages every participan
       pages++;
     } while (cursor !== undefined);
     assert.ok(pages > 1, "A registry exceeding the MCP byte budget must be completely paginated");
-    assert.deepEqual(listed, expected, "Only authorized public session metadata may leave the broker");
+    assert.deepEqual(listed, expected, "Same-owner sessions remain discoverable without repository enrollment");
     assert.deepEqual((await setup.runPromise(mcp.call(url, "foreign", "session.list", {}))).sessions.map((session) => session.sessionId), ["foreign"]);
-    assert.deepEqual((await setup.runPromise(mcp.call(url, "restricted", "session.list", {}))).sessions.map((session) => session.sessionId), ["restricted"]);
+    assert.equal(await setup.runPromise(mcp.call(url, peer, "session.heartbeat", discovered).pipe(Effect.catchTag("HttpError", (error) => Effect.succeed(error.status)))), 403);
+    const unauthorizedWork = Schema.decodeUnknownSync(Work)({
+      taskId: "unlinked-execution", repo: unlinkedRepo, ref: "refs/heads/main", sha, launcher: "omp", prompt: "approved bounded work",
+      scope: "execution must remain denied", restrictions: "no changes", expectedEvidence: ["CI/verify"], deadline: now + 60000,
+      workerId: "unlinked-worker", githubRepoId: 43, requiredLanes: ["CI/verify"], bypassPeer: false, approved: true,
+    });
+    assert.equal(await setup.runPromise(mcp.call(url, "unlinked", "task.submit", unauthorizedWork).pipe(Effect.catchTag("HttpError", (error) => Effect.succeed(error.status)))), 403);
     assert.equal(await setup.runPromise(mcp.call(url, reviewer, "session.list", {}).pipe(Effect.catchTag("HttpError", (error) => Effect.succeed(error.status)))), 403);
     now += 10001;
     assert.equal((await setup.runPromise(mcp.call(url, peer, "session.list", {}))).sessions[0]?.status, "stale");

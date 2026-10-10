@@ -244,7 +244,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       return {
         listSessions: Effect.fn("Broker.listSessions")(function*({ cursor }: CommandInput<"session.list">): Effect.fn.Return<CommandOutput<"session.list">, unknown> {
           yield* role(principal, "coordinator", "session");
-          const visible = [...sessions.values()].filter((session) => session.owner === principal.owner && principal.repos.includes(session.repo) && (cursor === undefined || session.sessionId > cursor))
+          const visible = [...sessions.values()].filter((session) => session.owner === principal.owner && (cursor === undefined || session.sessionId > cursor))
             .sort((a, b) => a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0);
           const page: CommandOutput<"session.list"> = { sessions: [] };
           for (const session of visible) {
@@ -261,7 +261,8 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           return page;
         }),
         heartbeatSession: Effect.fn("Broker.heartbeatSession")(function*(params: CommandInput<"session.heartbeat">): Effect.fn.Return<CommandOutput<"session.heartbeat">, unknown> {
-          (yield* role(principal, "session")); const input = params; (yield* repo(principal, input.repo));
+          // Repository is detected presence metadata, not session admission authority.
+          (yield* role(principal, "session")); const input = params;
           const existing = sessions.get(input.sessionId);
           if (existing && (existing.principal !== principal.id || existing.owner !== principal.owner)) return yield* new HttpError({ status: 403, message: "Session already enrolled by another principal" });
           if (existing && existing.incarnation !== input.incarnation && existing.verified && existing.liveUntil > now) return yield* new HttpError({ status: 409, message: "Prior session incarnation still live" });
