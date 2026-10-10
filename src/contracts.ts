@@ -301,7 +301,7 @@ const pluginReadback = Schema.Struct({ ...RunnerPrepare.fields, reason: Schema.o
 const absolutePath = Schema.String.check(Schema.isPattern(/^\/[^\r\n\u0000]*$/));
 export const Commands = {
   health: command("shared", "health", "Read authenticated service health.", empty, Health, { exposure: "internal" }),
-  "session.list": command("broker", "listSessions", "List owner- and repository-authorized enrolled sessions with current liveness in bounded pages.", Schema.Struct({ cursor: Schema.optional(SessionId) }), sessionPage, { exposure: "tool", transaction: "transaction" }),
+  "session.list": command("broker", "listSessions", "List authenticated same-owner sessions across repositories with current liveness in bounded pages.", Schema.Struct({ cursor: Schema.optional(SessionId) }), sessionPage, { exposure: "tool", transaction: "transaction" }),
   "session.heartbeat": command("broker", "heartbeatSession", "Renew the verified native session lease without replacing a live incarnation.", Session, Schema.Struct({ liveUntil: Schema.Finite }), { exposure: "internal", transaction: "transaction" }),
   "session.poll": command("broker", "pollSession", "Fetch owner- and incarnation-scoped peer messages, offers and releases.", SessionKey, Poll, { exposure: "internal", transaction: "transaction" }),
   "session.stop": command("broker", "stopSession", "Revoke the bound session and its peer deliveries.", SessionKey, Schema.Struct({ stopped: Schema.Literal(true) }), { exposure: "internal", transaction: "transaction" }),
