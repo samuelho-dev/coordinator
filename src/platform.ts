@@ -1,8 +1,31 @@
-import { Context, Crypto, Effect, FileSystem, Layer, Option, Path, Result, Schema, Stream } from "effect";
+import { Cause, Context, Crypto, Effect, FileSystem, Layer, Option, Path, Result, Schema, Stream } from "effect";
 import { Hex } from "effect/encoding";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { NodeServices } from "@effect/platform-node";
 import { CommandError, Hash, Repo } from "./contracts.ts";
+
+const diagnosticError = Schema.Union([
+  Schema.Struct({ _tag: Schema.Literal("HttpError"), status: Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 599 })) }),
+  Schema.Struct({ _tag: Schema.Literal("PlatformError"), reason: Schema.Struct({ _tag: Schema.Literals(["AlreadyExists", "BadResource", "Busy", "InvalidData", "NotFound", "PermissionDenied", "TimedOut", "UnexpectedEof", "Unknown", "WouldBlock", "WriteZero", "BadArgument"]) }) }),
+  Schema.Struct({ _tag: Schema.Literals(["CommandError", "BackupError", "TimeoutError", "SqlError", "SchemaError"]) }),
+]);
+// Only typed failures contribute allowlisted metadata; defects never expose their payload.
+export const redactedCause = (cause: Cause.Cause<unknown>): string => cause.reasons.map((reason) => {
+  if (Cause.isDieReason(reason)) return "unknown defect";
+  if (Cause.isInterruptReason(reason)) return "interrupted";
+  const decoded = Schema.decodeUnknownOption(diagnosticError)(reason.error);
+  if (Option.isNone(decoded)) return "unknown failure";
+  const error = decoded.value;
+  if (error._tag === "HttpError") return `HTTP status=${error.status}`;
+  if (error._tag === "PlatformError") return `platform ${error.reason._tag}`;
+  switch (error._tag) {
+    case "CommandError": return "command failure";
+    case "BackupError": return "backup failure";
+    case "TimeoutError": return "timeout";
+    case "SqlError": return "database failure";
+    case "SchemaError": return "invalid boundary data";
+  }
+}).join("; ") || "unknown cause";
 
 const utf8 = new TextEncoder();
 // WebCrypto requires ArrayBuffer-backed, exact-range views; never copy or expose the rest of a backing buffer.

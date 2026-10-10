@@ -9,7 +9,7 @@ import type { NativeLifecycleEvent } from "@samuelho/coordinator-native-control/
 import { makeNativeControl } from "./native-plugin.ts";
 import type { NativeSession } from "./native-session.ts";
 import { Mcp } from "./http.ts";
-import { Platform } from "./platform.ts";
+import { Platform, redactedCause } from "./platform.ts";
 import { Journal } from "./journal.ts";
 
 const display = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown, {
@@ -87,7 +87,10 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
     owner: NativeSession; scope: Scope.Closeable; journal: Journal["Service"]; repo: Repo; heartbeat: number; dispatching: boolean } | undefined;
   let sessionScope: Scope.Closeable | undefined;
   const serial = <A, E, R>(effect: Effect.Effect<A, E, R>) => semaphore.withPermits(1)(effect);
-  const call = <const M extends McpToolName>(method: M, params: CommandInput<M>) => mcp.call(config.brokerUrl, token, method, params);
+  const held = <A, E, R>(operation: string, effect: Effect.Effect<A, E, R>) => effect.pipe(
+    Effect.tapCause((cause) => active ? notify(active.ctx, `Coordinator dispatch held at ${operation}: ${redactedCause(cause)}.`, "warning") : Effect.void),
+  );
+  const call = <const M extends McpToolName>(method: M, params: CommandInput<M>) => held(`broker ${method}`, mcp.call(config.brokerUrl, token, method, params));
   const notify = (ctx: Context, text: string, level: "info" | "warning" | "error" = "info") => Effect.sync(() => ctx.ui.notify(text, level));
   const confirm = (ctx: Context, title: string, text: string) => Effect.gen(function*() {
     inputs.set("coordinator-approval", "approval");
@@ -109,24 +112,24 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
     if (!current) return;
     const { ctx, sessionId, incarnation, workerId, journal } = current;
     if (ctx.sessionManager.getSessionId() !== current.parentSessionId) return;
-    current.repo = (yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote));
+    current.repo = yield* held("repository inspection", platform.inspectedRepo(ctx.cwd, config.selectedRemote));
     if ((yield* Clock.currentTimeMillis) - current.heartbeat >= 10000) {
       yield* call("session.heartbeat", { sessionId, incarnation, machineId: config.machineId, host: config.host, repo: current.repo, workerId });
       current.heartbeat = (yield* Clock.currentTimeMillis);
     }
     const poll = yield* call("session.poll", { sessionId, incarnation });
-    if (poll.archiveEnabled === false && journal.state.consent) yield* journal.erase();
+    if (poll.archiveEnabled === false && journal.state.consent) yield* held("journal write (erase)", journal.erase());
     for (const message of poll.messages) {
       if (message.incarnation !== incarnation || message.expiresAt <= (yield* Clock.currentTimeMillis)) continue;
-      const newlyHandled = yield* journal.receive(message.messageId, message.payload);
+      const newlyHandled = yield* held("journal write (receive)", journal.receive(message.messageId, message.payload));
       if (newlyHandled) yield* notify(ctx, `Coordinator message ${message.messageId}; /coordinator inbox shows the durably received content.`);
       yield* call("peer.ack", { sessionId, incarnation, messageId: message.messageId });
     }
     for (const offer of poll.offers) {
       const handledKey = JournalHandledKey.make(`offer:${offer.taskId}`);
-      if (yield* journal.handled(handledKey)) continue;
+      if (yield* held("journal read", journal.handled(handledKey))) continue;
       yield* notify(ctx, `Coordinator offer ${offer.taskId}: ${offer.request.repo} ${offer.request.ref} ${offer.request.sha}. /coordinator status {"taskId":"${offer.taskId}"}; then accept or decline explicitly.`);
-      yield* journal.handle(handledKey);
+      yield* held("journal write (offer)", journal.handle(handledKey));
     }
     for (const task of poll.releases) {
       const address = task.address;
@@ -136,7 +139,7 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
       if (current.dispatching || current.owner.pendingSubmissions > 0 || current.owner.session.isStreaming || current.owner.session.isCompacting ||
         (current.owner.backend.host === "pi" ? current.owner.backend.session.pendingMessageCount > 0 :
           current.owner.backend.session.queuedMessageCount > 0 || current.owner.backend.session.hasPendingAsyncWork())) continue;
-      const actual = yield* local(ctx);
+      const actual = yield* held("repository inspection", local(ctx));
       if (actual.repo !== address.repo || actual.ref !== address.ref || actual.sha !== address.sha) {
         yield* call("task.readback", { taskId: task.taskId, address, disposition: "hold", reason: "Local repository/ref/SHA changed", nextCheck: (yield* Clock.currentTimeMillis) + 60000 });
         continue;
@@ -148,13 +151,13 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
         }
         continue;
       }
-      if (!(yield* journal.releaseIntent(key))) continue;
+      if (!(yield* held("journal write (release intent)", journal.releaseIntent(key)))) continue;
       const submissionId = NativeSubmissionId.make(yield* platform.crypto.randomUUIDv4);
       current.dispatching = true;
       // Durable intent precedes SDK admission. No response/connection failure can replay this revision.
       yield* current.owner.prompt({ binding: current.owner.binding, submissionId, message: task.instruction?.prompt ?? task.request.prompt },
         (admission) => Effect.runPromise(Effect.gen(function*() {
-          yield* journal.releaseSent(key);
+          yield* held("journal write (release sent)", journal.releaseSent(key));
           if (admission.disposition !== "handled") yield* call("task.report", { taskId: task.taskId, sessionId, incarnation, state: "RUNNING",
             result: { revision: address.revision, admission, evidenceVerified: false } });
         }))).pipe(
@@ -162,15 +165,19 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
           state: result.disposition === "handled" || result.final.outcome === "aborted" ? "HELD" : result.final.outcome === "error" ? "FAILED" : "SUCCEEDED",
           result: { revision: address.revision, admission: result.admission, ...(result.disposition === "settled" ? { final: result.final } : {}),
             evidenceVerified: false, reason: "SDK execution outcome; deliverable evidence remains separate" } })),
-        Effect.catchCause(() => call("task.report", { taskId: task.taskId, sessionId, incarnation, state: "HELD",
-          result: { revision: address.revision, reason: "SDK delivery or outcome could not be proven; explicit new addressed revision required" } })),
+        Effect.catchCause((cause) => Effect.gen(function*() {
+          const reason = `SDK delivery or outcome: ${redactedCause(cause)}; explicit new addressed revision required`;
+          yield* notify(ctx, `Coordinator dispatch held at ${reason}.`, "warning");
+          return yield* call("task.report", { taskId: task.taskId, sessionId, incarnation, state: "HELD",
+            result: { revision: address.revision, reason } });
+        })),
         Effect.ensuring(Effect.sync(() => { current.dispatching = false; })),
-        Effect.tapCause(() => notify(ctx, "Coordinator SDK outcome report unavailable; reconcile this revision explicitly.", "warning")),
+        Effect.tapCause((cause) => notify(ctx, `Coordinator SDK outcome report unavailable: ${redactedCause(cause)}; reconcile this revision explicitly.`, "warning")),
         Effect.forkIn(current.scope),
       );
     }
-    yield* journal.scan(current.owner.manager.getSessionFile());
-    yield* journal.upload((entry) => call("archive.append", { sessionId, ...entry }), 1);
+    yield* held("journal scan", journal.scan(current.owner.manager.getSessionFile()));
+    yield* held("journal upload", journal.upload((entry) => call("archive.append", { sessionId, ...entry }), 1));
   });
   const stop = Effect.fn("Plugin.stop")(function*() {
     const previous = active, scope = sessionScope;
@@ -212,17 +219,16 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
       repo: yield* platform.inspectedRepo(ctx.cwd, config.selectedRemote), journal: EffectContext.get(context, Journal), heartbeat: 0, dispatching: false };
     let updates = Promise.resolve();
     const unsubscribe = owner.journal.subscribe((event) => {
-      updates = updates.then(() => Effect.runPromise(native(event, ctx))).catch((cause: unknown) => {
+      updates = updates.then(() => Effect.runPromise(native(event, ctx).pipe(Effect.catchCause((cause) => Effect.sync(() => {
         base = "unknown";
-        console.error("Coordinator owned SDK status unavailable", cause);
-        ctx.ui.notify("Coordinator owned SDK status unavailable; displayed status may be stale.", "warning");
-      });
+        ctx.ui.notify(`Coordinator owned SDK status unavailable: ${redactedCause(cause)}; displayed status may be stale.`, "warning");
+      })))));
     });
     yield* Effect.addFinalizer(() => Effect.promise(async () => { unsubscribe(); await updates; })).pipe(Effect.provideService(Scope.Scope, scope));
     for (const event of owner.journal.read(owner.binding, NativeEventSequence.make(0)).entries) yield* native(event, ctx);
     yield* Effect.gen(function*() {
       yield* Effect.sleep("1 second");
-      yield* serial(tick()).pipe(Effect.catchCause(() => notify(ctx, "Coordinator connection or journal unavailable; dispatch held.", "warning")));
+      yield* serial(tick()).pipe(Effect.catchCause((cause) => Effect.logWarning(`Coordinator periodic dispatch recovery: ${redactedCause(cause)}`)));
     }).pipe(Effect.forever, Effect.forkIn(scope));
     yield* tick();
   })));

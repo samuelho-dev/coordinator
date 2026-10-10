@@ -105,8 +105,6 @@ const HttpsObjectBackupConfig = Schema.Struct({
 });
 export const SnapshotKey = Schema.String.check(Schema.isPattern(/^sanitized\/[0-9]{13}\.sqlite$/)).pipe(Schema.brand("@samuelho/coordinator/SnapshotKey"));
 export type SnapshotKey = typeof SnapshotKey.Type;
-export const SnapshotList = Schema.Struct({ keys: Schema.Array(SnapshotKey), next: Schema.optional(Schema.String.check(Schema.isPattern(/^[A-Za-z0-9+/=._:-]{1,4096}$/))) });
-export type SnapshotList = typeof SnapshotList.Type;
 export const BrokerConfig = Schema.Struct({ database: Text, host: Text, port, principals: Schema.mutableKey(Schema.Array(Principal)), backupDirectory: Text, archiveRetentionMs: Schema.Finite, backupRetentionMs: Schema.Finite, objectBackup: Schema.optional(HttpsObjectBackupConfig), githubTokenEnv: Schema.optional(Text), repositoryIds: Schema.Record(Repo, GitHubRepositoryId.check(Schema.isGreaterThan(0))) });
 export type BrokerConfig = typeof BrokerConfig.Type;
 export const RunnerConfig = Schema.Struct({

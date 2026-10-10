@@ -4,7 +4,7 @@ import { Clock, Deferred, Effect, Fiber, Layer, ManagedRuntime, Schema } from "e
 import { HttpClient, HttpClientResponse } from "effect/http";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { Broker } from "../src/broker.ts";
-import { Commands, HttpError, JsonValue, Task, Address, BrokerConfig, Work, Repo, Sha, TaskId, MessageId, RunnerId, SessionId, IncarnationId, MachineId, WorkerId, PrincipalId, OwnerId, ReportState, type ArchiveEntry, type ArchiveRow, type CommandInput, type CommandOutput } from "../src/contracts.ts";
+import { Commands, HttpError, JsonValue, Task, Address, BrokerConfig, Work, Repo, Sha, TaskId, MessageId, RunnerId, SessionId, IncarnationId, MachineId, WorkerId, PrincipalId, OwnerId, ReportState, type BrokerConfig as BrokerConfigType, type ArchiveEntry, type ArchiveRow, type CommandInput, type CommandOutput } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
 import { Mcp } from "../src/http.ts";
@@ -487,6 +487,51 @@ test("session discovery isolates owners and repositories, pages every participan
   } finally {
     await runtime.dispose();
     await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true }));
+    await setup.dispose();
+  }
+});
+
+test("snapshot cadence expires local files even when remote put or list fails", async () => {
+  const base = Layer.merge(Platform.layer, Mcp.layer);
+  const setup = ManagedRuntime.make(base);
+  const platform = await setup.runPromise(Platform);
+  const root = await setup.runPromise(platform.fs.makeTempDirectory({ prefix: "coordinator-retention-" }));
+  const accessKeyFile = platform.path.join(root, "access"), secretKeyFile = platform.path.join(root, "secret");
+  await setup.runPromise(platform.fs.writeFileString(accessKeyFile, "FixtureAccess", { mode: 0o600 }));
+  await setup.runPromise(platform.fs.writeFileString(secretKeyFile, "FixtureSecret", { mode: 0o600 }));
+  let failing = "PUT";
+  const requests: string[] = [];
+  const client = HttpClient.make((request) => Effect.sync(() => {
+    requests.push(request.method);
+    return HttpClientResponse.fromWeb(request, new Response("", { status: request.method === failing ? 503 : 200 }));
+  }));
+  const config: BrokerConfigType = {
+    database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0,
+    backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
+    principals: [], repositoryIds: {}, objectBackup: { endpoint: "http://127.0.0.1:1", region: "fixture", bucket: "fixture-backups", accessKeyFile, secretKeyFile },
+  };
+  const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(Layer.merge(base, Layer.succeed(HttpClient.HttpClient, client)))));
+  try {
+    const broker = await runtime.runPromise(Broker);
+    for (const method of ["PUT", "GET"]) {
+      failing = method;
+      const expired = platform.path.join(config.backupDirectory, `${method}.sqlite`);
+      const recent = platform.path.join(config.backupDirectory, `recent-${method}.sqlite`);
+      await setup.runPromise(platform.fs.writeFileString(expired, "", { mode: 0o600 }));
+      await setup.runPromise(platform.fs.utimes(expired, new Date(0), new Date(0)));
+      await setup.runPromise(platform.fs.writeFileString(recent, "", { mode: 0o600 }));
+      await runtime.runPromise(broker.maintain());
+      assert.equal(await setup.runPromise(platform.fs.exists(expired)), true, "One-second maintenance must not walk or expire snapshots");
+      requests.length = 0;
+      assert.equal((await runtime.runPromise(Effect.exit(broker.snapshot())))._tag, "Failure");
+      assert.ok(requests.includes(method), "Exercise the actual remote failure stage");
+      assert.equal(await setup.runPromise(platform.fs.exists(expired)), false);
+      assert.equal(await setup.runPromise(platform.fs.exists(recent)), true, "Expiry uses mtime, not the file name");
+      assert.ok((await setup.runPromise(platform.fs.readDirectory(config.backupDirectory))).every((file) => !file.endsWith(".partial")));
+    }
+  } finally {
+    await runtime.dispose();
+    await setup.runPromise(platform.fs.remove(root, { recursive: true }));
     await setup.dispose();
   }
 });

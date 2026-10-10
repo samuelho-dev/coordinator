@@ -1,9 +1,9 @@
-import { Clock, Config, Context, Effect, Layer, Option, Schedule, Schema, Semaphore } from "effect";
+import { Cause, Clock, Config, Context, Effect, Layer, Option, Schedule, Schema, Semaphore } from "effect";
 import * as PersistedQueue from "effect/persistence/PersistedQueue";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { HttpClient, HttpServer } from "effect/http";
 import { Commands, Address, Work, TaskId, SessionId, RunnerId, WorkerId, Repo, Sha, Hash, BrokerConfig, Task, LiveSession, ArchivePayload, ArchiveEntry, ArchiveRow, JournalState, Json, JsonValue, Poll, Delivery, EvidenceObservation, HttpError, type CommandCapabilities, type CommandInput, type CommandOutput, type BrokerRequest, type Principal, type Role, type SessionKey, type LiveRunner } from "./contracts.ts";
-import { Platform } from "./platform.ts";
+import { Platform, redactedCause } from "./platform.ts";
 import { Mcp, serverLayer, MCP_RESULT_LIMIT } from "./http.ts";
 import { pollCi } from "./evidence.ts";
 import { SnapshotStore } from "./backup.ts";
@@ -65,7 +65,15 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         const target = platform.path.join(config.backupDirectory, `${yield* Clock.currentTimeMillis}.sqlite`);
         const partial = platform.path.join(platform.path.dirname(config.database), "snapshot.partial");
         const sanitized = `${target}.partial`;
+        let stage = "local pruning";
         return yield* Effect.gen(function*() {
+          const cutoff = (yield* Clock.currentTimeMillis) - config.backupRetentionMs;
+          for (const file of yield* platform.fs.readDirectory(config.backupDirectory)) {
+            if (!file.endsWith(".sqlite")) continue;
+            const path = platform.path.join(config.backupDirectory, file);
+            if (Option.getOrThrow((yield* platform.fs.stat(path)).mtime).getTime() < cutoff) yield* platform.fs.remove(path);
+          }
+          stage = "local creation";
           yield* platform.fs.writeFileString(partial, "", { flag: "w", mode: 0o600 });
           yield* platform.fs.chmod(partial, 0o600);
           yield* sql.backup(partial);
@@ -80,13 +88,18 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           yield* platform.fs.chmod(sanitized, 0o600);
           yield* platform.fs.rename(sanitized, target);
           if (objectBackup) {
+            stage = "remote put";
             yield* objectBackup.put(target);
+            stage = "remote expiry";
             yield* objectBackup.expire((yield* Clock.currentTimeMillis) - config.backupRetentionMs);
           }
           return target;
-        }).pipe(Effect.ensuring(Effect.gen(function*() {
-          for (const path of [partial, sanitized]) yield* platform.fs.remove(path, { force: true }).pipe(Effect.orDie);
-        })));
+        }).pipe(
+          Effect.tapCause((cause) => Effect.logError(`broker snapshot ${stage} failed: ${redactedCause(cause)}`)),
+          Effect.ensuring(Effect.gen(function*() {
+            for (const path of [partial, sanitized]) yield* platform.fs.remove(path, { force: true }).pipe(Effect.orDie);
+          }).pipe(Effect.tapCause((cause) => Effect.logError(`broker snapshot partial cleanup failed: ${redactedCause(cause)}`)))),
+        );
       }));
     });
     const role = Effect.fn("Broker.role")(function*(principal: Principal, ...roles: Role[]) {
@@ -172,7 +185,8 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           if (result.accepted) { current.state = ["HELD", "PROMPT_INTENT"].includes(result.state ?? "") ? "HELD" : "ACCEPTED"; current.reason = result.reason; yield* save(current); return; }
           if (result.state === "not-accepted") { current.state = "QUEUED"; delete current.runnerId; yield* save(current); }
           else { current.state = "HELD"; current.reason = "Runner acceptance unknown; reassignment blocked"; yield* save(current); }
-        }).pipe(Effect.catch(() => Effect.gen(function*() {
+        }).pipe(Effect.catch((error) => Effect.gen(function*() {
+          yield* Effect.logWarning(`broker runner journal reconciliation held: ${redactedCause(Cause.fail(error))}`);
           const current = (yield* tasks()).find((t) => t.taskId === id);
           if (!current || current.runnerId !== runnerId || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
           current.state = "HELD"; current.reason = "Runner acceptance unknown; reassignment blocked"; yield* save(current);
@@ -195,7 +209,8 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         if (result.accepted) { if (current.state === "ASSIGNING") current.state = "ACCEPTED"; (yield* save(current)); return; }
         if (result.reason === "full" || result.state === "not-accepted") { current.state = "QUEUED"; delete current.runnerId; (yield* save(current)); }
         else { current.state = "HELD"; current.reason = result.reason ?? "Runner declined unsafe material"; (yield* save(current)); }
-      }).pipe(Effect.catch(() => Effect.gen(function*() {
+      }).pipe(Effect.catch((error) => Effect.gen(function*() {
+        yield* Effect.logWarning(`broker runner acceptTask held: ${redactedCause(Cause.fail(error))}`);
         const current = (yield* tasks()).find((t) => t.taskId === id);
         if (!current || current.runnerId !== candidate.runnerId || ["RUNNING", "SUCCEEDED", "FAILED"].includes(current.state)) return;
         current.state = "HELD"; current.reason = "Runner acceptance unknown; reassignment blocked"; (yield* save(current));
@@ -397,7 +412,8 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
             yield* Effect.gen(function*() {
               if (!runner?.runnerUrl) return yield* new HttpError({ status: 409, message: "Runner unavailable" });
               (yield* mcp.call(runner.runnerUrl, (yield* runnerToken(runner)), "release", { taskId: task.taskId, address, prompt: task.request.prompt }, 15000));
-            }).pipe(Effect.catch(() => Effect.gen(function*() {
+            }).pipe(Effect.catch((error) => Effect.gen(function*() {
+              yield* Effect.logWarning(`broker runner release held: ${redactedCause(Cause.fail(error))}`);
               task.state = "HELD"; task.reason = "Prompt delivery uncertain; inspect assigned runner journal, never replay automatically"; (yield* save(task));
               return yield* new HttpError({ status: 409, message: task.reason });
             })));
@@ -543,10 +559,6 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       if (task.offerDecision === "pending" && (task.offerExpires ?? 0) <= now) { task.offerDecision = "expired"; (yield* save(task)); (yield* offer(task)); }
       if (task.state === "QUEUED") (yield* offer(task));
     }
-    for (const file of ((yield* platform.fs.readDirectory(config.backupDirectory)))) {
-      const path = platform.path.join(config.backupDirectory, file);
-      if (file.endsWith(".sqlite") && Option.getOrThrow((((yield* platform.fs.stat(path)))).mtime).getTime() < now - config.backupRetentionMs) ((yield* platform.fs.remove(path)));
-    }
 
     });
     const handle = Effect.fn("Broker.handle")(function*(principal: Principal, request: BrokerRequest) {
@@ -568,9 +580,9 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     yield* mcp.serve(server, { target: "broker", authorize, handle });
     for (const value of yield* tasks()) yield* offer(value);
     // ponytail: four bounded consumers; increase only for independent runner throughput.
-    for (let i = 0; i < 4; i++) yield* queue.take(assign).pipe(Effect.catch(() => Effect.sleep(500)), Effect.forever, Effect.forkScoped);
-    yield* maintain().pipe(Effect.catch(() => Effect.logError("broker maintenance failed")), Effect.repeat(Schedule.spaced("1 second")), Effect.forkScoped);
-    yield* snapshot().pipe(Effect.catch(() => Effect.logError("broker snapshot failed")), Effect.repeat(Schedule.spaced("1 minute")), Effect.forkScoped);
+    for (let i = 0; i < 4; i++) yield* queue.take(assign).pipe(Effect.catch((error) => Effect.logError(`broker dispatch failed: ${redactedCause(Cause.fail(error))}`).pipe(Effect.andThen(Effect.sleep(500)))), Effect.forever, Effect.forkScoped);
+    yield* maintain().pipe(Effect.catch((error) => Effect.logError(`broker maintenance failed: ${redactedCause(Cause.fail(error))}`)), Effect.repeat(Schedule.spaced("1 second")), Effect.forkScoped);
+    yield* snapshot().pipe(Effect.catch(() => Effect.void), Effect.repeat(Schedule.spaced("1 minute")), Effect.forkScoped);
     return { config, sql, sessions, runners, server, authorize, handle, snapshot, maintain };
   }),
 }) {

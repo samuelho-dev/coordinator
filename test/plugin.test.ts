@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Clock, ConfigProvider, Context as EffectContext, Deferred, Effect, Layer, Schema, Sink, Stdio } from "effect";
+import { Cause, Clock, ConfigProvider, Context as EffectContext, Deferred, Effect, Layer, Schema, Sink, Stdio } from "effect";
 import { ChildProcess } from "effect/process";
 import { HttpServer } from "effect/http";
 import { NativeBinding, NativeEventSequence, NativeRunId } from "@samuelho/coordinator-native-control/contracts";
 import { Mcp, serverLayer } from "../src/http.ts";
-import { Platform } from "../src/platform.ts";
+import { Platform, redactedCause } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
-import { CommandError, HttpError, Task, Principal, PluginConfig, JournalReleaseKey } from "../src/contracts.ts";
+import { CommandError, Delivery, HttpError, Task, Principal, PluginConfig, JournalReleaseKey } from "../src/contracts.ts";
 import type { Context, BrokerRequest } from "../src/contracts.ts";
 import { Plugin } from "../src/plugin.ts";
 
@@ -130,19 +130,30 @@ test("a refused startup heartbeat retains scoped enrollment until its lease fenc
   yield* platform.fs.writeFileString(tokenFile, "test-token", { mode: 0o600 });
   const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
   const polled = yield* Deferred.make<void>();
+  const journalHeld = yield* Deferred.make<void>();
   let heartbeatAttempts = 0, polls = 0;
   yield* mcp.serve(server, { target: "broker", authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
     handle: (_principal, request: BrokerRequest) => Effect.gen(function*() {
-      if (request.method === "session.heartbeat") { heartbeatAttempts++; if (heartbeatAttempts === 1) return yield* new HttpError({ status: 409, message: "Prior incarnation still live" }); return { liveUntil: (yield* Clock.currentTimeMillis) + 30000 }; }
-      if (request.method === "session.poll") { polls++; yield* Deferred.succeed(polled, undefined); return { messages: [], offers: [], releases: [] }; }
+      if (request.method === "session.heartbeat") { heartbeatAttempts++; if (heartbeatAttempts === 1) return yield* new HttpError({ status: 409, message: "PRIVATE_ENDPOINT_TOKEN_PATH" }); return { liveUntil: (yield* Clock.currentTimeMillis) + 30000 }; }
+      if (request.method === "session.poll") {
+        polls++;
+        yield* Deferred.succeed(polled, undefined);
+        return { messages: [Schema.decodeUnknownSync(Delivery)({ messageId: "private-fixture-message", incarnation: request.params.incarnation,
+          payload: polls === 1 ? "PRIVATE_INITIAL_PAYLOAD" : "PRIVATE_CONFLICT_PAYLOAD", expiresAt: (yield* Clock.currentTimeMillis) + 60000 })], offers: [], releases: [] };
+      }
+      if (request.method === "peer.ack") return { handled: true };
       if (request.method === "session.stop") return { stopped: true };
       return yield* new CommandError({ message: "Unexpected broker route" });
     }),
   });
   if (server.address._tag !== "InetAddressV4") return yield* new CommandError({ message: "Expected TCP server" });
   yield* platform.fs.writeFileString(config, Schema.encodeUnknownSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
+  const notifications: string[] = [];
   const ctx: Context = { cwd: directory, mode: "rpc", hasUI: false,
-    sessionManager: { getSessionId: () => "parent-session" }, ui: { notify: () => {}, confirm: async () => false } };
+    sessionManager: { getSessionId: () => "parent-session" }, ui: { notify: (text) => {
+      notifications.push(text);
+      if (text.includes("journal write") && text.includes("command failure")) Effect.runSync(Deferred.succeed(journalHeld, undefined));
+    }, confirm: async () => false } };
   const plugin = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
     Layer.provide(Layer.succeed(Platform, platform)),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
@@ -151,13 +162,24 @@ test("a refused startup heartbeat retains scoped enrollment until its lease fenc
   assert.ok(plugin);
   assert.equal((yield* Effect.exit(plugin.start(ctx)))._tag, "Failure");
   assert.equal(heartbeatAttempts, 1);
+  assert.ok(notifications.some((text) => text.includes("session.heartbeat") && text.includes("409")), "Held startup identifies the failed broker operation and status");
+  assert.ok(!notifications.some((text) => text.includes("PRIVATE_ENDPOINT_TOKEN_PATH") || text.includes(directory) || text.includes("test-token")));
   yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
   assert.equal(heartbeatAttempts, 2);
+  yield* Deferred.await(journalHeld).pipe(Effect.timeout("15 seconds"));
+  assert.ok(notifications.some((text) => text.includes("journal write") && text.includes("command failure")), "A real inbox conflict identifies the journal failure stage");
+  assert.ok(!notifications.some((text) => /PRIVATE_|test-token/.test(text)), "Private causal messages and inbox payloads stay redacted");
   yield* plugin.stop();
   const stoppedPolls = polls;
   yield* Effect.sleep("1200 millis");
   assert.equal(polls, stoppedPolls, "Retirement cancels periodic polling");
 })).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer)))));
+
+test("safe causal summaries never decode unknown defects as typed success", () => {
+  assert.match(redactedCause(Cause.die({ _tag: "HttpError", status: 200, message: "PRIVATE" })), /unknown defect/);
+  assert.match(redactedCause(Cause.fail({ _tag: "UnknownPrivateTag", token: "PRIVATE" })), /unknown failure/);
+  assert.ok(!redactedCause(Cause.fail(new HttpError({ status: 503, message: "PRIVATE" }))).includes("PRIVATE"));
+});
 
 test("unconfigured hosts stay disabled but present insecure or malformed plugin config fails closed", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;

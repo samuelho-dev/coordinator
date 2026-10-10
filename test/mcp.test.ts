@@ -7,8 +7,19 @@ import { HttpServer } from "effect/http";
 import { Acceptance, HttpError, TaskId, type CommandInput } from "../src/contracts.ts";
 import { Mcp, serverLayer } from "../src/http.ts";
 
-test("native MCP authorizes each tool with its HTTP bearer, not session or model metadata", async () => {
+test("stateless MCP calls authorize every HTTP request and close without retaining sessions", async () => {
   let handled = 0;
+  const nativeServer = createServer({ requestTimeout: 15000 });
+  const exchanges: Array<{ protocol: string | undefined; requestSession: string | undefined; responseSession: string | number | string[] | undefined }> = [];
+  nativeServer.on("request", (request, response) => {
+    const exchange = {
+      protocol: request.headersDistinct["mcp-protocol-version"]?.[0],
+      requestSession: request.headersDistinct["mcp-session-id"]?.[0],
+      responseSession: response.getHeader("mcp-session-id"),
+    };
+    exchanges.push(exchange);
+    response.once("finish", () => { exchange.responseSession = response.getHeader("mcp-session-id"); });
+  });
   class Endpoint extends Context.Service<Endpoint>()("test/McpEndpoint", {
     make: Effect.gen(function*() {
       const mcp = yield* Mcp;
@@ -27,7 +38,10 @@ test("native MCP authorizes each tool with its HTTP bearer, not session or model
       return { server, mcp };
     }),
   }) {}
-  const runtime = ManagedRuntime.make(Layer.effect(Endpoint, Endpoint.make).pipe(Layer.provide(Layer.merge(Mcp.layer, serverLayer("127.0.0.1", 0)))));
+  const runtime = ManagedRuntime.make(Layer.effect(Endpoint, Endpoint.make).pipe(Layer.provide(Layer.merge(
+    Mcp.layer,
+    NodeHttpServer.layerServer(() => nativeServer, { host: "127.0.0.1", port: 0, gracefulShutdownTimeout: "1 second" }),
+  ))));
   try {
     const { server, mcp } = await runtime.runPromise(Endpoint);
     const url = HttpServer.formatAddress(server.address);
@@ -38,12 +52,18 @@ test("native MCP authorizes each tool with its HTTP bearer, not session or model
     assert.equal(await status("caller-a", { taskId: TaskId.make("caller-b") }), 403);
     assert.equal(await status("caller-b", { taskId: TaskId.make("caller-a") }), 403);
     assert.equal(await status("not-enrolled", { taskId: TaskId.make("caller-a") }), 401);
+    assert.equal(await status("", { taskId: TaskId.make("caller-a") }), 401);
     assert.equal(await status("caller-a", { taskId: TaskId.make("caller-a") }), 200);
+    for (const exchange of exchanges) {
+      assert.equal(exchange.protocol, "2026-07-28");
+      assert.equal(exchange.requestSession, undefined);
+      assert.equal(exchange.responseSession, undefined);
+    }
     const beforeMalformed = handled;
     const malformed = await fetch(`${url}/mcp`, {
       method: "POST",
-      headers: { authorization: "Bearer caller-a", "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-11-25" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "journal", arguments: { taskId: "caller-a", principal: "caller-b" } } }),
+      headers: { authorization: "Bearer caller-a", "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2026-07-28", "mcp-method": "tools/call", "mcp-name": "journal" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} }, name: "journal", arguments: { taskId: "caller-a", principal: "caller-b" } } }),
     });
     if (malformed.status === 200) {
       const failure: unknown = await malformed.json();
@@ -56,6 +76,7 @@ test("native MCP authorizes each tool with its HTTP bearer, not session or model
   } finally {
     await runtime.dispose();
   }
+  assert.equal(nativeServer.listening, false);
 });
 
 test("native MCP proxy disposes after its downstream runner closes during a tool call", async () => {
@@ -192,10 +213,10 @@ test("aborted unread MCP body cannot hold HTTP server cleanup", { timeout: 5000 
     NodeHttpServer.layerServer(() => nativeServer, { host: "127.0.0.1", port: 0, gracefulShutdownTimeout: "1 second" }),
   ))));
   const { server } = await runtime.runPromise(Endpoint);
-  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} } } });
   const request = httpRequest(`${HttpServer.formatAddress(server.address)}/mcp`, {
     method: "POST",
-    headers: { authorization: "Bearer caller", "content-type": "application/json", "content-length": Buffer.byteLength(body), accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-11-25" },
+    headers: { authorization: "Bearer caller", "content-type": "application/json", "content-length": Buffer.byteLength(body), accept: "application/json, text/event-stream", "mcp-protocol-version": "2026-07-28", "mcp-method": "tools/list" },
   });
   const clientError = Promise.withResolvers<Error>();
   request.once("error", clientError.resolve);

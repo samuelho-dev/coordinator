@@ -2,13 +2,90 @@ import { Clock, Context, Effect, FileSystem, Layer, Schema, Stream } from "effec
 import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientRequest, type HttpClientResponse } from "effect/http";
 import { BackupError, ObjectBackupConfig, SnapshotKey } from "./contracts.ts";
-import { decodeSnapshotList } from "./http.ts";
 import { Platform } from "./platform.ts";
 
 const utf8 = new TextEncoder();
 const encode = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 const failure = () => new BackupError({ message: "Snapshot object storage operation failed" });
 const checked = <A>(f: () => A) => Effect.try({ try: f, catch: failure });
+
+const SnapshotList = Schema.Struct({ keys: Schema.Array(SnapshotKey), next: Schema.optional(Schema.String.check(Schema.isMinLength(1))) });
+const xmlCharacters = /^[\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]*$/u;
+const decodeXmlText = (text: string): string => {
+  if (!xmlCharacters.test(text) || text.includes("]]>")) throw failure();
+  return text.replace(/&(?:amp|lt|gt|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);|&/g, (reference) => {
+    switch (reference) {
+      case "&amp;": return "&";
+      case "&lt;": return "<";
+      case "&gt;": return ">";
+      case "&quot;": return '"';
+      case "&apos;": return "'";
+      case "&": throw failure();
+      default: {
+        const number = reference.startsWith("&#x") ? Number.parseInt(reference.slice(3, -1), 16) : Number(reference.slice(2, -1));
+        if (!Number.isSafeInteger(number) || number < 0 || number > 0x10ffff) throw failure();
+        const character = String.fromCodePoint(number);
+        if (!xmlCharacters.test(character)) throw failure();
+        return character;
+      }
+    }
+  });
+};
+
+export function decodeSnapshotList(text: string): typeof SnapshotList.Type {
+  // ponytail: validate S3's small listing envelope, not a general XML document; DTDs and external entities are never accepted.
+  if (text.includes("<!") || !/^\s*(?:<\?xml\s[^<>]*\?>\s*)?<ListBucketResult(?:\s[^>]*)?>[\s\S]*<\/ListBucketResult>\s*$/.test(text)) throw failure();
+  const tags: string[] = [];
+  const fields = new Set<string>();
+  let rootSeen = false;
+  let through = 0;
+  for (const token of text.matchAll(/<[^<>]*>/g)) {
+    const value = text.slice(through, token.index);
+    if (value.includes("<")) throw failure();
+    decodeXmlText(value);
+    through = token.index + token[0].length;
+    if (/^<\?xml\s+version=(?:"1\.0"|'1\.0')(?:\s+encoding=(?:"UTF-8"|'UTF-8'))?(?:\s+standalone=(?:"(?:yes|no)"|'(?:yes|no)'))?\s*\?>$/i.test(token[0]) && tags.length === 0 && !rootSeen) continue;
+    const name = /^<\/?([A-Za-z_][\w.-]*)(?:\s+[A-Za-z_][\w.:-]*\s*=\s*(?:"[^"<]*"|'[^'<]*'))*\s*\/?>$/.exec(token[0])?.[1];
+    if (!name) throw failure();
+    const attributes = new Set<string>();
+    for (const attribute of token[0].matchAll(/\s+([A-Za-z_][\w.:-]*)\s*=\s*("[^"]*"|'[^']*')/g)) {
+      const [, attributeName, quotedValue] = attribute;
+      if (attributeName === undefined || quotedValue === undefined || attributes.has(attributeName)) throw failure();
+      attributes.add(attributeName);
+      decodeXmlText(quotedValue.slice(1, -1));
+    }
+    if (token[0].startsWith("</")) {
+      if (token[0] !== `</${name}>` || tags.pop() !== name) throw failure();
+    } else {
+      if (["Key", "IsTruncated", "NextContinuationToken", "KeyCount", "MaxKeys"].includes(tags.at(-1) ?? "")) throw failure();
+      if (["Contents", "Key", "IsTruncated", "NextContinuationToken", "KeyCount", "MaxKeys"].includes(name)) {
+        if (token[0] !== `<${name}>` || tags.join("/") !== (name === "Key" ? "ListBucketResult/Contents" : "ListBucketResult")) throw failure();
+        if (name !== "Contents" && name !== "Key") {
+          if (fields.has(name)) throw failure();
+          fields.add(name);
+        }
+      }
+      if (name === "ListBucketResult") {
+        if (rootSeen || tags.length !== 0) throw failure();
+        rootSeen = true;
+      }
+      if (!token[0].endsWith("/>")) tags.push(name);
+    }
+  }
+  if (tags.length || text.slice(through).includes("<")) throw failure();
+  decodeXmlText(text.slice(through));
+  const contents = [...text.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)];
+  const keys = contents.map((item) => {
+    const matches = [...item[1]!.matchAll(/<Key>([^<]*)<\/Key>/g)];
+    if (matches.length !== 1) throw failure();
+    return decodeXmlText(matches[0]![1]!);
+  });
+  const truncated = [...text.matchAll(/<IsTruncated>(true|false)<\/IsTruncated>/g)];
+  const next = [...text.matchAll(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/g)];
+  const count = [...text.matchAll(/<KeyCount>([0-9]+)<\/KeyCount>/g)], maximum = [...text.matchAll(/<MaxKeys>([0-9]+)<\/MaxKeys>/g)];
+  if ((text.match(/<\/?Key\b/g)?.length ?? 0) !== contents.length * 2 || (text.match(/<\/?Contents\b/g)?.length ?? 0) !== contents.length * 2 || keys.length > 256 || truncated.length !== 1 || next.length !== (truncated[0]![1] === "true" ? 1 : 0) || count.length !== 1 || Number(count[0]![1]) !== keys.length || maximum.length !== 1 || !Number.isSafeInteger(Number(maximum[0]![1])) || Number(maximum[0]![1]) < keys.length || Number(maximum[0]![1]) > 256) throw failure();
+  return Schema.decodeUnknownSync(SnapshotList, { onExcessProperty: "error" })({ keys, ...(next.length ? { next: decodeXmlText(next[0]![1]!) } : {}) });
+}
 
 const contentLength = (response: HttpClientResponse.HttpClientResponse) => checked(() => {
   const value = response.headers["content-length"];

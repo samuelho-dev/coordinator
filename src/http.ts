@@ -6,38 +6,11 @@ import { lookup } from "node:dns";
 import type { LookupFunction } from "node:net";
 import { McpProtocol, McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { BackupError, SnapshotList, BrokerRequest, RunnerRequest, ConnectHosts, HttpError, CommandError, BoundaryError, Json, Commands, McpCommandName, type CommandInput, type McpEndpoint } from "./contracts.ts";
+import { BrokerRequest, RunnerRequest, ConnectHosts, HttpError, CommandError, BoundaryError, Json, Commands, McpCommandName, type CommandInput, type McpEndpoint } from "./contracts.ts";
 
 export const LIMIT = 64 * 1024;
 export const MCP_RESULT_LIMIT = LIMIT - 1024;
-export function decodeSnapshotList(text: string): SnapshotList {
-  // ponytail: S3's fixed ASCII snapshot names only; reject entities and foreign keys instead of adding a general XML parser.
-  if (text.includes("<!") || !/^\s*(?:<\?xml\s[^<>]*\?>\s*)?<ListBucketResult(?:\s[^>]*)?>[\s\S]*<\/ListBucketResult>\s*$/.test(text)) throw new BackupError({ message: "Invalid S3 snapshot listing" });
-  const tags: string[] = [];
-  let through = 0;
-  for (const token of text.matchAll(/<[^<>]*>/g)) {
-    if (text.slice(through, token.index).includes("<")) throw new BackupError({ message: "Malformed S3 snapshot listing" });
-    through = token.index + token[0].length;
-    if (/^<\?xml\s[^<>]*\?>$/.test(token[0])) continue;
-    const name = /^<\/?([A-Za-z_][\w.-]*)(?:\s[^<>]*)?\/?>$/.exec(token[0])?.[1];
-    if (!name) throw new BackupError({ message: "Malformed S3 snapshot tag" });
-    if (token[0].startsWith("</")) {
-      if (tags.pop() !== name) throw new BackupError({ message: "Malformed S3 snapshot nesting" });
-    } else if (!token[0].endsWith("/>")) tags.push(name);
-  }
-  if (tags.length || text.slice(through).includes("<")) throw new BackupError({ message: "Incomplete S3 snapshot nesting" });
-  const contents = [...text.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)];
-  const keys = contents.map((item) => {
-    const matches = [...item[1]!.matchAll(/<Key>([^<]*)<\/Key>/g)];
-    if (matches.length !== 1) throw new BackupError({ message: "Invalid S3 snapshot key" });
-    return matches[0]![1]!;
-  });
-  const truncated = [...text.matchAll(/<IsTruncated>(true|false)<\/IsTruncated>/g)];
-  const next = [...text.matchAll(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/g)];
-  const count = [...text.matchAll(/<KeyCount>([0-9]+)<\/KeyCount>/g)], maximum = [...text.matchAll(/<MaxKeys>([0-9]+)<\/MaxKeys>/g)];
-  if ((text.match(/<\/?Key\b/g)?.length ?? 0) !== contents.length * 2 || (text.match(/<\/?Contents\b/g)?.length ?? 0) !== contents.length * 2 || truncated.length !== 1 || next.length !== (truncated[0]![1] === "true" ? 1 : 0) || count.length !== 1 || Number(count[0]![1]) !== keys.length || maximum.length !== 1 || !Number.isSafeInteger(Number(maximum[0]![1])) || Number(maximum[0]![1]) < keys.length) throw new BackupError({ message: "Incomplete S3 snapshot listing" });
-  return Schema.decodeUnknownSync(SnapshotList, { onExcessProperty: "error" })({ keys, ...(next.length ? { next: next[0]![1]! } : {}) });
-}
+const commandProtocol = McpProtocol.v2026_07_28;
 
 const clientLayer = Layer.unwrap(Effect.gen(function*() {
   const configuredHosts = yield* Config.String("COORDINATOR_CONNECT_HOSTS_JSON").pipe(Config.withDefault("{}"));
@@ -116,9 +89,14 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
       const input = yield* Schema.decodeUnknownEffect(descriptor.input, { onExcessProperty: "error" })(params).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
       const endpoint = yield* Effect.try({ try: () => new URL("/mcp", url), catch: () => new HttpError({ status: 400, message: "Invalid MCP endpoint" }) });
       if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname))) return yield* new HttpError({ status: 400, message: "TLS required except loopback" });
+      // Capture typed HTTP failures before Promise/SDK wrapping, only for this scoped call.
+      let httpFailure: HttpError | undefined;
       const sdkFetch: typeof globalThis.fetch = async (input, init) => {
         const request = new Request(input, init);
-        if (new URL(request.url).origin !== endpoint.origin) throw new HttpError({ status: 400, message: "Cross-origin MCP request prohibited" });
+        if (new URL(request.url).origin !== endpoint.origin) {
+          httpFailure = new HttpError({ status: 400, message: "Cross-origin MCP request prohibited" });
+          throw httpFailure;
+        }
         return Effect.runPromise(Effect.scoped(Effect.gen(function*() {
           let outbound = fromWebRequest(request);
           let body = "";
@@ -140,17 +118,21 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
           const discovery = method === "server/discover" || method === "tools/list";
           const text = yield* boundedText(response, discovery ? 512 * 1024 : LIMIT);
           if (response.status < 200 || response.status >= 300) return yield* new HttpError({ status: response.status, message: "MCP request rejected" });
+          httpFailure = undefined;
           return new Response(text || null, { status: response.status, headers: response.headers });
+        })).pipe(Effect.catchTag("HttpError", (error) => {
+          httpFailure = error;
+          return Effect.fail(error);
         })), { signal: request.signal });
       };
       const client = yield* Effect.acquireRelease(
-        Effect.sync(() => new Client({ name: "coordinator", version: "0.1.0" })),
+        Effect.sync(() => new Client({ name: "coordinator", version: "0.1.0" }, { versionNegotiation: { mode: { pin: commandProtocol.protocolVersion } } })),
         (client) => Effect.tryPromise({ try: () => client.close(), catch: () => new CommandError({ message: "MCP connection cleanup failed" }) }).pipe(Effect.orDie),
       );
-      yield* Effect.tryPromise({ try: (signal) => client.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: { token: async () => token }, fetch: (input, init) => sdkFetch(input, { ...init, signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal }), requestInit: { redirect: "error" } })), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: "MCP connection unavailable" }) });
+      yield* Effect.tryPromise({ try: (signal) => client.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: { token: async () => token }, fetch: (input, init) => sdkFetch(input, { ...init, signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal }), requestInit: { redirect: "error" } })), catch: (error) => httpFailure ?? (error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: "MCP connection unavailable" })) });
       const encoded = yield* Schema.encodeUnknownEffect(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(input).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
       const arguments_ = yield* Schema.decodeUnknownEffect(Schema.Record(Schema.String, Schema.Unknown), { onExcessProperty: "error" })(encoded).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
-      const result = yield* Effect.tryPromise({ try: (signal) => client.callTool({ name: descriptor.method ?? method, arguments: arguments_ }, { signal, timeout: timeoutMs }), catch: (error) => error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: "MCP operation unavailable" }) });
+      const result = yield* Effect.tryPromise({ try: (signal) => client.callTool({ name: descriptor.method ?? method, arguments: arguments_ }, { signal, timeout: timeoutMs }), catch: (error) => httpFailure ?? (error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: "MCP operation unavailable" })) });
       if (result.isError) {
         const decoded = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(ToolFailure), { onExcessProperty: "error" })(result.structuredContent).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
         return yield* decoded.error;
@@ -228,7 +210,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         };
         return makeTool(descriptor.method ?? commandName, descriptor.input, descriptor.structuredOutput, descriptor.description);
       });
-      const native = McpServer.layerHttp({ name: "coordinator", version: "0.1.0", path: "/mcp", protocols: [McpProtocol.v2026_07_28, McpProtocol.v2025_11_25], allowedOrigins: [] });
+      const native = McpServer.layerHttp({ name: "coordinator", version: "0.1.0", path: "/mcp", protocols: [commandProtocol], allowedOrigins: [] });
       const app = yield* HttpRouter.toHttpEffect(tools.reduce(
         (layer, tool) => Layer.merge(layer, tool.pipe(Layer.provide(native))),
         native,
