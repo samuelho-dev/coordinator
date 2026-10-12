@@ -1,6 +1,6 @@
-import { Cause, Clock, Config, Context, Effect, Layer, Option, Schedule, Schema, Semaphore } from "effect";
+import { Cause, Clock, Config, Context, Deferred, Effect, Exit, Layer, Option, Schedule, Schema, Scope, Semaphore } from "effect";
 import * as PersistedQueue from "effect/persistence/PersistedQueue";
-import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
+import { Sqlite } from "./sqlite.ts";
 import { HttpClient, HttpServer } from "effect/http";
 import { Commands, Address, Work, TaskId, SessionId, RunnerId, WorkerId, Repo, Sha, Hash, BrokerConfig, Task, LiveSession, ArchivePayload, ArchiveEntry, ArchiveRow, JournalState, Json, JsonValue, Poll, Delivery, EvidenceObservation, HttpError, type CommandCapabilities, type CommandInput, type CommandOutput, type BrokerRequest, type Principal, type Role, type SessionKey, type LiveRunner } from "./contracts.ts";
 import { Platform, redactedCause } from "./platform.ts";
@@ -28,16 +28,31 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       yield* platform.fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
       yield* platform.fs.chmod(directory, 0o700);
     }
+    const fatal = yield* Deferred.make<never, HttpError>();
+    let ownershipLost = false;
+    const owned = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.suspend<A, E | HttpError, R>(() =>
+      ownershipLost ? Deferred.await(fatal) : effect.pipe(Effect.raceFirst(Deferred.await(fatal))));
+    const ledgerScope = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void));
     yield* platform.fs.writeFileString(config.database, "", { flag: "a", mode: 0o600 });
     yield* platform.fs.chmod(config.database, 0o600);
-    const sqlite = SqliteClient.layer({ filename: config.database });
+    const sqlite = Sqlite.layer({ filename: config.database });
     const storage = PersistedQueue.layerStoreSql({ pollInterval: "200 millis", lockRefreshInterval: "1 second", lockExpiration: "5 seconds" });
-    const services = yield* Layer.build(PersistedQueue.layer.pipe(Layer.provideMerge(storage), Layer.provideMerge(sqlite)));
-    const sql = Context.get(services, SqliteClient.SqliteClient);
+    const services = yield* Layer.build(PersistedQueue.layer.pipe(Layer.provideMerge(storage), Layer.provideMerge(sqlite))).pipe(Effect.provideService(Scope.Scope, ledgerScope));
+    const database = Context.get(services, Sqlite);
+    const sql = database.sql;
+    yield* database.failure.pipe(
+      Effect.catch((error) => Effect.gen(function*() {
+        ownershipLost = true;
+        yield* Deferred.fail(fatal, new HttpError({ status: 503, message: "Broker database ownership unavailable" }));
+        yield* Effect.logError(`broker SQLite ownership failed: ${redactedCause(Cause.fail(error))}`);
+        yield* Scope.close(ledgerScope, Exit.void);
+      })),
+      Effect.forkScoped({ startImmediately: true })
+    );
     yield* platform.fs.chmod(config.database, 0o600);
-    for (const statement of ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000"]) yield* sql.unsafe(statement);
-    yield* migrateBroker(sql);
-    yield* sql.unsafe("PRAGMA secure_delete=ON");
+    for (const statement of ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000"]) yield* owned(sql.unsafe(statement));
+    yield* owned(migrateBroker(sql));
+    yield* owned(sql.unsafe("PRAGMA secure_delete=ON"));
     const sessions = new Map<SessionId, LiveSession>();
     const runners = new Map<RunnerId, LiveRunner>();
     const versions = new WeakMap<Task, string>();
@@ -55,7 +70,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     const authorize = Effect.fn("Broker.authorize")(function*(token: string) {
       for (const principal of config.principals) if (yield* platform.checkToken(token, principal.tokenHash)) return principal;
       return yield* new HttpError({ status: 401, message: "Invalid credential" });
-    });
+    }, owned);
 
     const objectBackup = config.objectBackup ? Context.get(yield* Layer.build(SnapshotStore.layer(config.objectBackup)), SnapshotStore) : undefined;
     if (!objectBackup) yield* Effect.logWarning("Durable object backup is unconfigured: dedicated bucket and narrow credentials required");
@@ -76,12 +91,12 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           stage = "local creation";
           yield* platform.fs.writeFileString(partial, "", { flag: "w", mode: 0o600 });
           yield* platform.fs.chmod(partial, 0o600);
-          yield* sql.backup(partial);
+          yield* database.backup(partial);
           yield* platform.fs.chmod(partial, 0o600);
           // Hot backup first; secure deletion and VACUUM remove recoverable transcripts and consent.
           yield* Effect.scoped(Effect.gen(function*() {
-            const context = yield* Layer.build(SqliteClient.layer({ filename: partial, disableWAL: true }));
-            const temporary = Context.get(context, SqliteClient.SqliteClient);
+            const context = yield* Layer.build(Sqlite.layer({ filename: partial, disableWAL: true }));
+            const temporary = Context.get(context, Sqlite).sql;
             for (const statement of ["PRAGMA journal_mode=DELETE", "PRAGMA secure_delete=ON", "DELETE FROM archive", "DELETE FROM consents", "DELETE FROM participant_consents", "VACUUM"]) yield* temporary.unsafe(statement);
           }));
           yield* platform.fs.copyFile(partial, sanitized);
@@ -101,7 +116,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           }).pipe(Effect.tapCause((cause) => Effect.logError(`broker snapshot partial cleanup failed: ${redactedCause(cause)}`)))),
         );
       }));
-    });
+    }, owned);
     const role = Effect.fn("Broker.role")(function*(principal: Principal, ...roles: Role[]) {
     if (!roles.some((role) => principal.roles.includes(role))) return yield* new HttpError({ status: 403, message: "Operation not authorized" });
 
@@ -561,7 +576,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       if (task.state === "QUEUED") (yield* offer(task));
     }
 
-    });
+    }, owned);
     const handle = Effect.fn("Broker.handle")(function*(principal: Principal, request: BrokerRequest) {
       // Network operations commit their fences before awaiting a runner, which may call task.get.
       const command = Commands[request.method];
@@ -575,15 +590,15 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         yield* offer(yield* loadTask(principal, taskId));
       }
       return value;
-    });
-    const serverContext = yield* Layer.build(serverLayer(config.host, config.port));
+    }, owned);
+    const serverContext = yield* owned(Layer.build(serverLayer(config.host, config.port)).pipe(Effect.provideService(Scope.Scope, ledgerScope)));
     const server = Context.get(serverContext, HttpServer.HttpServer);
-    yield* mcp.serve(server, { target: "broker", authorize, handle });
+    yield* owned(mcp.serve(server, { target: "broker", authorize, handle }).pipe(Effect.provideService(Scope.Scope, ledgerScope)));
     for (const value of yield* tasks()) yield* offer(value);
     // ponytail: four bounded consumers; increase only for independent runner throughput.
-    for (let i = 0; i < 4; i++) yield* queue.take(assign).pipe(Effect.catch((error) => Effect.logError(`broker dispatch failed: ${redactedCause(Cause.fail(error))}`).pipe(Effect.andThen(Effect.sleep(500)))), Effect.forever, Effect.forkScoped);
-    yield* maintain().pipe(Effect.catch((error) => Effect.logError(`broker maintenance failed: ${redactedCause(Cause.fail(error))}`)), Effect.repeat(Schedule.spaced("1 second")), Effect.forkScoped);
-    yield* snapshot().pipe(Effect.catch(() => Effect.void), Effect.repeat(Schedule.spaced("1 minute")), Effect.forkScoped);
+    for (let i = 0; i < 4; i++) yield* queue.take(assign).pipe(Effect.catch((error) => Effect.logError(`broker dispatch failed: ${redactedCause(Cause.fail(error))}`).pipe(Effect.andThen(Effect.sleep(500)))), Effect.forever, Effect.forkScoped, Effect.provideService(Scope.Scope, ledgerScope));
+    yield* maintain().pipe(Effect.catch((error) => Effect.logError(`broker maintenance failed: ${redactedCause(Cause.fail(error))}`)), Effect.repeat(Schedule.spaced("1 second")), Effect.forkScoped, Effect.provideService(Scope.Scope, ledgerScope));
+    yield* snapshot().pipe(Effect.catch(() => Effect.void), Effect.repeat(Schedule.spaced("1 minute")), Effect.forkScoped, Effect.provideService(Scope.Scope, ledgerScope));
     return { config, sql, sessions, runners, server, authorize, handle, snapshot, maintain };
   }),
 }) {

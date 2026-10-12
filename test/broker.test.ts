@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { Clock, Deferred, Effect, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
@@ -543,6 +546,119 @@ test("snapshot cadence expires local files even when remote put or list fails", 
   } finally {
     await runtime.dispose();
     await setup.runPromise(platform.fs.remove(root, { recursive: true }));
+    await setup.dispose();
+  }
+});
+
+test("broker health stays responsive while SQLite waits for a writer", { timeout: 20000 }, async () => {
+  const base = Layer.merge(Platform.layer, Mcp.layer);
+  const setup = ManagedRuntime.make(base);
+  const platform = await setup.runPromise(Platform);
+  const root = await setup.runPromise(platform.fs.makeTempDirectory({ prefix: "coordinator-http-lock-" }));
+  const token = `health-lock-${root}`;
+  const config = Schema.decodeUnknownSync(BrokerConfig)({
+    database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0,
+    backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
+    repositoryIds: { [repo]: 42 },
+    principals: [{ id: "health-peer", owner: "health-owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(token)) }],
+  });
+  const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(base)));
+  const children: ChildProcess[] = [];
+  const message = (child: ChildProcess) => new Promise<unknown>((resolve, reject) => {
+    const cleanup = () => { child.off("message", received); child.off("exit", exited); child.off("error", failed); };
+    const received = (value: unknown) => { cleanup(); resolve(value); };
+    const exited = (code: number | null) => { cleanup(); reject(new Error(`SQLite contention helper exited before IPC (code ${code})`)); };
+    const failed = (error: Error) => { cleanup(); reject(error); };
+    child.once("message", received); child.once("exit", exited); child.once("error", failed);
+  });
+  const start = (script: string) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "ignore", "inherit", "ipc"] });
+    children.push(child);
+    return child;
+  };
+  try {
+    const broker = await runtime.runPromise(Broker);
+    const bound = broker.server.address;
+    if (bound._tag !== "InetAddressV4") throw new Error("Expected IPv4 TCP server");
+    const url = `http://127.0.0.1:${bound.port}`;
+    const session: CommandInput<"session.heartbeat"> = {
+      sessionId: SessionId.make("health-session"), incarnation: IncarnationId.make("health-incarnation"),
+      machineId: MachineId.make("health-machine"), host: "omp", repo, workerId: WorkerId.make("health-worker"),
+    };
+    // The observer's clock and HTTP abort remain live even when the broker's Node loop is blocked.
+    // Real platform time is intentional: fake timers cannot detect starvation of a different process's HTTP loop.
+    const observer = start(`
+      import assert from "node:assert/strict";
+      import { once } from "node:events";
+      import { setTimeout as sleep } from "node:timers/promises";
+      import { Layer, ManagedRuntime } from "effect";
+      import { Mcp } from ${JSON.stringify(new URL("../src/http.ts", import.meta.url).href)};
+      import { Platform } from ${JSON.stringify(new URL("../src/platform.ts", import.meta.url).href)};
+      const runtime = ManagedRuntime.make(Layer.merge(Platform.layer, Mcp.layer));
+      try {
+        const mcp = await runtime.runPromise(Mcp);
+        const url = ${JSON.stringify(url)}, token = ${JSON.stringify(token)}, session = ${JSON.stringify(session)};
+        const key = { sessionId: session.sessionId, incarnation: session.incarnation };
+        const health = async () => {
+          const response = await fetch(url + "/healthz", { headers: { authorization: "Bearer " + token }, signal: AbortSignal.timeout(500) });
+          return { status: response.status, body: await response.json() };
+        };
+        const initial = await runtime.runPromise(mcp.call(url, token, "session.heartbeat", session));
+        const before = await runtime.runPromise(mcp.call(url, token, "session.poll", key));
+        assert.deepEqual(await health(), { status: 200, body: { status: "ok" } });
+        const start = once(process, "message");
+        process.send("warm");
+        await start;
+        let settled = false;
+        const heartbeat = runtime.runPromise(mcp.call(url, token, "session.heartbeat", session));
+        heartbeat.then(() => { settled = true; }, () => { settled = true; });
+        await sleep(200);
+        const waitingBeforeHealth = !settled;
+        let observed;
+        try { observed = await health(); }
+        catch (error) { observed = { error: error.name }; }
+        const waitingAfterHealth = !settled;
+        const renewed = await heartbeat;
+        const after = await runtime.runPromise(mcp.call(url, token, "session.poll", key));
+        process.send({ waitingBeforeHealth, waitingAfterHealth, observed, initial, renewed, before, after });
+      } finally {
+        await runtime.dispose();
+        process.disconnect();
+      }
+    `);
+    assert.equal(await message(observer), "warm");
+    // Start the lock only after imports, MCP discovery and both bound-session requests are warm.
+    const locker = start(`
+      import { DatabaseSync } from "node:sqlite";
+      const database = new DatabaseSync(${JSON.stringify(config.database)});
+      database.exec("BEGIN IMMEDIATE");
+      const release = () => { database.exec("ROLLBACK"); database.close(); process.disconnect(); };
+      process.once("disconnect", () => process.exit());
+      setTimeout(release, 2500);
+      process.send("locked");
+    `);
+    assert.equal(await message(locker), "locked");
+    const result = message(observer);
+    observer.send("observe");
+    const observed = Schema.decodeUnknownSync(Schema.Struct({
+      waitingBeforeHealth: Schema.Boolean, waitingAfterHealth: Schema.Boolean, observed: Schema.Unknown,
+      initial: Commands["session.heartbeat"].output, renewed: Commands["session.heartbeat"].output,
+      before: Commands["session.poll"].output, after: Commands["session.poll"].output,
+    }))(await result);
+    assert.equal(observed.waitingBeforeHealth, true, "The bound heartbeat must still be waiting for the external writer");
+    assert.equal(observed.waitingAfterHealth, true, "Health must finish before the blocked heartbeat");
+    assert.deepEqual(observed.observed, { status: 200, body: { status: "ok" } }, "Authenticated health must meet its independent 500ms deadline during the 2500ms writer lock");
+    assert.ok(observed.renewed.liveUntil > observed.initial.liveUntil, "The bound session lease must renew after the writer releases");
+    assert.deepEqual(observed.after, observed.before, "The same bound session must poll successfully after the writer releases");
+  } finally {
+    await Promise.all(children.map(async (child) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit");
+      child.kill();
+      await exited;
+    }));
+    await runtime.dispose();
+    await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true }));
     await setup.dispose();
   }
 });

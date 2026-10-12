@@ -41,7 +41,7 @@ const runnerMigrations = Migrator.fromRecord({
 });
 
 // Connection pragmas and runner privacy scrub/VACUUM stay outside migration transactions.
-export const migrateBroker = (sql: (typeof SqliteClient.SqliteClient)["Service"]) =>
+export const migrateBroker = (sql: SqlClient.SqlClient) =>
   Migrator.make({})({ loader: brokerMigrations, table: "coordinator_broker_migrations" }).pipe(
     Effect.provideService(SqlClient.SqlClient, sql)
   );
