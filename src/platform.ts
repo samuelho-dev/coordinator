@@ -127,15 +127,20 @@ export class Platform extends Context.Service<Platform>()("@samuelho/coordinator
       return yield* Effect.try({ try: () => canonicalRemote(urls[0]!), catch: () => new CommandError({ message: "Noncanonical remote" }) });
     });
     const acquireJournalOwnership = Effect.fnUntraced(function*(file: string) {
-      yield* fs.writeFileString(file, "", { flag: "a", mode: 0o600 });
-      if (((yield* fs.stat(file)).mode & 0o077) !== 0) return yield* new CommandError({ message: "Private journal ownership lock required" });
+      if (!path.isAbsolute(file) || path.resolve(file) !== file ||
+        (yield* fs.realPath(path.dirname(file))) !== path.dirname(file) ||
+        ((yield* fs.stat(path.dirname(file))).mode & 0o077) !== 0) return yield* new CommandError({ message: "Canonical private ownership lock directory required" });
+      yield* fs.writeFileString(file, "", { flag: "wx", mode: 0o600 }).pipe(Effect.catch((error) =>
+        error.reason._tag === "AlreadyExists" ? Effect.void : Effect.fail(error)));
+      const info = yield* fs.stat(file);
+      if ((yield* fs.realPath(file)) !== file || info.type !== "File" || (info.mode & 0o077) !== 0) return yield* new CommandError({ message: "Canonical private ownership lock required" });
       // Effect has no native advisory-lock API; the fixed helper holds flock until its scoped stdin closes.
       const guard = yield* spawner.spawn(ChildProcess.make("/usr/bin/flock", ["--exclusive", "--nonblock", file, "/bin/sh", "-c", "printf 'locked\\n'; exec /usr/bin/cat >/dev/null"], {
         env: {}, extendEnv: false, stdin: Stream.never, forceKillAfter: "1 second",
       }));
       yield* Effect.forkScoped(Stream.runDrain(guard.stderr));
       const marker = yield* guard.stdout.pipe(Stream.decodeText(), Stream.splitLines, Stream.runHead, Effect.timeout("10 seconds"));
-      if (Option.isNone(marker) || marker.value !== "locked") return yield* new CommandError({ message: "Runner journal already owned or kernel lock unavailable" });
+      if (Option.isNone(marker) || marker.value !== "locked") return yield* new CommandError({ message: "Journal already owned or kernel lock unavailable" });
       return guard;
     });
     return { fs, path, crypto, spawner, digest, hmac, fingerprint, checkToken, privateFile, inspectedRepo, canonicalRemote, exec, acquireJournalOwnership };

@@ -12,7 +12,6 @@ import {
   NativePrivateResultBytes,
   NativePrivateResultId,
   NativePrivateResultReference,
-  NativeState,
   nativePrivateResultUri,
   nativeToolInputSchema,
   nativeToolOutputSchema,
@@ -29,18 +28,22 @@ import { nativeMcpProtocol, nativeMcpStdioLayer } from "./mcp-protocol.js";
 export type NativeMcpRequestContext = McpSchema.McpRequestContext["Service"];
 export const nativeMcpRequestContext = McpSchema.McpRequestContext;
 
-const NativeControlServerConfiguration = Schema.Struct({
-  host: NativeHost,
-  binding: NativeBinding,
-  journal: Schema.instanceOf(NativeLifecycleJournal),
-});
 const failureSchema = Schema.Struct({ error: NativeControlError });
-const snapshotSchema = Schema.Struct({ bytes: Schema.Uint8Array, owner: Schema.String });
 type CapturePrivateResult = (
   binding: NativeBinding,
   bytes: Uint8Array,
   owner: string,
 ) => Effect.Effect<NativePrivateResultReference, NativeControlError>;
+
+const promptSettlements: {
+  readonly [N in NativeToolName]?: (journal: NativeLifecycleJournal, result: NativeToolOutput<N>) => Effect.Effect<void, NativeControlError>;
+} = {
+  "native.prompt": (journal, result) => awaitPromptSettlement(journal, result),
+  "native.abort_and_prompt": (journal, result) => awaitPromptSettlement(journal, result),
+};
+const resultBindings: { readonly [N in NativeToolName]?: (result: NativeToolOutput<N>) => NativeBinding } = {
+  "native.get_state": (result) => result.binding,
+};
 
 export type NativeToolRegistration<R = never> = {
   readonly name: NativeToolName;
@@ -95,17 +98,15 @@ export const nativeTool = <N extends NativeToolName, R = never>(
           return yield* new McpSchema.InternalError({ message: "Native tool requires an initialized MCP client" });
         }
         const input = yield* Effect.try({
-          try: () => Schema.decodeUnknownSync(inputCodec)(payload, { onExcessProperty: "error" }),
+          try: () => Schema.decodeUnknownSync<Schema.toCodecJson<(typeof NativeTools)[N]["input"]>>(inputCodec)(payload, { onExcessProperty: "error" }),
           catch: () => new NativeControlError({ code: "invalid_input", message: "Invalid native tool input" }),
         });
         const result = yield* handler(input, context).pipe(
           Effect.provideContext(Context.add(Context.merge(services, invocation), McpSchema.McpServerClient, client)),
         );
-        if (name === "native.prompt" || name === "native.abort_and_prompt") {
-          const prompt = yield* Schema.decodeUnknownEffect(NativePromptResult)(result, { onExcessProperty: "error" }).pipe(
-            Effect.mapError(() => new NativeControlError({ code: "native_failure", message: "Invalid native prompt result" })),
-          );
-          yield* awaitPromptSettlement(journal, prompt);
+        const settlement = promptSettlements[name];
+        if (settlement !== undefined) {
+          yield* settlement(journal, result);
           if (presentation !== undefined) yield* Effect.tryPromise({
             try: () => presentation.flush(),
             catch: () => new NativeControlError({ code: "native_failure", message: "Native presentation publication failed" }),
@@ -123,30 +124,16 @@ export const nativeTool = <N extends NativeToolName, R = never>(
         if (bytes.byteLength + 11 <= NativeMcpResultBytes) {
           envelope = { result: value };
         } else {
-          const original = yield* Schema.decodeUnknownEffect(Schema.Struct({ binding: Schema.optional(NativeBinding) }))(input).pipe(
-            Effect.mapError(() => new NativeControlError({ code: "binding_mismatch", message: "Invalid native invocation binding" })),
-          );
-          let binding = original.binding;
-          if (binding === undefined && name === "native.get_state") {
-            binding = (yield* Schema.decodeUnknownEffect(NativeState)(result).pipe(
-              Effect.mapError(() => new NativeControlError({ code: "binding_mismatch", message: "Native bootstrap state is missing its actual binding" })),
-            )).binding;
-          }
+          let binding = "binding" in input ? input.binding : undefined;
+          if (binding === undefined) binding = resultBindings[name]?.(result);
           if (binding === undefined) return yield* new NativeControlError({ code: "binding_mismatch", message: "Native result is missing its invocation binding" });
           const resultResource = yield* capturePrivateResult(binding, bytes, yield* nativeMcpPrivateOwner);
-          envelope = yield* Schema.decodeUnknownEffect(Schema.JsonObject)({ resultResource }).pipe(
-            Effect.mapError(() => new McpSchema.InternalError({ message: "Invalid native result reference" })),
-          );
+          envelope = { resultResource: Schema.encodeSync(Schema.toCodecJson(NativePrivateResultReference))(resultResource) };
         }
-        yield* Effect.try({
-          try: () => Schema.decodeUnknownSync(structuredCodec)(envelope, { onExcessProperty: "error" }),
-          catch: () => new McpSchema.InternalError({ message: "Invalid native result envelope" }),
-        });
         return new McpSchema.CallToolResult({ content: [], structuredContent: envelope });
       }).pipe(
         Effect.catchTag("NativeControlError", (error) =>
           Schema.encodeUnknownEffect(Schema.toCodecJson(failureSchema))({ error }, { onExcessProperty: "error" }).pipe(
-            Effect.flatMap(Schema.decodeUnknownEffect(Schema.JsonObject)),
             Effect.map((structuredContent) => new McpSchema.CallToolResult({ isError: true, content: [], structuredContent })),
             Effect.mapError(() => new McpSchema.InternalError({ message: "Invalid native failure envelope" })),
           )),
@@ -158,7 +145,10 @@ export const nativeTool = <N extends NativeToolName, R = never>(
   }),
 });
 
-export type NativeControlServerOptions<R = never> = typeof NativeControlServerConfiguration.Type & {
+export type NativeControlServerOptions<R = never> = {
+  readonly host: NativeHost;
+  readonly binding: NativeBinding;
+  readonly journal: NativeLifecycleJournal;
   readonly tools: readonly NativeToolRegistration<R>[];
   readonly presentation?: NativePresentation;
 };
@@ -230,7 +220,7 @@ export const registerNativeControl = <R = never>(options: NativeControlServerOpt
     });
     const crypto = yield* Crypto.Crypto;
     const snapshots = yield* Effect.acquireRelease(
-      Effect.sync(() => new Map<string, typeof snapshotSchema.Type>()),
+      Effect.sync(() => new Map<string, { readonly bytes: Uint8Array; readonly owner: string }>()),
       (store) => Effect.sync(() => store.clear()),
     );
     let retainedBytes = 0;
@@ -238,7 +228,7 @@ export const registerNativeControl = <R = never>(options: NativeControlServerOpt
       if (bytes.byteLength < 1 || bytes.byteLength > NativePrivateResultBytes) {
         return yield* new NativeControlError({ code: "native_failure", message: "Native private result exceeds snapshot capacity" });
       }
-      const id = Schema.decodeUnknownSync(NativePrivateResultId)(yield* crypto.randomUUIDv4.pipe(
+      const id = Schema.decodeUnknownSync(NativePrivateResultId)(yield* crypto.randomUUIDv4().pipe(
         Effect.mapError(() => new NativeControlError({ code: "native_failure", message: "Unable to allocate a private result identifier" })),
       ));
       const uri = nativePrivateResultUri(binding, id);
@@ -248,9 +238,9 @@ export const registerNativeControl = <R = never>(options: NativeControlServerOpt
         snapshots.delete(oldest[0]);
         retainedBytes -= oldest[1].bytes.byteLength;
       }
-      const reference = Schema.decodeUnknownSync(NativePrivateResultReference)({
+      const reference: NativePrivateResultReference = {
         binding, uri, mimeType: "application/json", byteLength: bytes.byteLength,
-      });
+      };
       snapshots.set(uri, { bytes, owner });
       retainedBytes += bytes.byteLength;
       return reference;

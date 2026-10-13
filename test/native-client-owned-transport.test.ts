@@ -55,6 +55,16 @@ test("attached SDK transport retains private state/proof and distinguishes logic
     assert.equal(client.pid, null);
     physicalObservation = Effect.runPromise(client.observedProcessClosed).then(() => { observedPhysical = true; });
     void physicalObservation.catch(() => undefined);
+    for (const timeoutMs of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+      const invalidCall = yield* client.call("native.get_state", { binding: client.binding }, { timeoutMs }).pipe(Effect.result);
+      assert.equal(invalidCall._tag, "Failure");
+      if (invalidCall._tag === "Failure") assert.equal(invalidCall.failure.code, "invalid_input");
+      const invalidPrompt = yield* client.prompt({ binding: client.binding, submissionId: NativeSubmissionId.make("invalid-budget"), message: "complete" }, {
+        after: NativeEventSequence.make(0), timeoutMs, onAdmission() { assert.fail("Invalid budget must not admit native work"); },
+      }).pipe(Effect.result);
+      assert.equal(invalidPrompt._tag, "Failure");
+      if (invalidPrompt._tag === "Failure") assert.equal(invalidPrompt.failure.code, "invalid_input");
+    }
     const state = yield* client.call("native.get_state", { binding: client.binding }, { timeoutMs: 3000 });
     assert.equal(state.systemPrompt, "private-system-prompt-" + "λ".repeat(40000));
     assert.equal(state.dumpTools?.at(0)?.name, "proof-tool");
@@ -71,11 +81,18 @@ test("attached SDK transport retains private state/proof and distinguishes logic
     assert.equal(complete.disposition, "settled");
     assert.equal(admissions, 1);
     // A request deadline cancels the request, not the physical owner.
+    let independentProgress = false;
     const cancelled = yield* client.prompt({ binding: client.binding, submissionId: Schema.decodeSync(NativeSubmissionId)("missing-terminal"), message: "missing-terminal" }, {
-      after: complete.admission.seq, timeoutMs: 100, onAdmission() {},
+      after: complete.admission.seq, timeoutMs: 1000,
+      async onAdmission() {
+        const concurrentState = await Effect.runPromise(client.call("native.get_state", { binding: client.binding }, { timeoutMs: 500 }));
+        assert.equal(concurrentState.binding.generation, client.binding.generation);
+        independentProgress = true;
+      },
     }).pipe(Effect.result);
     assert.equal(cancelled._tag, "Failure");
     if (cancelled._tag === "Failure") assert.equal(cancelled.failure.code, "deadline_exceeded");
+    assert.equal(independentProgress, true, "A real SDK state request completes while the independently admitted prompt remains unsettled");
     assert.equal(physicallyClosed, false);
     const failed = yield* client.call("native.bash", { binding: client.binding, command: "printf ordinary" }, { timeoutMs: 3000 }).pipe(Effect.result);
     assert.equal(failed._tag, "Failure");
@@ -192,12 +209,12 @@ for (const uncertain of [false, true]) test(`terminal official SDK message valid
   }
 });
 
-test("attached acquisition failure still closes ownership and preserves uncertain physical-exit failure", async () => {
+for (const connectTimeoutMs of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) test(`invalid attached timeout ${connectTimeoutMs} still closes ownership and preserves uncertain physical-exit failure`, async () => {
   let closed = 0;
   const uncertain = new NativeControlError({ code: "transport_closed", message: "Physical owner exit is unproven" });
   const stdio = new StdioClientTransport({ command: process.execPath, args: ["--import", "tsx", source], cwd, env: { NATIVE_CLIENT_PROOF_SERVER: "1" }, stderr: "ignore" });
   const observedProcessClosed = new Promise<void>(() => {});
-  const result = await Effect.runPromiseExit(Effect.scoped(connectNativeTransport({ host: "pi", connectTimeoutMs: 0 }, stdio, {
+  const result = await Effect.runPromiseExit(Effect.scoped(connectNativeTransport({ host: "pi", connectTimeoutMs }, stdio, {
     pid: null,
     observedProcessClosed,
     async close() { closed++; throw uncertain; },

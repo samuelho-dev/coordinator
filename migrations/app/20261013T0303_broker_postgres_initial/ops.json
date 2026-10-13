@@ -1,0 +1,597 @@
+[
+  {
+    "id": "schema.public",
+    "label": "Create schema \"public\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres"
+    },
+    "precheck": [],
+    "execute": [
+      {
+        "description": "Create schema \"public\"",
+        "sql": "CREATE SCHEMA IF NOT EXISTS \"public\"",
+        "params": []
+      }
+    ],
+    "postcheck": []
+  },
+  {
+    "id": "table.archive",
+    "label": "Create table \"archive\"",
+    "summary": "Creates table \"archive\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "archive"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"archive\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"archive\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"archive\"",
+        "sql": "CREATE TABLE \"public\".\"archive\" (\n  \"created\" float8 NOT NULL,\n  \"digest\" text NOT NULL,\n  \"entry\" text NOT NULL,\n  \"gaps\" text NOT NULL,\n  \"owner\" text NOT NULL,\n  \"payload\" text NOT NULL,\n  \"sequence\" BIGSERIAL NOT NULL,\n  \"session\" text NOT NULL,\n  PRIMARY KEY (\"sequence\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"archive\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"archive\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.consents",
+    "label": "Create table \"consents\"",
+    "summary": "Creates table \"consents\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "consents"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"consents\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"consents\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"consents\"",
+        "sql": "CREATE TABLE \"public\".\"consents\" (\n  \"enabled\" int4 NOT NULL,\n  \"owner\" text NOT NULL,\n  \"participants\" text NOT NULL,\n  \"session\" text NOT NULL,\n  PRIMARY KEY (\"owner\", \"session\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"consents\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"consents\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.effect_queue",
+    "label": "Create table \"effect_queue\"",
+    "summary": "Creates table \"effect_queue\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "effect_queue"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"effect_queue\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"effect_queue\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"effect_queue\"",
+        "sql": "CREATE TABLE \"public\".\"effect_queue\" (\n  \"acquired_at\" timestamp(6),\n  \"acquired_by\" uuid,\n  \"attempts\" int4 DEFAULT 0 NOT NULL,\n  \"created_at\" timestamp(6) NOT NULL,\n  \"element\" text NOT NULL,\n  \"id\" character varying(255) NOT NULL,\n  \"last_failure\" text,\n  \"queue_name\" character varying(255) NOT NULL,\n  \"sequence\" BIGSERIAL NOT NULL,\n  \"state\" character varying(10) NOT NULL,\n  \"updated_at\" timestamp(6) NOT NULL,\n  \"visible_at\" timestamp(6) NOT NULL,\n  PRIMARY KEY (\"sequence\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"effect_queue\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"effect_queue\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.effect_queue_migrations",
+    "label": "Create table \"effect_queue_migrations\"",
+    "summary": "Creates table \"effect_queue_migrations\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "effect_queue_migrations"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"effect_queue_migrations\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"effect_queue_migrations\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"effect_queue_migrations\"",
+        "sql": "CREATE TABLE \"public\".\"effect_queue_migrations\" (\n  \"created_at\" timestamptz(6) DEFAULT (now()) NOT NULL,\n  \"migration_id\" int4 NOT NULL,\n  \"name\" text NOT NULL,\n  PRIMARY KEY (\"migration_id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"effect_queue_migrations\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"effect_queue_migrations\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.evidence",
+    "label": "Create table \"evidence\"",
+    "summary": "Creates table \"evidence\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "evidence"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"evidence\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"evidence\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"evidence\"",
+        "sql": "CREATE TABLE \"public\".\"evidence\" (\n  \"data\" text NOT NULL,\n  \"id\" BIGSERIAL NOT NULL,\n  \"kind\" text NOT NULL,\n  \"observed\" float8 NOT NULL,\n  \"principal\" text NOT NULL,\n  \"sha\" text NOT NULL,\n  \"task\" text NOT NULL,\n  PRIMARY KEY (\"id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"evidence\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"evidence\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.participant_consents",
+    "label": "Create table \"participant_consents\"",
+    "summary": "Creates table \"participant_consents\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "participant_consents"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"participant_consents\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"participant_consents\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"participant_consents\"",
+        "sql": "CREATE TABLE \"public\".\"participant_consents\" (\n  \"enabled\" int4 NOT NULL,\n  \"owner\" text NOT NULL,\n  \"participant\" text NOT NULL,\n  \"session\" text NOT NULL,\n  PRIMARY KEY (\"owner\", \"session\", \"participant\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"participant_consents\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"participant_consents\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.peers",
+    "label": "Create table \"peers\"",
+    "summary": "Creates table \"peers\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "peers"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"peers\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"peers\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"peers\"",
+        "sql": "CREATE TABLE \"public\".\"peers\" (\n  \"expires\" float8 NOT NULL,\n  \"fingerprint\" text NOT NULL,\n  \"id\" text NOT NULL,\n  \"incarnation\" text NOT NULL,\n  \"owner\" text NOT NULL,\n  \"payload\" text NOT NULL,\n  \"sender\" text NOT NULL,\n  \"session\" text NOT NULL,\n  PRIMARY KEY (\"id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"peers\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"peers\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.recovery_gate",
+    "label": "Create table \"recovery_gate\"",
+    "summary": "Creates table \"recovery_gate\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "recovery_gate"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"recovery_gate\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"recovery_gate\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"recovery_gate\"",
+        "sql": "CREATE TABLE \"public\".\"recovery_gate\" (\n  \"id\" int4 NOT NULL,\n  \"ready\" bool NOT NULL,\n  PRIMARY KEY (\"id\"),\n  CONSTRAINT \"recovery_gate_singleton_7faf435e\" CHECK (id = 1)\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"recovery_gate\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"recovery_gate\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.sessions",
+    "label": "Create table \"sessions\"",
+    "summary": "Creates table \"sessions\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "sessions"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"sessions\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"sessions\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"sessions\"",
+        "sql": "CREATE TABLE \"public\".\"sessions\" (\n  \"data\" text NOT NULL,\n  \"id\" text NOT NULL,\n  PRIMARY KEY (\"id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"sessions\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"sessions\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.tasks",
+    "label": "Create table \"tasks\"",
+    "summary": "Creates table \"tasks\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "tasks"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"tasks\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"tasks\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"tasks\"",
+        "sql": "CREATE TABLE \"public\".\"tasks\" (\n  \"data\" text NOT NULL,\n  \"id\" text NOT NULL,\n  PRIMARY KEY (\"id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"tasks\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"tasks\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "unique.archive.archive_owner_session_entry_digest_key",
+    "label": "Add unique constraint on \"archive\" (owner, session, entry, digest)",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "unique",
+        "name": "archive_owner_session_entry_digest_key",
+        "table": "archive"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure constraint \"archive_owner_session_entry_digest_key\" does not exist",
+        "sql": "SELECT NOT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "archive_owner_session_entry_digest_key",
+          "public",
+          "\"public\".\"archive\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "add unique constraint \"archive_owner_session_entry_digest_key\"",
+        "sql": "ALTER TABLE \"public\".\"archive\" ADD CONSTRAINT \"archive_owner_session_entry_digest_key\" UNIQUE (\"owner\", \"session\", \"entry\", \"digest\")"
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify constraint \"archive_owner_session_entry_digest_key\" exists",
+        "sql": "SELECT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "archive_owner_session_entry_digest_key",
+          "public",
+          "\"public\".\"archive\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "unique.effect_queue.idx_effect_queue_id",
+    "label": "Add unique constraint on \"effect_queue\" (id, queue_name)",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "unique",
+        "name": "idx_effect_queue_id",
+        "table": "effect_queue"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure constraint \"idx_effect_queue_id\" does not exist",
+        "sql": "SELECT NOT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "idx_effect_queue_id",
+          "public",
+          "\"public\".\"effect_queue\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "add unique constraint \"idx_effect_queue_id\"",
+        "sql": "ALTER TABLE \"public\".\"effect_queue\" ADD CONSTRAINT \"idx_effect_queue_id\" UNIQUE (\"id\", \"queue_name\")"
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify constraint \"idx_effect_queue_id\" exists",
+        "sql": "SELECT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "idx_effect_queue_id",
+          "public",
+          "\"public\".\"effect_queue\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "index.effect_queue.idx_effect_queue_take_3179164e",
+    "label": "Create index \"idx_effect_queue_take_3179164e\" on \"effect_queue\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "index",
+        "name": "idx_effect_queue_take_3179164e",
+        "table": "effect_queue"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure index \"idx_effect_queue_take_3179164e\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"idx_effect_queue_take_3179164e\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create index \"idx_effect_queue_take_3179164e\"",
+        "sql": "CREATE INDEX \"idx_effect_queue_take_3179164e\" ON \"public\".\"effect_queue\" (\"queue_name\", \"visible_at\") WHERE (state = 'pending')",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify index \"idx_effect_queue_take_3179164e\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"idx_effect_queue_take_3179164e\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "index.effect_queue.idx_effect_queue_update",
+    "label": "Create index \"idx_effect_queue_update\" on \"effect_queue\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "index",
+        "name": "idx_effect_queue_update",
+        "table": "effect_queue"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure index \"idx_effect_queue_update\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"idx_effect_queue_update\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create index \"idx_effect_queue_update\"",
+        "sql": "CREATE INDEX \"idx_effect_queue_update\" ON \"public\".\"effect_queue\" (\"sequence\", \"acquired_by\")",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify index \"idx_effect_queue_update\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"idx_effect_queue_update\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "data.effect_queue_migrations.seed",
+    "label": "Attest native Effect queue versions",
+    "operationClass": "data",
+    "target": {
+      "id": "postgres"
+    },
+    "precheck": [
+      {
+        "description": "Tracker is empty before initial seeding",
+        "sql": "SELECT NOT EXISTS (SELECT 1 FROM public.effect_queue_migrations) AS ok"
+      }
+    ],
+    "execute": [
+      {
+        "description": "Seed the native queue migration versions atomically with schema creation",
+        "sql": "INSERT INTO public.effect_queue_migrations (migration_id,name) VALUES (1,'create_table'),(2,'upgrade_schema')"
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "Tracker contains exactly the native final schema versions",
+        "sql": "SELECT count(*) = 2 AND count(*) FILTER (WHERE (migration_id=1 AND name='create_table') OR (migration_id=2 AND name='upgrade_schema')) = 2 AS ok FROM public.effect_queue_migrations"
+      }
+    ]
+  }
+]

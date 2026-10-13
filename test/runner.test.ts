@@ -8,10 +8,13 @@ import { Reactivity } from "effect/reactivity";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { Runner } from "../src/runner.ts";
 import { Broker } from "../src/broker.ts";
+import { makeDatabase } from "../src/kysely.ts";
 import { Mcp, serverLayer } from "../src/http.ts";
 import { Platform } from "../src/platform.ts";
 import { Address, BrokerRequest, CommandError, HttpError, Json, JsonValue, RunnerEvent, RunnerResult, RunnerNativeState, RunnerRequest, RunnerRow, Task, TaskId, RunnerId, Repo, Hash, GitHubRepositoryId, Principal, RunnerConfig, Work } from "../src/contracts.ts";
-import { NativeMessagesPage } from "@samuelho/coordinator-native-control/contracts";
+import { NativeBinding, NativeEventSequence, NativeGeneration, NativeIncarnationId, NativeSessionId, NativeMessagesPage } from "@samuelho/coordinator-native-control/contracts";
+import { NativeLifecycleJournal } from "@samuelho/coordinator-native-control/lifecycle";
+import { provisionPostgres, dropPostgres } from "./postgres-fixture.ts";
 
 const enrollment = "regression-only-enrollment-000000000000";
 const control = "regression-only-control-000000000000000";
@@ -36,9 +39,11 @@ async function fixture(slots = 1, hostMode = "complete", phase: (name: string) =
   const credentials = join(root, "credentials"); await run(fs.makeDirectory(credentials, { mode: 0o700 }));
   const tokenFile = join(credentials, "token"); await run(fs.writeFileString(tokenFile, enrollment, { mode: 0o600 }));
   const principal = Schema.decodeUnknownSync(Principal, { onExcessProperty: "error" })({ id: "runner-test", owner: "owner", roles: ["runner"], repos: ["github.com/test/runner"], tokenHash: await run(platform.digest(enrollment)), controlTokenHash: await run(platform.digest(control)) });
-  const brokerRuntime = ManagedRuntime.make(Broker.layer({ database: join(root, "broker", "broker.sqlite"), backupDirectory: join(root, "backups"), host: "127.0.0.1", port: 0,
+  const databaseUrlFile = await services.runPromise(provisionPostgres(credentials));
+  const brokerRuntime = ManagedRuntime.make(Broker.layer({ databaseUrlFile, backupDirectory: join(root, "backups"), host: "127.0.0.1", port: 0,
     archiveRetentionMs: 60000, backupRetentionMs: 60000, repositoryIds: { [Repo.make("github.com/test/runner")]: GitHubRepositoryId.make(1) }, principals: [principal] }).pipe(Layer.provide(common)));
   const broker = await brokerRuntime.runPromise(Broker);
+  const { client: db, execute } = makeDatabase(broker.sql);
   let unavailable = false, taskReads = 0;
   let gate: { reached: Deferred.Deferred<void>; proceed: Deferred.Deferred<void> } | undefined;
   class Proxy extends Context.Service<Proxy>()("runner-test/Proxy", {
@@ -96,6 +101,13 @@ if (process.argv.includes("--version")) {
   if (${JSON.stringify(hostMode)} === "acquisition-discovery") writeFileSync(process.env.HOME + "/acquisition.pid", JSON.stringify(process.pid), { mode: 0o600 });
   const binding = Schema.decodeUnknownSync(NativeBinding)({ host: "omp", sessionId: randomUUID(), incarnation: randomUUID(), generation: 0 });
   const journal = new NativeLifecycleJournal({ retention: ${hostMode === "gap" ? 1 : 1024} });
+  if (${JSON.stringify(hostMode)} === "invalid-event") {
+    const read = journal.read.bind(journal);
+    journal.read = (...args) => {
+      const page = read(...args);
+      return { ...page, entries: page.entries.map(event => event.kind === "run_started" ? { ...event, seq: -1 } : event) };
+    };
+  }
   const secret = "native-secret-provider-token-DO-NOT-STORE";
   const messages = [{ role: "assistant", content: [{ type: "thinking", thinking: secret }, { type: "toolCall", arguments: { token: secret } }] }, { role: "user", content: "λ ✓", fixtureIdentity: { uid: process.getuid(), effectiveUid: process.geteuid(), cwd: realpathSync(process.cwd()), capabilityEffective: status.match(/^CapEff:\\s+(.*)$/m)[1], noNewPrivileges: status.match(/^NoNewPrivs:\\s+(.*)$/m)[1], environmentKeys: Object.keys(process.env) } }];
   const privateState = { systemPrompt: [secret], dumpTools: [{ name: "fixture-tool", description: secret, parameters: { type: "object", properties: { token: { type: "string", description: secret } } }, examples: [{ call: { token: secret } }] }], todoPhases: [{ name: "fixture-phase", tasks: [{ content: secret, status: "pending" }] }], queuedMessages: { steering: [], followUp: [] }, autoCompactionEnabled: false, interruptMode: "immediate", fastModeEnabled: false, fastModeActive: false, slowModeSupported: false, slowModeEnabled: false, tokensPerSecond: null, goal: null };
@@ -166,7 +178,8 @@ if (process.argv.includes("--version")) {
     workerId: "native-worker", githubRepoId: 1, requiredLanes: [], bypassPeer: false, approved: true });
   async function save(work: Work, overrides: Partial<Task> = {}) {
     const task: Task = { taskId: work.taskId, owner: principal.owner, fingerprint: await run(platform.fingerprint(work)), request: work, state: "ACCEPTED", runnerId, createdAt: 1, updatedAt: 1, ...overrides };
-    await run(broker.sql.unsafe("INSERT OR REPLACE INTO tasks(id,data) VALUES (?,?)", [task.taskId, Schema.encodeUnknownSync(Schema.fromJsonString(Task))(task)])); return task;
+    const data = Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(task);
+    await run(execute(db.insertInto("tasks").values({ id: task.taskId, data }).onConflict((conflict) => conflict.column("id").doUpdateSet({ data })))); return task;
   }
   await save(work);
   const runtimes = new Set<ManagedRuntime.ManagedRuntime<Runner, unknown>>();
@@ -206,6 +219,7 @@ if (process.argv.includes("--version")) {
       phase("fixture.proxy.dispose.done");
       phase("fixture.broker.dispose.start");
       await brokerRuntime.dispose();
+      await services.runPromise(dropPostgres(databaseUrlFile));
       phase("fixture.broker.dispose.done");
       phase("fixture.root.remove.start");
       await run(fs.remove(root, { recursive: true, force: true }));
@@ -216,6 +230,32 @@ if (process.argv.includes("--version")) {
     }
   };
 }
+
+test("typed lifecycle derivation preserves retained gaps, binding generations and ordered reentrant fanout", async () => {
+  const journal = new NativeLifecycleJournal({ retention: 2 });
+  const binding: NativeBinding = { host: "omp", sessionId: NativeSessionId.make("session"),
+    incarnation: NativeIncarnationId.make("incarnation"), generation: NativeGeneration.make(0) };
+  const retired = { ...binding, generation: NativeGeneration.make(1) };
+  const delivered: number[] = [];
+  const stop = journal.subscribe((event) => {
+    delivered.push(event.seq);
+    if (event.seq === 1) journal.append({ type: "native_lifecycle", binding, runId: null, at: 2, kind: "session_retired", reason: "retired", replacement: retired });
+  });
+  const first = journal.append({ type: "native_lifecycle", binding, runId: null, at: 1, kind: "session_started" });
+  assert.notEqual(first.binding, binding, "Journal freezing must not mutate the caller's binding");
+  assert.equal(Object.isFrozen(binding), false);
+  await new Promise<void>((resolve) => queueMicrotask(() => queueMicrotask(resolve)));
+  assert.deepEqual(delivered, [1, 2]);
+  journal.append({ type: "native_lifecycle", binding: retired, runId: null, at: 3, kind: "session_started" });
+  const old = journal.read(binding, NativeEventSequence.make(0));
+  assert.deepEqual(old.gap, { from: 1, through: 1 });
+  assert.deepEqual(old.entries.map((event) => event.seq), [2]);
+  assert.equal(old.nextAfter, 3);
+  assert.deepEqual(journal.read(retired, NativeEventSequence.make(1)).entries.map((event) => event.seq), [3]);
+  assert.throws(() => journal.read(binding, NativeEventSequence.make(4)), { code: "invalid_input" });
+  assert.throws(() => journal.read(binding, NativeEventSequence.make(0), 0), { code: "invalid_input" });
+  stop();
+});
 
 
 
@@ -457,6 +497,11 @@ test("native event and result projection omits secret content from durable journ
       for (;;) { const current = yield* runner.service.row(f.work.taskId); if (current?.state === "SUCCEEDED") return; if (current?.state === "HELD" || current?.state === "FAILED") return yield* Effect.fail(new CommandError({ message: "Fixture prompt did not settle" })); yield* Effect.sleep("10 millis"); }
     }).pipe(Effect.timeout("15 seconds")));
     const events = await f.run(runner.service.sql.unsafe<Json>("SELECT payload FROM events"));
+    const originalIdentities = events.map((event) => Schema.decodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(String(event.payload)))
+      .filter((event) => event.type === "readback" || event.type === "native_lifecycle")
+      .map(({ type, address, binding, runId, nativeCursor, kind }) => ({ type, address, binding, runId, nativeCursor, kind }));
+    assert.ok(originalIdentities.some((event) => event.type === "readback" && event.address));
+    assert.ok(originalIdentities.some((event) => event.type === "native_lifecycle" && event.binding));
     assert.ok(events.some((event) => Schema.decodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(String(event.payload)).kind === "run_settled"));
     assert.equal(JSON.stringify(events).includes(secret), false);
     assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(RunnerResult), { onExcessProperty: "error" })((await f.run(runner.service.row(f.work.taskId)))!.result!), { hostSettled: true, evidenceVerified: false });
@@ -465,10 +510,37 @@ test("native event and result projection omits secret content from durable journ
     await f.run(runner.service.sql.unsafe("UPDATE tasks SET result=?,reason=? WHERE taskId='one'", [Schema.encodeUnknownSync(Schema.fromJsonString(Json))({ hostSettled: true, credentials: secret }), secret]));
     await f.run(runner.service.sql.unsafe("PRAGMA user_version=0"));
     await runner.close(); runner = await f.open();
+    const migratedIdentities = (await f.run(runner.service.sql.unsafe<Json>("SELECT payload FROM events")))
+      .map((event) => Schema.decodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(String(event.payload)))
+      .filter((event) => event.type === "readback" || event.type === "native_lifecycle")
+      .map(({ type, address, binding, runId, nativeCursor, kind }) => ({ type, address, binding, runId, nativeCursor, kind }));
+    assert.deepEqual(migratedIdentities, originalIdentities);
     assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await f.run(runner.service.sql.unsafe("SELECT payload FROM events"))).includes(secret), false);
     assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await f.run(runner.service.sql.unsafe("SELECT result,reason FROM tasks"))).includes(secret), false);
     const database = await f.run(f.fs.readFile(f.join(f.config.stateDirectory, "runner.sqlite")));
     assert.equal(new TextDecoder().decode(database).includes(secret), false);
+  } finally { await f.close(); }
+});
+
+test("legacy journal migration rejects missing and invalid readback addresses and native bindings", async (t) => {
+  const f = await fixture();
+  try {
+    const cases: { name: string; payload: Json }[] = [
+      { name: "missing readback address", payload: { type: "readback" } },
+      { name: "invalid readback address", payload: { type: "readback", address: {} } },
+      { name: "missing native binding", payload: { type: "native_lifecycle", runId: null, nativeCursor: 1, kind: "session_started" } },
+      { name: "invalid native binding", payload: { type: "native_lifecycle", binding: {}, runId: null, nativeCursor: 1, kind: "session_started" } },
+    ];
+    for (const [index, { name, payload }] of cases.entries()) await t.test(name, async () => {
+      const config = { ...f.config, stateDirectory: f.join(f.root, `legacy-${index}`) };
+      const runner = await f.open(config);
+      await runner.close();
+      await f.seed(config.stateDirectory, (sql) => Effect.gen(function*() {
+        yield* sql.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", [f.work.taskId, Schema.encodeUnknownSync(Schema.fromJsonString(Json))(payload)]);
+        yield* sql.unsafe("PRAGMA user_version=0");
+      }));
+      await assert.rejects(f.open(config));
+    });
   } finally { await f.close(); }
 });
 
@@ -523,7 +595,7 @@ test("runner refuses overlapping child roots and model seeds containing session 
 });
 
 test("native missing admission, resource gaps and transport loss hold durable intent without replay", async (t) => {
-  for (const mode of ["missing-admission", "gap", "transport"]) await t.test(mode, async () => {
+  for (const mode of ["missing-admission", "gap", "transport", "invalid-event"]) await t.test(mode, async () => {
     // Fixed, metadata-only boundaries remain visible even when disposal never resolves.
     const phase = (name: string) => process.stderr.write(`[native-held:${mode}] ${name} ${Date.now()}\n`);
     phase("fixture.open.start");

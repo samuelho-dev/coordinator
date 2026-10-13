@@ -5,7 +5,7 @@ import { ChildProcess } from "effect/process";
 import { HttpServer } from "effect/http";
 import { Reactivity } from "effect/reactivity";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
-import { Address, Work, RunnerConfig, RunnerRow, Json, JsonValue, RunnerEvent, RunnerResult, RunnerInspection, RunnerNativeState, TaskId, MessageId, SessionId, IncarnationId, WorkerId, UserId, Acceptance, HttpError, CommandError, Commands, type CommandCapabilities, type CommandInput, type RunnerReleased, type RunnerRelease, type RunnerRequest, type RunnerAdmission, type Task } from "./contracts.ts";
+import { Address, Work, RunnerConfig, RunnerRow, Json, JsonValue, RunnerEvent, RunnerResult, RunnerInspection, RunnerNativeState, TaskId, MessageId, SessionId, IncarnationId, WorkerId, UserId, Acceptance, HttpError, CommandError, Commands, type CommandCapabilities, type CommandInput, type CommandOutput, type RunnerReleased, type RunnerRelease, type RunnerRequest, type RunnerAdmission, type Task } from "./contracts.ts";
 import { Platform } from "./platform.ts";
 import { Mcp, serverLayer, LIMIT, MCP_RESULT_LIMIT } from "./http.ts";
 import { migrateRunner } from "./database.ts";
@@ -90,7 +90,7 @@ class RunnerConfiguration extends Context.Service<RunnerConfiguration, RunnerCon
 
 const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
   const platform = yield* Platform, rpc = yield* Mcp;
-  const config = Schema.decodeUnknownSync(RunnerConfig, { onExcessProperty: "error" })(input);
+  const config = input;
   const { fs: fileSystem, path: paths } = platform;
   const nativeEnvironment = yield* childEnvironment();
   const { isAbsolute, join, relative, resolve, sep } = paths;
@@ -180,6 +180,9 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       ...(row.address ? { address: Schema.decodeUnknownSync(Schema.fromJsonString(Address), { onExcessProperty: "error" })(row.address) } : {}), ...(row.reason ? { reason: row.reason } : {}) };
   };
   const load = Effect.fn("Runner.load")(function*(): Effect.fn.Return<number, unknown> { return Number(((yield* sql.unsafe<Json>("SELECT count(*) AS count FROM tasks WHERE occupied=1"))[0])!.count); });
+  // Legacy SQLite TEXT-JSON is untrusted; these scrubbers are used only by the journal migration.
+  const legacyReadbackEvent = Schema.Struct({ ...RunnerEvent.fields, address: Address });
+  const legacyNativeEvent = Schema.Struct({ ...RunnerEvent.fields, binding: NativeBinding });
   const resultMetadata = (value: unknown): RunnerResult => {
     if (!record(value)) return null;
     const result: Json = {};
@@ -192,30 +195,30 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     if (!record(value)) return { type: "host_event", contentOmitted: true };
     const type = typeof value.type === "string" && /^[a-z_]{1,40}$/.test(value.type) ? value.type : "host_event";
     const result: Json = { type, contentOmitted: true };
-    if (type === "readback") result.address = Schema.decodeUnknownSync(Address, { onExcessProperty: "error" })(value.address);
     if (typeof value.state === "string" && ["ACCEPTED", "LAUNCHING", "READY", "PROMPT_INTENT", "RUNNING", "SUCCEEDED", "FAILED", "HELD"].includes(value.state)) result.state = value.state;
     if (typeof value.status === "string" && ["completed", "failed", "aborted", "error"].includes(value.status)) result.status = value.status;
     for (const key of ["fingerprint", "digest"]) if (typeof value[key] === "string" && /^[a-f0-9]{64}$/.test(value[key])) result[key] = value[key];
     if (typeof value.id === "string" && /^[a-f0-9-]{36}$/.test(value.id)) result.id = value.id;
     if (type === "native_lifecycle") {
-      result.binding = Schema.decodeUnknownSync(NativeBinding, { onExcessProperty: "error" })(value.binding);
       if (value.runId !== undefined) result.runId = value.runId;
       if (value.nativeCursor !== undefined) result.nativeCursor = value.nativeCursor;
       if (value.kind !== undefined) result.kind = value.kind;
     }
+    // Require the legacy event's identity while decoding the projected storage value exactly once.
+    if (type === "readback") return Schema.decodeUnknownSync(legacyReadbackEvent, { onExcessProperty: "error" })({ ...result, address: value.address });
+    if (type === "native_lifecycle") return Schema.decodeUnknownSync(legacyNativeEvent, { onExcessProperty: "error" })({ ...result, binding: value.binding });
     return Schema.decodeUnknownSync(RunnerEvent, { onExcessProperty: "error" })(result);
   };
-  const event = Effect.fn("Runner.event")(function*(taskId: TaskId, value: unknown): Effect.fn.Return<void, unknown> {
-    const payload = Schema.encodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(eventMetadata(value));
+  const event = Effect.fn("Runner.event")(function*(taskId: TaskId, value: RunnerEvent): Effect.fn.Return<void, unknown> {
+    const payload = Schema.encodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })({ ...value, contentOmitted: true });
     (yield* sql.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", [taskId, payload]));
     (yield* sql.unsafe("DELETE FROM events WHERE taskId=? AND seq NOT IN (SELECT seq FROM events WHERE taskId=? ORDER BY seq DESC LIMIT ?)", [taskId, taskId, RETAIN_EVENTS]));
   }, owned);
-  const state = Effect.fn("Runner.state")(function*(taskId: TaskId, state: string, reason: string | null = null, result: unknown = null): Effect.fn.Return<void, unknown> {
-    const metadata = resultMetadata(result);
-    (yield* sql.unsafe("UPDATE tasks SET state=?,reason=?,result=? WHERE taskId=?", [state, reason, metadata === null ? null : Schema.encodeUnknownSync(Schema.fromJsonString(RunnerResult), { onExcessProperty: "error" })(metadata), taskId]));
-    (yield* event(taskId, { type: "runner_state", state, reason }));
+  const state = Effect.fn("Runner.state")(function*(taskId: TaskId, state: NonNullable<RunnerEvent["state"]>, reason: string | null = null, result: RunnerResult = null): Effect.fn.Return<void, unknown> {
+    (yield* sql.unsafe("UPDATE tasks SET state=?,reason=?,result=? WHERE taskId=?", [state, reason, result === null ? null : Schema.encodeUnknownSync(Schema.fromJsonString(RunnerResult), { onExcessProperty: "error" })(result), taskId]));
+    (yield* event(taskId, { type: "runner_state", state }));
   }, owned);
-  const handle = Effect.fn("Runner.handle")(function*(request: RunnerRequest, controlToken: string): Effect.fn.Return<unknown, unknown> {
+  const handle = Effect.fn("Runner.handle")(function*(request: RunnerRequest, controlToken: string): Effect.fn.Return<CommandOutput<RunnerRequest["method"]>, unknown> {
     if (!(yield* platform.checkToken(controlToken, config.controlTokenHash))) return yield* new HttpError({ status: 401, message: "Control credential required" });
     if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
     // Capabilities are composed only after checking the trusted control credential.
@@ -241,7 +244,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
         }
         return { ...acceptance(row), events, nextCursor };
       }),
-      commandTask: Effect.fnUntraced(function*(input: CommandInput<"command">) {
+      commandTask: Effect.fnUntraced(function*(input: CommandInput<"command">): Effect.fn.Return<CommandOutput<"command">, unknown> {
         const { taskId, type } = input;
         yield* requireRow(taskId);
         const child = yield* requireChild(taskId);
@@ -256,7 +259,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
           return yield* new CommandError({ message: "Native control response binding mismatch" });
         }
         if (type === "abort") yield* hold(taskId, "operator requested abort; await host outcome");
-        return byteLength(nativeResponseText({ result: response })) <= MCP_RESULT_LIMIT ? response : { type: "gap" as const, reason: "native response exceeds endpoint bound" };
+        return byteLength(nativeResponseText({ result: response })) <= MCP_RESULT_LIMIT ? response : { type: "gap", reason: "native response exceeds endpoint bound" };
       }),
       prepareTask: Effect.fnUntraced(function*(input: CommandInput<"prepare">) {
         const row = yield* requireRow(input.taskId);
@@ -272,7 +275,18 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       }),
       releaseTask: release,
     };
-    return yield* Commands[request.method].executeDecoded(capabilities, request.params);
+    switch (request.method) {
+      case "acceptTask": return yield* Commands.acceptTask.execute(capabilities, request.params);
+      case "journal": return yield* Commands.journal.execute(capabilities, request.params);
+      case "inspect": return yield* Commands.inspect.execute(capabilities, request.params);
+      case "command": return yield* Commands.command.execute(capabilities, request.params);
+      case "prepare": return yield* Commands.prepare.execute(capabilities, request.params);
+      case "release": return yield* Commands.release.execute(capabilities, request.params);
+      default: {
+        const exhaustive: never = request;
+        throw new Error(`Unsupported runner request: ${exhaustive}`);
+      }
+    }
   }, Effect.catch((error) => Effect.fail(error instanceof HttpError ? error : new HttpError({ status: 400, message: "Invalid request or unavailable owned child" }))));
   const brokerTask = Effect.fn("Runner.brokerTask")(function*(work: Work, address?: Address): Effect.fn.Return<Task, unknown> {
     const task = yield* rpc.call(config.brokerUrl, token, "task.get", { taskId: work.taskId });
@@ -298,7 +312,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     const accepted = (yield* getRow(work.taskId));
     if (accepted) { if (accepted.fingerprint !== hash) return yield* new HttpError({ status: 409, message: "Task fingerprint conflict" }); return acceptance(accepted); }
     const worktree = join(config.childDirectory, (yield* platform.digest(work.taskId)), "repo");
-    const incarnation = IncarnationId.make(yield* platform.crypto.randomUUIDv4);
+    const incarnation = IncarnationId.make(yield* platform.crypto.randomUUIDv4());
     const reserved = yield* owned(sql.withTransaction(Effect.gen(function*() {
       if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
       const existing = yield* getRow(work.taskId);
@@ -340,9 +354,9 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     const lines = shell.output.trim().split("\n");
     if (!sameBinding(shell.binding, data.binding) || shell.exitCode !== 0 || shell.truncated || shell.killed || lines.length !== 5 || lines[0] !== row.worktree || lines[1] !== "origin" || platform.canonicalRemote(lines[2]!) !== work.repo || lines[3] !== work.sha || lines[4] !== work.sha) return yield* new CommandError({ message: "Native cwd or checkout identity mismatch" });
     yield* verifyCheckout(row);
-    return Schema.decodeUnknownSync(Address, { onExcessProperty: "error" })({ messageId: template?.messageId ?? MessageId.make(row.taskId), revision: template?.revision ?? 1, workerId: WorkerId.make(data.binding.sessionId), sessionId: SessionId.make(data.binding.sessionId),
+    return { messageId: template?.messageId ?? MessageId.make(row.taskId, { disableChecks: true }), revision: template?.revision ?? 1, workerId: WorkerId.make(data.binding.sessionId, { disableChecks: true }), sessionId: SessionId.make(data.binding.sessionId, { disableChecks: true }),
       incarnation: row.incarnation, repo: work.repo, ref: work.ref, sha: work.sha,
-      scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline });
+      scope: work.scope, restrictions: work.restrictions, expectedEvidence: work.expectedEvidence, deadline: work.deadline };
   });
   const projectState = (data: NativeState): typeof RunnerNativeState.Type => ({
     binding: data.binding, ...(data.sessionFile === undefined ? {} : { sessionFile: data.sessionFile }), cwd: data.cwd,
@@ -380,7 +394,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     // Native readback awaited RPCs; recheck the ledger immediately before reserving prompt intent.
     yield* brokerTask(work, input.address);
     if (input.address.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });
-    const promptId = NativeSubmissionId.make(yield* platform.crypto.randomUUIDv4);
+    const promptId = NativeSubmissionId.make(yield* platform.crypto.randomUUIDv4());
     yield* owned(sql.withTransaction(Effect.gen(function*() {
       if (closed) return yield* new HttpError({ status: 503, message: "Runner journal ownership unavailable" });
       if (input.address.deadline <= (yield* Clock.currentTimeMillis)) return yield* new HttpError({ status: 409, message: "Approved prompt deadline elapsed" });

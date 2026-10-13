@@ -2,13 +2,81 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest, type IncomingMessage } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
-import { Context, Effect, Layer, ManagedRuntime, Schema } from "effect";
+import { Context, Deferred, Effect, Layer, ManagedRuntime } from "effect";
 import { HttpServer } from "effect/http";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { Acceptance, HttpError, TaskId, type CommandInput } from "../src/contracts.ts";
 import { Mcp, serverLayer } from "../src/http.ts";
 
-test("stateless MCP calls authorize every HTTP request and close without retaining sessions", async () => {
+test("Mcp.call closes its real HTTP 401 body before releasing the body or disposing its layer", { timeout: 5000 }, async () => {
+  const releaseBody = await Effect.runPromise(Deferred.make<void>());
+  const disconnected = Promise.withResolvers<void>();
+  let bodyReleased = false;
+  const nativeServer = createServer((_request, response) => {
+    response.once("close", disconnected.resolve);
+    response.writeHead(401, { "content-type": "text/plain" });
+    response.write("Credential required");
+    void Effect.runPromise(Deferred.await(releaseBody)).then(() => {
+      bodyReleased = true;
+      response.end();
+    });
+  });
+  const runtime = ManagedRuntime.make(Mcp.layer);
+  try {
+    await new Promise<void>((resolve) => nativeServer.listen(0, "127.0.0.1", resolve));
+    const address = nativeServer.address();
+    assert.ok(address !== null && typeof address !== "string");
+    const mcp = await runtime.runPromise(Mcp);
+    const status = await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("physical-401") }).pipe(Effect.match({
+      onSuccess: () => 200,
+      onFailure: (error) => { assert.ok(error instanceof HttpError); return error.status; },
+    })));
+    assert.equal(status, 401);
+    await Effect.runPromise(Effect.promise(() => disconnected.promise).pipe(Effect.timeout("1 second")));
+    assert.equal(bodyReleased, false, "The peer closes while the server body remains blocked and Mcp.layer remains alive");
+  } finally {
+    await Effect.runPromise(Deferred.succeed(releaseBody, undefined));
+    nativeServer.closeAllConnections();
+    await runtime.dispose();
+    await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("Mcp.call timeout closes its real HTTP streaming body before disposing its layer", { timeout: 5000 }, async () => {
+  const releaseBody = await Effect.runPromise(Deferred.make<void>());
+  const disconnected = Promise.withResolvers<void>();
+  let bodyReleased = false;
+  const nativeServer = createServer((_request, response) => {
+    response.once("close", disconnected.resolve);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(": waiting\n\n");
+    void Effect.runPromise(Deferred.await(releaseBody)).then(() => {
+      bodyReleased = true;
+      response.end();
+    });
+  });
+  const runtime = ManagedRuntime.make(Mcp.layer);
+  try {
+    await new Promise<void>((resolve) => nativeServer.listen(0, "127.0.0.1", resolve));
+    const address = nativeServer.address();
+    assert.ok(address !== null && typeof address !== "string");
+    const mcp = await runtime.runPromise(Mcp);
+    const result = await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("physical-timeout") }, 250).pipe(Effect.exit));
+    assert.equal(result._tag, "Failure");
+    await Effect.runPromise(Effect.promise(() => disconnected.promise).pipe(Effect.timeout("1 second")));
+    assert.equal(bodyReleased, false, "Timeout closes the peer without server EOF or layer disposal");
+  } finally {
+    await Effect.runPromise(Deferred.succeed(releaseBody, undefined));
+    nativeServer.closeAllConnections();
+    await runtime.dispose();
+    await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("stateless MCP calls authorize every HTTP request and close without retaining sessions", { timeout: 15000 }, async () => {
   let handled = 0;
+  const slowEntered = Promise.withResolvers<void>();
+  const releaseSlow = Promise.withResolvers<void>();
   const nativeServer = createServer({ requestTimeout: 15000 });
   const exchanges: Array<{ protocol: string | undefined; requestSession: string | undefined; responseSession: string | number | string[] | undefined }> = [];
   nativeServer.on("request", (request, response) => {
@@ -32,6 +100,10 @@ test("stateless MCP calls authorize every HTTP request and close without retaini
         handle: (caller, request) => Effect.gen(function*() {
           handled++;
           if (request.method !== "journal" || request.params.taskId !== caller) return yield* new HttpError({ status: 403, message: "Task belongs to another caller" });
+          if (caller === "caller-a" && request.params.taskId === "caller-a") {
+            slowEntered.resolve();
+            yield* Effect.promise(() => releaseSlow.promise);
+          }
           return Acceptance.make({ taskId: request.params.taskId, accepted: false, state: "absent" });
         }),
       });
@@ -53,7 +125,15 @@ test("stateless MCP calls authorize every HTTP request and close without retaini
     assert.equal(await status("caller-b", { taskId: TaskId.make("caller-a") }), 403);
     assert.equal(await status("not-enrolled", { taskId: TaskId.make("caller-a") }), 401);
     assert.equal(await status("", { taskId: TaskId.make("caller-a") }), 401);
-    assert.equal(await status("caller-a", { taskId: TaskId.make("caller-a") }), 200);
+    // One admitted caller remains pending while another caller completes on its own SDK connection.
+    const slow = status("caller-a", { taskId: TaskId.make("caller-a") });
+    await slowEntered.promise;
+    try {
+      assert.equal(await status("caller-b", { taskId: TaskId.make("caller-b") }), 200);
+    } finally {
+      releaseSlow.resolve();
+    }
+    assert.equal(await slow, 200);
     for (const exchange of exchanges) {
       assert.equal(exchange.protocol, "2026-07-28");
       assert.equal(exchange.requestSession, undefined);
@@ -74,6 +154,7 @@ test("stateless MCP calls authorize every HTTP request and close without retaini
     }
     assert.equal(handled, beforeMalformed);
   } finally {
+    releaseSlow.resolve();
     await runtime.dispose();
   }
   assert.equal(nativeServer.listening, false);
@@ -130,8 +211,6 @@ test("native MCP proxy disposes after its downstream runner closes during a tool
 
 test("cancelled native MCP subscription releases its response and application scope", { timeout: 15000 }, async () => {
   const nativeServer = createServer({ requestTimeout: 15000 });
-  const bodyReceived = Promise.withResolvers<void>();
-  nativeServer.once("request", (request) => { request.once("end", bodyReceived.resolve); });
   class Endpoint extends Context.Service<Endpoint>()("test/McpSubscriptionShutdown", {
     make: Effect.gen(function*() {
       const mcp = yield* Mcp;
@@ -150,37 +229,29 @@ test("cancelled native MCP subscription releases its response and application sc
     Mcp.layer,
     NodeHttpServer.layerServer(() => nativeServer, { host: "127.0.0.1", port: 0, gracefulShutdownTimeout: "1 second" }),
   ))));
-  const controller = new AbortController();
+  const client = new Client({ name: "incremental-sse-regression", version: "1.0.0" }, {
+    versionNegotiation: { mode: { pin: "2026-07-28" } },
+  });
   try {
     const { server, mcp } = await runtime.runPromise(Endpoint);
     const url = HttpServer.formatAddress(server.address);
-    const listening = fetch(`${url}/mcp`, {
-      method: "POST",
-      headers: {
-        authorization: "Bearer caller", "content-type": "application/json", accept: "application/json, text/event-stream",
-        "mcp-protocol-version": "2026-07-28", "mcp-method": "subscriptions/listen",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0", id: 203, method: "subscriptions/listen",
-        params: {
-          _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} },
-          notifications: { toolsListChanged: true },
-        },
-      }),
-      signal: controller.signal,
-    }).then(() => "response", (error: unknown) => {
-      Schema.decodeUnknownSync(Schema.Struct({ name: Schema.Literal("AbortError") }))(error);
-      return "aborted";
-    });
-    await bodyReceived.promise;
-    // A subsequent real command fences request delivery without a sleep or invented subscription outcome.
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${url}/mcp`), {
+      requestInit: { headers: { authorization: "Bearer caller" }, redirect: "error" },
+    }));
+    // The official SDK resolves listen only after parsing the acknowledged SSE event.
+    // This must happen while the long-lived response is still open, not at EOF.
+    const subscription = await client.listen({ toolsListChanged: true }, { timeout: 3000 });
+    assert.equal(subscription.honoredFilter.toolsListChanged, true);
+    let ended = false;
+    const closed = subscription.closed.then((reason) => { ended = true; return reason; });
     const fenceId = TaskId.make("after-listen-admission");
     const fence = await runtime.runPromise(mcp.call(url, "caller", "journal", { taskId: fenceId }));
     assert.equal(fence.taskId, fenceId);
-    controller.abort();
-    assert.equal(await listening, "aborted");
+    assert.equal(ended, false, "First SSE event is delivered before stream closure; independent requests keep progressing");
+    await subscription.close();
+    assert.equal(await closed, "local");
   } finally {
-    controller.abort();
+    await client.close();
     await runtime.dispose();
   }
   assert.equal(nativeServer.listening, false);

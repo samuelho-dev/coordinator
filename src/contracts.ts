@@ -2,14 +2,15 @@ import { Deferred, Effect, Option, Schema, SchemaGetter } from "effect";
 import { Tool } from "effect/ai";
 import { ChildProcessSpawner } from "effect/process";
 import { NativeBinding, NativeRunId, NativeSubmissionId, NativeEventSequence, NativeState, NativeGetMessagesInput, NativeMessagesPage, NativeAbortResult } from "@samuelho/coordinator-native-control/contracts";
+import { TasksId, PeersId, SessionsId } from "./generated/database/types.ts";
 
 const identifierPattern = Schema.isPattern(/^[a-zA-Z0-9_.:-]{1,160}$/);
 const identifier = Schema.String.check(identifierPattern);
-export const TaskId = identifier.pipe(Schema.brand("@samuelho/coordinator/TaskId"));
+export const TaskId = TasksId.check(identifierPattern);
 export type TaskId = typeof TaskId.Type;
-export const MessageId = identifier.pipe(Schema.brand("@samuelho/coordinator/MessageId"));
+export const MessageId = PeersId.check(identifierPattern);
 export type MessageId = typeof MessageId.Type;
-export const SessionId = identifier.pipe(Schema.brand("@samuelho/coordinator/SessionId"));
+export const SessionId = SessionsId.check(identifierPattern);
 export type SessionId = typeof SessionId.Type;
 export const IncarnationId = identifier.pipe(Schema.brand("@samuelho/coordinator/IncarnationId"));
 export type IncarnationId = typeof IncarnationId.Type;
@@ -103,9 +104,9 @@ const HttpsObjectBackupConfig = Schema.Struct({
   ...ObjectBackupConfig.fields,
   endpoint: Text.check(Schema.isPattern(/^https:\/\/[^/?#@\\\s]+\/?$/i), Schema.makeFilter((value) => URL.canParse(value) ? undefined : "Valid HTTPS object backup authority required")),
 });
-export const SnapshotKey = Schema.String.check(Schema.isPattern(/^sanitized\/[0-9]{13}\.sqlite$/)).pipe(Schema.brand("@samuelho/coordinator/SnapshotKey"));
+export const SnapshotKey = Schema.String.check(Schema.isPattern(/^sanitized\/[0-9]{13}\.pgdump$/)).pipe(Schema.brand("@samuelho/coordinator/SnapshotKey"));
 export type SnapshotKey = typeof SnapshotKey.Type;
-export const BrokerConfig = Schema.Struct({ database: Text, host: Text, port, principals: Schema.mutableKey(Schema.Array(Principal)), backupDirectory: Text, archiveRetentionMs: Schema.Finite, backupRetentionMs: Schema.Finite, objectBackup: Schema.optional(HttpsObjectBackupConfig), githubTokenEnv: Schema.optional(Text), repositoryIds: Schema.Record(Repo, GitHubRepositoryId.check(Schema.isGreaterThan(0))) });
+export const BrokerConfig = Schema.Struct({ databaseUrlFile: Text, host: Text, port, principals: Schema.mutableKey(Schema.Array(Principal)), backupDirectory: Text, archiveRetentionMs: Schema.Finite, backupRetentionMs: Schema.Finite, objectBackup: Schema.optional(HttpsObjectBackupConfig), githubTokenEnv: Schema.optional(Text), repositoryIds: Schema.Record(Repo, GitHubRepositoryId.check(Schema.isGreaterThan(0))) });
 export type BrokerConfig = typeof BrokerConfig.Type;
 export const RunnerConfig = Schema.Struct({
   id: RunnerId, brokerUrl: Schema.String, tokenFile: Schema.String, host: Schema.String, port, controlTokenHash: Hash,
@@ -146,7 +147,7 @@ export const ArchiveRow = Schema.Struct({ ...ArchiveEntry.fields, sequence: Sche
 export type ArchiveRow = typeof ArchiveRow.Type;
 export const InboxEntry = Schema.Struct({ payload: JsonValue, digest: Hash, receivedAt: Schema.Finite });
 export type InboxEntry = typeof InboxEntry.Type;
-export const Inbox = Schema.Record(Schema.String.pipe(Schema.brand("@samuelho/coordinator/MessageId")), Schema.mutableKey(InboxEntry));
+export const Inbox = Schema.Record(MessageId, Schema.mutableKey(InboxEntry));
 export const JournalState = Schema.Struct({
   handled: Schema.Record(JournalHandledKey, Schema.mutableKey(Schema.Literal(true))),
   releases: Schema.Record(JournalReleaseKey, Schema.mutableKey(Schema.Literals(["intent", "sent"]))),
@@ -387,8 +388,8 @@ export const Commands = {
     if (flags["--remote"] && !flags["--remote-root"]) return "Remote installation requires --remote-root";
     return undefined;
   })), Schema.Union([InstallPlan, Schema.Void]), { exposure: "private" }),
-  "program.deploy-init.broker": command("program", "initializeBrokerDeployment", "Initialize private broker enrollment and optional file-based backup credentials from deployment environment.", empty, Schema.Void, { exposure: "private" }),
-  "program.deploy-init.runner": command("program", "initializeRunnerDeployment", "Initialize private runner configuration from pinned image and enrollment environment.", empty, Schema.Void, { exposure: "private" }),
+  "program.deploy-init.broker": command("program", "initializeBrokerDeployment", "Stage schema-valid operator broker configuration and private credentials.", empty, Schema.Void, { exposure: "private" }),
+  "program.deploy-init.runner": command("program", "initializeRunnerDeployment", "Stage operator runner configuration, pinned repositories and model seed.", empty, Schema.Void, { exposure: "private" }),
   "program.smoke": command("program", "runSmoke", "Run the integration smoke with configured real host and GitHub read credential.", Schema.Struct({ "--runner-isolation-only": Schema.optional(Schema.Boolean).annotate({ description: "Run only the real Linux native-child isolation proof." }) }), Schema.Void, { exposure: "private" }),
   "program.smoke:isolation": command("program", "runIsolationSmoke", "Run only the real Linux setpriv and native-child isolation proof.", empty, Schema.Void, { exposure: "private" }),
   "program.smoke:hosts": command("program", "runHostSmoke", "Exercise installed Pi/OMP public-plugin control and report the whole-run admission/final-outcome blocker without a model turn.", empty, Schema.Void, { exposure: "private" }),
@@ -453,18 +454,15 @@ export type MergeRef = typeof MergeRef.Type;
 export type CiLane = typeof CiLane.Type;
 export type NativeResponse = typeof NativeResponse.Type;
 
-export const BrokerServer = Schema.Struct({
-  target: Schema.Literal("broker"),
-  authorize: Schema.declare<(token: string) => Effect.Effect<Principal, unknown>>((value): value is (token: string) => Effect.Effect<Principal, unknown> => typeof value === "function"),
-  handle: Schema.declare<(principal: Principal, request: BrokerRequest) => Effect.Effect<unknown, unknown>>((value): value is (principal: Principal, request: BrokerRequest) => Effect.Effect<unknown, unknown> => typeof value === "function"),
-});
-export const RunnerServer = Schema.Struct({
-  target: Schema.Literal("runner"),
-  authorize: Schema.declare<(token: string) => Effect.Effect<string, unknown>>((value): value is (token: string) => Effect.Effect<string, unknown> => typeof value === "function"),
-  handle: Schema.declare<(principal: string, request: RunnerRequest) => Effect.Effect<unknown, unknown>>((value): value is (principal: string, request: RunnerRequest) => Effect.Effect<unknown, unknown> => typeof value === "function"),
-});
-export const McpEndpoint = Schema.Union([BrokerServer, RunnerServer]);
-export type McpEndpoint = typeof McpEndpoint.Type;
+export type McpEndpoint = {
+  readonly target: "broker";
+  readonly authorize: (token: string) => Effect.Effect<Principal, unknown>;
+  readonly handle: (principal: Principal, request: BrokerRequest) => Effect.Effect<CommandOutput<BrokerRequest["method"]>, unknown>;
+} | {
+  readonly target: "runner";
+  readonly authorize: (token: string) => Effect.Effect<string, unknown>;
+  readonly handle: (principal: string, request: RunnerRequest) => Effect.Effect<CommandOutput<RunnerRequest["method"]>, unknown>;
+};
 
 export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", { status: Schema.Int, message: Schema.String }) {}
 export class CommandError extends Schema.TaggedError<CommandError>()("CommandError", { message: Schema.String }) {}

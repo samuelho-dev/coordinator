@@ -6,6 +6,9 @@ import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { NodeRuntime, NodeStdio } from "@effect/platform-node";
 import { SqliteClient } from "@effect/sql-sqlite-node";
+import * as SqlClient from "effect/sql/SqlClient";
+import { dropPostgres, postgresAdmin, provisionPostgres } from "../test/postgres-fixture.ts";
+import { restoreBrokerDatabase } from "../src/backup.ts";
 import { BrokerConfig, RunnerConfig, RunnerNativeState, ModelProfile, TaskId, MessageId, SessionId, IncarnationId, MachineId, WorkerId, RunnerId, PrincipalId, OwnerId, ArchiveEntryId, GitHubRepositoryId, UserId, ProcessId, Repo, Sha, Json, JsonValue, HttpError, Commands, CommandError, type CommandInput, type Work, type Address, type SessionKey } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { inspectGithubRepository } from "../src/evidence.ts";
@@ -23,7 +26,7 @@ const runSmoke = (flags: CommandInput<"program.smoke">) => Effect.gen(function*(
   const stdio = yield* Stdio.Stdio;
   const print = (line: string) => Stream.make(`${line}\n`).pipe(Stream.run(stdio.stdout()));
   const setting = (key: string, fallback: string) => Config.String(key).pipe(Config.withDefault(fallback));
-  const uuid = crypto.randomUUIDv4;
+  const uuid = crypto.randomUUIDv4();
   const secret = Effect.fnUntraced(function*() { return Hex.encode(yield* crypto.randomBytes(32)); });
   const rejects = Effect.fnUntraced(function*<A, E, R>(operation: Effect.Effect<A, E, R>, expected: number) {
     const result = yield* Effect.exit(operation);
@@ -54,6 +57,12 @@ const runSmoke = (flags: CommandInput<"program.smoke">) => Effect.gen(function*(
       const sql = yield* SqliteClient.SqliteClient;
       return yield* sql.unsafe<Json>(statement, params);
     }).pipe(Effect.provide(SqliteClient.layer({ filename, readonly: true })), Effect.scoped);
+  });
+  const postgresRows = Effect.fnUntraced(function*(urlFile: string, statement: string, params: readonly (string | number)[] = []) {
+    return yield* Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient;
+      return yield* sql.unsafe<Json>(statement, params);
+    }).pipe(Effect.provide(postgresAdmin(urlFile)), Effect.scoped);
   });
   if (flags["--runner-isolation-only"]) {
     const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "coordinator-isolation-" });
@@ -135,7 +144,9 @@ const port = () => Effect.scoped(Effect.gen(function*() {
 }).pipe(Effect.provide(serverLayer("127.0.0.1", 0))));
 const brokerPort = yield* port(), runnerPort = yield* port(), proxyPort = yield* port(), alternatePort = yield* port();
 const brokerUrl = `http://127.0.0.1:${brokerPort}`, runnerUrl = `http://127.0.0.1:${runnerPort}`, proxyUrl = `http://127.0.0.1:${proxyPort}`, alternateUrl = `http://127.0.0.1:${alternatePort}`;
-const brokerConfig: BrokerConfig = { database: join(state, "broker", "ledger.sqlite"), host: "127.0.0.1", port: brokerPort,
+const brokerDirectory = join(state, "broker");
+yield* fileSystem.makeDirectory(brokerDirectory, { mode: 0o700 });
+const brokerConfig: BrokerConfig = { databaseUrlFile: yield* provisionPostgres(brokerDirectory), host: "127.0.0.1", port: brokerPort,
   backupDirectory: join(state, "snapshots"), archiveRetentionMs: 86400000, backupRetentionMs: 3600000, githubTokenEnv: "GITHUB_READ_TOKEN",
   repositoryIds: { [repo]: identity.id },
   principals: [
@@ -161,7 +172,9 @@ const processFor = Effect.fnUntraced(function*(mode: "broker" | "runner", config
   const env = { ...(yield* childEnvironment(yield* setting("HOME", "/tmp"))), COORDINATOR_CONFIG: config, COORDINATOR_RUNNER_TOKEN_DIRECTORY: tokenDirectory };
   const readToken = yield* setting("GITHUB_READ_TOKEN", "");
   const hosts = yield* setting("COORDINATOR_CONNECT_HOSTS_JSON", "{}");
-  const runtimeEnv = { ...env, COORDINATOR_CONNECT_HOSTS_JSON: hosts, ...(mode === "broker" && readToken ? { GITHUB_READ_TOKEN: readToken } : {}) };
+  const ca = yield* setting("NODE_EXTRA_CA_CERTS", "");
+  const runtimeEnv = { ...env, COORDINATOR_CONNECT_HOSTS_JSON: hosts, ...(mode === "broker" && readToken ? { GITHUB_READ_TOKEN: readToken } : {}),
+    ...(mode === "broker" && ca ? { NODE_EXTRA_CA_CERTS: ca } : {}) };
   const child = yield* spawner.spawn(ChildProcess.make(process.execPath, ["--import", join(root, "node_modules/tsx/dist/loader.mjs"), join(root, "src/main.ts"), mode], {
     cwd: root, env: runtimeEnv, extendEnv: false, stdin: "ignore", forceKillAfter: "1 second",
   }));
@@ -188,7 +201,8 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   for (const child of [alternate, runner, broker]) if (child) yield* exit(child, "SIGTERM").pipe(Effect.ignore);
   // Effect cannot signal arbitrary PIDs recovered from a different supervisor's journal.
   for (const pid of [workerPid, uncertainPid]) if (pid) yield* Effect.try(() => process.kill(pid, "SIGTERM")).pipe(Effect.ignore);
-}));
+  if (!(yield* broker.isRunning)) yield* dropPostgres(brokerConfig.databaseUrlFile).pipe(Effect.orDie);
+}).pipe(Effect.orDie));
   yield* ready(brokerUrl);
   yield* rejects(rpc(brokerUrl, (yield* secret()), "task.get", { taskId: TaskId.make("missing") }), 401);
   const session = { sessionId: SessionId.make("native-owner-session"), incarnation: IncarnationId.make(yield* uuid), machineId: MachineId.make("homelab"), host: "omp" as const, repo, workerId: WorkerId.make("existing-omp-smoke-worker") };
@@ -267,14 +281,19 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   const archived = yield* rpc(brokerUrl, coordinator, "archive.list", { sessionId: session.sessionId });
   assert.equal(archived.length, 1);
   assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(archived).includes(unsafePayload.text), false);
-  assert.equal((yield* sqlRows(brokerConfig.database, "SELECT count(*) AS count FROM archive WHERE payload LIKE ?", [`%${unsafePayload.text}%`]))[0]?.count, 0);
+  assert.equal((yield* postgresRows(brokerConfig.databaseUrlFile, "SELECT count(*)::integer AS count FROM archive WHERE payload LIKE $1", [`%${unsafePayload.text}%`]))[0]?.count, 0);
   yield* rejects(rpc(brokerUrl, writer, "archive.delete", { sessionId: session.sessionId }), 403);
   assert.deepEqual(yield* rpc(brokerUrl, outsider, "archive.list", { sessionId: session.sessionId }), []);
   const snapshotNames = new Set(yield* (fileSystem.readDirectory(brokerConfig.backupDirectory)));
-  const snapshotName = yield* until(() => fileSystem.readDirectory(brokerConfig.backupDirectory).pipe(Effect.map((names) => names.find((name) => name.endsWith(".sqlite") && !snapshotNames.has(name)))), (name) => Boolean(name), 75000);
+  const snapshotName = yield* until(() => fileSystem.readDirectory(brokerConfig.backupDirectory).pipe(Effect.map((names) => names.find((name) => name.endsWith(".pgdump") && !snapshotNames.has(name)))), (name) => Boolean(name), 75000);
   const snapshot = join(brokerConfig.backupDirectory, snapshotName!);
-  for (const table of ["archive", "consents", "participant_consents"]) assert.equal((yield* sqlRows(snapshot, `SELECT count(*) AS count FROM ${table}`))[0]?.count, 0);
-  assert.ok((yield* sqlRows(snapshot, "SELECT id FROM tasks WHERE id=?", [work.taskId]))[0]);
+  const snapshotDirectory = join(state, "snapshot-database");
+  yield* fileSystem.makeDirectory(snapshotDirectory, { mode: 0o700 });
+  const snapshotUrlFile = yield* provisionPostgres(snapshotDirectory);
+  yield* restoreBrokerDatabase({ ...brokerConfig, databaseUrlFile: snapshotUrlFile }, snapshot, true);
+  for (const table of ["archive", "consents", "participant_consents"]) assert.equal((yield* postgresRows(snapshotUrlFile, `SELECT count(*)::integer AS count FROM ${table}`))[0]?.count, 0);
+  assert.ok((yield* postgresRows(snapshotUrlFile, "SELECT id FROM tasks WHERE id=$1", [work.taskId]))[0]);
+  yield* dropPostgres(snapshotUrlFile);
   assert.equal((yield* rpc(brokerUrl, coordinator, "archive.list", { sessionId: session.sessionId })).length, 1);
   yield* rejects(rpc(brokerUrl, outsider, "archive.participantConsent", { owner: OwnerId.make("owner"), sessionId: session.sessionId, enabled: false }), 403);
   yield* rpc(brokerUrl, outsider, "archive.participantConsent", { owner: OwnerId.make("owner"), sessionId: session.sessionId, enabled: true });

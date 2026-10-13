@@ -8,7 +8,7 @@ import { Mcp, serverLayer } from "../src/http.ts";
 import { Platform, redactedCause } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
 import { CommandError, Delivery, HttpError, Task, Principal, PluginConfig, JournalReleaseKey } from "../src/contracts.ts";
-import type { Context, BrokerRequest } from "../src/contracts.ts";
+import type { Context, BrokerRequest, CommandOutput } from "../src/contracts.ts";
 import { Plugin } from "../src/plugin.ts";
 
 test("ordinary host startup discovers private plugin config and fences owned SDK delivery", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -61,7 +61,7 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
         return { liveUntil: now + 30000 };
       }
       if (request.method === "session.poll") return { messages: [], offers: [], releases: task === undefined ? [] : [task] };
-      if (request.method === "session.stop") return { stopped: true };
+      if (request.method === "session.stop") return { stopped: true } satisfies CommandOutput<"session.stop">;
       if (request.method === "task.report" && task !== undefined) {
         const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, request.params.sessionId)), Journal);
         assert.equal(persisted.state.releases[JournalReleaseKey.make("task:1")], "sent", "SDK admission must follow durable intent before reporting");

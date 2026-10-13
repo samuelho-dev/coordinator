@@ -1,10 +1,6 @@
 import { Schema } from "effect";
 import { NativeBinding, NativeControlError, NativeEventPage, NativeEventSequence, NativeLifecycleEmission, NativeLifecycleEvent, NativeMcpResultBytes, nativeEventsUri } from "./contracts.js";
 
-const decodeEmission = Schema.decodeUnknownSync(NativeLifecycleEmission, { onExcessProperty: "error" });
-const decodeEvent = Schema.decodeUnknownSync(NativeLifecycleEvent, { onExcessProperty: "error" });
-const decodeBinding = Schema.decodeUnknownSync(NativeBinding, { onExcessProperty: "error" });
-const sequence = Schema.decodeUnknownSync(NativeEventSequence);
 const utf8 = new TextEncoder();
 const eventText = Schema.encodeUnknownSync(Schema.fromJsonString(NativeLifecycleEvent), { onExcessProperty: "error" });
 const escapedText = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.String));
@@ -14,9 +10,9 @@ export class NativeLifecycleJournal {
   readonly #maxPageSize: number;
   readonly #entries: NativeLifecycleEvent[] = [];
   readonly #listeners = new Set<(event: NativeLifecycleEvent) => void>();
-  #highWater = sequence(0);
-  #evictedThrough = sequence(0);
-  #fanoutThrough = sequence(0);
+  #highWater = NativeEventSequence.make(0);
+  #evictedThrough = NativeEventSequence.make(0);
+  #fanoutThrough = NativeEventSequence.make(0);
   #fanoutScheduled = false;
   readonly #flushFanout = (): void => {
     const through = this.#highWater;
@@ -48,12 +44,14 @@ export class NativeLifecycleJournal {
 
   get highWater(): NativeEventSequence { return this.#highWater; }
 
+  // SDK adapters derive this typed metadata; unknown SDK/network values are decoded before reaching the journal.
   append(emission: NativeLifecycleEmission): NativeLifecycleEvent {
     if (this.#highWater === Number.MAX_SAFE_INTEGER) {
       throw new NativeControlError({ code: "sequence_exhausted", message: "Native lifecycle sequence exhausted" });
     }
-    const metadata = decodeEmission(emission);
-    const event = decodeEvent({ ...metadata, seq: sequence(this.#highWater + 1) });
+    const event: NativeLifecycleEvent = { ...emission, binding: { ...emission.binding },
+      ...(emission.kind === "session_retired" && emission.replacement ? { replacement: { ...emission.replacement } } : {}),
+      seq: NativeEventSequence.make(this.#highWater + 1) };
     Object.freeze(event.binding);
     if (event.kind === "session_retired" && event.replacement) Object.freeze(event.replacement);
     Object.freeze(event);
@@ -71,13 +69,14 @@ export class NativeLifecycleJournal {
     return event;
   }
 
+  // Resource handlers decode wire bindings/cursors; the journal enforces retained-history and paging bounds.
   read(binding: NativeBinding, after: NativeEventSequence, limit = this.#maxPageSize): NativeEventPage {
-    const identity = decodeBinding(binding);
-    const cursor = sequence(after);
+    const identity = { ...binding };
+    const cursor = after;
     if (cursor > this.#highWater || !Number.isSafeInteger(limit) || limit < 1 || limit > this.#maxPageSize) {
       throw new NativeControlError({ code: "invalid_input", message: "Invalid lifecycle resource cursor or page limit" });
     }
-    const gap = cursor < this.#evictedThrough ? Object.freeze({ from: sequence(cursor + 1), through: this.#evictedThrough }) : null;
+    const gap = cursor < this.#evictedThrough ? Object.freeze({ from: NativeEventSequence.make(cursor + 1), through: this.#evictedThrough }) : null;
     const entries: NativeLifecycleEvent[] = [];
     const pageBase = { binding: identity, after: cursor, oldestAvailable: this.#entries[0]?.seq ?? this.#highWater, highWater: this.#highWater, gap };
     const baseBytes = utf8.encode(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))({

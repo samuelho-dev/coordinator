@@ -1,0 +1,81 @@
+// use prisma-8
+// Opaque broker payloads deliberately remain TEXT; runner storage is separate.
+model tasks {
+  id String @id
+  data String
+}
+model sessions {
+  id String @id
+  data String
+}
+model peers {
+  id String @id
+  owner String
+  sender String
+  session String
+  incarnation String
+  payload String
+  fingerprint String
+  expires Float
+}
+model consents {
+  owner String
+  session String
+  enabled Int
+  participants String
+  @@id([owner, session])
+}
+model participant_consents {
+  owner String
+  session String
+  participant String
+  enabled Int
+  @@id([owner, session, participant])
+}
+model archive {
+  sequence BigInt @id @default(autoincrement())
+  owner String
+  session String
+  entry String
+  digest String
+  payload String
+  gaps String
+  created Float
+  @@unique([owner, session, entry, digest])
+}
+model evidence {
+  id BigInt @id @default(autoincrement())
+  task String
+  kind String
+  sha String
+  principal String
+  data String
+  observed Float
+}
+model effect_queue {
+  sequence BigInt @id @default(autoincrement())
+  id VarChar(255)
+  queue_name VarChar(255)
+  element String
+  state VarChar(10)
+  attempts Int @default(0)
+  last_failure String?
+  visible_at TimestampString(6)
+  acquired_at TimestampString(6)?
+  acquired_by Uuid?
+  created_at TimestampString(6)
+  updated_at TimestampString(6)
+  @@unique([id, queue_name], map: "idx_effect_queue_id")
+  @@index([sequence, acquired_by], map: "idx_effect_queue_update")
+  @@index([queue_name, visible_at], where: "state = 'pending'", name: "idx_effect_queue_take")
+}
+model effect_queue_migrations {
+  migration_id Int @id
+  created_at TimestamptzString(6) @default(now())
+  name String
+}
+model recovery_gate {
+  id Int @id
+  ready Boolean
+  @@check(expression: "id = 1", name: "recovery_gate_singleton")
+}

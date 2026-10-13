@@ -1,0 +1,40 @@
+image:
+  repository: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+sourceSha: ""
+imagePullSecrets: []
+nodeSelector:
+  kubernetes.io/arch: amd64
+tls:
+  existingCaSecret: ""
+broker:
+  existingSecret: ""
+  deploymentAnnotations: {}
+  podAnnotations: {}
+  port: 8787
+  connectHosts: {}
+  extraEnv: []
+  resources: {}
+runner:
+  enabled: false
+  existingSecret: ""
+  deploymentAnnotations: {}
+  podAnnotations: {}
+  port: 8788
+  connectHosts: {}
+  extraEnv: []
+  resources: {}
+persistence:
+  backups:
+    existingClaim: ""
+    storageClass: null
+    size: 10Gi
+    accessModes: [ReadWriteOnce]
+  work:
+    existingClaim: ""
+    storageClass: null
+    size: 20Gi
+    accessModes: [ReadWriteOnce]
+# TLS termination and NetworkPolicies are operator-owned integration inputs.
+# No ingress, provider CRDs, HPA, or public service are created.
