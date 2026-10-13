@@ -6,6 +6,8 @@ sourceSha: ""
 imagePullSecrets: []
 nodeSelector:
   kubernetes.io/arch: amd64
+# ponytail: Kubernetes validates native toleration fields.
+tolerations: []
 tls:
   existingCaSecret: ""
 broker:
