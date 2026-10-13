@@ -12,6 +12,19 @@ Set `broker.port`/`runner.port` to the corresponding config port (defaults 8787/
 
 Each role also accepts `deploymentAnnotations` and `podAnnotations` as string maps (both default `{}`). They apply to Deployment metadata and pod-template metadata respectively; use them for operator-owned Secret-reload controllers, backup exclusions, or lifecycle/privacy ownership without copying workloads. The chart retains its automatic pod `checksum/values` annotation; that key cannot be supplied through `podAnnotations`. Secret contents are not included in that checksum, and annotations alone do not install a controller.
 
+`nodeSelector` and the native `tolerations` array apply to both roles; defaults retain amd64 selection and tolerate no taints. Kubernetes owns toleration-field validation. Selecting a tainted data/control-plane node without its matching toleration leaves Pods Pending; use the operator's actual taint, not a global admission exception:
+
+```yaml
+nodeSelector:
+  kubernetes.io/hostname: homelab-cp
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+```
+
+[Native taints/tolerations](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/) permit scheduling, not physical storage isolation, security elevation or HA.
+
 `persistence.backups` and `.work` expose existingClaim, storageClass, size and accessModes; defaults create10Gi backups and20Gi work (runner only), ReadWriteOnce/RWOP. Null storageClass uses cluster default; empty string selects no provisioner. Claims have Helm keep; existing claims are not Helm-owned. Set PV Retain and protect external PostgreSQL plus runner WAL/backups off-cluster. **No broker data PVC/mount/value exists.** There is one broker and at most one runner, Recreate/no HPA/60s termination. Advisory ownership fences the same database, not restored copies.
 
 ## Existing Secret keys

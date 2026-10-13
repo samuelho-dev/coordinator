@@ -49,6 +49,10 @@ spec:
       terminationGracePeriodSeconds: 60
       nodeSelector:
         {{- toYaml $.Values.nodeSelector | nindent 8 }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
