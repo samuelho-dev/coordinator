@@ -5,12 +5,15 @@ import type { ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { Clock, Deferred, Effect, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { HttpClient, HttpClientResponse } from "effect/http";
-import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
+import { SqlClient } from "effect/sql";
+import { provisionPostgres, postgresAdmin, dropPostgres } from "./postgres-fixture.ts";
 import { Broker } from "../src/broker.ts";
 import { Commands, HttpError, JsonValue, Task, Address, BrokerConfig, Work, Repo, Sha, TaskId, MessageId, RunnerId, SessionId, IncarnationId, MachineId, WorkerId, PrincipalId, OwnerId, ReportState, type BrokerConfig as BrokerConfigType, type ArchiveEntry, type ArchiveRow, type CommandInput, type CommandOutput } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
 import { Mcp } from "../src/http.ts";
+import { restoreBrokerDatabase } from "../src/backup.ts";
+import { makeDatabase } from "../src/kysely.ts";
 
 const repo = Repo.make("github.com/test/broker"), sha = Sha.make("1".repeat(40));
 const coordinator = "coordinator-regression-only-credential", peer = "native-peer-regression-only-credential", reviewer = "reviewer-regression-only-credential";
@@ -24,7 +27,7 @@ test("native release fences and independent evidence survive stale peers and CI 
   const now = await setup.runPromise(Clock.currentTimeMillis);
   let respond = (_url: string): Response => response({});
   const client = HttpClient.make((request, url) => Effect.sync(() => HttpClientResponse.fromWeb(request, respond(url.toString()))));
-  const config = Schema.decodeUnknownSync(BrokerConfig, { onExcessProperty: "error" })({ database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0, backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
+  const config = Schema.decodeUnknownSync(BrokerConfig, { onExcessProperty: "error" })({ databaseUrlFile: await setup.runPromise(provisionPostgres(root)), host: "127.0.0.1", port: 0, backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
     repositoryIds: { [repo]: 42 }, principals: [
       { id: "coordinator", owner: "owner", roles: ["coordinator"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(coordinator)) },
       { id: "peer", owner: "owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(peer)) },
@@ -32,10 +35,8 @@ test("native release fences and independent evidence survive stale peers and CI 
     ] });
   const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(Layer.merge(base, Layer.succeed(HttpClient.HttpClient, client)))));
   const broker = await runtime.runPromise(Broker);
+  const { client: db, execute } = makeDatabase(broker.sql);
   const mcp = await setup.runPromise(Mcp);
-  // Metadata only: distinguish the original call timeout from transaction or scoped teardown stalls.
-  let phase = "peer delivery";
-  console.error("[BROKER-AWAIT] phase.start", phase);
   try {
     const bound = broker.server.address;
     if (bound._tag !== "InetAddressV4") throw new Error("Expected IPv4 TCP server");
@@ -72,8 +73,6 @@ test("native release fences and independent evidence survive stale peers and CI 
     assert.equal(expiring.offerDecision, "pending");
     assert.ok(expiring.offerExpires !== undefined);
     const offerExpires = expiring.offerExpires;
-    phase = "transaction-owned offer expiry";
-    console.error("[BROKER-AWAIT] transaction.start");
     const peerPrincipal = await runtime.runPromise(broker.authorize(peer));
     await runtime.runPromise(Effect.gen(function*() {
       const locked = yield* Deferred.make<void>();
@@ -104,12 +103,9 @@ test("native release fences and independent evidence survive stale peers and CI 
       yield* Fiber.join(holder);
       yield* Fiber.join(reply);
     }));
-    console.error("[BROKER-AWAIT] transaction.end");
     const expiredStored = await setup.runPromise(mcp.call(url, coordinator, "task.get", { taskId: expiring.taskId }));
     assert.equal(expiredStored.offerDecision, "pending");
     assert.equal(expiredStored.state, "QUEUED");
-    phase = "native release fences";
-    console.error("[BROKER-AWAIT] phase.start", phase);
     const acceptedWork = { ...work, taskId: TaskId.make("bound-native-work") };
     const offered = await setup.runPromise(mcp.call(url, coordinator, "task.submit", acceptedWork)); assert.equal(offered.offerDecision, "pending");
     const report = (state: typeof ReportState.Type) => mcp.call(url, peer, "task.report", { ...key, taskId: acceptedWork.taskId, state, result: { completed: true } });
@@ -136,21 +132,21 @@ test("native release fences and independent evidence survive stale peers and CI 
     await setup.runPromise(report("SUCCEEDED"));
     await conflict(report("RUNNING"));
     const stored = await setup.runPromise(mcp.call(url, coordinator, "task.get", { taskId: acceptedWork.taskId }));
-    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })({ ...stored, runnerId: RunnerId.make("assigned-runner") }), stored.taskId]));
+    await runtime.runPromise(execute(db.updateTable("tasks").set({ data: Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })({ ...stored, runnerId: RunnerId.make("assigned-runner") }) }).where("id", "=", stored.taskId)));
     await conflict(report("SUCCEEDED"));
-    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(stored), stored.taskId]));
+    await runtime.runPromise(execute(db.updateTable("tasks").set({ data: Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(stored) }).where("id", "=", stored.taskId)));
     // Existing pre-cutover pending confirmations cannot become native releases after decline/runner acceptance.
     const legacyPending: Task = { ...stored, state: "QUEUED", offerDecision: "pending", offerExpires: now + 15000 };
-    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(legacyPending), stored.taskId]));
+    await runtime.runPromise(execute(db.updateTable("tasks").set({ data: Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(legacyPending) }).where("id", "=", stored.taskId)));
     await conflict(mcp.call(url, coordinator, "task.address", { taskId: stored.taskId, address }));
     await conflict(mcp.call(url, peer, "task.readback", { taskId: stored.taskId, address, disposition: "ready" }));
     await conflict(mcp.call(url, coordinator, "task.confirm", { taskId: stored.taskId, revision: 1 }));
     assert.deepEqual((await setup.runPromise(mcp.call(url, peer, "session.poll", key))).releases, []);
     await setup.runPromise(mcp.call(url, peer, "peer.reply", { ...key, taskId: stored.taskId, decision: "declined" }));
-    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })({ ...legacyPending, state: "ACCEPTED", offerDecision: "declined", runnerId: RunnerId.make("assigned-runner") }), stored.taskId]));
+    await runtime.runPromise(execute(db.updateTable("tasks").set({ data: Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })({ ...legacyPending, state: "ACCEPTED", offerDecision: "declined", runnerId: RunnerId.make("assigned-runner") }) }).where("id", "=", stored.taskId)));
     assert.deepEqual((await setup.runPromise(mcp.call(url, peer, "session.poll", key))).releases, []);
     await conflict(mcp.call(url, peer, "task.readback", { taskId: stored.taskId, address, disposition: "ready" }));
-    await runtime.runPromise(broker.sql.unsafe("UPDATE tasks SET data=? WHERE id=?", [Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(stored), stored.taskId]));
+    await runtime.runPromise(execute(db.updateTable("tasks").set({ data: Schema.encodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(stored) }).where("id", "=", stored.taskId)));
     const transferred = await setup.runPromise(mcp.call(url, coordinator, "task.handoff", handoff));
     assert.equal(transferred.address?.workerId, next.workerId);
     assert.ok(transferred.address);
@@ -159,8 +155,6 @@ test("native release fences and independent evidence survive stale peers and CI 
     await setup.runPromise(mcp.call(url, peer, "task.readback", { taskId: stored.taskId, address: transferred.address, disposition: "ready" }));
     await setup.runPromise(mcp.call(url, coordinator, "task.confirm", { taskId: stored.taskId, revision: 2 }));
     assert.deepEqual((await setup.runPromise(mcp.call(url, peer, "session.poll", { sessionId: next.sessionId, incarnation: next.incarnation }))).releases, []);
-    phase = "independent evidence";
-    console.error("[BROKER-AWAIT] phase.start", phase);
     const payload = { taskId: acceptedWork.taskId, sha };
     await setup.runPromise(mcp.call(url, coordinator, "evidence.local", { ...payload, commands: ["consumer-visible scenario"], passed: true }));
     await setup.runPromise(mcp.call(url, coordinator, "evidence.deployment", { ...payload, environment: "regression", url: "https://example.invalid", observedState: "not deployed", provenance: "explicit negative observation" }));
@@ -187,35 +181,32 @@ test("native release fences and independent evidence survive stale peers and CI 
     const newRef = await setup.runPromise(mcp.call(url, coordinator, "task.get", { taskId: acceptedWork.taskId }));
     if (!newRef.evidence) throw new Error("Expected persisted evidence");
     assert.equal(newRef.evidence.find((item) => item.kind === "ci")?.stale, true);
-    phase = "sanitized snapshot";
-    console.error("[BROKER-AWAIT] phase.start", phase);
-    await runtime.runPromise(broker.sql.unsafe("INSERT INTO consents VALUES (?,?,?,?)", ["owner", session.sessionId, 1, '["owner"]']));
-    await runtime.runPromise(broker.sql.unsafe("INSERT INTO participant_consents VALUES (?,?,?,?)", ["owner", session.sessionId, "owner", 1]));
-    await runtime.runPromise(broker.sql.unsafe("INSERT INTO archive(owner,session,entry,digest,payload,gaps,created) VALUES (?,?,?,?,?,?,?)", ["owner", session.sessionId, "private-entry", sha, '{"text":"private transcript"}', "[]", now]));
+    await runtime.runPromise(execute(db.insertInto("consents").values({ owner: "owner", session: session.sessionId, enabled: 1, participants: '["owner"]' })));
+    await runtime.runPromise(execute(db.insertInto("participant_consents").values({ owner: "owner", session: session.sessionId, participant: "owner", enabled: 1 })));
+    await runtime.runPromise(execute(db.insertInto("archive").values({ owner: "owner", session: session.sessionId, entry: "private-entry", digest: sha, payload: '{"text":"private transcript"}', gaps: "[]", created: now })));
     const snapshot = await runtime.runPromise(broker.snapshot());
-    const backup = ManagedRuntime.make(SqliteClient.layer({ filename: snapshot, readonly: true }));
+    const restoreRoot = platform.path.join(root, "restore");
+    await setup.runPromise(platform.fs.makeDirectory(restoreRoot, { mode: 0o700 }));
+    const restoredUrlFile = await setup.runPromise(provisionPostgres(restoreRoot));
+    await setup.runPromise(restoreBrokerDatabase({ ...config, databaseUrlFile: restoredUrlFile }, snapshot, true));
+    const backup = ManagedRuntime.make(postgresAdmin(restoredUrlFile).pipe(Layer.provide(Platform.layer)));
     try {
-      const sql = await backup.runPromise(SqliteClient.SqliteClient);
-      for (const table of ["archive", "consents", "participant_consents"]) assert.deepEqual(await backup.runPromise(sql.unsafe(`SELECT * FROM ${table}`)), []);
+      const sql = await backup.runPromise(SqlClient.SqlClient);
+      const restored = makeDatabase(sql);
+      assert.deepEqual(await backup.runPromise(restored.execute(restored.client.selectFrom("archive").selectAll())), []);
+      assert.deepEqual(await backup.runPromise(restored.execute(restored.client.selectFrom("consents").selectAll())), []);
+      assert.deepEqual(await backup.runPromise(restored.execute(restored.client.selectFrom("participant_consents").selectAll())), []);
       assert.equal((await setup.runPromise(platform.fs.stat(snapshot))).mode & 0o777, 0o600);
       assert.ok((await setup.runPromise(platform.fs.readDirectory(config.backupDirectory))).every((file) => !file.endsWith(".partial")));
     } finally {
-      console.error("[BROKER-AWAIT] backup.dispose.start");
       await backup.dispose();
-      console.error("[BROKER-AWAIT] backup.dispose.end");
+      await setup.runPromise(dropPostgres(restoredUrlFile));
     }
-    phase = "assertions complete";
-  } catch (error) {
-    console.error("[BROKER-AWAIT] consumer.failure", phase);
-    throw error;
   } finally {
-    console.error("[BROKER-AWAIT] runtime.dispose.start", phase);
     await runtime.dispose();
-    console.error("[BROKER-AWAIT] runtime.dispose.end");
+    await setup.runPromise(dropPostgres(config.databaseUrlFile));
     await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true }));
-    console.error("[BROKER-AWAIT] setup.dispose.start");
     await setup.dispose();
-    console.error("[BROKER-AWAIT] setup.dispose.end");
   }
 });
 
@@ -238,7 +229,7 @@ test("broker restart preserves RPC delivery, release fences and consented JSONL 
     }));
     const participantToken = "archive-participant-regression-only-credential";
     const config = Schema.decodeUnknownSync(BrokerConfig, { onExcessProperty: "error" })({
-      database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0,
+      databaseUrlFile: await setup.runPromise(provisionPostgres(root)), host: "127.0.0.1", port: 0,
       backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
       repositoryIds: { [repo]: 42 }, principals: [
         { id: "coordinator", owner: "owner", roles: ["coordinator"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(coordinator)) },
@@ -336,8 +327,8 @@ test("broker restart preserves RPC delivery, release fences and consented JSONL 
     await setup.runPromise(append(first));
     await reject(409, append({ ...first, digest: await setup.runPromise(platform.digest("incorrect digest")) }));
     assert.deepEqual(await archive(), archived);
-    for (const path of [root, config.backupDirectory, platform.path.dirname(journal.path)]) assert.equal((await setup.runPromise(platform.fs.stat(path))).mode & 0o777, 0o700);
-    for (const path of [file, config.database, journal.path]) assert.equal((await setup.runPromise(platform.fs.stat(path))).mode & 0o777, 0o600);
+    for (const path of [root, platform.path.dirname(config.databaseUrlFile), platform.path.dirname(journal.path)]) assert.equal((await setup.runPromise(platform.fs.stat(path))).mode & 0o777, 0o700);
+    for (const path of [file, config.databaseUrlFile, journal.path]) assert.equal((await setup.runPromise(platform.fs.stat(path))).mode & 0o777, 0o600);
     assert.equal((await setup.runPromise(platform.fs.readFileString(journal.path))).includes("private-"), false);
     const beforeRestartTask = await setup.runPromise(mcp.call(url, coordinator, "task.get", { taskId: work.taskId }));
 
@@ -406,7 +397,10 @@ test("broker restart preserves RPC delivery, release fences and consented JSONL 
   } finally {
     try { await runtime?.dispose(); }
     finally {
-      try { await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true })); }
+      try {
+        await setup.runPromise(dropPostgres(platform.path.join(root, "database.url")));
+        await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true }));
+      }
       finally { await setup.dispose(); }
     }
   }
@@ -427,7 +421,7 @@ test("session discovery admits unlinked repositories, isolates owners, and pages
   }));
   const unlinkedRepo = Repo.make("github.com/test/private");
   const config = Schema.decodeUnknownSync(BrokerConfig)({
-    database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0,
+    databaseUrlFile: await setup.runPromise(provisionPostgres(root)), host: "127.0.0.1", port: 0,
     backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
     repositoryIds: { [repo]: 42 },
     principals: [
@@ -479,7 +473,14 @@ test("session discovery admits unlinked repositories, isolates owners, and pages
     } while (cursor !== undefined);
     assert.ok(pages > 1, "A registry exceeding the MCP byte budget must be completely paginated");
     assert.deepEqual(listed, expected, "Same-owner sessions remain discoverable without repository enrollment");
-    assert.deepEqual((await setup.runPromise(mcp.call(url, "foreign", "session.list", {}))).sessions.map((session) => session.sessionId), ["foreign"]);
+    const foreignPage = await setup.runPromise(mcp.call(url, "foreign", "session.list", {}));
+    assert.deepEqual(foreignPage.sessions.map((session) => session.sessionId), ["foreign"]);
+    // The broker emits an explicit optional undefined; native MCP must encode JSON before constructing its result.
+    const foreignExpected: CommandOutput<"session.list"> = { sessions: [{
+      sessionId: SessionId.make("foreign"), incarnation: IncarnationId.make("foreign"), machineId: MachineId.make("foreign"),
+      host: "pi", repo: unlinkedRepo, workerId: undefined, status: "stale", liveUntil: now + 30000,
+    }] };
+    assert.deepEqual(foreignPage, foreignExpected);
     assert.equal(await setup.runPromise(mcp.call(url, peer, "session.heartbeat", discovered).pipe(Effect.catchTag("HttpError", (error) => Effect.succeed(error.status)))), 403);
     const unauthorizedWork = Schema.decodeUnknownSync(Work)({
       taskId: "unlinked-execution", repo: unlinkedRepo, ref: "refs/heads/main", sha, launcher: "omp", prompt: "approved bounded work",
@@ -500,6 +501,7 @@ test("session discovery admits unlinked repositories, isolates owners, and pages
     assert.equal((await setup.runPromise(mcp.call(url, peer, "session.list", {}))).sessions[0]?.status, "stale");
   } finally {
     await runtime.dispose();
+    await setup.runPromise(dropPostgres(config.databaseUrlFile));
     await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true }));
     await setup.dispose();
   }
@@ -520,7 +522,7 @@ test("snapshot cadence expires local files even when remote put or list fails", 
     return HttpClientResponse.fromWeb(request, new Response("", { status: request.method === failing ? 503 : 200 }));
   }));
   const config: BrokerConfigType = {
-    database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0,
+    databaseUrlFile: await setup.runPromise(provisionPostgres(root)), host: "127.0.0.1", port: 0,
     backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
     principals: [], repositoryIds: {}, objectBackup: { endpoint: "http://127.0.0.1:1", region: "fixture", bucket: "fixture-backups", accessKeyFile, secretKeyFile },
   };
@@ -529,8 +531,8 @@ test("snapshot cadence expires local files even when remote put or list fails", 
     const broker = await runtime.runPromise(Broker);
     for (const method of ["PUT", "GET"]) {
       failing = method;
-      const expired = platform.path.join(config.backupDirectory, `${method}.sqlite`);
-      const recent = platform.path.join(config.backupDirectory, `recent-${method}.sqlite`);
+      const expired = platform.path.join(config.backupDirectory, `${method}.pgdump`);
+      const recent = platform.path.join(config.backupDirectory, `recent-${method}.pgdump`);
       await setup.runPromise(platform.fs.writeFileString(expired, "", { mode: 0o600 }));
       await setup.runPromise(platform.fs.utimes(expired, new Date(0), new Date(0)));
       await setup.runPromise(platform.fs.writeFileString(recent, "", { mode: 0o600 }));
@@ -545,19 +547,88 @@ test("snapshot cadence expires local files even when remote put or list fails", 
     }
   } finally {
     await runtime.dispose();
+    await setup.runPromise(dropPostgres(config.databaseUrlFile));
     await setup.runPromise(platform.fs.remove(root, { recursive: true }));
     await setup.dispose();
   }
 });
 
-test("broker health stays responsive while SQLite waits for a writer", { timeout: 20000 }, async () => {
+test("PostgreSQL ownership excludes duplicate serving, releases on shutdown, and fences owner session death", { timeout: 60000 }, async () => {
+  const setup = ManagedRuntime.make(Layer.merge(Platform.layer, Mcp.layer));
+  const platform = await setup.runPromise(Platform);
+  const root = await setup.runPromise(platform.fs.makeTempDirectory({ prefix: "coordinator-broker-owner-" }));
+  const config = Schema.decodeUnknownSync(BrokerConfig)({
+    databaseUrlFile: await setup.runPromise(provisionPostgres(root)), host: "127.0.0.1", port: 0,
+    backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
+    repositoryIds: {}, principals: [],
+  });
+  const runtimes: Array<ManagedRuntime.ManagedRuntime<Broker, unknown>> = [];
+  const admin = ManagedRuntime.make(postgresAdmin(config.databaseUrlFile).pipe(Layer.provide(Platform.layer)));
+  const services = Layer.merge(Mcp.layer, Platform.layer);
+  const open = () => {
+    const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(services)));
+    runtimes.push(runtime);
+    return runtime;
+  };
+  try {
+    const first = open();
+    const broker = await first.runPromise(Broker);
+    const { client: db, execute } = makeDatabase(broker.sql);
+    assert.equal((await setup.runPromise(platform.fs.stat(config.databaseUrlFile))).mode & 0o777, 0o600);
+    const duplicate = open();
+    await assert.rejects(duplicate.runPromise(Broker));
+    await duplicate.dispose();
+    assert.deepEqual(await first.runPromise(execute(db.selectNoFrom((eb) => eb.val(1).as("healthy")))), [{ healthy: 1 }]);
+    await assert.rejects(first.runPromise(broker.sql.withTransaction(Effect.gen(function*() {
+      yield* execute(db.insertInto("sessions").values({ id: SessionId.make("rollback-probe"), data: "{}" }));
+      yield* execute(db.selectNoFrom((eb) => eb(eb.val(1), "/", eb.val(0)).as("failure"))).pipe(Effect.ignore);
+    }))), "An aborted PostgreSQL COMMIT must not acknowledge success");
+    assert.deepEqual(await first.runPromise(execute(db.selectFrom("sessions").select("id").where("id", "=", SessionId.make("rollback-probe")))), []);
+    await first.dispose();
+    const second = open();
+    const replacement = await second.runPromise(Broker);
+    const url = replacement.server.address._tag === "InetAddressV4" ? `http://127.0.0.1:${replacement.server.address.port}` : assert.fail("Expected IPv4 TCP server");
+    assert.equal((await fetch(url + "/livez", { signal: AbortSignal.timeout(1000) })).status, 200);
+    const backend = (await second.runPromise(replacement.sql.unsafe<{ pid: number }>("SELECT pg_backend_pid() AS pid")))[0];
+    assert.ok(backend);
+    const { pid } = backend;
+    await admin.runPromise(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepEqual(yield* sql.unsafe("SELECT pg_terminate_backend($1) AS terminated", [pid]), [{ terminated: true }]);
+    }));
+    await setup.runPromise(Effect.gen(function*() {
+      for (;;) {
+        const result = yield* replacement.maintain().pipe(Effect.match({ onFailure: (error) => error, onSuccess: () => undefined }));
+        if (result instanceof HttpError && result.status === 503) return;
+        yield* Effect.sleep("10 millis");
+      }
+    }).pipe(Effect.timeout("5 seconds")));
+    // Teardown may already have removed the socket; either outcome is non-live.
+    const live = await fetch(url + "/livez", { signal: AbortSignal.timeout(1000) }).then((response) => response.status, () => 503);
+    assert.equal(live, 503);
+    const third = open();
+    assert.equal(await second.runPromise(replacement.maintain().pipe(Effect.catchTag("HttpError", (error) => Effect.succeed(error.status)))), 503);
+    await second.dispose();
+    const recovered = await third.runPromise(Broker);
+    const recovery = makeDatabase(recovered.sql);
+    assert.deepEqual(await third.runPromise(recovery.execute(recovery.client.selectNoFrom((eb) => eb.val(1).as("healthy")))), [{ healthy: 1 }]);
+  } finally {
+    for (const runtime of runtimes) await runtime.dispose();
+    await admin.dispose();
+    await setup.runPromise(dropPostgres(config.databaseUrlFile));
+    await setup.runPromise(platform.fs.remove(root, { recursive: true }));
+    await setup.dispose();
+  }
+});
+
+test("broker health stays responsive while PostgreSQL waits for a table lock", { timeout: 60000 }, async () => {
   const base = Layer.merge(Platform.layer, Mcp.layer);
   const setup = ManagedRuntime.make(base);
   const platform = await setup.runPromise(Platform);
   const root = await setup.runPromise(platform.fs.makeTempDirectory({ prefix: "coordinator-http-lock-" }));
   const token = `health-lock-${root}`;
   const config = Schema.decodeUnknownSync(BrokerConfig)({
-    database: platform.path.join(root, "ledger.sqlite"), host: "127.0.0.1", port: 0,
+    databaseUrlFile: await setup.runPromise(provisionPostgres(root)), host: "127.0.0.1", port: 0,
     backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
     repositoryIds: { [repo]: 42 },
     principals: [{ id: "health-peer", owner: "health-owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(token)) }],
@@ -567,7 +638,7 @@ test("broker health stays responsive while SQLite waits for a writer", { timeout
   const message = (child: ChildProcess) => new Promise<unknown>((resolve, reject) => {
     const cleanup = () => { child.off("message", received); child.off("exit", exited); child.off("error", failed); };
     const received = (value: unknown) => { cleanup(); resolve(value); };
-    const exited = (code: number | null) => { cleanup(); reject(new Error(`SQLite contention helper exited before IPC (code ${code})`)); };
+    const exited = (code: number | null) => { cleanup(); reject(new Error(`PostgreSQL contention helper exited before IPC (code ${code})`)); };
     const failed = (error: Error) => { cleanup(); reject(error); };
     child.once("message", received); child.once("exit", exited); child.once("error", failed);
   });
@@ -603,9 +674,18 @@ test("broker health stays responsive while SQLite waits for a writer", { timeout
           const response = await fetch(url + "/healthz", { headers: { authorization: "Bearer " + token }, signal: AbortSignal.timeout(500) });
           return { status: response.status, body: await response.json() };
         };
+        const probe = async (path, authenticated = false, timeout = 2000) => {
+          const response = await fetch(url + path, { headers: authenticated ? { authorization: "Bearer " + token } : {}, signal: AbortSignal.timeout(timeout) });
+          return { status: response.status, body: await response.json() };
+        };
         const initial = await runtime.runPromise(mcp.call(url, token, "session.heartbeat", session));
         const before = await runtime.runPromise(mcp.call(url, token, "session.poll", key));
         assert.deepEqual(await health(), { status: 200, body: { status: "ok" } });
+        assert.equal((await probe("/readyz")).status, 401);
+        assert.equal((await fetch(url + "/readyz", { headers: { authorization: "Bearer not-enrolled" }, signal: AbortSignal.timeout(500) })).status, 401);
+        assert.equal((await probe("/healthz", false, 500)).status, 401);
+        assert.deepEqual(await probe("/readyz", true), { status: 200, body: { status: "ok" } });
+        assert.deepEqual(await probe("/livez", false, 500), { status: 200, body: { status: "ok" } });
         const start = once(process, "message");
         process.send("warm");
         await start;
@@ -618,9 +698,15 @@ test("broker health stays responsive while SQLite waits for a writer", { timeout
         try { observed = await health(); }
         catch (error) { observed = { error: error.name }; }
         const waitingAfterHealth = !settled;
+        assert.equal((await probe("/readyz", false, 500)).status, 401, "Unauthorized readiness must not wait behind the PostgreSQL table lock");
+        const live = await probe("/livez", false, 500);
+        const ready = await probe("/readyz", true);
+        const waitingAfterReadiness = !settled;
+        const liveAfterReadiness = await probe("/livez", false, 500);
         const renewed = await heartbeat;
         const after = await runtime.runPromise(mcp.call(url, token, "session.poll", key));
-        process.send({ waitingBeforeHealth, waitingAfterHealth, observed, initial, renewed, before, after });
+        const readyAfter = await probe("/readyz", true);
+        process.send({ waitingBeforeHealth, waitingAfterHealth, observed, live, ready, waitingAfterReadiness, liveAfterReadiness, readyAfter, initial, renewed, before, after });
       } finally {
         await runtime.dispose();
         process.disconnect();
@@ -629,27 +715,45 @@ test("broker health stays responsive while SQLite waits for a writer", { timeout
     assert.equal(await message(observer), "warm");
     // Start the lock only after imports, MCP discovery and both bound-session requests are warm.
     const locker = start(`
-      import { DatabaseSync } from "node:sqlite";
-      const database = new DatabaseSync(${JSON.stringify(config.database)});
-      database.exec("BEGIN IMMEDIATE");
-      const release = () => { database.exec("ROLLBACK"); database.close(); process.disconnect(); };
-      process.once("disconnect", () => process.exit());
-      setTimeout(release, 2500);
-      process.send("locked");
+      import { Effect, Layer, ManagedRuntime } from "effect";
+      import { SqlClient } from "effect/sql";
+      import { postgresAdmin } from ${JSON.stringify(new URL("./postgres-fixture.ts", import.meta.url).href)};
+      import { Platform } from ${JSON.stringify(new URL("../src/platform.ts", import.meta.url).href)};
+      const runtime = ManagedRuntime.make(postgresAdmin(${JSON.stringify(config.databaseUrlFile)}).pipe(Layer.provide(Platform.layer)));
+      try {
+        await runtime.runPromise(Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql.withTransaction(Effect.gen(function*() {
+            yield* sql.unsafe("LOCK TABLE sessions IN ACCESS EXCLUSIVE MODE");
+            process.send("locked");
+            yield* Effect.sleep(2500);
+          }));
+        }));
+      } finally {
+        await runtime.dispose();
+        process.disconnect();
+      }
     `);
     assert.equal(await message(locker), "locked");
     const result = message(observer);
     observer.send("observe");
     const observed = Schema.decodeUnknownSync(Schema.Struct({
       waitingBeforeHealth: Schema.Boolean, waitingAfterHealth: Schema.Boolean, observed: Schema.Unknown,
+      live: Schema.Unknown, ready: Schema.Unknown, waitingAfterReadiness: Schema.Boolean, liveAfterReadiness: Schema.Unknown,
+      readyAfter: Schema.Unknown,
       initial: Commands["session.heartbeat"].output, renewed: Commands["session.heartbeat"].output,
       before: Commands["session.poll"].output, after: Commands["session.poll"].output,
     }))(await result);
     assert.equal(observed.waitingBeforeHealth, true, "The bound heartbeat must still be waiting for the external writer");
     assert.equal(observed.waitingAfterHealth, true, "Health must finish before the blocked heartbeat");
     assert.deepEqual(observed.observed, { status: 200, body: { status: "ok" } }, "Authenticated health must meet its independent 500ms deadline during the 2500ms writer lock");
+    assert.deepEqual(observed.live, { status: 200, body: { status: "ok" } });
+    assert.deepEqual(observed.ready, { status: 503, body: { error: "Broker database not ready" } }, "Readiness must time out while SELECT 1 waits behind the owned transaction");
+    assert.equal(observed.waitingAfterReadiness, true, "The readiness deadline must not wait for the blocked PostgreSQL query");
+    assert.deepEqual(observed.liveAfterReadiness, { status: 200, body: { status: "ok" } }, "A timed-out readiness probe must not revoke process liveness");
     assert.ok(observed.renewed.liveUntil > observed.initial.liveUntil, "The bound session lease must renew after the writer releases");
     assert.deepEqual(observed.after, observed.before, "The same bound session must poll successfully after the writer releases");
+    assert.deepEqual(observed.readyAfter, { status: 200, body: { status: "ok" } }, "Readiness must recover without restarting the database owner");
   } finally {
     await Promise.all(children.map(async (child) => {
       if (child.exitCode !== null || child.signalCode !== null) return;
@@ -658,6 +762,7 @@ test("broker health stays responsive while SQLite waits for a writer", { timeout
       await exited;
     }));
     await runtime.dispose();
+    await setup.runPromise(dropPostgres(config.databaseUrlFile));
     await setup.runPromise(platform.fs.remove(root, { recursive: true, force: true }));
     await setup.dispose();
   }

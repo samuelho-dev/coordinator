@@ -1,0 +1,36 @@
+import { parseArgs } from "node:util";
+import { Effect, Layer, Schema } from "effect";
+import { NodeRuntime } from "@effect/platform-node";
+import { BrokerConfig, RunnerConfig, BackupError, Sha } from "../src/contracts.ts";
+import { privateRecoveryPath, recover } from "../src/backup.ts";
+import { Platform } from "../src/platform.ts";
+
+// Offline only: this command never pauses services, dispatches work, or deletes existing state.
+const usage = "Usage: tsx scripts/recover.ts backup|restore --broker-config /private/broker.json [--runner-config /private/runner.json] --artifact /private/new-artifact --source-sha <40-lowercase-hex> --offline-maintenance [--hold-accepted-work (restore only)]. Stop broker/runner/native children offline. Restore into a fresh empty exactly-migrated PostgreSQL database via private databaseUrlFile; mount fresh runner roots at identical absolute paths/UID layout. PostgreSQL 18 custom data-only broker.pgdump replaces broker SQLite. Independently reconstruct excluded credentials/model seed; encrypt private artifacts outside Git. Failed partial targets remain fenced; no replay or native reattachment.";
+process.umask(0o077);
+NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
+  const args = yield* Effect.try({ try: () => parseArgs({ allowPositionals: true, options: {
+    "broker-config": { type: "string" }, "runner-config": { type: "string" }, artifact: { type: "string" },
+    "source-sha": { type: "string" }, "offline-maintenance": { type: "boolean" }, "hold-accepted-work": { type: "boolean" }, help: { type: "boolean" },
+  } }), catch: () => new BackupError({ message: "Invalid recovery arguments" }) });
+  if (args.values.help) { console.log(usage); return; }
+  const operation = args.positionals[0];
+  const configPath = args.values["broker-config"], artifact = args.values.artifact, sha = args.values["source-sha"];
+  if (args.positionals.length !== 1 || (operation !== "backup" && operation !== "restore") || !configPath || !artifact || !sha || !args.values["offline-maintenance"] || (operation === "backup" && args.values["hold-accepted-work"])) return yield* new BackupError({ message: usage });
+  const sourceSha = yield* Schema.decodeUnknownEffect(Sha)(sha);
+  const platform = yield* Platform;
+  yield* privateRecoveryPath(configPath, "file");
+  const broker = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(yield* platform.privateFile(configPath));
+  let runner: RunnerConfig | undefined;
+  if (args.values["runner-config"]) {
+    yield* privateRecoveryPath(args.values["runner-config"], "file");
+    runner = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(yield* platform.privateFile(args.values["runner-config"]));
+  }
+  if (runner && [runner.childDirectory, ...Object.values(runner.repositories)].some((root) =>
+    [configPath, args.values["runner-config"]].some((file) => file && (file === root || file.startsWith(`${root}/`))))) return yield* new BackupError({ message: "Operator config files must remain outside archived runner roots" });
+  const metadata = yield* recover(operation, broker, artifact, sourceSha, runner, args.values["hold-accepted-work"] === true);
+  console.log(JSON.stringify({ operation, artifact, kind: metadata.kind, sourceSha: metadata.sourceSha, brokerRows: metadata.broker.rows, runnerRows: metadata.runner?.rows ?? null,
+    acceptedRowsFencedHeld: operation === "restore" ? metadata.broker.pendingAccepted + (metadata.runner?.pendingAccepted ?? 0) : 0,
+    brokerRowsFencedHeld: operation === "restore" ? metadata.broker.pendingAccepted : 0, runnerRowsFencedHeld: operation === "restore" ? metadata.runner?.pendingAccepted ?? 0 : 0, excluded: metadata.excluded,
+    maintenance: "Keep all services stopped until successful complete restore. On failure quarantine partial fresh volumes; do not start them. Reconstruct excluded credentials and model seed independently. Start broker, then runner with the same source/absolute paths/UID layout; reconcile HELD outcomes manually without replay. Unknown external side effects are not recoverable." }));
+})).pipe(Effect.provide(Layer.mergeAll(Platform.layer))));

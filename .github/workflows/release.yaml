@@ -1,0 +1,159 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Prepare artifacts privately, or explicitly publish chart and GitHub release (never changes visibility)
+        type: choice
+        options: [prepare-private, publish]
+        default: prepare-private
+      source_sha:
+        description: Full source commit from successful trusted main CI
+        required: true
+        type: string
+      ci_run_id:
+        description: Successful CI run which produced the existing signed image
+        required: true
+        type: string
+      version:
+        description: Stable or beta.N SemVer matching the exact-source packaged Chart.yaml version
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: coordinator-release
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    steps:
+      - name: Require successful exact-source trusted producer CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ inputs.source_sha }}
+          CI_RUN: ${{ inputs.ci_run_id }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$CI_RUN" =~ ^[0-9]+$ && "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.[1-9][0-9]*)?$ ]]
+          gh api "repos/$REPOSITORY/actions/runs/$CI_RUN" > "$RUNNER_TEMP/ci.json"
+          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" '.repository.full_name == $repo and .head_repository.full_name == $repo and .head_sha == $sha and .head_branch == "main" and .path == ".github/workflows/ci.yaml" and (.event == "push" or .event == "workflow_dispatch") and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/ci.json"
+          gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/jobs?filter=latest&per_page=100" --jq '.jobs[] | {name,conclusion}' | jq -s -e 'all(.[]; .conclusion == "success") and any(.[]; .name == "supplementary") and any(.[]; .name == "chart") and any(.[]; .name == "publish")'
+          # A main SHA must be in this repository's main history, not merely a named foreign object.
+          gh api "repos/$REPOSITORY/compare/$SHA...main" --jq '.status' | grep -Ex 'ahead|identical'
+          mkdir -p producer
+          gh run download "$CI_RUN" --repo "$REPOSITORY" --name "image-$SHA" --dir producer
+          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg image "ghcr.io/${REPOSITORY,,}" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .imageRepository == $image and (.imageDigest | test("^sha256:[0-9a-f]{64}$")) and .platform == "linux/amd64" and .protocol == "2026-07-28" and .pi == "1.0.4" and .omp == "18.6.1"' producer/image.json
+          gh run download "$CI_RUN" --repo "$REPOSITORY" --name "chart-$SHA" --dir producer
+          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg version "$VERSION" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .gate == "chart" and .chartVersion == $version and (.chartArchiveSha256 | test("^[0-9a-f]{64}$"))' producer/chart.json
+          test "$(sha256sum "producer/coordinator-$VERSION.tgz" | cut -d' ' -f1)" = "$(jq -r .chartArchiveSha256 producer/chart.json)"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+          path: source
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify exact image producer, issuer, source, SBOM and provenance
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ inputs.source_sha }}
+          CI_RUN: ${{ inputs.ci_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          IMAGE="$(jq -r '.imageRepository + "@" + .imageDigest' producer/image.json)"
+          IDENTITY="https://github.com/$REPOSITORY/.github/workflows/ci.yaml@refs/heads/main"
+          cosign verify --certificate-identity "$IDENTITY" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE" > release/image-signature.json
+          cosign verify-attestation --type https://slsa.dev/provenance/v1 --certificate-identity "$IDENTITY" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE" > release/image-attestation.json
+          DIGEST="$(jq -r .imageDigest producer/image.json)"
+          jq -s -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg digest "${DIGEST#sha256:}" --arg builder "$IDENTITY" --arg invocation "https://github.com/$REPOSITORY/actions/runs/$CI_RUN/attempts/" 'any(.[]; (.payload | @base64d | fromjson) as $s | $s.predicateType == "https://slsa.dev/provenance/v1" and any($s.subject[]; .digest.sha256 == $digest) and $s.predicate.buildDefinition.buildType == "https://actions.github.io/buildtypes/workflow/v1" and $s.predicate.buildDefinition.externalParameters == {repository:$repo,ref:"refs/heads/main",sha:$sha} and any($s.predicate.buildDefinition.resolvedDependencies[]; .uri == ("git+https://github.com/"+$repo) and .digest.gitCommit == $sha) and $s.predicate.runDetails.builder.id == $builder and ($s.predicate.runDetails.metadata.invocationId | startswith($invocation)))' release/image-attestation.json
+          docker buildx imagetools inspect "$IMAGE" --format '{{json .SBOM}}' > release/image-sbom.json
+          docker buildx imagetools inspect "$IMAGE" --format '{{json .Provenance}}' > release/image-buildkit-provenance.json
+          jq -e 'type == "object" and length > 0 and ((.["linux/amd64"] // .).SPDX | .SPDXID == "SPDXRef-DOCUMENT" and (.spdxVersion | test("^SPDX-2\\.[0-9]+$")) and (.packages | type == "array" and length > 0))' release/image-sbom.json
+          jq -e 'type == "object" and length > 0' release/image-buildkit-provenance.json
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.19.0
+      - name: Prepare source-gated chart and private preparation manifest
+        env:
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(helm show chart source/deploy/helm/coordinator | ruby -ryaml -e 'puts YAML.load(STDIN.read)["version"]')" = "$VERSION"
+          test "$(helm show chart "producer/coordinator-$VERSION.tgz" | ruby -ryaml -e 'puts YAML.load(STDIN.read)["version"]')" = "$VERSION"
+          cp "producer/coordinator-$VERSION.tgz" producer/chart.json release/
+          cp source/LICENSE source/THIRD_PARTY_NOTICES.md release/
+          CHART_SHA="$(sha256sum "release/coordinator-$VERSION.tgz" | cut -d' ' -f1)"
+          OWNER="${REPOSITORY%%/*}"
+          jq --slurpfile chartGate producer/chart.json --arg version "$VERSION" --arg chart "oci://ghcr.io/${OWNER,,}/charts/coordinator" --arg tarSha "$CHART_SHA" --arg identity "https://github.com/$REPOSITORY/.github/workflows/ci.yaml@refs/heads/main" '. + {releaseVersion:$version,chartVersion:$version,chartRepository:$chart,chartOciDigest:null,chartArchiveSha256:$tarSha,chartSourceGate:$chartGate[0],imageProducer:$identity,oidcIssuer:"https://token.actions.githubusercontent.com",publication:"prepared-private",redistributionAudit:"incomplete; see THIRD_PARTY_NOTICES.md"}' producer/image.json > release/release-manifest.json
+          printf 'Private preparation only. Existing image verified; chart archive SHA256 is not an OCI digest. No artifact visibility changed.\n' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: prepared-release-${{ inputs.source_sha }}
+          path: release/
+          if-no-files-found: error
+  publish:
+    needs: prepare
+    if: github.ref == 'refs/heads/main' && inputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: prepared-release-${{ inputs.source_sha }}
+          path: release
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.19.0
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Publish chart once, sign its digest, and attach exact release coordinates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          OWNER="${REPOSITORY%%/*}"
+          CHART="ghcr.io/${OWNER,,}/charts/coordinator"
+          printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          # Refuse to replace an existing version or release; no semver alias/rebuild of the image.
+          if helm show chart "oci://$CHART" --version "$VERSION" >/dev/null 2>&1; then echo 'Chart version already exists' >&2; exit 1; fi
+          if gh release view "v$VERSION" --repo "$REPOSITORY" >/dev/null 2>&1; then echo 'Release version already exists' >&2; exit 1; fi
+          helm push "release/coordinator-$VERSION.tgz" "oci://ghcr.io/${OWNER,,}/charts" 2>&1 | tee "$RUNNER_TEMP/chart-push.txt"
+          DIGEST="$(grep -Eo 'sha256:[0-9a-f]{64}' "$RUNNER_TEMP/chart-push.txt")"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          IMAGE="$(jq -r '.imageRepository + "@" + .imageDigest' release/release-manifest.json)"
+          # Never sign the image here: only the trusted CI producer may sign that artifact.
+          cosign sign --yes --new-bundle-format=false --use-signing-config=false --registry-referrers-mode=legacy "$CHART@$DIGEST"
+          cosign verify --certificate-identity "https://github.com/$REPOSITORY/.github/workflows/release.yaml@refs/heads/main" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$CHART@$DIGEST" > release/chart-signature.json
+          IDENTITY="https://github.com/$REPOSITORY/.github/workflows/release.yaml@refs/heads/main"
+          jq -n --arg repo "$REPOSITORY" --arg sha "$SHA" --arg builder "$IDENTITY" --arg invocation "https://github.com/$REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" '{buildDefinition:{buildType:"https://actions.github.io/buildtypes/workflow/v1",externalParameters:{repository:$repo,ref:"refs/heads/main",sha:$sha},resolvedDependencies:[{uri:("git+https://github.com/"+$repo),digest:{gitCommit:$sha}}]},runDetails:{builder:{id:$builder},metadata:{invocationId:$invocation}}}' > release/chart-provenance.json
+          cosign attest --yes --new-bundle-format=false --use-signing-config=false --registry-referrers-mode=legacy --type https://slsa.dev/provenance/v1 --predicate release/chart-provenance.json "$CHART@$DIGEST"
+          cosign verify-attestation --type https://slsa.dev/provenance/v1 --certificate-identity "$IDENTITY" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$CHART@$DIGEST" > release/chart-attestation.json
+          jq -s -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg digest "${DIGEST#sha256:}" 'any(.[]; (.payload | @base64d | fromjson) as $s | any($s.subject[]; .digest.sha256 == $digest) and $s.predicate.buildDefinition.externalParameters == {repository:$repo,ref:"refs/heads/main",sha:$sha})' release/chart-attestation.json
+          jq --arg digest "$DIGEST" '.chartOciDigest=$digest | .publication="published-existing-visibility"' release/release-manifest.json > "$RUNNER_TEMP/manifest.json"
+          mv "$RUNNER_TEMP/manifest.json" release/release-manifest.json
+          printf 'Exact source: `%s`\n\nImage: `%s`\n\nChart: `oci://%s@%s`\n\nPlatform: linux/amd64; protocol: 2026-07-28; Pi: 1.0.4; OMP: 18.6.1.\n\nRedistribution audit is incomplete; this is not a public-ready certification. Package/repository visibility is unchanged.\n' "$SHA" "$IMAGE" "$CHART" "$DIGEST" > "$RUNNER_TEMP/release-notes.txt"
+          PRERELEASE=()
+          if [[ "$VERSION" == *-beta.* ]]; then PRERELEASE=(--prerelease); fi
+          gh release create "v$VERSION" release/* --repo "$REPOSITORY" --target "$SHA" --title "Coordinator $VERSION" --notes-file "$RUNNER_TEMP/release-notes.txt" "${PRERELEASE[@]}"

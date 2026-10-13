@@ -143,7 +143,7 @@ test("identity branding preserves malformed ID rejection and positive integer re
   }
   assert.throws(() => Schema.decodeUnknownSync(C.Work, { onExcessProperty: "error" })({ ...wireWork, githubRepoId: 1.5 }));
   const config = Schema.decodeUnknownSync(C.BrokerConfig, { onExcessProperty: "error" })({
-    database: ":memory:", host: "127.0.0.1", port: 0, principals: [], backupDirectory: "/tmp/backups",
+    databaseUrlFile: "/tmp/private/database.url", host: "127.0.0.1", port: 0, principals: [], backupDirectory: "/tmp/backups",
     archiveRetentionMs: 1000, backupRetentionMs: 1000, repositoryIds: { "github.com/owner/project": 1 },
   });
   for (const repositoryId of [0, -1, 1.5]) {

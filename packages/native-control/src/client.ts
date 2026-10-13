@@ -9,22 +9,17 @@ import { open } from "node:fs/promises";
 import { Cause, Effect, Schema, Scope } from "effect";
 import type { Exit } from "effect";
 import { McpSchema } from "effect/ai";
-import { NativePresentationCursor, NativePresentationPage, nativePresentationUri, type NativePresentationValue } from "./interaction.js";
+import { NativePresentationPage, nativePresentationUri, type NativePresentationCursor, type NativePresentationValue } from "./interaction.js";
 export { nativeMcpWireByteGate } from "./mcp-protocol.js";
 import {
-  NativeBinding,
   NativeControlError,
   NativePluginEndpoint,
   NativeEventPage,
   NativeEventSequence,
-  NativeHost,
-  NativeLifecycleEvent,
-  NativePromptAdmission,
   NativeMcpResultBytes,
   NativeMcpWireBytes,
   NativeMcpProtocolVersion,
   NativePrivateResultId,
-  NativePrivateResultReference,
   nativePrivateResultUri,
   NativeTools,
   nativeEventsUri,
@@ -44,27 +39,19 @@ import {
 } from "./contracts.js";
 import { Record } from "effect";
 
-const nonEmpty = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096));
-const timeout = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 2_147_483_647 }));
-export const NativeClientLaunch = Schema.Struct({
-  host: NativeHost,
-  command: nonEmpty,
-  args: Schema.optional(Schema.Array(Schema.String.check(Schema.isMaxLength(16000))).check(Schema.isMaxLength(256))),
-  env: Schema.Record(Schema.String.check(Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/)), Schema.String.check(Schema.isMaxLength(262144))),
-  cwd: nonEmpty,
-  maxBufferSize: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 268435456 }))),
-  connectTimeoutMs: timeout,
-  plugin: Schema.optional(Schema.Struct({ endpointFile: nonEmpty, token: Schema.String.check(Schema.isMinLength(32), Schema.isMaxLength(480)) })),
-});
-export type NativeClientLaunch = typeof NativeClientLaunch.Type;
-
-export const NativeClientConnection = Schema.Struct({ host: NativeHost, connectTimeoutMs: timeout });
-export type NativeClientConnection = typeof NativeClientConnection.Type;
-
-export const NativeCallBudget = Schema.Struct({ timeoutMs: timeout });
-export type NativeCallBudget = typeof NativeCallBudget.Type;
-export const NativeLifecycleCursor = Schema.Struct({ binding: NativeBinding, after: NativeEventSequence });
-export type NativeLifecycleCursor = typeof NativeLifecycleCursor.Type;
+export type NativeClientLaunch = Readonly<{
+  host: NativeHostType;
+  command: string;
+  args?: readonly string[];
+  env: Readonly<Record<string, string>>;
+  cwd: string;
+  maxBufferSize?: number;
+  connectTimeoutMs: number;
+  plugin?: Readonly<{ endpointFile: string; token: string }>;
+}>;
+export type NativeClientConnection = Readonly<{ host: NativeHostType; connectTimeoutMs: number }>;
+export type NativeCallBudget = Readonly<{ timeoutMs: number }>;
+export type NativeLifecycleCursor = Readonly<{ binding: NativeBindingType; after: NativeEventSequenceType }>;
 
 export type NativeElicitation = Readonly<{
   capabilities: NonNullable<ClientCapabilities["elicitation"]>;
@@ -87,7 +74,11 @@ const fail = (code: ConstructorParameters<typeof NativeControlError>[0]["code"],
 const transportFailure = () => fail("transport_closed", "Native MCP connection closed before the operation was proven complete");
 const nativeFailure = () => fail("native_failure", "Native MCP operation failed");
 const deadlineFailure = () => fail("deadline_exceeded", "Native MCP operation exceeded its caller-provided deadline");
+const validTimeout = (milliseconds: number) => Number.isInteger(milliseconds) && milliseconds >= 1 && milliseconds <= 2_147_483_647;
 const failureEnvelope = Schema.Struct({ error: NativeControlError });
+const resultBindings: { readonly [N in NativeToolName]?: (output: NativeToolOutput<N>) => NativeBindingType } = {
+  "native.get_state": (output) => output.binding,
+};
 const waitFor = <A>(promise: Promise<A>, signal: AbortSignal): Promise<A> => {
   if (signal.aborted) {
     // The caller may already have started a read/drain before observing abort.
@@ -103,6 +94,32 @@ const waitFor = <A>(promise: Promise<A>, signal: AbortSignal): Promise<A> => {
 };
 const queryEventsUri = (binding: NativeBindingType, after: NativeEventSequenceType, limit = 256) =>
   `${nativeEventsUri(binding)}?after=${after}&limit=${limit}`;
+
+// Bound wire resources before the SDK parser allocates; never cap a whole SSE subscription.
+const boundedNativeFetch = (endpoint: URL): typeof fetch => async (input, init) => {
+  const request = new Request(input, init);
+  if (new URL(request.url).origin !== endpoint.origin) throw transportFailure();
+  const response = await fetch(request);
+  if (response.body === null) return response;
+  const sse = response.headers.get("content-type")?.split(";")[0]?.trim() === "text/event-stream";
+  let bytes = 0;
+  let lineBytes = 0;
+  let previousCR = false;
+  const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      for (const byte of chunk) {
+        if (++bytes > NativeMcpWireBytes) throw transportFailure();
+        if (sse && (byte === 13 || (byte === 10 && !previousCR))) {
+          if (lineBytes === 0) bytes = 0;
+          lineBytes = 0;
+        } else if (byte !== 10 && byte !== 13) lineBytes++;
+        previousCR = byte === 13;
+      }
+      controller.enqueue(chunk);
+    },
+  }));
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+};
 
 const transportEffect = <A>(run: (signal: AbortSignal) => Promise<A>, deadline = false): Effect.Effect<A, NativeControlError> =>
   Effect.tryPromise({
@@ -139,10 +156,11 @@ export type NativeClient<ProcessID extends number | null = number> = Readonly<{
 }>;
 
 export const connectNativeClient = (
-  untrustedLaunch: NativeClientLaunch,
+  launch: NativeClientLaunch,
   elicitation?: NativeElicitation,
 ): Effect.Effect<NativeClient, NativeControlError, Scope.Scope> => Effect.gen(function*() {
-  const launch = yield* Effect.try({ try: () => Schema.decodeUnknownSync(NativeClientLaunch, { onExcessProperty: "error" })(untrustedLaunch), catch: () => fail("invalid_input", "Invalid native MCP launch configuration") });
+  if (!validTimeout(launch.connectTimeoutMs)) return yield* Effect.fail(fail("invalid_input", "Invalid native MCP launch timeout"));
+  if (launch.maxBufferSize !== undefined && (!Number.isInteger(launch.maxBufferSize) || launch.maxBufferSize < 1024 || launch.maxBufferSize > 268435456)) return yield* Effect.fail(fail("invalid_input", "Invalid native MCP launch buffer limit"));
   let resolveProcessClosed!: () => void;
   const processClosedPromise = new Promise<void>((resolve) => { resolveProcessClosed = resolve; });
   const envArgs = Object.entries(launch.env).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}`);
@@ -217,6 +235,7 @@ export const connectNativeClient = (
             endpointBinding = endpoint.binding;
             http = new StreamableHTTPClientTransport(new URL(endpoint.url), {
               requestInit: { headers: { Authorization: `Bearer ${plugin.token}` }, redirect: "error" },
+              fetch: boundedNativeFetch(new URL(endpoint.url)),
             });
             http.onclose = () => bridge.onclose?.();
             http.onerror = (error) => bridge.onerror?.(error);
@@ -276,7 +295,7 @@ export const connectNativeClient = (
 });
 
 export const connectNativeTransport = <ProcessID extends number | null>(
-  untrustedConnection: NativeClientConnection,
+  launch: NativeClientConnection,
   transport: Transport,
   ownership: Readonly<{ pid: ProcessID; observedProcessClosed: Promise<void>; close: () => Promise<void> }>,
   elicitation?: NativeElicitation,
@@ -305,7 +324,7 @@ export const connectNativeTransport = <ProcessID extends number | null>(
         reason._tag === "Fail" ? Cause.makeDieReason(reason.error) : reason)))),
     ),
   );
-  const launch = yield* Effect.try({ try: () => Schema.decodeUnknownSync(NativeClientConnection, { onExcessProperty: "error" })(untrustedConnection), catch: () => fail("invalid_input", "Invalid native MCP connection configuration") });
+  if (!validTimeout(launch.connectTimeoutMs)) return yield* Effect.fail(fail("invalid_input", "Invalid native MCP connection timeout"));
   let resolveConnectionClosed!: () => void;
   const connectionClosedPromise = new Promise<void>((resolve) => { resolveConnectionClosed = resolve; });
   let connectionClosed = false;
@@ -401,29 +420,27 @@ export const connectNativeTransport = <ProcessID extends number | null>(
     for (const hint of lifecycleHints.get(notification.params.uri) ?? []) hint();
   });
 
-  const call = <N extends NativeToolName>(name: N, untrustedInput: NativeToolInput<N>, budget: NativeCallBudget) => Effect.gen(function*() {
+  const call = <N extends NativeToolName>(name: N, input: NativeToolInput<N>, budget: NativeCallBudget): Effect.Effect<NativeToolOutput<N>, NativeControlError> => Effect.gen(function*() {
     if (connectionClosed) return yield* Effect.fail(transportFailure());
-    const input = yield* Effect.try({ try: () => Schema.decodeUnknownSync(nativeToolInputSchema(name), { onExcessProperty: "error" })(untrustedInput), catch: () => fail("invalid_input", "Invalid native tool input") });
-    const checkedBudget = yield* Effect.try({ try: () => Schema.decodeUnknownSync(NativeCallBudget, { onExcessProperty: "error" })(budget), catch: () => fail("invalid_input", "Invalid native request budget") });
-    const deadlineAt = performance.now() + checkedBudget.timeoutMs;
+    if (!validTimeout(budget.timeoutMs)) return yield* Effect.fail(fail("invalid_input", "Invalid native request budget"));
+    const deadlineAt = performance.now() + budget.timeoutMs;
     if (!expectedNames.includes(name)) return yield* Effect.fail(fail("unsupported_operation", "Native tool is unavailable on the connected host"));
-    const encoded = yield* Effect.try({
-      try: () => Schema.encodeUnknownSync(Schema.toCodecJson(nativeToolInputSchema(name)), { onExcessProperty: "error" })(input),
+    const arguments_ = yield* Effect.try({
+      try: () => Schema.encodeSync<(typeof NativeTools)[N]["input"]>(nativeToolInputSchema(name), { onExcessProperty: "error" })(input),
       catch: () => fail("invalid_input", "Invalid native tool input"),
     });
-    const arguments_ = yield* Effect.try({ try: () => Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown), { onExcessProperty: "error" })(encoded), catch: () => fail("invalid_input", "Native tool input is not an object") });
-    const response = yield* sdkEffect((signal) => client.callTool({ name, arguments: arguments_ }, { signal, timeout: checkedBudget.timeoutMs, maxTotalTimeout: checkedBudget.timeoutMs }), true);
+    const response = yield* sdkEffect((signal) => client.callTool({ name, arguments: arguments_ }, { signal, timeout: budget.timeoutMs, maxTotalTimeout: budget.timeoutMs }), true);
     if (response.isError) {
       if (response.structuredContent === undefined) return yield* Effect.fail(nativeFailure());
       return yield* Effect.fail(yield* Effect.try({ try: () => Schema.decodeUnknownSync(Schema.toCodecJson(failureEnvelope), { onExcessProperty: "error" })(response.structuredContent).error, catch: () => nativeFailure() }));
     }
     if (response.structuredContent === undefined) return yield* Effect.fail(nativeFailure());
-    const envelope = yield* Effect.try({ try: () => Schema.decodeUnknownSync(Schema.toCodecJson(NativeTools[name].structuredOutput), { onExcessProperty: "error" })(response.structuredContent), catch: () => nativeFailure() });
-    if ("result" in envelope) return yield* Effect.try({ try: () => Schema.decodeUnknownSync(nativeToolOutputSchema(name), { onExcessProperty: "error" })(envelope.result), catch: () => nativeFailure() });
-    const reference = yield* Effect.try({ try: () => Schema.decodeUnknownSync(NativePrivateResultReference, { onExcessProperty: "error" })(envelope.resultResource), catch: () => nativeFailure() });
+    const envelope = yield* Effect.try({ try: () => Schema.decodeUnknownSync<Schema.toCodecJson<(typeof NativeTools)[N]["structuredOutput"]>>(Schema.toCodecJson(NativeTools[name].structuredOutput), { onExcessProperty: "error" })(response.structuredContent), catch: () => nativeFailure() });
+    if ("result" in envelope) return envelope.result;
+    const reference = envelope.resultResource;
     const bytes = yield* sdkEffect(async (signal) => {
       if (reference.binding.host !== launch.host) throw fail("binding_mismatch", "Native result resource belongs to another host");
-      if (arguments_.binding !== undefined) assertBinding(Schema.decodeUnknownSync(NativeBinding, { onExcessProperty: "error" })(arguments_.binding), reference.binding);
+      if ("binding" in input && input.binding !== undefined) assertBinding(input.binding, reference.binding);
       const resultId = Schema.decodeUnknownSync(NativePrivateResultId, { onExcessProperty: "error" })(reference.uri.split("/").at(-1));
       if (reference.uri !== nativePrivateResultUri(reference.binding, resultId)) throw fail("binding_mismatch", "Native result resource URI does not match its owner binding");
       const bytes = new Uint8Array(reference.byteLength);
@@ -446,12 +463,12 @@ export const connectNativeTransport = <ProcessID extends number | null>(
       return bytes;
     }, true);
     const output = yield* Effect.try({
-      try: () => Schema.decodeUnknownSync(Schema.fromJsonString(Schema.toCodecJson(nativeToolOutputSchema(name))), { onExcessProperty: "error" })(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+      try: () => Schema.decodeUnknownSync<Schema.fromJsonString<Schema.toCodecJson<(typeof NativeTools)[N]["output"]>>>(Schema.fromJsonString(Schema.toCodecJson(nativeToolOutputSchema(name))), { onExcessProperty: "error" })(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
       catch: () => nativeFailure(),
     });
-    if (name === "native.get_state") {
-      const state = yield* Effect.try({ try: () => Schema.decodeUnknownSync(nativeToolOutputSchema("native.get_state"), { onExcessProperty: "error" })(output), catch: () => nativeFailure() });
-      yield* Effect.try({ try: () => assertBinding(reference.binding, state.binding), catch: () => fail("binding_mismatch", "Native state snapshot binding does not match its result resource") });
+    const outputBinding = resultBindings[name]?.(output);
+    if (outputBinding !== undefined) {
+      yield* Effect.try({ try: () => assertBinding(reference.binding, outputBinding), catch: () => fail("binding_mismatch", "Native state snapshot binding does not match its result resource") });
     }
     return output;
   });
@@ -499,8 +516,7 @@ export const connectNativeTransport = <ProcessID extends number | null>(
     if (detached._tag === "Failure") return yield* Effect.failCause(detached.cause);
   }).pipe(Effect.uninterruptible);
 
-  const watchLifecycle = (untrustedCursor: NativeLifecycleCursor, onEvent: (event: NativeLifecycleEventType) => void | Promise<void>, deadlineAt?: number) => Effect.gen(function*() {
-    const cursor = yield* Effect.try({ try: () => Schema.decodeUnknownSync(NativeLifecycleCursor, { onExcessProperty: "error" })(untrustedCursor), catch: () => fail("invalid_input", "Invalid native lifecycle cursor") });
+  const watchLifecycle = (cursor: NativeLifecycleCursor, onEvent: (event: NativeLifecycleEventType) => void | Promise<void>, deadlineAt?: number) => Effect.gen(function*() {
     const baseUri = nativeEventsUri(cursor.binding);
     const cancellation = new AbortController();
     let failure: NativeControlError | undefined;
@@ -529,12 +545,12 @@ export const connectNativeTransport = <ProcessID extends number | null>(
               if (closeHighWater !== undefined && event.seq > closeHighWater) break;
               assertBinding(cursor.binding, event.binding);
               if (event.seq <= after || event.seq > page.nextAfter) throw fail("resource_gap", "Native lifecycle events are duplicated or reordered");
-              await waitFor(Promise.resolve(onEvent(Schema.decodeUnknownSync(NativeLifecycleEvent, { onExcessProperty: "error" })(event))), cancellation.signal);
+              await waitFor(Promise.resolve(onEvent(event)), cancellation.signal);
               after = event.seq;
               if (stopped) return;
             }
             if (page.nextAfter < after || (page.more && (page.entries.length === 0 || page.nextAfter !== page.entries.at(-1)?.seq || page.nextAfter >= page.highWater)) || (!page.more && page.nextAfter !== page.highWater)) throw fail("resource_gap", "Native lifecycle page made no valid progress");
-            after = closeHighWater === undefined ? page.nextAfter : Schema.decodeUnknownSync(NativeEventSequence)(Math.min(page.nextAfter, closeHighWater));
+            after = closeHighWater === undefined ? page.nextAfter : NativeEventSequence.make(Math.min(page.nextAfter, closeHighWater));
           } while (closeHighWater === undefined ? page.more : after < closeHighWater);
         } while (hinted && !closing && !stopped);
       })().catch((cause) => {
@@ -584,8 +600,7 @@ export const connectNativeTransport = <ProcessID extends number | null>(
     return { drain: sdkEffect((signal) => waitFor(drain(), signal)), connectionClosed, close: release };
   });
 
-  const watchPresentation = (untrustedCursor: NativePresentationCursor, onValue: (value: NativePresentationValue) => void | Promise<void>) => Effect.gen(function*() {
-    const cursor = yield* Effect.try({ try: () => Schema.decodeUnknownSync(NativePresentationCursor, { onExcessProperty: "error" })(untrustedCursor), catch: () => fail("invalid_input", "Invalid native presentation cursor") });
+  const watchPresentation = (cursor: NativePresentationCursor, onValue: (value: NativePresentationValue) => void | Promise<void>) => Effect.gen(function*() {
     if (!hasPresentation) return yield* Effect.fail(fail("unsupported_operation", "Public plugin does not expose native presentation resources"));
     const baseUri = nativePresentationUri(cursor.binding);
     const cancellation = new AbortController();
@@ -698,8 +713,8 @@ export const connectNativeTransport = <ProcessID extends number | null>(
   });
 
   const prompt = (input: NativePromptInputType, options: NativePromptCallOptions) => Effect.scoped(Effect.gen(function*() {
-    const budget = yield* Effect.try({ try: () => Schema.decodeUnknownSync(NativeCallBudget, { onExcessProperty: "error" })({ timeoutMs: options.timeoutMs }), catch: () => fail("invalid_input", "Invalid native request budget") });
-    const deadlineAt = performance.now() + budget.timeoutMs;
+    if (!validTimeout(options.timeoutMs)) return yield* Effect.fail(fail("invalid_input", "Invalid native request budget"));
+    const deadlineAt = performance.now() + options.timeoutMs;
     let watch: NativeLifecycleWatch | undefined;
     return yield* Effect.gen(function*() {
       let admission: NativePromptAdmissionType | undefined;
@@ -710,7 +725,7 @@ export const connectNativeTransport = <ProcessID extends number | null>(
         if (event.kind === "session_retired") throw fail("binding_mismatch", "Native owner generation retired while prompt state was unresolved");
         if (event.kind === "submission_admitted" && event.submissionId === input.submissionId) {
           if (admission !== undefined) throw fail("native_failure", "Native prompt submission was admitted more than once");
-          admission = Schema.decodeUnknownSync(NativePromptAdmission, { onExcessProperty: "error" })({ binding: event.binding, submissionId: event.submissionId, disposition: event.disposition, runId: event.runId, eventsUri: nativeEventsUri(event.binding), seq: event.seq });
+          admission = { binding: event.binding, submissionId: event.submissionId, disposition: event.disposition, runId: event.runId, eventsUri: nativeEventsUri(event.binding), seq: event.seq };
           if ((admission.disposition === "handled") !== (admission.runId === null)) throw fail("native_failure", "Native prompt admission has a contradictory run identity");
           if (performance.now() >= deadlineAt) throw deadlineFailure();
           await options.onAdmission(admission);
@@ -742,7 +757,7 @@ export const connectNativeTransport = <ProcessID extends number | null>(
       }
       return result;
     }).pipe(
-      Effect.timeoutOrElse({ duration: budget.timeoutMs, orElse: () => Effect.fail(deadlineFailure()) }),
+      Effect.timeoutOrElse({ duration: options.timeoutMs, orElse: () => Effect.fail(deadlineFailure()) }),
       Effect.onExit(() => watch?.close ?? Effect.void),
     );
   }));

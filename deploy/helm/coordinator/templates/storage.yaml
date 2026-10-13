@@ -1,0 +1,21 @@
+{{- range $name := list "backups" "work" }}
+{{- $settings := index $.Values.persistence $name }}
+{{- if and (or (ne $name "work") $.Values.runner.enabled) (not $settings.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $.Release.Name }}-{{ $name }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml $settings.accessModes | nindent 4 }}
+  {{- if ne $settings.storageClass nil }}
+  storageClassName: {{ $settings.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ required (printf "persistence.%s.size required" $name) $settings.size }}
+{{- end }}
+{{- end }}

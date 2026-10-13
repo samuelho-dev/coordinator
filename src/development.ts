@@ -1,4 +1,4 @@
-import { Effect, Layer, Stdio } from "effect";
+import { Config, Effect, Layer, Stdio } from "effect";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import getExePath from "@effect/tsgo/lib/getExePath";
@@ -17,8 +17,13 @@ NodeRuntime.runMain(Effect.gen(function*() {
     if (code !== 0) return yield* new CommandError({ message: `Development command exited with status ${code}` });
   });
   const capabilities = {
-    checkTypes: () => run(getExePath(), ["--noEmit"]),
+    checkTypes: () => Effect.gen(function*() {
+      yield* run("pnpm", ["db:generate"]);
+      yield* run(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", "import './src/generated/database/index.ts'"]);
+      yield* run(getExePath(), ["--noEmit"]);
+    }),
     runTests: () => Effect.gen(function*() {
+      yield* Config.String("COORDINATOR_TEST_POSTGRES_URL_FILE");
       const files = (yield* platform.fs.readDirectory(platform.path.join(root, "test"))).filter((name) => name.endsWith(".test.ts")).sort();
       if (files.length === 0) return yield* new CommandError({ message: "No repository test files found" });
       yield* run(process.execPath, ["--import", "tsx", "--test", "--test-concurrency=1", ...files.map((name) => platform.path.join(root, "test", name))]);

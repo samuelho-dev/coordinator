@@ -2,15 +2,18 @@ packages:
   - .
   - packages/native-control
 overrides:
-  effect: https://pkg.pr.new/Effect-TS/effect/effect@d6082a25a3779f7e2abba2787323d5d9c7e1d24a
-  '@effect/platform-node': 4.0.2
-  '@effect/platform-node-shared': 4.0.2
-  '@effect/sql-sqlite-node': 4.0.2
+  effect: 4.0.3
+  '@effect/platform-node': 4.0.3
+  '@effect/platform-node-shared': 4.0.3
+  '@effect/sql-sqlite-node': 4.0.3
+  '@effect/sql-pg': 4.0.3
 allowBuilds:
   '@google/genai': false
   esbuild: true
   onnxruntime-node: false
   protobufjs: false
+  # ponytail: Prisma's cloud/composer runtime is unused; local contract/migration CLI needs no workerd binary.
+  workerd: false
 minimumReleaseAgeExclude:
   - '@earendil-works/chord@1.0.4'
   - '@earendil-works/pi-agent-core@1.0.4'
@@ -20,9 +23,11 @@ minimumReleaseAgeExclude:
   - '@earendil-works/pi-mcp@1.0.4'
   - '@earendil-works/pi-telemetry@1.0.4'
   - '@earendil-works/pi-tui@1.0.4'
-  - '@effect/platform-node@4.0.2'
-  - '@effect/platform-node-shared@4.0.2'
-  - '@effect/sql-sqlite-node@4.0.2'
+  - 'effect@4.0.3'
+  - '@effect/platform-node@4.0.3'
+  - '@effect/platform-node-shared@4.0.3'
+  - '@effect/sql-sqlite-node@4.0.3'
+  - '@effect/sql-pg@4.0.3'
   - '@effect/tsgo-darwin-arm64@0.49.0'
   - '@effect/tsgo-darwin-x64@0.49.0'
   - '@effect/tsgo-linux-arm64@0.49.0'
@@ -31,3 +36,4 @@ minimumReleaseAgeExclude:
   - '@effect/tsgo-win32-arm64@0.49.0'
   - '@effect/tsgo-win32-x64@0.49.0'
   - '@effect/tsgo@0.49.0'
+  - 'prisma-effect-kysely@9.0.2'

@@ -14,6 +14,7 @@ import type { Json } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { Broker } from "../src/broker.ts";
 import { Mcp } from "../src/http.ts";
+import { dropPostgres, provisionPostgres } from "../test/postgres-fixture.ts";
 
 // Installed CLIs, unmodified public SDKs and real provider parsing against a local SSE fixture.
 // No external provider, global profile, native UI consent or terminal rendering is inferred.
@@ -98,8 +99,10 @@ const runHostSmoke = () => Effect.gen(function*() {
   const repo = yield* platform.inspectedRepo(root);
   const coordinatorToken = Hex.encode(yield* crypto.randomBytes(32));
   const sessionToken = Hex.encode(yield* crypto.randomBytes(32));
+  const brokerDirectory = join(directory, "broker");
+  yield* fs.makeDirectory(brokerDirectory, { mode: 0o700 });
   const brokerConfig = yield* Schema.decodeUnknownEffect(BrokerConfig)({
-    database: join(directory, "broker", "ledger.sqlite"), host: "127.0.0.1", port: 0,
+    databaseUrlFile: yield* provisionPostgres(brokerDirectory), host: "127.0.0.1", port: 0,
     backupDirectory: join(directory, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
     repositoryIds: Object.fromEntries([[repo, 1]]),
     principals: [
@@ -107,9 +110,10 @@ const runHostSmoke = () => Effect.gen(function*() {
       { id: "session", owner: "stock-smoke", roles: ["session"], repos: [repo], tokenHash: yield* platform.digest(sessionToken) },
     ],
   });
+  const brokerScope = yield* Scope.fork(yield* Effect.scope);
   const brokerContext = yield* Layer.build(Broker.layer(brokerConfig).pipe(
     Layer.provideMerge(Mcp.layer), Layer.provide(Layer.succeed(Platform, platform)),
-  ));
+  )).pipe(Effect.provideService(Scope.Scope, brokerScope));
   const broker = Context.get(brokerContext, Broker);
   const mcp = Context.get(brokerContext, Mcp);
   const address = broker.server.address;
@@ -175,11 +179,11 @@ const runHostSmoke = () => Effect.gen(function*() {
       const session = enrolled[0]!;
       assert.equal(session.sessionId, client.binding.sessionId);
       assert.equal(session.repo, repo);
-      const durableRows = yield* broker.sql.unsafe<Json>("SELECT data FROM sessions WHERE id=?", [session.sessionId]);
+      const durableRows = yield* broker.sql.unsafe<Json>("SELECT data FROM sessions WHERE id=$1", [session.sessionId]);
       assert.equal(durableRows.length, 1);
       const durableSession = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(LiveSession))(durableRows[0]!.data);
       assert.equal(durableSession.incarnation, session.incarnation);
-      const messageId = MessageId.make(yield* crypto.randomUUIDv4);
+      const messageId = MessageId.make(yield* crypto.randomUUIDv4());
       const payload = { note: `Real ${host} public-plugin durable inbox delivery; no prompt requested` };
       const sent = yield* mcp.call(brokerUrl, coordinatorToken, "peer.send", {
         sessionId: session.sessionId, incarnation: session.incarnation, messageId, payload, ttlMs: 60000,
@@ -195,7 +199,7 @@ const runHostSmoke = () => Effect.gen(function*() {
         assert.equal(journal.inbox[messageId].digest, yield* platform.fingerprint(payload));
         assert.equal(journal.handled[JournalHandledKey.make(`peer:${messageId}`)], true);
         assert.equal(journal.consent, false, "Headless smoke cannot forge participant consent");
-        const queued = yield* broker.sql.unsafe<Json>("SELECT id FROM peers WHERE id=?", [messageId]);
+        const queued = yield* broker.sql.unsafe<Json>("SELECT id FROM peers WHERE id=$1", [messageId]);
         return queued.length === 0;
       }), Boolean);
       const events: NativeLifecycleEvent[] = [];
@@ -279,7 +283,7 @@ const runHostSmoke = () => Effect.gen(function*() {
       if (failed.disposition !== "settled") return yield* new CommandError({ message: "Expected error SDK run" });
       assert.equal(failed.final.outcome, "error");
       let admittedAbort = false;
-      const abortRun = yield* Effect.forkIn(client.prompt({ binding: client.binding, submissionId: NativeSubmissionId.make(yield* crypto.randomUUIDv4), message: "SDK_ABORT" }, {
+      const abortRun = yield* Effect.forkIn(client.prompt({ binding: client.binding, submissionId: NativeSubmissionId.make(yield* crypto.randomUUIDv4()), message: "SDK_ABORT" }, {
         after: NativeEventSequence.make(0), timeoutMs: 60000, onAdmission: () => { admittedAbort = true; },
       }), scope);
       yield* until(() => Effect.sync(() => admittedAbort), Boolean);
@@ -343,6 +347,8 @@ const runHostSmoke = () => Effect.gen(function*() {
     yield* client.observedProcessClosed.pipe(Effect.timeout("10 seconds"));
     observations.push({ host, binding: client.binding, pid: client.pid, capabilities: client.capabilities, physicalProcessClosed: true });
   }
+  yield* Scope.close(brokerScope, Exit.void);
+  yield* dropPostgres(brokerConfig.databaseUrlFile);
   yield* fs.writeFileString(transcript, JSON.stringify({ accepted: true, observations,
     controlsAcceptance: "accepted", exercisedControls,
     guardedNegativeControls: { controls: guardedNegativeControls, result: "binding_mismatch before delivery" },

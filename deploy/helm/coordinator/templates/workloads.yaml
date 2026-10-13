@@ -1,0 +1,225 @@
+{{- $repository := required "image.repository is required" .Values.image.repository -}}
+{{- $digest := required "image.digest is required" .Values.image.digest -}}
+{{- $sha := required "sourceSha is required" .Values.sourceSha -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) }}{{ fail "image.digest must be sha256 plus 64 lowercase hexadecimal digits" }}{{ end -}}
+{{- if not (regexMatch "^[a-f0-9]{40}$" $sha) }}{{ fail "sourceSha must be the full 40-character source commit" }}{{ end -}}
+{{- if or (contains "@" $repository) (contains " " $repository) }}{{ fail "image.repository must not contain a digest or whitespace" }}{{ end -}}
+{{- $caSecret := .Values.tls.existingCaSecret -}}
+{{- if and $caSecret (or (gt (len $caSecret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caSecret))) }}{{ fail "tls.existingCaSecret must be a Kubernetes Secret name" }}{{ end -}}
+{{- range $role := list "broker" "runner" }}
+{{- $settings := index $.Values $role }}
+{{- if or (eq $role "broker") $settings.enabled }}
+{{- $secret := required (printf "%s.existingSecret is required" $role) $settings.existingSecret }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $secret) }}{{ fail "existingSecret must be a Kubernetes Secret name" }}{{ end }}
+{{- if hasKey $settings.podAnnotations "checksum/values" }}{{ fail "podAnnotations must not override checksum/values" }}{{ end }}
+{{- range $env := $settings.extraEnv }}
+{{- if eq $env.name "NODE_EXTRA_CA_CERTS" }}{{ fail "NODE_EXTRA_CA_CERTS is reserved; use tls.existingCaSecret" }}{{ end }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $.Release.Name }}-{{ $role }}
+  {{- with $settings.deploymentAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coordinator
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $role }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coordinator
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        app.kubernetes.io/component: {{ $role }}
+      annotations:
+        checksum/values: {{ toJson $.Values | sha256sum }}
+        {{- with $settings.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        {{- toYaml $.Values.nodeSelector | nindent 8 }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: stage-config
+          image: {{ printf "%s@%s" $repository $digest | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: [node, --import, tsx, scripts/deploy-init.ts, {{ $role }}, --input, /input, --config, /config]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN, FOWNER, DAC_OVERRIDE]
+          volumeMounts:
+            - {name: input, mountPath: /input, readOnly: true}
+            - {name: config, mountPath: /config}
+            - {name: tmp, mountPath: /tmp}
+            {{- if eq $role "broker" }}
+            - {name: backups, mountPath: /backups}
+            {{- else }}
+            - {name: work, mountPath: /work}
+            {{- end }}
+        {{- if eq $role "broker" }}
+        - name: migrate
+          image: {{ printf "%s@%s" $repository $digest | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: [node, --import, tsx, scripts/migrate.ts]
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - {name: COORDINATOR_DATABASE_URL_FILE, value: /config/database.url}
+            - {name: HOME, value: /tmp}
+            {{- if $caSecret }}
+            - {name: NODE_EXTRA_CA_CERTS, value: /etc/coordinator/ca/ca.crt}
+            {{- end }}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            {{- if $caSecret }}
+            - {name: ca, mountPath: /etc/coordinator/ca, readOnly: true}
+            {{- end }}
+        {{- end }}
+      containers:
+        - name: {{ $role }}
+          image: {{ printf "%s@%s" $repository $digest | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          {{- if eq $role "runner" }}
+          command: [/usr/bin/setpriv, --reuid=1000, --regid=1000, --clear-groups, "--inh-caps=+chown,+dac_override,+kill,+setuid,+setgid,+setpcap", "--ambient-caps=+chown,+dac_override,+kill,+setuid,+setgid,+setpcap", --no-new-privs, node, --import, tsx, src/main.ts, runner]
+          {{- else }}
+          command: [node, --import, tsx, src/main.ts, broker]
+          {{- end }}
+          securityContext:
+            {{- if eq $role "runner" }}
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            {{- else }}
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            {{- end }}
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              {{- if eq $role "runner" }}
+              add: [CHOWN, DAC_OVERRIDE, KILL, SETUID, SETGID, SETPCAP]
+              {{- end }}
+          env:
+            - {name: COORDINATOR_CONFIG, value: {{ printf "/config/%s.json" $role | quote }}}
+            - {name: COORDINATOR_IMAGE_SHA, value: {{ $sha | quote }}}
+            - {name: COORDINATOR_CONNECT_HOSTS_JSON, value: {{ toJson $settings.connectHosts | quote }}}
+            {{- if $caSecret }}
+            - {name: NODE_EXTRA_CA_CERTS, value: /etc/coordinator/ca/ca.crt}
+            {{- end }}
+            {{- if eq $role "broker" }}
+            - {name: COORDINATOR_RUNNER_TOKEN_DIRECTORY, value: /config/tokens}
+            {{- else }}
+            - {name: HOME, value: /work/home}
+            {{- end }}
+            {{- with $settings.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - {name: http, containerPort: {{ $settings.port }}, protocol: TCP}
+          startupProbe:
+            {{- if eq $role "broker" }}
+            httpGet: {path: /livez, port: http}
+            {{- else }}
+            exec:
+              command: [curl, --fail, --silent, --show-error, --max-time, "3", --header, "@/config/health.header", {{ printf "http://127.0.0.1:%v/healthz" $settings.port | quote }}]
+            timeoutSeconds: 5
+            {{- end }}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            {{- if eq $role "broker" }}
+            httpGet: {path: /livez, port: http}
+            {{- else }}
+            exec:
+              command: [curl, --fail, --silent, --show-error, --max-time, "3", --header, "@/config/health.header", {{ printf "http://127.0.0.1:%v/healthz" $settings.port | quote }}]
+            timeoutSeconds: 5
+            {{- end }}
+            periodSeconds: 20
+          readinessProbe:
+            exec:
+              command: [curl, --fail, --silent, --show-error, --max-time, "3", --header, "@/config/health.header", {{ printf "http://127.0.0.1:%v/%s" $settings.port (ternary "readyz" "healthz" (eq $role "broker")) | quote }}]
+            periodSeconds: 5
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml $settings.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            {{- if $caSecret }}
+            - {name: ca, mountPath: /etc/coordinator/ca, readOnly: true}
+            {{- end }}
+            {{- if eq $role "broker" }}
+            - {name: backups, mountPath: /backups}
+            {{- else }}
+            - {name: work, mountPath: /work}
+            {{- end }}
+      volumes:
+        - name: input
+          secret:
+            secretName: {{ $secret }}
+            defaultMode: 0400
+        {{- if $caSecret }}
+        - name: ca
+          secret:
+            secretName: {{ $caSecret | quote }}
+            defaultMode: 0444
+            items:
+              - {key: ca.crt, path: ca.crt}
+        {{- end }}
+        - name: config
+          emptyDir: {medium: Memory}
+        - name: tmp
+          emptyDir: {}
+        {{- range $volume := ternary (list "backups") (list "work") (eq $role "broker") }}
+        - name: {{ $volume }}
+          persistentVolumeClaim:
+            claimName: {{ (index $.Values.persistence $volume).existingClaim | default (printf "%s-%s" $.Release.Name $volume) }}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Release.Name }}-{{ $role }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: coordinator
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ $role }}
+  ports:
+    - {name: http, port: {{ $settings.port }}, targetPort: http, protocol: TCP}
+{{- end }}
+{{- end }}

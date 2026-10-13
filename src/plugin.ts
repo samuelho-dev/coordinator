@@ -152,7 +152,7 @@ const makePlugin = Effect.fn("Plugin.make")(function*() {
         continue;
       }
       if (!(yield* held("journal write (release intent)", journal.releaseIntent(key)))) continue;
-      const submissionId = NativeSubmissionId.make(yield* platform.crypto.randomUUIDv4);
+      const submissionId = NativeSubmissionId.make(yield* platform.crypto.randomUUIDv4());
       current.dispatching = true;
       // Durable intent precedes SDK admission. No response/connection failure can replay this revision.
       yield* current.owner.prompt({ binding: current.owner.binding, submissionId, message: task.instruction?.prompt ?? task.request.prompt },

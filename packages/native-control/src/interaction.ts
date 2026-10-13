@@ -110,7 +110,7 @@ export const withNativeMcpRequest = <A>(body: (signal: AbortSignal) => Promise<A
       if (signal.aborted) cancel();
       const runSignal = connectionSignal === undefined ? lifetime.signal : AbortSignal.any([lifetime.signal, connectionSignal]);
       try {
-        return await invocation.run({ context, owner, client, scope, signal: runSignal, registry, uuid: () => Effect.runPromise(crypto.randomUUIDv4) }, () => body(runSignal));
+        return await invocation.run({ context, owner, client, scope, signal: runSignal, registry, uuid: () => Effect.runPromise(crypto.randomUUIDv4()) }, () => body(runSignal));
       } finally {
         // Successful receipts release their request signal, not any still-owned Source run.
         signal.removeEventListener("abort", cancel);

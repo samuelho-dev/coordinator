@@ -3,36 +3,22 @@ import assert from "node:assert/strict";
 import { Effect, Layer } from "effect";
 import { Reactivity } from "effect/reactivity";
 import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
-import { migrateBroker, migrateRunner } from "../src/database.ts";
+import type { ContractMarkerRow } from "@prisma/orm-postgres/family/verify";
+import type { LedgerEntryRecord } from "@prisma/orm-postgres/contract/types";
+import { assertBrokerSchema, brokerSchemaIdentity, brokerStorageHash, migrateRunner } from "../src/database.ts";
 import { Platform } from "../src/platform.ts";
+import { SqlClient } from "effect/sql";
+import { dropPostgres, postgresAdmin, provisionPostgres } from "./postgres-fixture.ts";
+import { migrateBrokerPostgres } from "../scripts/migrate.ts";
+import { makeDatabase } from "../src/kysely.ts";
+import {
+  type ArchiveInsert, EffectQueueMigrationsId, RecoveryGateId, type RecoveryGateInsert, type TasksInsert, TasksId
+} from "../src/generated/database/types.ts";
 
-test("legacy SQLite rows survive baseline adoption and repeated detached evolution", () => Effect.runPromise(
+test("runner legacy rows preserve HELD occupancy through repeated native binding migration", () => Effect.runPromise(
   Effect.scoped(Effect.gen(function*() {
     const platform = yield* Platform;
     const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-migrations-" });
-    const broker = yield* SqliteClient.make({ filename: platform.path.join(directory, "broker.sqlite") });
-    yield* broker.unsafe("CREATE TABLE tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
-    yield* broker.unsafe("CREATE TABLE archive (sequence INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, session TEXT NOT NULL, entry TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL, gaps TEXT NOT NULL, created REAL NOT NULL, UNIQUE(owner,session,entry,digest))");
-    yield* broker.unsafe("CREATE TABLE consents (owner TEXT NOT NULL, session TEXT NOT NULL, enabled INTEGER NOT NULL, participants TEXT NOT NULL, PRIMARY KEY(owner,session))");
-    yield* broker.unsafe("CREATE TABLE participant_consents (owner TEXT NOT NULL, session TEXT NOT NULL, participant TEXT NOT NULL, enabled INTEGER NOT NULL, PRIMARY KEY(owner,session,participant))");
-    yield* broker.unsafe("INSERT INTO tasks VALUES (?,?)", ["legacy", '{"state":"HELD"}']);
-    yield* broker.unsafe("INSERT INTO archive(owner,session,entry,digest,payload,gaps,created) VALUES (?,?,?,?,?,?,?)", ["owner", "session", "entry", "digest", "metadata", "[]", 1]);
-    yield* broker.unsafe("INSERT INTO consents VALUES (?,?,?,?)", ["owner", "session", 1, '["participant"]']);
-    yield* broker.unsafe("INSERT INTO participant_consents VALUES (?,?,?,?)", ["owner", "session", "participant", 1]);
-    const brokerTasks = yield* broker.unsafe("SELECT * FROM tasks");
-    const archive = yield* broker.unsafe("SELECT * FROM archive");
-    const consents = yield* broker.unsafe("SELECT * FROM consents");
-    const participantConsents = yield* broker.unsafe("SELECT * FROM participant_consents");
-    yield* migrateBroker(broker);
-    yield* migrateBroker(broker);
-    assert.deepEqual(yield* broker.unsafe("SELECT * FROM tasks"), brokerTasks);
-    assert.deepEqual(yield* broker.unsafe("SELECT * FROM archive"), archive);
-    assert.deepEqual(yield* broker.unsafe("SELECT * FROM consents"), consents);
-    assert.deepEqual(yield* broker.unsafe("SELECT * FROM participant_consents"), participantConsents);
-    yield* broker.unsafe("INSERT INTO sessions VALUES (?,?)", ["session", "metadata"]);
-    yield* migrateBroker(broker);
-    assert.deepEqual(yield* broker.unsafe("SELECT id,data FROM sessions").values, [["session", "metadata"]]);
-
     const filename = platform.path.join(directory, "runner.sqlite");
     yield* Effect.scoped(Effect.gen(function*() {
       const runner = yield* SqliteClient.make({ filename });
@@ -71,4 +57,87 @@ test("legacy SQLite rows survive baseline adoption and repeated detached evoluti
     assert.deepEqual(yield* runner.unsafe("SELECT seq,taskId,payload FROM events").values, [[1, "legacy", "metadata"]]);
     assert.deepEqual(yield* runner.unsafe("SELECT nativeBinding,nativeRunId,nativeCursor FROM tasks").values, [[JSON.stringify({ host: "omp", sessionId: "native-session", incarnation: "native-incarnation", generation: 2 }), "run-1", 7]]);
   })).pipe(Effect.provide(Layer.merge(Reactivity.layer, Platform.layer)))
+));
+
+test("committed PostgreSQL migrations preserve opaque rows and reject version or recovery uncertainty", () => Effect.runPromise(
+  Effect.scoped(Effect.gen(function*() {
+    const platform = yield* Platform;
+    const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-schema-" });
+    const urlFile = yield* provisionPostgres(directory);
+    yield* Effect.addFinalizer(() => dropPostgres(urlFile).pipe(Effect.orDie));
+    yield* Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient;
+      const db = makeDatabase(sql);
+      const metadata = db.client.withTables<{
+        "prisma_contract.marker": Pick<ContractMarkerRow, "core_hash" | "profile_hash"> & Pick<LedgerEntryRecord, "space">;
+        "prisma_contract.ledger": {
+          space: LedgerEntryRecord["space"];
+          migration_hash: LedgerEntryRecord["migrationHash"];
+        };
+        "information_schema.columns": { table_schema: string; table_name: string; column_name: string; data_type: string };
+      }>();
+      const held: TasksInsert = { id: TasksId.make("held"), data: '{"state":"HELD","accepted":true}' };
+      const gateId = RecoveryGateId.make(1);
+      const queueVersion = EffectQueueMigrationsId.make(2);
+      yield* assertBrokerSchema(sql);
+      assert.match(yield* brokerSchemaIdentity(sql), new RegExp(`^${brokerStorageHash}:queue=`));
+      yield* db.execute(db.client.insertInto("tasks").values(held).returning("id"));
+      const columns = yield* db.execute(metadata.selectFrom("information_schema.columns")
+        .select(["table_name", "column_name", "data_type"]).where("table_schema", "=", "public"));
+      for (const [table, column] of [["archive", "sequence"], ["evidence", "id"], ["effect_queue", "sequence"]]) {
+        assert.equal(columns.find((row) => row.table_name === table && row.column_name === column)?.data_type, "bigint");
+      }
+      assert.equal(columns.find((row) => row.table_name === "tasks" && row.column_name === "data")?.data_type, "text");
+      assert.equal((yield* db.execute(db.client.insertInto("tasks")
+        .values({ ...held, data: "changed" }).returning("id")).pipe(Effect.result))._tag, "Failure");
+      const invalidGate: RecoveryGateInsert = { id: RecoveryGateId.make(2), ready: true };
+      assert.equal((yield* db.execute(db.client.insertInto("recovery_gate")
+        .values(invalidGate).returning("id")).pipe(Effect.result))._tag, "Failure");
+      const archive: ArchiveInsert = {
+        owner: "owner", session: "session", entry: "entry", digest: "digest", payload: "opaque", gaps: "[]", created: 1
+      };
+      yield* db.execute(db.client.insertInto("archive").values(archive).returning("sequence"));
+      assert.equal((yield* db.execute(db.client.insertInto("archive")
+        .values({ ...archive, payload: "changed", created: 2 }).returning("sequence")).pipe(Effect.result))._tag, "Failure");
+      yield* db.execute(db.client.insertInto("recovery_gate").values({ id: gateId, ready: false }).returning("id"));
+      assert.equal((yield* assertBrokerSchema(sql).pipe(Effect.result))._tag, "Failure");
+      assert.match(yield* brokerSchemaIdentity(sql), new RegExp(`^${brokerStorageHash}:queue=`));
+      yield* db.execute(db.client.updateTable("recovery_gate").set({ ready: true }).where("id", "=", gateId).returning("id"));
+      yield* db.execute(db.client.updateTable("effect_queue_migrations")
+        .set({ name: "unexpected" }).where("migration_id", "=", queueVersion).returning("migration_id"));
+      assert.equal((yield* assertBrokerSchema(sql).pipe(Effect.result))._tag, "Failure");
+      yield* db.execute(db.client.updateTable("effect_queue_migrations")
+        .set({ name: "upgrade_schema" }).where("migration_id", "=", queueVersion).returning("migration_id"));
+      const marker = (yield* db.execute(metadata.selectFrom("prisma_contract.marker")
+        .select("profile_hash").where("space", "=", "app")))[0];
+      const ledger = (yield* db.execute(metadata.selectFrom("prisma_contract.ledger")
+        .select("migration_hash").where("space", "=", "app")))[0];
+      assert.ok(marker);
+      assert.ok(ledger);
+      yield* db.execute(metadata.updateTable("prisma_contract.marker")
+        .set({ profile_hash: "wrong" }).where("space", "=", "app").returning("space"));
+      assert.equal((yield* assertBrokerSchema(sql).pipe(Effect.result))._tag, "Failure");
+      yield* db.execute(metadata.updateTable("prisma_contract.marker")
+        .set({ profile_hash: marker.profile_hash }).where("space", "=", "app").returning("space"));
+      yield* db.execute(metadata.updateTable("prisma_contract.ledger")
+        .set({ migration_hash: "wrong" }).where("space", "=", "app").returning("space"));
+      assert.equal((yield* assertBrokerSchema(sql).pipe(Effect.result))._tag, "Failure");
+      yield* db.execute(metadata.updateTable("prisma_contract.ledger")
+        .set({ migration_hash: ledger.migration_hash }).where("space", "=", "app").returning("space"));
+      yield* db.execute(metadata.updateTable("prisma_contract.marker")
+        .set({ core_hash: "wrong" }).where("space", "=", "app").returning("space"));
+      assert.equal((yield* assertBrokerSchema(sql).pipe(Effect.result))._tag, "Failure");
+      yield* db.execute(metadata.updateTable("prisma_contract.marker")
+        .set({ core_hash: brokerStorageHash }).where("space", "=", "app").returning("space"));
+    }).pipe(Effect.provide(postgresAdmin(urlFile)), Effect.scoped);
+    yield* migrateBrokerPostgres(urlFile);
+    yield* Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient;
+      const db = makeDatabase(sql);
+      const heldId = TasksId.make("held");
+      yield* assertBrokerSchema(sql);
+      assert.equal((yield* db.execute(db.client.selectFrom("tasks").select("data").where("id", "=", heldId)))[0]?.data,
+        '{"state":"HELD","accepted":true}');
+    }).pipe(Effect.provide(postgresAdmin(urlFile)), Effect.scoped);
+  })).pipe(Effect.provide(Platform.layer))
 ));

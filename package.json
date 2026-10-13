@@ -1,10 +1,10 @@
 {
   "name": "@samuelho/coordinator",
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.16"
+    "node": ">=22.19"
   },
   "packageManager": "pnpm@11.9.0",
   "scripts": {
@@ -16,22 +16,32 @@
     "install:host": "pnpm run native:build && tsx scripts/install.ts",
     "smoke": "pnpm run native:build && tsx scripts/smoke.ts",
     "smoke:hosts": "pnpm run native:build && tsx scripts/host-smoke.ts",
-    "smoke:backup": "pnpm run native:build && tsx scripts/backup-smoke.ts"
+    "smoke:backup": "pnpm run native:build && tsx scripts/backup-smoke.ts",
+    "smoke:recovery": "pnpm run native:build && tsx scripts/recovery-smoke.ts",
+    "smoke:import": "tsx scripts/import-smoke.ts",
+    "db:generate": "prisma contract emit && prisma-effect-kysely contract --contract src/generated/prisma/contract.json --schema prisma/contract.prisma --output src/generated/database",
+    "db:migrate": "tsx scripts/migrate.ts"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.0.4",
     "@oh-my-pi/pi-coding-agent": "18.6.1",
-    "@effect/platform-node": "4.0.2",
-    "@effect/sql-sqlite-node": "4.0.2",
+    "@effect/platform-node": "4.0.3",
+    "@effect/sql-pg": "4.0.3",
+    "@effect/sql-sqlite-node": "4.0.3",
     "@modelcontextprotocol/client": "2.3.1",
     "@samuelho/coordinator-native-control": "workspace:*",
-    "effect": "https://pkg.pr.new/Effect-TS/effect/effect@d6082a25a3779f7e2abba2787323d5d9c7e1d24a",
+    "@prisma/orm-postgres": "8.0.0-rc.17",
+    "effect": "4.0.3",
+    "kysely": "0.29.6",
+    "prisma": "8.0.0-rc.22",
+    "temporal-polyfill": "1.0.4",
     "tsx": "^4.20.0"
   },
   "devDependencies": {
     "@effect/tsgo": "0.49.0",
     "@types/node": "^24.0.0",
     "esbuild": "0.28.2",
+    "prisma-effect-kysely": "9.0.2",
     "typescript": "7.0.2"
   },
   "pi": {

@@ -16,9 +16,9 @@ Can Coordinator retain concurrent requests and Effect fibers while keeping corre
 - **Busy timeout is lock-wait policy, not an operation deadline.** The busy handler sleeps until its configured accumulated sleep time and then returns `SQLITE_BUSY`; SQLite may bypass it to avoid deadlock. It does not cap slow reads, writes, checkpoints, or storage sync latency. Reducing it can shorten synchronous lock waits but can also turn contention into earlier errors; it does not fix stalled storage. [5][6]
 - **Checkpoint latency is distinct from commit sync latency.** SQLite's default automatic checkpoint threshold is 1,000 WAL pages; the committing thread runs the checkpoint by default, making some commits slower. Checkpoints can instead be scheduled in another thread/process. That does not remove FULL's per-commit WAL sync, and long reader snapshots can retain WAL pages. [1]
 
-## Exact installed adapter and runtime facts
+## Historical inspected adapter and runtime facts
 
-Repository dependencies pin `@effect/sql-sqlite-node` and `@effect/platform-node` to **4.0.2**, while `effect` is pinned to commit **d6082a25a3779f7e2abba2787323d5d9c7e1d24a**. The engine constraint is Node >=22.16 ([package.json](../package.json)); the image build pins Node **24.21.0** ([Dockerfile](../Dockerfile)). Those are repository configuration facts, not a fresh measurement of the deployed process. The local mechanism check below ran on Node **26.4.0**; Node24 documentation establishes the documented synchronous API contract.
+At the **2026-10-12 investigation**, repository dependencies pinned `@effect/sql-sqlite-node` and `@effect/platform-node` to **4.0.2**, with `effect` at commit **d6082a25a3779f7e2abba2787323d5d9c7e1d24a**, and Node >=22.16. The **2026-10-13 follow-up** upgrades the repository to published **Effect/platform-node/sql-sqlite-node 4.0.3** and Node >=22.19 ([package.json](../package.json)); the image remains Node **24.21.0** ([Dockerfile](../Dockerfile)). Preserve the investigation's versioned source citations and measurements below as historical, not a fresh measurement of the deployed process or acceptance of the new runtime. The local mechanism check below ran on Node **26.4.0**; Node24 documentation establishes the synchronous API contract.
 
 The official 4.0.2 SQLite adapter source confirms: [7]
 
