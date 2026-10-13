@@ -1,4 +1,4 @@
-# Coordinator chart 0.2.0-beta.2
+# Coordinator chart 0.2.0-beta.3
 
 **Private beta, not public production certification.** External PostgreSQL18 is required; no database server/provider CRD/common-chart/ingress/namespace/HPA/public endpoint is installed. No publication, visibility change or deployment is implied. Broker-only is supported with runner disabled and no runner principals. Effect4.0.3 is stable; Prisma8.0.0-rc.22 and transitive orm-postgres8.0.0-rc.17 are RC dependencies.
 
