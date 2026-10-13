@@ -10,7 +10,7 @@ import { NativeLifecycleJournal } from "@samuelho/coordinator-native-control/lif
 type Outcome = "completed" | "aborted" | "error";
 type Selection = { provider: string; id: string };
 const failure = () => new NativeControlError({ code: "native_failure", message: "Owned SDK operation failed; no result was inferred" });
-const operation = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: failure });
+const operation = <A>(run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: error => error instanceof NativeControlError ? error : failure() });
 
 export interface NativeSession {
   readonly session: PiSession | OmpSession;
@@ -20,8 +20,9 @@ export interface NativeSession {
   readonly journal: NativeLifecycleJournal;
   readonly currentRunId: NativeRunId | null;
   readonly pendingSubmissions: number;
+  retireIfIdle(): boolean;
   bound(binding?: NativeBinding): Effect.Effect<void, NativeControlError>;
-  prompt(input: NativePromptInput, onAdmission?: (admission: NativePromptAdmission) => void | Promise<void>): Effect.Effect<NativePromptResult, NativeControlError>;
+  prompt(input: NativePromptInput, onAdmission?: (admission: NativePromptAdmission) => void | Promise<void>, canAdmit?: () => boolean): Effect.Effect<NativePromptResult, NativeControlError>;
   queue(input: Omit<NativePromptInput, "submissionId" | "streamingBehavior">, behavior: "steer" | "followUp"): Effect.Effect<void | "queued" | "handled", NativeControlError>;
   abort(): Effect.Effect<NativeAbortResult, NativeControlError>;
   operation<A>(run: () => Promise<A>): Effect.Effect<A, NativeControlError>;
@@ -78,6 +79,7 @@ export const makeNativeSession = Effect.fn("Plugin.ownedSession")(function*(host
   let active: Run | undefined;
   let tail = Promise.resolve();
   let pending = 0;
+  let runningOperations = 0;
   let cancellationEpoch = 0;
   const submissions = new Set<string>();
   const admit = (run: Run, input: NativePromptInput, disposition: "started" | "queued" | "handled", submission: Submission = run) => {
@@ -118,8 +120,9 @@ export const makeNativeSession = Effect.fn("Plugin.ownedSession")(function*(host
       throw new NativeControlError({ code: "binding_mismatch", message: "Owned SDK session generation changed" });
     }
   }, catch: () => new NativeControlError({ code: "binding_mismatch", message: "Owned SDK session generation changed" }) });
-  const execute = async (input: NativePromptInput, epoch: number, result: Promise<NativePromptResult>, onAdmission?: (admission: NativePromptAdmission) => void | Promise<void>): Promise<NativePromptResult> => {
+  const execute = async (input: NativePromptInput, epoch: number, result: Promise<NativePromptResult>, onAdmission?: (admission: NativePromptAdmission) => void | Promise<void>, canAdmit?: () => boolean): Promise<NativePromptResult> => {
     if (retired || epoch !== cancellationEpoch) throw failure();
+    if (canAdmit && !canAdmit()) throw new NativeControlError({ code: "invalid_input", message: "Native admission is fenced" });
     const run: Run = { id: NativeRunId.make(randomUUID()), input, admission: undefined, outcome: undefined, cancelled: false, started: false, terminal: false,
       publication: Promise.resolve(), publicationFailed: false, onAdmission, accepting: true, enqueues: [], result };
     active = run;
@@ -164,8 +167,9 @@ export const makeNativeSession = Effect.fn("Plugin.ownedSession")(function*(host
       return { admission, disposition: "settled", final };
     } finally { run.accepting = false; active = undefined; }
   };
-  const prompt = (input: NativePromptInput, onAdmission?: (admission: NativePromptAdmission) => void | Promise<void>) => Effect.gen(function*(): Effect.fn.Return<NativePromptResult, NativeControlError> {
+  const prompt = (input: NativePromptInput, onAdmission?: (admission: NativePromptAdmission) => void | Promise<void>, canAdmit?: () => boolean) => Effect.gen(function*(): Effect.fn.Return<NativePromptResult, NativeControlError> {
     yield* bound(input.binding);
+    if (canAdmit && !canAdmit()) return yield* new NativeControlError({ code: "invalid_input", message: "Native admission is fenced" });
     if (submissions.has(input.submissionId)) return yield* new NativeControlError({ code: "invalid_input", message: "Submission identity was already used; delivery is never replayed" });
     submissions.add(input.submissionId);
     const run = active;
@@ -196,7 +200,7 @@ export const makeNativeSession = Effect.fn("Plugin.ownedSession")(function*(host
     // ponytail: one FIFO per owned session. Concurrent independent submissions never share an outcome.
     const epoch = cancellationEpoch;
     pending++;
-    const result: Promise<NativePromptResult> = tail.then(() => execute(input, epoch, result, onAdmission)).finally(() => { pending--; });
+    const result: Promise<NativePromptResult> = tail.then(() => execute(input, epoch, result, onAdmission, canAdmit)).finally(() => { pending--; });
     // A failed ticket must not poison later independent requests. The caller receives its failure.
     tail = result.then(() => undefined, () => undefined);
     return yield* operation(() => result);
@@ -240,6 +244,19 @@ export const makeNativeSession = Effect.fn("Plugin.ownedSession")(function*(host
     unsubscribe();
     journal.append({ type: "native_lifecycle", kind: "session_retired", binding, runId: null, at: Date.now(), reason: "owned SDK session disposed" });
   }).pipe(Effect.orDie));
-  return { session, manager, backend, binding, journal, bound, prompt, queue, abort,
-    get currentRunId() { return active?.admission?.runId ?? null; }, get pendingSubmissions() { return pending; }, operation };
+  const retireIfIdle = () => {
+    if (runningOperations > 0 || pending > 0 || active !== undefined || session.isStreaming || session.isCompacting ||
+      (backend.host === "pi" ? backend.session.pendingMessageCount > 0 :
+        backend.session.queuedMessageCount > 0 || backend.session.hasPendingAsyncWork())) return false;
+    retired = true;
+    return true;
+  };
+  return { session, manager, backend, binding, journal, bound, prompt, queue, abort, retireIfIdle,
+    get currentRunId() { return active?.admission?.runId ?? null; }, get pendingSubmissions() { return pending; },
+    operation: <A>(run: () => Promise<A>) => operation(async () => {
+      if (retired) throw new NativeControlError({ code: "binding_mismatch", message: "Owned SDK session retired" });
+      runningOperations++;
+      try { return await run(); }
+      finally { runningOperations--; }
+    }) };
 });

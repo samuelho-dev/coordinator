@@ -1,11 +1,11 @@
 import { ByteSize, Cause, Config, Context, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect";
-import { HttpBody, HttpClient, HttpClientRequest, HttpIncomingMessage, HttpRouter, HttpServer, HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { HttpBody, HttpClient, HttpClientError, HttpClientRequest, HttpIncomingMessage, HttpRouter, HttpServer, HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { NodeHttpClient, NodeHttpServer } from "@effect/platform-node";
 import { createServer } from "node:http";
 import { lookup } from "node:dns";
 import type { LookupFunction } from "node:net";
 import { McpProtocol, McpSchema, McpServer } from "effect/ai";
-import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { Client, ProtocolError, SdkError, SdkErrorCode, StreamableHTTPClientTransport, isJSONRPCErrorResponse, parseJSONRPCMessage } from "@modelcontextprotocol/client";
 import { BrokerRequest, RunnerRequest, ConnectHosts, HttpError, CommandError, BoundaryError, Json, Commands, type McpCommandName, type CommandInput, type CommandOutput, type McpEndpoint } from "./contracts.ts";
 
 export const LIMIT = 64 * 1024;
@@ -26,7 +26,15 @@ export const serverLayer = (host: string, port: number) => NodeHttpServer.layerS
 const ToolFailure = Schema.Struct({ error: HttpError });
 const boundaryFailure = (cause: Cause.Cause<unknown>) => {
   const error = Cause.squash(cause);
-  return new HttpError({ status: error instanceof HttpError ? error.status : 400, message: error instanceof HttpError ? error.message.slice(0, 512) : "Invalid request or unavailable operation" });
+  return new HttpError({
+    status: error instanceof HttpError ? error.status : 400,
+    message: error instanceof HttpError ? error.message.slice(0, 512) : "Invalid request or unavailable operation",
+    ...(error instanceof HttpError ? {
+      ...(error.retryAfter === undefined ? {} : { retryAfter: error.retryAfter.slice(0, 512) }),
+      ...(error.wwwAuthenticate === undefined ? {} : { wwwAuthenticate: error.wwwAuthenticate.slice(0, 512) }),
+      ...(error.protocolCode === undefined ? {} : { protocolCode: error.protocolCode }),
+    } : {}),
+  });
 };
 // Byte-only SSE resource guard; the native transport still owns framing/JSON.
 // Reset at blank lines, not at response EOF: legitimate subscriptions are unbounded in duration.
@@ -96,13 +104,47 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
       const input = params;
       const endpoint = yield* Effect.try({ try: () => new URL("/mcp", url), catch: () => new HttpError({ status: 400, message: "Invalid MCP endpoint" }) });
       if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname))) return yield* new HttpError({ status: 400, message: "TLS required except loopback" });
-      // Capture typed HTTP failures before Promise/SDK wrapping, only for this scoped call.
+      // Small call-local evidence survives native Promise/SDK wrapping; never infer network failure from text.
       let httpFailure: HttpError | undefined;
+      let commandFailure: CommandError | undefined;
+      let responseMetadata: { status: number; retryAfter?: string; wwwAuthenticate?: string; protocolCode?: number } | undefined;
+      const captureNativeFailure = (error: unknown, responseStream = false) => {
+        if (error instanceof HttpError) httpFailure = error;
+        else if (HttpClientError.isHttpClientError(error)) {
+          const cause = "cause" in error.reason ? error.reason.cause : undefined;
+          if (cause instanceof HttpError) httpFailure = cause;
+          else if (error.reason._tag === "TransportError" || (responseStream && error.reason._tag === "DecodeError")) {
+            commandFailure = new CommandError({ reason: "transport", message: "MCP transport unavailable" });
+          }
+        }
+        return error;
+      };
+      const sdkFailure = (error: unknown) => {
+        let protocolCode: number | undefined;
+        if (error instanceof ProtocolError) protocolCode = error.code;
+        else protocolCode = responseMetadata?.protocolCode;
+        if (httpFailure) return httpFailure;
+        if (responseMetadata && (responseMetadata.status < 200 || responseMetadata.status >= 300 || protocolCode !== undefined)) {
+          return new HttpError({ ...responseMetadata, message: protocolCode === undefined ? "MCP request rejected" : "MCP protocol rejected request", ...(protocolCode === undefined ? {} : { protocolCode }) });
+        }
+        if (commandFailure) return commandFailure;
+        if (error instanceof HttpError || error instanceof CommandError) return error;
+        if (error instanceof SyntaxError || (error instanceof SdkError && [
+          SdkErrorCode.InvalidResult, SdkErrorCode.UnsupportedResultType, SdkErrorCode.CapabilityNotSupported,
+          SdkErrorCode.MethodNotSupportedByProtocolVersion, SdkErrorCode.ClientHttpUnexpectedContent,
+        ].includes(error.code))) return new CommandError({ reason: "protocol", message: "Invalid or incompatible MCP protocol" });
+        return new CommandError({ message: "MCP operation unavailable" });
+      };
+      return yield* Effect.gen(function*() {
       const sdkFetch: typeof globalThis.fetch = async (input, init) => {
         const request = new Request(input, init);
         if (new URL(request.url).origin !== endpoint.origin) {
           httpFailure = new HttpError({ status: 400, message: "Cross-origin MCP request prohibited" });
           throw httpFailure;
+        }
+        // A pinned/static-credential call cannot correct a rejection; prohibit SDK corrective POST replay too.
+        if (request.method === "POST" && (httpFailure || commandFailure || (responseMetadata && (responseMetadata.status < 200 || responseMetadata.status >= 300 || responseMetadata.protocolCode !== undefined)))) {
+          throw sdkFailure(new CommandError({ message: "MCP request already failed" }));
         }
         return Effect.runPromise(Effect.gen(function*() {
           const responseScope = yield* Scope.fork(callScope);
@@ -122,30 +164,50 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
             if (!request.headers.has("content-type")) outbound = HttpClientRequest.removeHeader(outbound, "content-type");
           }
           const response = yield* HttpClient.withScope(http).execute(outbound).pipe(Effect.mapError((error) => {
-            const cause = "cause" in error.reason ? error.reason.cause : undefined;
-            return cause instanceof HttpError ? cause : error;
+            captureNativeFailure(error);
+            return httpFailure ?? commandFailure ?? error;
           }));
           body += decoder.decode();
           // Discovery contains the full catalog; command responses keep the existing 64 KiB bound.
           const method = body ? (yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Json), { onExcessProperty: "error" })(body)).method : undefined;
           const discovery = method === "server/discover" || method === "tools/list";
-          const limit = discovery ? 512 * 1024 : LIMIT;
-          if (response.status < 200 || response.status >= 300) return yield* new HttpError({ status: response.status, message: "MCP request rejected" });
-          httpFailure = undefined;
+          const rejected = response.status < 200 || response.status >= 300;
+          const limit = !rejected && discovery ? 512 * 1024 : LIMIT;
+          responseMetadata = {
+            status: response.status,
+            ...(response.headers["retry-after"] === undefined ? {} : { retryAfter: response.headers["retry-after"].slice(0, 512) }),
+            ...(response.headers["www-authenticate"] === undefined ? {} : { wwwAuthenticate: response.headers["www-authenticate"].slice(0, 512) }),
+          };
           let size = 0;
-          const gate = response.headers["content-type"]?.split(";")[0]?.trim() === "text/event-stream"
+          let rejectedBody = "";
+          const rejectedDecoder = rejected ? new TextDecoder() : undefined;
+          const gate = !rejected && response.headers["content-type"]?.split(";")[0]?.trim() === "text/event-stream"
             ? eventByteGate(limit)
             : (chunk: Uint8Array) => {
               size += chunk.byteLength;
-              return size > limit ? Effect.fail(new HttpError({ status: 413, message: "HTTP body exceeds bound" })) : Effect.succeed(chunk);
+              return size > limit ? Effect.fail(new HttpError({ ...(rejected ? responseMetadata! : { status: 413 }), message: "HTTP body exceeds bound" })) : Effect.succeed(chunk);
             };
-          const reader = Stream.toReadableStream(response.stream.pipe(Stream.mapEffect(gate)), { strategy: { highWaterMark: 0 } }).getReader();
+          const reader = Stream.toReadableStream(response.stream.pipe(
+            Stream.mapEffect(gate),
+            Stream.tap((chunk) => Effect.sync(() => {
+              if (rejectedDecoder) rejectedBody += rejectedDecoder.decode(chunk, { stream: true });
+            })),
+            Stream.mapError((error) => {
+              captureNativeFailure(error, true);
+              return error;
+            }),
+          ), { strategy: { highWaterMark: 0 } }).getReader();
           yield* Scope.addFinalizer(responseScope, Effect.promise(() => reader.cancel()));
           const readable = new ReadableStream<Uint8Array>({
             async pull(controller) {
               try {
                 const next = await reader.read();
                 if (next.done) {
+                  if (rejectedDecoder) {
+                    rejectedBody += rejectedDecoder.decode();
+                    const decoded = Effect.runSync(Effect.try(() => parseJSONRPCMessage(JSON.parse(rejectedBody))).pipe(Effect.option));
+                    if (Option.isSome(decoded) && isJSONRPCErrorResponse(decoded.value)) responseMetadata = { ...responseMetadata!, protocolCode: decoded.value.error.code };
+                  }
                   controller.close();
                   await Effect.runPromise(close);
                 } else controller.enqueue(next.value);
@@ -171,16 +233,66 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         Effect.sync(() => new Client({ name: "coordinator", version: "0.1.0" }, { versionNegotiation: { mode: { pin: commandProtocol.protocolVersion } } })),
         (client) => Effect.tryPromise({ try: () => client.close(), catch: () => new CommandError({ message: "MCP connection cleanup failed" }) }).pipe(Effect.orDie),
       );
-      yield* Effect.tryPromise({ try: (signal) => client.connect(new StreamableHTTPClientTransport(endpoint, { authProvider: { token: async () => token }, fetch: (input, init) => sdkFetch(input, { ...init, signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal }), requestInit: { redirect: "error" } })), catch: (error) => httpFailure ?? (error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: "MCP connection unavailable" })) });
+      client.onerror = (error) => {
+        if (error instanceof SyntaxError) commandFailure = new CommandError({ reason: "protocol", message: "Invalid or incompatible MCP protocol" });
+        else commandFailure ??= new CommandError({ message: "MCP operation unavailable" });
+        // A failed native stream/parser cannot produce a valid final reply; close, don't wait for its deadline.
+        if (commandFailure || httpFailure) void client.close();
+      };
+      yield* Effect.tryPromise({
+        try: (signal) => {
+          const transport = new StreamableHTTPClientTransport(endpoint, {
+            authProvider: { token: async () => token },
+            fetch: (input, init) => sdkFetch(input, { ...init, signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal }),
+            requestInit: { redirect: "error" },
+          });
+          Effect.runSync(Scope.addFinalizer(callScope, Effect.promise(() => transport.close())));
+          const send = transport.send.bind(transport);
+          let observedMessage: typeof transport.onmessage;
+          let observedError: typeof transport.onerror;
+          // ProbeWindow and Protocol replace handlers on handover. Observe their native decoded evidence.
+          transport.send = (message, options) => {
+            if (transport.onmessage !== observedMessage) {
+              const onmessage = transport.onmessage;
+              observedMessage = (reply) => {
+                if (isJSONRPCErrorResponse(reply) && responseMetadata) responseMetadata = { ...responseMetadata, protocolCode: reply.error.code };
+                onmessage?.(reply);
+              };
+              transport.onmessage = observedMessage;
+            }
+            if (transport.onerror !== observedError) {
+              const onerror = transport.onerror;
+              observedError = (error) => {
+                if (error instanceof SyntaxError) commandFailure = new CommandError({ reason: "protocol", message: "Invalid or incompatible MCP protocol" });
+                else commandFailure ??= new CommandError({ message: "MCP operation unavailable" });
+                void transport.close();
+                onerror?.(error);
+              };
+              transport.onerror = observedError;
+            }
+            return send(message, options);
+          };
+          return client.connect(transport);
+        },
+        catch: sdkFailure,
+      });
       const arguments_ = yield* Schema.encodeEffect(descriptor.input, { onExcessProperty: "error" })(input).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
-      const result = yield* Effect.tryPromise({ try: (signal) => client.callTool({ name: descriptor.method ?? method, arguments: arguments_ }, { signal, timeout: timeoutMs }), catch: (error) => httpFailure ?? (error instanceof HttpError || error instanceof CommandError ? error : new CommandError({ message: "MCP operation unavailable" })) });
+      const result = yield* Effect.tryPromise({ try: (signal) => client.callTool({ name: descriptor.method ?? method, arguments: arguments_ }, { signal, timeout: timeoutMs }), catch: sdkFailure });
       if (result.isError) {
         const decoded = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(ToolFailure), { onExcessProperty: "error" })(result.structuredContent).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
         return yield* decoded.error;
       }
       const output = yield* Schema.decodeUnknownEffect<Schema.toCodecJson<(typeof Commands)[M]["structuredOutput"]>>(Schema.toCodecJson(descriptor.structuredOutput), { onExcessProperty: "error" })(result.structuredContent).pipe(Effect.mapError(() => new HttpError({ status: 400, message: "Invalid command input or output" })));
       return output.result;
-    })).pipe(Effect.timeout(timeoutMs));
+      }).pipe(
+        Effect.timeout(timeoutMs),
+        Effect.catchTag("TimeoutError", (error) => Effect.fail(
+          responseMetadata && (responseMetadata.status < 200 || responseMetadata.status >= 300)
+            ? sdkFailure(error)
+            : commandFailure ?? error,
+        )),
+      );
+    }));
 
     const serve = (server: HttpServer.HttpServer["Service"], options: McpEndpoint, probes?: {
       readonly live: Effect.Effect<void, HttpError>;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { Clock, Config, Context, Effect, Exit, Fiber, Layer, Schema, Scope } from "effect";
@@ -36,6 +36,7 @@ const runHostSmoke = () => Effect.gen(function*() {
   const guardedNegativeControls: ("native.steer" | "native.follow_up")[] = ["native.steer", "native.follow_up"];
   let fixtureCalls = 0;
   const paused = new Map<string, () => void>();
+  const pauseRequests = new Map<string, number>();
   const retryAttempts = new Map<string, number>(), compacted = new Set<string>(), asyncIssued = new Set<string>();
   let asyncDirectory = "";
   const requestBody = Schema.Struct({ messages: Schema.Array(Schema.Struct({ role: Schema.String, content: Schema.optional(Schema.Json) })),
@@ -82,7 +83,7 @@ const runHostSmoke = () => Effect.gen(function*() {
         chunk({ role: "assistant", content: "SDK_FIXTURE_OK" });
         if (primary && user.includes("SDK_ABORT")) return;
         const pause = primary && user.includes("SDK_PAUSE_pi") ? "pi" : primary && user.includes("SDK_PAUSE_omp") ? "omp" : undefined;
-        if (pause !== undefined) { paused.set(pause, finish); response.once("close", () => paused.delete(pause)); }
+        if (pause !== undefined) { pauseRequests.set(pause, (pauseRequests.get(pause) ?? 0) + 1); paused.set(pause, finish); response.once("close", () => paused.delete(pause)); }
         else finish();
       } catch (error) { console.error("Local scripted provider request failed", error); response.destroy(); }
     });
@@ -130,6 +131,7 @@ const runHostSmoke = () => Effect.gen(function*() {
     return yield* new CommandError({ message: "Stock plugin enrollment or durable delivery deadline expired" });
   });
   const observations: { host: NativeHost; binding: NativeBinding; pid: number; capabilities: readonly string[]; physicalProcessClosed: boolean }[] = [];
+  const controlChecks: { host: NativeHost; runId: string; transientPollFaults: number; recoveredHeartbeatPollPairs: number; permanentPresenceFaults: number; quietControlRequests: number; completedOutcomes: number; providerHeldRequests: number; fencedTaskState: string; retiredOwnerRequests: number }[] = [];
   for (const host of NativeHost.literals) {
     const binary = yield* fs.realPath(host === "pi" ? pi : omp);
     const home = join(directory, host), agent = join(home, "agent"), sessions = join(home, "sessions");
@@ -151,8 +153,56 @@ const runHostSmoke = () => Effect.gen(function*() {
     yield* fs.makeDirectory(pluginDirectory, { recursive: true, mode: 0o700 });
     const brokerTokenFile = join(home, "broker.token"), pluginConfigFile = join(pluginDirectory, "plugin.json"), stateDirectory = join(home, "coordinator-state");
     yield* fs.writeFileString(brokerTokenFile, sessionToken, { flag: "wx", mode: 0o600 });
+    // ponytail: one private transparent proxy per host; Node's no-agent request adds no HTTP pool.
+    let fault: "none" | "poll" | "presence" = "none";
+    const traffic: { method: string; sessionId?: string; incarnation?: string; status: number; completed: boolean }[] = [];
+    let proxyRequests = 0;
+    const rpc = Schema.Struct({ method: Schema.String, params: Schema.optional(Schema.Struct({
+      name: Schema.optional(Schema.String), arguments: Schema.optional(Schema.Struct({
+        sessionId: Schema.optional(Schema.String), incarnation: Schema.optional(Schema.String),
+      })),
+    })) });
+    const proxy = createServer((request, response) => {
+      proxyRequests++;
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      request.on("data", (chunk: Buffer) => { bytes += chunk.length; if (bytes > 64 * 1024) request.destroy(); else chunks.push(chunk); });
+      request.on("end", () => {
+        try {
+          const body = Buffer.concat(chunks);
+          const wire = body.length === 0 ? undefined : Schema.decodeUnknownSync(Schema.fromJsonString(rpc))(body.toString("utf8"));
+          const method = wire?.method === "tools/call" ? wire.params?.name ?? wire.method : wire?.method ?? request.method ?? "";
+          const entry = { method, ...wire?.params?.arguments, status: 0, completed: false };
+          traffic.push(entry);
+          if ((fault === "poll" && method === "session.poll") || (fault === "presence" && (method === "session.heartbeat" || method === "session.poll"))) {
+            entry.status = fault === "poll" ? 503 : 403;
+            if (fault === "poll") fault = "none";
+            response.writeHead(entry.status, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: "Private control fault fixture" }));
+            entry.completed = true;
+            return;
+          }
+          const upstream = httpRequest(new URL(request.url ?? "/mcp", brokerUrl), { method: request.method, headers: { ...request.headers, host: `127.0.0.1:${address.port}` }, agent: false }, (incoming) => {
+            entry.status = incoming.statusCode ?? 502;
+            response.writeHead(entry.status, incoming.headers);
+            incoming.once("end", () => { entry.completed = true; });
+            incoming.once("error", () => response.destroy());
+            incoming.pipe(response);
+          });
+          upstream.once("error", () => response.destroy());
+          response.once("close", () => upstream.destroy());
+          upstream.end(body);
+        } catch (error) { console.error("Private control proxy failed", error); response.destroy(); }
+      });
+    });
+    yield* Effect.acquireRelease(
+      Effect.promise(() => new Promise<void>((resolve, reject) => { proxy.once("error", reject); proxy.listen(0, "127.0.0.1", resolve); })),
+      () => Effect.promise(() => new Promise<void>((resolve, reject) => { proxy.closeAllConnections(); proxy.close((error) => error ? reject(error) : resolve()); })),
+    );
+    const proxyAddress = proxy.address();
+    if (proxyAddress === null || typeof proxyAddress === "string") return yield* new CommandError({ message: "Expected private control proxy address" });
     yield* fs.writeFileString(pluginConfigFile, yield* Schema.encodeEffect(Schema.fromJsonString(PluginConfig))({
-      brokerUrl, tokenFile: brokerTokenFile, machineId: MachineId.make(`stock-${host}`), stateDirectory, host,
+      brokerUrl: `http://127.0.0.1:${proxyAddress.port}`, tokenFile: brokerTokenFile, machineId: MachineId.make(`stock-${host}`), stateDirectory, host,
     }), { flag: "wx", mode: 0o600 });
     const scope = yield* Scope.fork(yield* Effect.scope);
     const client = yield* connectNativeClient({
@@ -342,14 +392,99 @@ const runHostSmoke = () => Effect.gen(function*() {
       const postRun = yield* client.call("native.get_state", { binding: client.binding }, { timeoutMs: 10000 });
       assert.equal(postRun.currentRunId, null);
       assert.equal(postRun.pendingMessageCount, 0);
+      // All original native and broker-addressed gates finish before permanent pause.
+      const pauseCallsBefore = pauseRequests.get(host) ?? 0;
+      const running = yield* Effect.forkIn(submit(`SDK_PAUSE_${host}`), scope);
+      yield* until(() => Effect.sync(() => paused.has(host)), Boolean);
+      const heldState = yield* client.call("native.get_state", { binding: client.binding }, { timeoutMs: 10000 });
+      assert.equal(heldState.isStreaming, true);
+      const runId = heldState.currentRunId;
+      assert.ok(runId);
+      const assertHeld = Effect.fnUntraced(function*() {
+        const state = yield* client.call("native.get_state", { binding: client.binding }, { timeoutMs: 10000 });
+        assert.deepEqual(state.binding, client.binding);
+        assert.equal(state.currentRunId, runId);
+        assert.equal(state.isStreaming, true);
+        assert.equal(state.pendingMessageCount, 0);
+        yield* watch.drain;
+        assert.equal(events.some((event) => event.kind === "run_settled" && event.runId === runId), false);
+        assert.equal(paused.has(host), true, "Control pause must not close the real provider stream");
+        assert.equal(pauseRequests.get(host), pauseCallsBefore + 1, "Control recovery must not resubmit the model prompt");
+      });
+      const presenceBefore = broker.sessions.get(session.sessionId);
+      assert.ok(presenceBefore);
+      const start = traffic.length, previousPoll = presenceBefore.polledAt, previousLease = presenceBefore.liveUntil;
+      fault = "poll";
+      yield* until(() => Effect.sync(() => traffic.slice(start).some((entry) => entry.method === "session.poll" && entry.status === 503 && entry.completed)), Boolean);
+      yield* assertHeld();
+      const failureIndex = traffic.findIndex((entry, index) => index >= start && entry.method === "session.poll" && entry.status === 503);
+      yield* until(() => Effect.sync(() => {
+        const recovered = traffic.slice(failureIndex + 1).filter((entry) => entry.method === "session.heartbeat" || entry.method === "session.poll");
+        const presence = broker.sessions.get(session.sessionId);
+        return recovered.length >= 2 && recovered[0]?.method === "session.heartbeat" && recovered[0].status === 200 && recovered[0].completed &&
+          recovered[1]?.method === "session.poll" && recovered[1].status === 200 && recovered[1].completed &&
+          presence !== undefined && presence.incarnation === session.incarnation && presence.liveUntil > previousLease && presence.polledAt > previousPoll;
+      }), Boolean);
+      const pair = traffic.slice(failureIndex + 1).filter((entry) => entry.method === "session.heartbeat" || entry.method === "session.poll").slice(0, 2);
+      for (const entry of pair) { assert.equal(entry.sessionId, session.sessionId); assert.equal(entry.incarnation, session.incarnation); }
+      yield* assertHeld();
+      const fencedTaskId = TaskId.make(`pause-fenced-${host}`), fencedDeadline = (yield* Clock.currentTimeMillis) + 60000;
+      yield* mcp.call(brokerUrl, coordinatorToken, "task.submit", { taskId: fencedTaskId, prompt: "SDK_FENCED_MUST_NOT_RUN", repo, ref, sha, launcher: host, scope: "owned SDK execution",
+        restrictions: "local scripted provider only", expectedEvidence: [], deadline: fencedDeadline, workerId, githubRepoId: GitHubRepositoryId.make(1), requiredLanes: ["supplementary"], bypassPeer: false, approved: true });
+      yield* mcp.call(brokerUrl, sessionToken, "peer.reply", { taskId: fencedTaskId, sessionId: session.sessionId, incarnation: session.incarnation, decision: "accepted" });
+      const fencedAddress = { ...addressed, messageId: MessageId.make(`pause-fenced-release-${host}`), deadline: fencedDeadline };
+      yield* mcp.call(brokerUrl, coordinatorToken, "task.address", { taskId: fencedTaskId, address: fencedAddress });
+      yield* mcp.call(brokerUrl, sessionToken, "task.readback", { taskId: fencedTaskId, address: fencedAddress, disposition: "ready" });
+      yield* mcp.call(brokerUrl, coordinatorToken, "task.confirm", { taskId: fencedTaskId, revision: 1 });
+      fault = "presence";
+      yield* until(() => Effect.sync(() => traffic.some((entry) => (entry.method === "session.poll" || entry.method === "session.heartbeat") && entry.status === 403 && entry.completed)), Boolean);
+      yield* assertHeld();
+      yield* Effect.sleep(500);
+      const quietStart = proxyRequests, callsWhileHeld = fixtureCalls;
+      yield* Effect.sleep(11000);
+      assert.equal(proxyRequests, quietStart, "Static credentials must stop unchanged control traffic, including initialization");
+      assert.equal(fixtureCalls, callsWhileHeld, "No background admission or business replay while the provider is held");
+      yield* assertHeld();
+      const release = paused.get(host);
+      assert.ok(release);
+      release();
+      const survived = yield* Fiber.join(running);
+      if (survived.disposition !== "settled") return yield* new CommandError({ message: "Expected SDK outcome after permanent control pause" });
+      assert.equal(survived.final.runId, runId);
+      assert.equal(survived.final.outcome, "completed");
+      yield* Effect.sleep(3000);
+      yield* watch.drain;
+      const completedOutcomes = events.filter((event) => event.kind === "run_settled" && event.runId === runId).length;
+      assert.equal(completedOutcomes, 1);
+      assert.equal(proxyRequests, quietStart, "Finishing accepted work must not restart paused presence");
+      assert.equal(fixtureCalls, callsWhileHeld, "An addressed release must remain fenced even after the accepted run completes");
+      const finalState = yield* client.call("native.get_state", { binding: client.binding }, { timeoutMs: 10000 });
+      assert.deepEqual(finalState.binding, client.binding);
+      assert.equal(finalState.currentRunId, null);
+      assert.equal(finalState.pendingMessageCount, 0);
+      const fencedTask = yield* mcp.call(brokerUrl, coordinatorToken, "task.get", { taskId: fencedTaskId });
+      assert.equal(fencedTask.state, "ACCEPTED");
+      assert.equal(fencedTask.confirmedRevision, 1);
+      assert.equal((yield* mcp.call(brokerUrl, coordinatorToken, "task.get", { taskId })).state, "SUCCEEDED", "The prior addressed business result must never be replayed or regressed");
+      assert.equal(traffic.filter((entry) => entry.status === 503).length, 1);
+      assert.equal(traffic.filter((entry) => entry.status === 403).length, 1, "Static authorization failure must not retry presence");
+      controlChecks.push({ host, runId, transientPollFaults: traffic.filter((entry) => entry.status === 503).length,
+        recoveredHeartbeatPollPairs: pair.length / 2, permanentPresenceFaults: traffic.filter((entry) => entry.status === 403).length,
+        quietControlRequests: proxyRequests - quietStart, completedOutcomes, providerHeldRequests: (pauseRequests.get(host) ?? 0) - pauseCallsBefore,
+        fencedTaskState: fencedTask.state, retiredOwnerRequests: 0 });
       yield* watch.close;
     }).pipe(Effect.ensuring(Scope.close(scope, Exit.void)));
     yield* client.observedProcessClosed.pipe(Effect.timeout("10 seconds"));
+    const retiredRequests = proxyRequests;
+    yield* Effect.sleep(2200);
+    const retiredOwnerRequests = proxyRequests - retiredRequests;
+    assert.equal(retiredOwnerRequests, 0, `${host}: a physically closed owner must never resume old-binding traffic`);
+    controlChecks[controlChecks.length - 1]!.retiredOwnerRequests = retiredOwnerRequests;
     observations.push({ host, binding: client.binding, pid: client.pid, capabilities: client.capabilities, physicalProcessClosed: true });
   }
   yield* Scope.close(brokerScope, Exit.void);
   yield* dropPostgres(brokerConfig.databaseUrlFile);
-  yield* fs.writeFileString(transcript, JSON.stringify({ accepted: true, observations,
+  yield* fs.writeFileString(transcript, JSON.stringify({ accepted: true, observations, controlChecks,
     controlsAcceptance: "accepted", exercisedControls,
     guardedNegativeControls: { controls: guardedNegativeControls, result: "binding_mismatch before delivery" },
     sendDeliveryAcceptance: "accepted: actual SDK tool, steering, queued follow-up and independent FIFO admission",
@@ -358,7 +493,7 @@ const runHostSmoke = () => Effect.gen(function*() {
     terminalAcceptance: "not-exercised",
     consentedCaptureAcceptance: "not-exercised: real participant consent requires native UI; broker regression remains in the separate unfiltered native suite",
     fixtureModelCalls: fixtureCalls, externalModelCalls: 0 }), { flag: "wx", mode: 0o600 });
-  console.log(JSON.stringify({ accepted: true, transcript, privateHome: directory, controlsAcceptance: "accepted", exercisedControls, guardedNegativeControls,
+  console.log(JSON.stringify({ accepted: true, transcript, privateHome: directory, controlChecks, controlsAcceptance: "accepted", exercisedControls, guardedNegativeControls,
     brokerPluginAcceptance: "accepted", wholeRunAcceptance: "accepted", terminalAcceptance: "not-exercised", consentedCaptureAcceptance: "not-exercised", fixtureModelCalls: fixtureCalls, externalModelCalls: 0 }));
 });
 NodeRuntime.runMain(Commands["program.smoke:hosts"].execute({ runHostSmoke }, {}).pipe(

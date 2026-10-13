@@ -5,17 +5,17 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { Context, Deferred, Effect, Layer, ManagedRuntime } from "effect";
 import { HttpServer } from "effect/http";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { Acceptance, HttpError, TaskId, type CommandInput } from "../src/contracts.ts";
-import { Mcp, serverLayer } from "../src/http.ts";
+import { Acceptance, CommandError, HttpError, TaskId, type CommandInput } from "../src/contracts.ts";
+import { LIMIT, Mcp, serverLayer } from "../src/http.ts";
 
-test("Mcp.call closes its real HTTP 401 body before releasing the body or disposing its layer", { timeout: 5000 }, async () => {
+test("Mcp.call closes its oversized real HTTP 401 body before releasing the body or disposing its layer", { timeout: 5000 }, async () => {
   const releaseBody = await Effect.runPromise(Deferred.make<void>());
   const disconnected = Promise.withResolvers<void>();
   let bodyReleased = false;
   const nativeServer = createServer((_request, response) => {
     response.once("close", disconnected.resolve);
-    response.writeHead(401, { "content-type": "text/plain" });
-    response.write("Credential required");
+    response.writeHead(401, { "content-type": "text/plain", "retry-after": "Wed, 14 Oct 2026 00:00:00 GMT", "www-authenticate": `Bearer realm="${"x".repeat(600)}"` });
+    response.write("x".repeat(LIMIT + 1));
     void Effect.runPromise(Deferred.await(releaseBody)).then(() => {
       bodyReleased = true;
       response.end();
@@ -29,7 +29,13 @@ test("Mcp.call closes its real HTTP 401 body before releasing the body or dispos
     const mcp = await runtime.runPromise(Mcp);
     const status = await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("physical-401") }).pipe(Effect.match({
       onSuccess: () => 200,
-      onFailure: (error) => { assert.ok(error instanceof HttpError); return error.status; },
+      onFailure: (error) => {
+        assert.ok(error instanceof HttpError);
+        assert.equal(error.retryAfter, "Wed, 14 Oct 2026 00:00:00 GMT");
+        assert.equal(error.wwwAuthenticate?.length, 512);
+        assert.equal(error.protocolCode, undefined);
+        return error.status;
+      },
     })));
     assert.equal(status, 401);
     await Effect.runPromise(Effect.promise(() => disconnected.promise).pipe(Effect.timeout("1 second")));
@@ -41,6 +47,54 @@ test("Mcp.call closes its real HTTP 401 body before releasing the body or dispos
     await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
   }
 });
+
+for (const variant of ["stalled-401", "stalled-503", "malformed-discovery"] as const) {
+  test(`Mcp.call preserves ${variant} failure instead of a retryable timeout`, { timeout: 5000 }, async () => {
+    let posts = 0;
+    const disconnected = Promise.withResolvers<void>();
+    const nativeServer = createServer((request, response) => {
+      posts++;
+      request.resume();
+      response.once("close", disconnected.resolve);
+      if (variant === "malformed-discovery") {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write("data: {invalid}\n\n");
+      } else {
+        response.writeHead(variant === "stalled-401" ? 401 : 503, {
+          "content-type": "application/json", "retry-after": "60", "www-authenticate": "Bearer",
+        });
+        response.write("{");
+      }
+    });
+    const runtime = ManagedRuntime.make(Mcp.layer);
+    try {
+      await new Promise<void>((resolve) => nativeServer.listen(0, "127.0.0.1", resolve));
+      const address = nativeServer.address();
+      assert.ok(address !== null && typeof address !== "string");
+      const mcp = await runtime.runPromise(Mcp);
+      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("incomplete-response") }, 250).pipe(Effect.match({
+        onSuccess: () => assert.fail("Invalid response must fail"),
+        onFailure: (error) => {
+          if (variant === "malformed-discovery") {
+            assert.ok(error instanceof CommandError);
+            assert.equal(error.reason, "protocol");
+          } else {
+            assert.ok(error instanceof HttpError);
+            assert.equal(error.status, variant === "stalled-401" ? 401 : 503);
+            assert.equal(error.retryAfter, "60");
+            assert.equal(error.wwwAuthenticate, "Bearer");
+          }
+        },
+      })));
+      await Effect.runPromise(Effect.promise(() => disconnected.promise).pipe(Effect.timeout("1 second")));
+      assert.equal(posts, 1, "Failure must not trigger another POST");
+    } finally {
+      nativeServer.closeAllConnections();
+      await runtime.dispose();
+      await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+}
 
 test("Mcp.call timeout closes its real HTTP streaming body before disposing its layer", { timeout: 5000 }, async () => {
   const releaseBody = await Effect.runPromise(Deferred.make<void>());
@@ -99,7 +153,7 @@ test("stateless MCP calls authorize every HTTP request and close without retaini
           : Effect.fail(new HttpError({ status: 401, message: "Credential required" })),
         handle: (caller, request) => Effect.gen(function*() {
           handled++;
-          if (request.method !== "journal" || request.params.taskId !== caller) return yield* new HttpError({ status: 403, message: "Task belongs to another caller" });
+          if (request.method !== "journal" || request.params.taskId !== caller) return yield* new HttpError({ status: 403, message: "Task belongs to another caller", wwwAuthenticate: 'Bearer scope="journal"' });
           if (caller === "caller-a" && request.params.taskId === "caller-a") {
             slowEntered.resolve();
             yield* Effect.promise(() => releaseSlow.promise);
@@ -119,7 +173,11 @@ test("stateless MCP calls authorize every HTTP request and close without retaini
     const url = HttpServer.formatAddress(server.address);
     const status = (token: string, params: CommandInput<"journal">) => runtime.runPromise(mcp.call(url, token, "journal", params).pipe(Effect.match({
       onSuccess: () => 200,
-      onFailure: (error) => { assert.ok(error instanceof HttpError); return error.status; },
+      onFailure: (error) => {
+        assert.ok(error instanceof HttpError);
+        if (error.status === 403) assert.equal(error.wwwAuthenticate, 'Bearer scope="journal"');
+        return error.status;
+      },
     })));
     assert.equal(await status("caller-a", { taskId: TaskId.make("caller-b") }), 403);
     assert.equal(await status("caller-b", { taskId: TaskId.make("caller-a") }), 403);
@@ -308,5 +366,147 @@ test("aborted unread MCP body cannot hold HTTP server cleanup", { timeout: 5000 
     request.destroy();
     proceed.resolve();
     await runtime.dispose();
+  }
+});
+
+for (const status of [400, 401, 403, 404, 429, 503]) {
+  test(`Mcp.call retains HTTP ${status}, bounded headers and protocol meaning without repeating POST`, { timeout: 5000 }, async () => {
+    let posts = 0;
+    const challenge = 'Bearer error="insufficient_scope", scope="coordinator"';
+    const nativeServer = createServer(async (request, response) => {
+      posts++;
+      assert.equal(request.method, "POST");
+      assert.equal(request.url, "/mcp");
+      assert.equal(request.headers.authorization, "Bearer caller");
+      assert.equal(request.headers["mcp-protocol-version"], "2026-07-28");
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      const rpc: unknown = JSON.parse(body);
+      assert.ok(rpc !== null && typeof rpc === "object" && "id" in rpc);
+      response.writeHead(status, { "content-type": "application/json", "retry-after": "17", "www-authenticate": challenge });
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, error: {
+        code: status === 400 ? -32022 : -32601, message: "Private rejected-body text",
+        ...(status === 400 ? { data: { supported: ["2026-07-28"], requested: "2026-07-28" } } : {}),
+      } }));
+    });
+    const runtime = ManagedRuntime.make(Mcp.layer);
+    try {
+      await new Promise<void>((resolve) => nativeServer.listen(0, "127.0.0.1", resolve));
+      const address = nativeServer.address();
+      assert.ok(address !== null && typeof address !== "string");
+      const mcp = await runtime.runPromise(Mcp);
+      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("typed-rejection") }).pipe(Effect.match({
+        onSuccess: () => assert.fail("Rejected RPC must fail"),
+        onFailure: (error) => {
+          assert.ok(error instanceof HttpError);
+          assert.equal(error.status, status);
+          assert.equal(error.retryAfter, "17");
+          assert.equal(error.wwwAuthenticate, challenge);
+          assert.equal(error.protocolCode, status === 400 ? -32022 : -32601);
+          assert.equal(error.message.includes("Private"), false);
+        },
+      })));
+      assert.equal(posts, 1);
+    } finally {
+      nativeServer.closeAllConnections();
+      await runtime.dispose();
+      await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+}
+
+for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-json", "unknown-sse", "interrupted", "valid-json", "valid-sse"] as const) {
+  test(`Mcp.call preserves ${variant} tool response semantics`, { timeout: 5000 }, async () => {
+    let tools = 0;
+    const nativeServer = createServer(async (request, response) => {
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      const rpc: unknown = JSON.parse(body);
+      assert.ok(rpc !== null && typeof rpc === "object" && "id" in rpc && "method" in rpc);
+      if (rpc.method === "server/discover") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { supportedVersions: ["2026-07-28"], capabilities: { tools: {} } } }));
+        return;
+      }
+      if (rpc.method === "tools/list") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { resultType: "complete", tools: [{ name: "journal", inputSchema: { type: "object" } }] } }));
+        return;
+      }
+      assert.equal(rpc.method, "tools/call");
+      tools++;
+      response.writeHead(200, { "content-type": variant === "sse" || variant === "unknown-sse" || variant === "valid-sse" || variant === "interrupted" ? "text/event-stream" : "application/json" });
+      if (variant === "interrupted") {
+        response.write(": connected\n\n");
+        setImmediate(() => response.destroy());
+      } else if (variant === "sse") response.end("data: not-json\n\n");
+      else if (variant === "json") response.end("not-json");
+      else if (variant === "invalid-result") response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { resultType: "complete", content: "invalid" } }));
+      else if (variant === "unknown-json" || variant === "unknown-sse") {
+        const envelope = JSON.stringify({ jsonrpc: "invalid", id: rpc.id, result: {} });
+        response.end(variant === "unknown-sse" ? `data: ${envelope}\n\n` : envelope);
+      }
+      else if (variant === "valid-json" || variant === "valid-sse") {
+        const result = JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { resultType: "complete", content: [], structuredContent: { result: { taskId: "response-failure", accepted: false, state: "absent" } } } });
+        response.end(variant === "valid-sse" ? `data: ${result}\n\n` : result);
+      } else response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, error: { code: -32602, message: "Invalid input" } }));
+    });
+    const runtime = ManagedRuntime.make(Mcp.layer);
+    try {
+      await new Promise<void>((resolve) => nativeServer.listen(0, "127.0.0.1", resolve));
+      const address = nativeServer.address();
+      assert.ok(address !== null && typeof address !== "string");
+      const mcp = await runtime.runPromise(Mcp);
+      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("response-failure") }, 1500).pipe(Effect.match({
+        onSuccess: (result) => {
+          assert.ok(variant === "valid-json" || variant === "valid-sse", "Invalid or interrupted RPC must fail");
+          assert.equal(result.taskId, "response-failure");
+          assert.equal(result.accepted, false);
+        },
+        onFailure: (error) => {
+          assert.ok(variant !== "valid-json" && variant !== "valid-sse", "Valid JSON/SSE RPC must succeed");
+          if (variant === "protocol") {
+            assert.ok(error instanceof HttpError);
+            assert.equal(error.status, 200);
+            assert.equal(error.protocolCode, -32602);
+          } else {
+            assert.ok(error instanceof CommandError);
+            assert.equal(error.reason, variant === "interrupted" ? "transport" : variant === "unknown-json" || variant === "unknown-sse" ? undefined : "protocol");
+          }
+        },
+      })));
+      assert.equal(tools, 1, "No tool POST is automatically retried");
+    } finally {
+      nativeServer.closeAllConnections();
+      await runtime.dispose();
+      await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+}
+
+test("Mcp.call retains an actual native pre-response transport interruption without repeating POST", { timeout: 5000 }, async () => {
+  let posts = 0;
+  const nativeServer = createServer((request) => {
+    posts++;
+    request.socket.destroy();
+  });
+  const runtime = ManagedRuntime.make(Mcp.layer);
+  try {
+    await new Promise<void>((resolve) => nativeServer.listen(0, "127.0.0.1", resolve));
+    const address = nativeServer.address();
+    assert.ok(address !== null && typeof address !== "string");
+    const mcp = await runtime.runPromise(Mcp);
+    await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("transport-failure") }).pipe(Effect.match({
+      onSuccess: () => assert.fail("Interrupted transport must fail"),
+      onFailure: (error) => {
+        assert.ok(error instanceof CommandError);
+        assert.equal(error.reason, "transport");
+      },
+    })));
+    assert.equal(posts, 1);
+  } finally {
+    nativeServer.closeAllConnections();
+    await runtime.dispose();
+    await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
   }
 });

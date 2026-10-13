@@ -1,0 +1,164 @@
+# Coordinator control recovery: program status, MCP and HTTP standards
+
+## Question and conclusion
+
+How should Coordinator handle repeated `session.poll` / `session.heartbeat` timeouts without confusing transport recovery with task acceptance, native host lifecycle, or terminal status?
+
+**Implemented rule.** Keep each command RPC bounded and recover only the current owner's control channel; never replay an accepted or acceptance-unknown business operation. A failure can be ambiguous, so transport/SDK code does not retransmit the failed request or the full tick. After a classified transient failure, owner recovery issues fresh heartbeat then poll calls; only their completed pair on the still-owned binding restores healthy status and dispatch eligibility. Presence-bound 409/410 instead fences the binding and requests a fresh incarnation once the native owner is quiescent. [11–13]
+
+**Use the correct protocol era.** The broker/runner command channel uses **2026-07-28**, whose HTTP binding has no protocol sessions, initialization handshake, GET notification stream, or `Last-Event-ID` resumption. The separate interactive native-control channel uses **2025-11-25**, which does have initialization, optional HTTP session IDs, and optional SSE resumption. A Coordinator domain `sessionId`/incarnation and lease are not an `MCP-Session-Id`. [1][2][6][7][11][14]
+
+**Program status is a separate contract.** PSP `idle` describes execution awaiting the next instruction; it does not mean broker presence should disappear. An automatically recovering connection is not a task that is still working, failed and stopped, or waiting for user input. The plugin reports connectivity through native keyed status and, on a capability-detected terminal, its own PSP record; it never replaces or clears the host root. PSP records require no heartbeat; broker leases still do. [12][18–20]
+
+**Scope and status.** The recovery policy below is implemented in source and exercised by focused tests and isolated runtime/host smoke procedures. This document separates protocol standards from application behavior and records evidence limits; it does not establish the cause of prior control timeouts, certify exactly-once outcomes, or claim production activation. No deployment change is made here. Current exact-SHA suite/host gate results are not asserted by this note.
+
+## Implemented recovery boundary
+
+The following describes the current source, not a generic retry recommendation. The command adapter remains pinned to MCP 2026-07-28 with a **10,000 ms** end-to-end call deadline. Each call uses a fresh client; HTTP status, bounded `Retry-After` and `WWW-Authenticate` values (512 characters each), and a structured JSON-RPC protocol code survive the native boundary. Transport failures and incompatible protocol errors are distinguished without classifying from exception text. After a known rejection/error, the adapter prevents SDK corrective POST replay. [11]
+
+The plugin has one recovery owner for the current session/incarnation. Its backoff targets are **1, 2, 4, 8, 16, then 30 seconds**, with native jitter and a final local delay bound of **1–30 seconds**. Valid `Retry-After` delta-seconds or HTTP-date is a lower bound and may exceed the local 30-second cap. The schedule and outage notice state reset only after heartbeat and then poll both succeed. Backoff does not extend the broker lease or poll-freshness window: an idle peer may become stale and must earn fresh eligibility through heartbeat and poll. [12][13]
+
+The implementation classifies typed transport/deadline failures and HTTP **408**, **429**, and **5xx except 501** as transient unless the parsed JSON-RPC code is **-32600 through -32603**; `CommandError(reason=protocol)` is permanent. HTTP **409/410** is transient only for presence heartbeat/poll; it fences the old incarnation and causes fresh enrollment after the owned SDK is safe to retire. Authentication/authorization failures (**401/403**), static request/configuration failures (**400/404/501**), those standard JSON-RPC protocol codes, non-presence conflicts, and local repository/journal/binding faults pause broker traffic pending correction or reconciliation. The static bearer path does not resend unchanged credentials. [11][12]
+
+Recovery does not retransmit the failed MCP request or replay the full periodic tick. On transient broker failure the active owner later issues fresh presence-maintenance calls (heartbeat, then poll) and resumes normal handling from the newly observed state; it never replays the failed business operation, infers nonacceptance from a timeout, reassigns acceptance-unknown work, resets a confirmed revision, clears HELD/occupied work, or resubmits an accepted native prompt. A fresh poll may rediscover an unacknowledged message; durable journal deduplication precedes its acknowledgement, which is delivery recovery rather than re-execution of accepted work. A pause blocks broker traffic/admission but is not `Plugin.stop()` and does not dispose the native owner, accepted run, or journal. [12][13]
+
+## Source-backed protocol requirements
+
+### Modern lifecycle: 2026-07-28
+
+The former `/basic/lifecycle` URL resolves to **Versioning and Compatibility**. There is **no negotiation handshake**: each request declares its version, client identity and capabilities in `_meta`; HTTP mirrors required metadata into headers. An unsupported version requires `UnsupportedProtocolVersionError`; clients **SHOULD** retry with a mutually supported version or surface an error if none exists. `server/discover` is mandatory for servers but optional for clients. This corrective version negotiation is not permission to repeat arbitrary accepted business work. [1][2]
+
+Modern HTTP requires POST per request, support for both JSON and request-scoped SSE responses, and required matching metadata/header values. Missing/mismatched metadata is a request error; an unsupported RPC method requires **HTTP 404 with JSON-RPC `-32601`**, not session replacement. Modern/legacy fallback is an explicit compatibility procedure, not a response to every timeout. Coordinator deliberately pins the modern command revision; this report does not propose silently downgrading it. [1][2][11]
+
+### Bounded requests, cancellation and long-lived subscriptions
+
+Both protocol eras say implementations **SHOULD** establish timeouts for sent requests, allow per-request configuration, cancel and stop waiting on timeout, and enforce a maximum timeout even if progress resets the clock. They do not specify ten seconds, a retry count, or an exponential-backoff constant. [3][7]
+
+In **modern HTTP**, closing the request's SSE response stream **MUST** be treated as cancellation; the server **SHOULD** stop work as soon as practical and **MUST NOT** send further messages for it. No client cancellation notification is expected on that binding. Modern stdio instead requires `notifications/cancelled`. Cancellation can race completed processing, and a receiver can be unable to cancel. **Cancellation is not rollback or evidence of nonacceptance.** [2][3]
+
+In **legacy HTTP**, disconnect **SHOULD NOT** be interpreted as cancellation. The client **SHOULD** explicitly send `notifications/cancelled` for an ordinary in-flight request. Legacy clients **MUST NOT** cancel `initialize`; task-augmented requests use their specified `tasks/cancel` mechanism instead. These special rules belong to that channel, not stateless broker commands or Coordinator's domain task cancellation. [6][7][8]
+
+A subscription is not a hung one-off RPC: modern `subscriptions/listen` intentionally remains open after its acknowledgment until cancellation or transport closure. An unexpected close **MAY** trigger reconnection; after stdio reconnection the client **MUST** resend subscriptions. The installed SDK explicitly bounds the acknowledgment phase, then keeps the subscription alive. A background discovery/refresh service can likewise live for the owner scope while each discrete `server/discover` / `tools/list` request remains bounded; there is no standard rule that the service itself must die after a ten-second lifetime. Keepalive SSE comments prevent quiet-stream intermediary timeouts but are not business progress, successful heartbeat renewal, or permission to run a one-off command forever. [2][9][15]
+
+**Source inconsistency to preserve:** the modern cancellation page says a server **MUST** send `notifications/cancelled` when tearing down a subscription, whereas the subscription page describes a successful completion response as its **SHOULD** graceful-close signal. Both agree on the long-lived stream and client cancellation mechanics. This report does not invent a resolution or require an SDK change on that basis. [3][9]
+
+### SSE resumption is delivery recovery, not operation replay
+
+**2025-11-25:** event IDs and replay storage are optional. If resuming, the client **SHOULD** GET with `Last-Event-ID`; the server **MAY** redeliver messages from the interrupted stream and **MUST NOT** replay another stream's messages. When a server intentionally closes a connection without terminating its resumable stream, a supplied SSE `retry` interval **MUST** be respected by the client. This is retrieval/redelivery of events from an existing operation, not re-POSTing the business request. Event IDs are not task idempotency keys. [6]
+
+**2026-07-28:** `Last-Event-ID` resumability is explicitly unsupported. Reopening a subscription obtains a new stream; re-reading authoritative state is needed where missed events matter. The mere presence of resumability methods/default reconnection settings in a dual-era SDK does not make them modern protocol semantics. The installed client transport's legacy reconnection defaults are initial **1 second**, maximum **30 seconds**, growth **1.5**, **2** attempts; these are SDK policy, not an MCP retry mandate and not Coordinator's periodic-loop budget. [2][15]
+
+### HTTP success versus RPC/tool success
+
+HTTP 200 establishes an HTTP response, not a successful tool operation. An SSE 200 can still fail/disconnect before a final JSON-RPC response. A complete JSON-RPC response can contain a protocol `error`; a tool result can contain `isError: true`, including downstream API or input validation failures. Inspect the correct layer and structured error; never classify every HTTP 200 as recovered or every `isError` as transient. For non-2xx responses the Coordinator adapter retains bounded status, `Retry-After`, `WWW-Authenticate`, and a parsed JSON-RPC error code when present; structured tool errors are decoded separately. [2][10][11]
+
+### HTTP retry safety and actual limits
+
+RFC 9110 §9.2.2 defines idempotency by the **intended effect**, not by identical response bytes. Clients **SHOULD NOT** automatically retry non-idempotent methods unless they know the actual request semantics are idempotent or can detect that the original was never applied. A proxy **MUST NOT** automatically retry non-idempotent requests. Importantly, a client **SHOULD NOT automatically retry a failed automatic retry**. That is a real conservative retry recommendation; it is not an RFC-mandated exponential policy or an arbitrary three/five-attempt rule. All MCP command POSTs need application knowledge before retry. Coordinator deliberately uses the narrow application-level presence-maintenance exception: after transient failure it makes fresh heartbeat then poll calls for the current owner, but does not retransmit the failed business request or whole tick. This is Coordinator policy, not MCP/HTTP idempotency semantics. [4]
+
+RFC 9110 §10.2.3 defines `Retry-After` as an HTTP-date or nonnegative decimal **seconds**, not milliseconds. For 503 it suggests expected unavailability; for redirects it specifies the requested minimum delay. RFC 6585 §4 defines 429 and says the server **MAY** provide `Retry-After`; RFC 9110 §15.6.4 says a 503 server **MAY** provide it. Neither defines a universal retry count or requires retrying unsafe requests. For classified transient failures, the implemented policy honors a valid delay without shortening it to fit the local 30-second cap; the broker lease/freshness windows can still expire. This is a conservative application decision, distinct from legacy SSE's explicit **MUST** respect `retry` milliseconds. [4][5][6]
+
+MCP authorization is a separate exception with explicit limits: step-up authorization says retry the original request with new authorization **no more than a few times**, then treat it as permanent authorization failure; clients **SHOULD** implement limits and track attempts per resource/operation. No exact number is mandated. Invalid/expired tokens require 401; insufficient scope has a 403 Bearer challenge. Repeating the same credential every second is not authorization recovery. Coordinator's command adapter uses a static bearer and retains bounded `WWW-Authenticate` metadata, but has no credential-refresh correction flow; unchanged 401/403 therefore pause broker traffic rather than retry. [16][11]
+
+AWS's first-party Builders' Library guidance supports a small retry budget, backoff/jitter, a single retry layer, latency-based deadlines, and not retrying side effects without idempotency. It also warns that a capped infinite retry rate still sustains outage load. This is engineering guidance, not a normative MCP/HTTP requirement or evidence that the current broker outage is caused by overload. [17]
+
+## Implemented classification and recovery policy
+
+This is the current source policy, not protocol-mandated retry behavior. A bounded call failure does not prove that the broker failed to commit; automatic recovery is therefore limited to restoring/re-observing control state, never replaying the original operation.
+
+| Evidence | Current classification and action |
+| --- | --- |
+| Typed timeout/transport failure | Transient. Leave the broker peer stale as its lease/poll windows expire; after the owner delay, issue fresh heartbeat then poll calls on the exact active binding. Do not retransmit the failed business method or replay the whole tick. |
+| HTTP 408, 429, or 5xx except 501 | Transient unless the parsed JSON-RPC code is -32600 through -32603 or the typed failure is a protocol error. Honor valid `Retry-After`; otherwise advance the one owner-scoped jittered schedule. Other 5xx can hide upstream effects, so recovery does not repeat that business method. |
+| HTTP 401/403, 400/404/501; JSON-RPC codes -32600 through -32603 or `CommandError(reason=protocol)`; non-presence 409/410; local repository/journal/binding failure | Permanent for unchanged inputs/owner. Pause broker traffic and expose paused status until a corrected/reconciled owner starts. Preserve bounded auth challenge/protocol metadata for classification; no unchanged static-credential retry. |
+| HTTP 409/410 from `session.heartbeat` or `session.poll` | Presence fence. Enter the recovery schedule, block old-binding poll/dispatch, then stop the old enrollment and create a fresh incarnation only when the owned SDK has no active/pending work that would be discarded. |
+| Complete tool error or other broker failure not above | Pause unless the typed error is one of the transient cases. HTTP success alone is not recovery; the complete heartbeat/poll pair is required. |
+| Explicit stop, host shutdown, or session replacement | Retire the owner scope. Interrupt in-flight requests and pending sleeps; an obsolete owner cannot resume recovery in the replacement session. |
+
+### Backoff, reset, UI and lifecycle
+
+The schedule targets **1, 2, 4, 8, 16, then 30 seconds**, applies native jitter, and clamps the local delay to **1–30 seconds** after jitter. Valid `Retry-After` delta-seconds or HTTP-date is a lower bound even above 30 seconds. Transient recovery continues without an attempt-count cutoff while the owner remains active; permanent errors pause broker traffic until correction/restart. A successful heartbeat alone is partial recovery: poll must then succeed before clearing outage status, notifying recovery, restoring eligibility, or resetting the schedule. [11–13]
+
+A failure advances the owner epoch. An in-flight poll from an older epoch cannot clear a concurrent outage or permanent pause; broker-addressed native admission rechecks the active owner and epoch after durable intent, at the fork boundary, and when its FIFO ticket actually starts.
+
+Transient failure produces one warning per outage; a single recovery notice follows only the complete heartbeat/poll pair. The plugin composes execution state with keyed UI statuses `coordinator.network` (“Coordinator reconnecting”) or `coordinator.paused` (“Coordinator network paused”). On an eligible interactive TTY it queries OSC 7501 support and emits one owned `id=coordinator:app=coordinator` PSP record. It does not replace the host root, globally clear PSP state, infer model work from connectivity, or report a fabricated `offline` execution state. On retirement it clears only its own record/status. [12][18–20]
+
+The recovery loop and each scoped HTTP call belong to the native owner. Stop/session replacement interrupts a pending call or sleep; the next owner gets its own binding and recovery state. A transient outage does not stop or dispose that native owner. Permanent pause blocks broker activity while already accepted native work continues and its journal/occupied uncertainty remains intact. Presence 409/410 requires a fresh incarnation, but the replacement waits until the old owner's native queues, streams, and async work are safe to retire. [12]
+
+Automatic retirement atomically fences new native admission only after rechecking idle state at retirement, not before a delay. Accepted standalone native shell operations also prevent retirement. A concurrent permanent pause prevents a queued conflict restart from creating another enrollment with unchanged credentials.
+
+**No-replay invariant:** communication recovery can re-observe durable broker state but cannot convert timeout to “not accepted,” clear HELD/occupied uncertainty, replay a confirmed revision, acknowledge work again as a substitute for missing proof, or issue the same native prompt twice. A local journal/binding failure pauses instead of repeating broker traffic around uncertain local state. [4][8][12][13]
+
+## Program Status Protocol and native host lifecycle
+
+The inspected PSP is Mitchell Hashimoto's **OSC 7501 draft 0.1**, gist revision `f838e7364cf4fa56e74814df517cac8c716d82d1`, updated 2026-09-30. It is a program-status proposal, not an IETF retry specification. [18]
+
+| Contract | Source-backed meaning | Coordinator behavior |
+| --- | --- | --- |
+| PSP `idle`, `working`, `blocked`, `error` (§5) | Awaiting next instruction; running; cannot continue until user acts; failed and stopped | Connectivity does not fabricate model work or terminal failure. `blocked` remains reserved for actual user-action dependencies. |
+| PSP record lifetime (§5) | No heartbeat; terminals MUST NOT require refresh to keep records alive | Execution/status transitions only; the broker lease still has its separate heartbeat. |
+| PSP root/child records (§§4–5) | No `id` addresses root; each report replaces its record; root `clear` removes all records | The plugin uses its one stable `id=coordinator:app=coordinator`; it never writes/clears the host root or unrelated records. |
+| PSP capability detection (§7) | OSC query/reply is authoritative; native terminfo `Pst` permits sending before a query | The interactive TTY path queries OSC support and emits status only after a reply; no competing stdin reader or terminal-name guess. |
+| Native agent idle/end | `ctx.isIdle()` is available; OMP `agent_end.willContinue=true` is not terminal settlement | Presence does not stop on idle/end; actual owned queue/compaction/async-drain settlement governs retirement. |
+| Native session lifecycle | OMP shutdown is process exit; switch replaces session. Pi shutdown includes quit/reload/new/resume/fork | Retire the old owner scope; cancel pending calls/sleeps and prevent old-binding recovery. |
+| Native UI status | Both supported SDKs expose `setStatus(key, text \| undefined)` | Compose retry/pause into `coordinator.network` / `coordinator.paused`, without overwriting other keys. |
+
+The emitted PSP connectivity messages are “Coordinator reconnecting” and “Coordinator network paused”, composed with the current execution record rather than represented as a new PSP state. The status is capability-gated and redacted; task completion/error retention remains deliberate. No native host root replacement/global clear occurs. Terminal rendering/keyboard behavior remains outside these loopback recovery checks. [12][18–20]
+
+
+## Implemented native mechanisms and transport boundary
+
+Effect 4.0.3 supplies the scheduler used by the plugin. A single owner-scoped schedule advances on transient failure, survives changes in failed presence method, resets only after the successful heartbeat/poll pair, and is interrupted with its scope. This avoids nested SDK/application retry loops and does not wrap the whole `tick()` in `Effect.retry`. [12][21]
+
+The HTTP adapter retains the minimum bounded evidence needed by the classifier: response status, up to 512 characters of `Retry-After` and `WWW-Authenticate`, and a parsed JSON-RPC code. `Retry-After` accepts delta-seconds and HTTP-date; malformed values add no delay. Protocol codes are not treated as transient merely because the HTTP status is 5xx. A pinned static bearer cannot correct an auth rejection, and the adapter prevents the SDK from correcting by replaying the rejected POST. The 10-second deadline closes scoped resources on completion/interruption. [11]
+
+Rejected response metadata survives a stalled response body reaching the deadline. Malformed discovery SSE closes the actual SDK probe transport and remains a typed protocol failure, rather than becoming a retryable timeout; probe transport cleanup belongs to the call scope.
+
+The SDK's optional legacy SSE reconnection and generic HTTP retry helpers are not used to resend command operations. They have different transport semantics and cannot establish business-operation idempotency. No second HTTP pool, generic retry service, circuit breaker, or database retry layer is added. [4][6][15][21][22]
+
+## Verification and beta rollout requirements
+
+Behavioral coverage is in [the focused recovery tests](../test/plugin-recovery.test.ts) and [stock-host smoke](../scripts/host-smoke.ts), not source-string assertions. Before private beta acceptance, repeat the full required suite and exact-candidate-SHA CI; run the stock-host smoke with the pinned Pi/OMP hosts and local fixture provider; record the retry/pause/status outcomes and prove no external model calls. Verify same-binding heartbeat-then-poll after a transient 503, `Retry-After` beyond the local cap, permanent 401/403/400/404/501 pause without unchanged traffic, conflict-driven new incarnation, in-flight request/sleep cancellation, and no old-owner traffic after physical host closure.
+
+The stock-host recovery case holds a real accepted provider request while it injects poll503 and verifies same-binding heartbeat/poll recovery, then injects presence403 and verifies **11 seconds with no control traffic**, no prompt replay, no admission of a fenced release, one terminal `run_settled` outcome, continued provider completion, and physical Pi/OMP process closure. The fixture provider is local; external model calls are zero. This is a procedure/evidence record, not proof of terminal rendering or production network behavior. [The smoke](../scripts/host-smoke.ts) also reports exact per-host control checks.
+
+Final local stock-host smoke passed on Pi1.0.4 and OMP18.6.1 with Node24.21.0, Bun1.4.2 and disposable PostgreSQL18: **56 fixture model calls, zero external calls**. Each host recorded one injected poll503, one recovered heartbeat/poll pair, one presence403, zero quiet-period requests, one completed outcome, one held provider request, an unexecuted fenced task still `ACCEPTED`, and zero retired-owner requests. The focused transport/recovery gate passed **33/33**; the real Pi retirement regression separately proved accepted work completes before retirement fences subsequent admission.
+
+An isolated PostgreSQL runtime smoke observed an accepted task still `RUNNING` with `providerCalls=1` across broker and PostgreSQL runtime stop/recreation at the **same loopback port**, then `SUCCEEDED`; one `run-settled` event and a release-journal marker were observed, with no external model calls. This was scoped runtime recreation, **not an OS kill**. Exactly-one durable outcome collection was unavailable; do not describe this as exactly-once durable outcome proof or as a PostgreSQL kill/failover test.
+
+**Rollout boundary:** recovery behavior is for the private beta candidate only. Exact-SHA full CI and recorded host/PostgreSQL recovery evidence remain required before private beta acceptance. These notes do not assert that pending parent gates passed. No production activation or deployment edit is part of this change.
+
+## Unresolved facts and boundaries
+
+- The cause of prior control timeouts remains unverified. Broker/event-loop/storage stalls, network/proxy behavior, and client discovery/decoding delays are possibilities, not findings; a healthy HTTP/Pod snapshot cannot select a cause retrospectively.
+- Host smoke uses a local provider and loopback fixtures; it is not terminal-rendering, production network, real external-provider, or production-load evidence.
+- PostgreSQL runtime recreation at the same loopback port is not an OS process kill, physical-failure test, failover guarantee, or exactly-once proof. The observed `providerCalls=1`, one settlement event and release marker are bounded evidence, not a durable exactly-once collection.
+- Protocol timeout/cancellation standards do not mandate this retry schedule. Retry targets and stale-peer behavior are Coordinator application policy; lease/freshness windows are not inflated to mask an outage.
+- PSP capability, owner-record semantics, and status composition are implemented, but native footer rendering/keyboard interaction is not covered by the isolated recovery smoke.
+
+The paired Mac runtime became reachable again during the final check, but Ghostty rejected the owned-window hotkey with `window_not_focused` despite `--restore-window`. Rendered native footer/PSP and keyboard acceptance remain unverified; loopback status-frame checks do not substitute for that acceptance.
+
+## Sources
+
+1. [MCP 2026-07-28: Versioning and Compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning) (the current lifecycle successor; inspected via `/basic/lifecycle`).
+2. [MCP 2026-07-28: Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http), especially receiving messages, cancellation, metadata/version validation and backward compatibility.
+3. [MCP 2026-07-28: Cancellation](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/cancellation), especially transport-specific cancellation, timeouts and races.
+4. [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html), §§[9.2.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2), [10.2.3](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3), [15.5](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5), [15.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6).
+5. [RFC 6585 §4: 429 Too Many Requests](https://www.rfc-editor.org/rfc/rfc6585.html#section-4).
+6. [MCP 2025-11-25: Transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports), especially disconnection, SSE polling/retry, resumability, session management and GET/DELETE 405.
+7. [MCP 2025-11-25: Lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle), especially initialization, shutdown and timeouts.
+8. [MCP 2025-11-25: Cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation).
+9. [MCP 2026-07-28: Subscriptions](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions), especially acknowledgment, graceful closure and reconnection.
+10. [MCP 2026-07-28: Tools — Error Handling](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#error-handling).
+11. Local [package.json](../package.json) and [src/http.ts](../src/http.ts): pinned protocol/dependencies, call deadline, bounded response metadata and typed failure/replay boundary; inspected 2026-10-13.
+12. Local [src/plugin.ts](../src/plugin.ts) and [src/plugin-status.ts](../src/plugin-status.ts): recovery classifier/schedule, owner lifecycle, keyed UI and capability-gated PSP status; inspected 2026-10-13.
+13. Local [src/broker.ts](../src/broker.ts): bound/recipient liveness at lines 170–181; acceptance reconciliation at lines 208–212; heartbeat/poll at lines 288–310; offers and conflicts at lines 330–345, inspected 2026-10-13.
+14. Local [packages/native-control/src/mcp-protocol.ts](../packages/native-control/src/mcp-protocol.ts): `v2025_11_25` stateful adapter at lines 15–16 and MCP-session-owned cursor handling at lines 30–40, inspected 2026-10-13.
+15. Installed **`@modelcontextprotocol/client` 2.3.1**, `node_modules/@modelcontextprotocol/client/dist/index.mjs`: subscription acknowledgment timer at lines 3953–4077; probe timeout retries at lines 2812–2828; legacy stream reconnection constants at lines 5280–5286; stream resumption/reconnect at lines 5485–5665; POST JSON/SSE handling at lines 5795–5815. Versioned upstream package: [npm 2.3.1](https://www.npmjs.com/package/@modelcontextprotocol/client/v/2.3.1), [published source bundle](https://unpkg.com/@modelcontextprotocol/client@2.3.1/dist/index.mjs). Installed source was inspected, not inferred from current upstream HEAD.
+16. [MCP 2026-07-28: Authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization), especially access-token validation, error handling and step-up authorization retry limits.
+17. [AWS Builders' Library: Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/) (official URL redirects to [AWS Builder Center](https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter)); first-party engineering guidance, not protocol requirements.
+18. [PSP OSC7501 draft0.1, immutable inspected spec content](https://gist.githubusercontent.com/mitchellh/7acae3abd8355c1c00287d67e96c913a/raw/547ca00a959ce5aec8be5f935839445e40257a32/spec.md), §§3–7,9–10; [gist revision metadata](https://api.github.com/gists/7acae3abd8355c1c00287d67e96c913a/f838e7364cf4fa56e74814df517cac8c716d82d1).
+19. Installed [OMP SDK18.6.1](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent/v/18.6.1): `src/extensibility/shared-events.ts:30–47,104–120,205–214` and `src/extensibility/extensions/types.ts:266–315,485–519`; [upstream repository coordinates](https://github.com/can1357/oh-my-pi/tree/main/packages/coding-agent). Installed versioned API is the inspected authority, not a moving-main guarantee.
+20. Installed [Pi SDK1.0.4](https://www.npmjs.com/package/@earendil-works/pi-coding-agent/v/1.0.4): `dist/core/extensions/types.d.ts:83–84,235–236,617–621`; [upstream repository coordinates](https://github.com/earendil-works/pi/tree/main/packages/coding-agent).
+21. Installed [Effect4.0.3](https://www.npmjs.com/package/effect/v/4.0.3), `src/Schedule.ts`, `src/Duration.ts`, `src/Effect.ts`, `src/Cause.ts` and `src/internal/schedule.ts`: native jitter, cap, typed retries, schedule state/reset and interruptible sleeps. Concrete minimum overload inspected at `Duration.ts:1443–1476`.
+22. Installed Effect4.0.3 `src/http/HttpClient.ts` and `src/http/HttpClientError.ts`, plus client2.3.1 bundles identified in [15]: transient classification, response-bearing errors, 429 rate-limiter delay handling and bounded auth versus SSE reconnection.
