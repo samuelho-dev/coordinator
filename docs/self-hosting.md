@@ -2,9 +2,9 @@
 
 ## Status and boundaries
 
-This guide describes **private beta 0.2.0-beta.2: prepared, not yet deployed or accepted**, not public production certification. Source, image and chart remain private. The separate beta needs fresh exact-source CI, signed image/chart/private prerelease and disposable install/TLS/rotation/disaster-recovery/observed MCP-streaming gates; historical October12 SQLite/native/KIND and pre-cutover Effect checks do not prove PostgreSQL. Production Coordinator/Hindsight data/resources/endpoints remain untouched. No new check/deployment is claimed here.
+This guide describes **private beta 0.2.0-beta.3: prepared, not yet deployed or accepted**, not public production certification. Source, image and chart remain private. The separate beta needs fresh exact-source CI, signed image/chart/private prerelease and disposable install/TLS/rotation/disaster-recovery/observed MCP-streaming gates; historical October12 SQLite/native/KIND and pre-cutover Effect checks do not prove PostgreSQL. Production Coordinator/Hindsight data/resources/endpoints remain untouched. No completed beta deployment is claimed here.
 
-The first [beta.1 publication attempt](https://github.com/samuelho-dev/coordinator/actions/runs/38373742895) verified the exact main image, SLSA provenance and SPDX inventory, then uploaded the chart but failed its cosign signing because Helm login did not populate Docker registry authentication. That unsigned beta.1 artifact is not a release and must not be replaced or deployed. Beta.2 uses the existing pinned Docker login action in the publisher before signing; require its new same-source CI and complete signed publication.
+The first [beta.1 publication attempt](https://github.com/samuelho-dev/coordinator/actions/runs/38373742895) verified the exact main image, SLSA provenance and SPDX inventory, then uploaded the chart but failed cosign signing because Helm login did not populate Docker authentication. [Beta.2 publication](https://github.com/samuelho-dev/coordinator/actions/runs/38380085130) used the corrected scoped Docker login, signed and verified its chart, then failed SLSA attestation because `cosign attest` rejects the sign-only `--registry-referrers-mode` flag. Neither incomplete chart is a release; do not replace or promote either. Beta.3 reuses the already successful image-CI attestation command, without that unsupported flag, and requires its own exact-source CI plus complete signed publication. No resume/overwrite bypass is added.
 
 MIT is selected in [LICENSE](../LICENSE). Source, image and chart remain private until a separate owner release/visibility decision. [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) records incomplete redistribution review; inspect source history, dependencies, native binary and notices before any public release. Current image builds no longer include the historical complete Git source bundle; old images/bundles need their own audit before redistribution. A license label or metadata spot-check does not certify that audit. Do not publish credentials, protected recovery artifacts or operator configuration.
 
@@ -53,7 +53,7 @@ The product chart creates ordinary Deployments, ClusterIP Services and PVCs only
 * Server/native runner image: Linux **amd64**, Node **24.21.0**; stock image installs checksum-pinned OMP **18.6.1** at `/usr/local/bin/omp`.
 * Supported native SDK/client hosts: Pi **1.0.4**, OMP **18.6.1**. The stock production image installs the real Pi CLI through its production dependency at `/app/node_modules/.bin/pi`; that exact installed CLI passed host smoke. Configure the actual absolute executable in RunnerConfig `launchers` and independently prove pinned repository, model/provider and runner isolation prerequisites before enabling Pi work. Any derivative image still needs its own tested/signed provenance, not a borrowed stock-image digest.
 * Broker/runner command transport: stateless MCP **2026-07-28**, official client **2.3.1**. Plugin-owned interactive native control remains stateful **2025-11-25**. Do not combine incompatible command clients/servers.
-* Chart/app version `0.2.0-beta.2`; **Effect4.0.3 is stable**, but Prisma **8.0.0-rc.22** and transitive `@prisma/orm-postgres` **8.0.0-rc.17** remain release candidates. This is explicitly a private beta, not a stable Prisma/public production release.
+* Chart/app version `0.2.0-beta.3`; **Effect4.0.3 is stable**, but Prisma **8.0.0-rc.22** and transitive `@prisma/orm-postgres` **8.0.0-rc.17** remain release candidates. This is explicitly a private beta, not a stable Prisma/public production release.
 * Full 40-hex source SHA, image `sha256:` digest and chart artifact checksum/OCI digest identify different things. A package version or configured readiness source header does not prove provenance; verify the immutable producer/source linkage.
 * Both interfaces use native MCP Streamable HTTP, not deprecated standalone HTTP+SSE. Stateless2026-07-28 commands use **POST-scoped** JSON/SSE (including `subscriptions/listen`), no protocol sessions or GET stream; stateful2025-11-25 plugin control remains separate. Preserve incremental delivery, cancellation/backpressure and individual-message limits, not whole-event-stream buffering/limits. Proxy TLS routes must not silently buffer SSE. Six actual SDK HTTP/SSE/auth/abort tests and a bounded real concurrent POST/SSE progress/cleanup proof passed locally; live-route acceptance remains required. Record actual progress/completions and latency, not configured handler count, saturated-producer backpressure or promised sustained capacity ([exact official specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http.md)).
 
@@ -66,7 +66,7 @@ pnpm install --frozen-lockfile
 pnpm native:build
 ```
 
-For a prepared release obtain `release-manifest.json`, `coordinator-0.2.0-beta.2.tgz`, license/notices and verification evidence from the release owner. Its source SHA, image repository/digest, CI run, producer and platform must agree. Verify archive SHA-256 against `chartArchiveSha256`; a private archive checksum is not an OCI digest.
+For a prepared release obtain `release-manifest.json`, `coordinator-0.2.0-beta.3.tgz`, license/notices and verification evidence from the release owner. Its source SHA, image repository/digest, CI run, producer and platform must agree. Verify archive SHA-256 against `chartArchiveSha256`; a private archive checksum is not an OCI digest.
 
 The [release workflow](../.github/workflows/release.yaml) must accept the exact source beta version and pass same-source supplementary/chart/image gates before private preparation. `prepare-private` is only artifact preparation, not a published/promotable release. The release owner must subsequently complete actual same-source `publish` at existing private visibility before beta GitOps promotion. Do not borrow old successful CI or infer a release from this document.
 
@@ -377,7 +377,7 @@ Create default-deny policies using labels `app.kubernetes.io/name=coordinator`, 
 
 ## 5. Disposable install and GitOps promotion
 
-First render/review and run a disposable install using `CHART` as the verified local `coordinator-0.2.0-beta.2.tgz` or exact-source chart directory. Do not invent a public remote release.
+First render/review and run a disposable install using `CHART` as the verified local `coordinator-0.2.0-beta.3.tgz` or exact-source chart directory. Do not invent a public remote release.
 
 ```sh
 helm lint "$CHART" -f "$OPERATOR_VALUES"
