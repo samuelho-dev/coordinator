@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { pipeline } from "node:stream/promises";
 import test from "node:test";
-import { Clock, ConfigProvider, Context as EffectContext, Effect, Fiber, Layer, Schema, Sink, Stdio } from "effect";
+import { Clock, ConfigProvider, Context as EffectContext, Deferred, Duration, Effect, Fiber, Layer, Schema, Sink, Stdio } from "effect";
 import type { Scope } from "effect";
 import { TestClock } from "effect/testing";
 import { ChildProcess } from "effect/process";
@@ -24,6 +24,8 @@ interface RecoveryFixture {
   frames: string[];
   advance: (milliseconds: number) => Effect.Effect<void>;
   settle: () => Effect.Effect<void>;
+  idleScheduled: Effect.Effect<void>;
+  idlePolled: Effect.Effect<void>;
   nativeState: () => Effect.Effect<{ messageCount: number; isStreaming: boolean }, unknown, Scope.Scope>;
   clock: TestClock.TestClock;
   eligible: () => boolean;
@@ -38,7 +40,12 @@ interface RecoveryFixture {
 // Native startup mutates Pi's documented agent directory; node:test runs these top-level tests serially.
 const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown, Platform | Mcp | Scope.Scope> {
   const platform = yield* Platform, mcp = yield* Mcp;
-  const clock = yield* TestClock.make({ warningDelay: "1 minute" });
+  const baseClock = yield* TestClock.make({ warningDelay: "1 minute" });
+  const idleScheduled = yield* Deferred.make<void>(), idlePolled = yield* Deferred.make<void>();
+  const clock: TestClock.TestClock = { ...baseClock, sleep: duration => Effect.gen(function*() {
+    if (Duration.toMillis(duration) === 1000) yield* Deferred.succeed(idleScheduled, undefined);
+    yield* baseClock.sleep(duration);
+  }) };
   yield* clock.setTime(Date.now());
   const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-recovery-" });
   yield* platform.fs.chmod(directory, 0o700);
@@ -64,7 +71,7 @@ const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown
       setStatus: (key, value) => { if (value === undefined) statuses.delete(key); else statuses.set(key, value); },
       onTerminalInput: (handler) => { input = handler; return () => { input = undefined; }; } } };
   const traffic: { method: string; at: number; sessionId?: string; incarnation?: string }[] = [];
-  let liveUntil = 0, polledAt = 0, conflict = false;
+  let liveUntil = 0, polledAt = 0, conflict = false, polls = 0;
   const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
   yield* mcp.serve(server, { target: "broker",
     authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "fixture", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
@@ -72,6 +79,7 @@ const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown
       const now = clock.currentTimeMillisUnsafe();
       if (request.method === "session.heartbeat") { liveUntil = now + 30000; return { liveUntil }; }
       if (request.method === "session.poll") {
+        if (++polls === 2) yield* Deferred.succeed(idlePolled, undefined);
         polledAt = now;
         return { messages: conflict ? [Schema.decodeUnknownSync(Delivery)({ messageId: "same-message", incarnation: request.params.incarnation,
           payload: now, expiresAt: now + 60000 })] : [], offers: [], releases: [] };
@@ -198,6 +206,7 @@ const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown
     return Schema.decodeUnknownSync(Schema.Struct({ result: Schema.Struct({ messageCount: Schema.Number, isStreaming: Schema.Boolean }) }))(result.structuredContent).result;
   });
   return { plugin, ctx, traffic, notifications, statuses, frames, advance, settle, nativeState, clock,
+    idleScheduled: Deferred.await(idleScheduled), idlePolled: Deferred.await(idlePolled),
     eligible: () => clock.currentTimeMillisUnsafe() < liveUntil && clock.currentTimeMillisUnsafe() - polledAt < 10000,
     fail: (value: typeof failure) => { failure = value; }, hang: (value: boolean) => { hanging = value; }, cancelled: () => cancelled,
     holdPoll: () => {
@@ -218,7 +227,9 @@ const warnings = (f: RecoveryFixture) => f.notifications.filter(item => item.lev
 
 test("idle presence survives one outage epoch, partial recovery, capped jitter and fresh reenrollment", { timeout: 60000 }, () => run(f => Effect.gen(function*() {
   yield* f.plugin.start(f.ctx);
-  yield* f.advance(1250);
+  yield* f.idleScheduled;
+  yield* f.clock.adjust(1250);
+  yield* f.idlePolled;
   assert.ok(f.traffic.filter(call => call.method === "session.poll").length >= 2, "Idle enrollment continues without native prompts");
   f.fail({ status: 503, method: "session.poll" });
   yield* f.advance(1500);

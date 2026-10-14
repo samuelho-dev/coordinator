@@ -72,7 +72,8 @@ NodeRuntime.runMain(Effect.gen(function*() {
   });
   const initializeRunnerDeployment = Effect.fnUntraced(function*() {
     const config = yield* decode(RunnerConfig, yield* read("config.json"));
-    if (!URL.canParse(config.brokerUrl) || new URL(config.brokerUrl).protocol !== "https:" || config.host !== "0.0.0.0" || !within(output, config.tokenFile)) return yield* fail("Runner requires private HTTPS broker, host 0.0.0.0 and config-mounted tokenFile");
+    if (output !== "/config" || config.databaseUrlFile !== "/config/database.url" || !URL.canParse(config.brokerUrl) || new URL(config.brokerUrl).protocol !== "https:" || config.host !== "0.0.0.0" || !within(output, config.tokenFile)) return yield* fail("Runner requires /config/database.url, private HTTPS broker, host 0.0.0.0 and config-mounted tokenFile");
+    yield* file(config.databaseUrlFile, yield* read("database.url"));
     for (const path of [config.stateDirectory, config.modelDirectory, config.childDirectory, ...Object.values(config.repositories)]) {
       if (!within("/work", path)) return yield* fail("Runner data paths must be canonical descendants of /work");
     }

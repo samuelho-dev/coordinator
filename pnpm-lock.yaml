@@ -8,7 +8,6 @@ overrides:
   effect: 4.0.3
   '@effect/platform-node': 4.0.3
   '@effect/platform-node-shared': 4.0.3
-  '@effect/sql-sqlite-node': 4.0.3
   '@effect/sql-pg': 4.0.3
 
 importers:
@@ -22,9 +21,6 @@ importers:
         specifier: 4.0.3
         version: 4.0.3(effect@4.0.3)(redis@6.3.0(@opentelemetry/api@1.9.1))
       '@effect/sql-pg':
-        specifier: 4.0.3
-        version: 4.0.3(effect@4.0.3)
-      '@effect/sql-sqlite-node':
         specifier: 4.0.3
         version: 4.0.3(effect@4.0.3)
       '@modelcontextprotocol/client':
@@ -486,11 +482,6 @@ packages:
 
   '@effect/sql-sqlite-do@4.0.3':
     resolution: {integrity: sha512-q3DeEnsmAbD2jQX9g3+U0iij7VFVgzPtSLoOwbB9oegeBkzzBXVDrblAvw2NgEfs0OctkaIkJhiYJROqSafQKA==}
-    peerDependencies:
-      effect: 4.0.3
-
-  '@effect/sql-sqlite-node@4.0.3':
-    resolution: {integrity: sha512-u+b0X/yt8vATwUscXKHdWF75LRMQKBIkx9DsNw8tdgF9xxPOTfx+e30gdwBjd1kY1GmQYkzD7/cP+9mys2b0pg==}
     peerDependencies:
       effect: 4.0.3
 
@@ -4010,10 +4001,6 @@ snapshots:
       effect: 4.0.3
 
   '@effect/sql-sqlite-do@4.0.3(effect@4.0.3)':
-    dependencies:
-      effect: 4.0.3
-
-  '@effect/sql-sqlite-node@4.0.3(effect@4.0.3)':
     dependencies:
       effect: 4.0.3
 

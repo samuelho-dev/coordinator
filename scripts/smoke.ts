@@ -5,11 +5,11 @@ import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { NodeRuntime, NodeStdio } from "@effect/platform-node";
-import { SqliteClient } from "@effect/sql-sqlite-node";
+import { makeDatabase, type DatabaseClient } from "../src/kysely.ts";
 import * as SqlClient from "effect/sql/SqlClient";
 import { dropPostgres, postgresAdmin, provisionPostgres } from "../test/postgres-fixture.ts";
 import { restoreBrokerDatabase } from "../src/backup.ts";
-import { BrokerConfig, RunnerConfig, RunnerNativeState, ModelProfile, TaskId, MessageId, SessionId, IncarnationId, MachineId, WorkerId, RunnerId, PrincipalId, OwnerId, ArchiveEntryId, GitHubRepositoryId, UserId, ProcessId, Repo, Sha, Json, JsonValue, HttpError, Commands, CommandError, type CommandInput, type Work, type Address, type SessionKey } from "../src/contracts.ts";
+import { BrokerConfig, RunnerConfig, RunnerNativeState, RunnerEvent, ModelProfile, TaskId, MessageId, SessionId, IncarnationId, MachineId, WorkerId, RunnerId, PrincipalId, OwnerId, ArchiveEntryId, GitHubRepositoryId, UserId, ProcessId, Repo, Sha, Json, JsonValue, HttpError, Commands, CommandError, type CommandInput, type Work, type Address, type SessionKey } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 import { inspectGithubRepository } from "../src/evidence.ts";
 import { Mcp, serverLayer } from "../src/http.ts";
@@ -52,18 +52,15 @@ const runSmoke = (flags: CommandInput<"program.smoke">) => Effect.gen(function*(
     if (yield* child.isRunning) yield* child.kill({ killSignal: signal });
     yield* until(() => child.isRunning, (running) => !running, 10000);
   });
-  const sqlRows = Effect.fnUntraced(function*(filename: string, statement: string, params: readonly (string | number)[] = []) {
-    return yield* Effect.gen(function*() {
-      const sql = yield* SqliteClient.SqliteClient;
-      return yield* sql.unsafe<Json>(statement, params);
-    }).pipe(Effect.provide(SqliteClient.layer({ filename, readonly: true })), Effect.scoped);
-  });
-  const postgresRows = Effect.fnUntraced(function*(urlFile: string, statement: string, params: readonly (string | number)[] = []) {
+  const postgresRead = Effect.fnUntraced(function*<A, E, R>(urlFile: string, query: (db: DatabaseClient) => Effect.Effect<A, E, R>) {
     return yield* Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient;
-      return yield* sql.unsafe<Json>(statement, params);
+      return yield* query(makeDatabase(sql));
     }).pipe(Effect.provide(postgresAdmin(urlFile)), Effect.scoped);
   });
+  const runnerEvents = (urlFile: string, taskId: TaskId) => postgresRead(urlFile, (db) =>
+    db.execute(db.client.selectFrom("runner_events").select("payload").where("taskId", "=", taskId).orderBy("seq"))).pipe(
+    Effect.flatMap((rows) => Effect.forEach(rows, (row) => Schema.decodeUnknownEffect(Schema.fromJsonString(RunnerEvent))(row.payload))));
   if (flags["--runner-isolation-only"]) {
     const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "coordinator-isolation-" });
     yield* fileSystem.chmod(directory, 0o711);
@@ -71,7 +68,7 @@ const runSmoke = (flags: CommandInput<"program.smoke">) => Effect.gen(function*(
     const ownRoot = join(children, "own"), sibling = join(children, "sibling");
     const own = join(ownRoot, "repo"), sessions = join(ownRoot, "sessions"), home = join(ownRoot, "home");
     for (const path of [credentials, children, model, ownRoot, own, sessions, home, sibling]) yield* fileSystem.makeDirectory(path, { mode: 0o700 });
-    const token = join(credentials, "runner.token"), controlPath = join(credentials, "control.token"), ledger = join(directory, "runner.sqlite");
+    const token = join(credentials, "runner.token"), controlPath = join(credentials, "control.token"), ledger = join(directory, "database.url");
     for (const path of [token, controlPath, ledger, join(sibling, "private")]) yield* fileSystem.writeFileString(path, "ISOLATION_SECRET", { mode: 0o600 });
     yield* fileSystem.makeDirectory(join(home, ".omp/agent"), { recursive: true, mode: 0o700 });
     yield* fileSystem.writeFileString(join(home, ".omp/agent/config.yml"), Schema.encodeUnknownSync(Schema.fromJsonString(ModelProfile), { onExcessProperty: "error" })({ modelRoles: { default: yield* setting("COORDINATOR_MODEL", "openai-codex/gpt-6.1-sol:xhigh") } }), { mode: 0o600 });
@@ -80,7 +77,7 @@ const runSmoke = (flags: CommandInput<"program.smoke">) => Effect.gen(function*(
     const parentProfile = join(model, ".omp/agent/auth.json");
     yield* fileSystem.writeFileString(parentProfile, "ISOLATION_SECRET", { mode: 0o600 });
     const launcher = yield* setting("COORDINATOR_TEST_OMP", "/usr/local/bin/omp");
-    const config: RunnerConfig = { id: RunnerId.make("isolation-probe"), brokerUrl: "http://127.0.0.1", tokenFile: token, controlTokenHash: yield* digest("control"),
+    const config: RunnerConfig = { id: RunnerId.make("isolation-probe"), databaseUrlFile: ledger, brokerUrl: "http://127.0.0.1", tokenFile: token, controlTokenHash: yield* digest("control"),
       stateDirectory: join(directory, "state"), host: "127.0.0.1", port: 0, slots: 1, repositories: {}, launchers: { omp: launcher },
       modelDirectory: model, childDirectory: children, childUidBase: UserId.make(CHILD_UID_BASE) };
     yield* requireIsolation(config);
@@ -159,12 +156,14 @@ const brokerConfig: BrokerConfig = { databaseUrlFile: yield* provisionPostgres(b
     { id: PrincipalId.make("outsider"), owner: OwnerId.make("outsider"), roles: ["coordinator", "session"], repos: [repo], tokenHash: (yield* digest(outsider)) },
   ] };
 const launcher = yield* setting("COORDINATOR_TEST_OMP", "/home/admin/.bun/bin/omp");
-const runnerConfig: RunnerConfig = { id: RunnerId.make("homelab-runner"), brokerUrl, tokenFile: runnerEnrollmentPath, host: "127.0.0.1", port: runnerPort,
+const runnerDatabaseDirectory = join(state, "runner-database"), alternateDatabaseDirectory = join(state, "alternate-database");
+for (const directory of [runnerDatabaseDirectory, alternateDatabaseDirectory]) yield* fileSystem.makeDirectory(directory, { mode: 0o700 });
+const runnerConfig: RunnerConfig = { id: RunnerId.make("homelab-runner"), databaseUrlFile: yield* provisionPostgres(runnerDatabaseDirectory), brokerUrl, tokenFile: runnerEnrollmentPath, host: "127.0.0.1", port: runnerPort,
   stateDirectory: join(state, "runner"), slots: 1, repositories: { [repo]: root }, launchers: { omp: launcher }, controlTokenHash: (yield* digest(runnerControl)),
   modelDirectory: yield* setting("COORDINATOR_MODEL_DIRECTORY", "/work/home"), childDirectory: join(state, "children"), childUidBase: UserId.make(1000000) };
 const brokerPath = join(state, "broker.json"), runnerPath = join(state, "runner.json");
 yield* (fileSystem.writeFileString(brokerPath, Schema.encodeUnknownSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(brokerConfig), { mode: 0o600 })); yield* (fileSystem.writeFileString(runnerPath, Schema.encodeUnknownSync(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(runnerConfig), { mode: 0o600 }));
-const alternateConfig: RunnerConfig = { ...runnerConfig, id: RunnerId.make("alternate-runner"), port: alternatePort, tokenFile: alternateEnrollmentPath, stateDirectory: join(state, "alternate-runner"), childDirectory: join(state, "alternate-children"), childUidBase: UserId.make(2000000), controlTokenHash: (yield* digest(alternateControl)) };
+const alternateConfig: RunnerConfig = { ...runnerConfig, databaseUrlFile: yield* provisionPostgres(alternateDatabaseDirectory), id: RunnerId.make("alternate-runner"), port: alternatePort, tokenFile: alternateEnrollmentPath, stateDirectory: join(state, "alternate-runner"), childDirectory: join(state, "alternate-children"), childUidBase: UserId.make(2000000), controlTokenHash: (yield* digest(alternateControl)) };
 const alternatePath = join(state, "alternate.json"); yield* (fileSystem.writeFileString(alternatePath, Schema.encodeUnknownSync(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(alternateConfig), { mode: 0o600 }));
 const transcript: JsonValue[] = [];
 const evidence = Effect.fnUntraced(function*(scenario: string, observed: unknown) { const entry = Schema.decodeUnknownSync(JsonValue, { onExcessProperty: "error" })({ scenario, observed, time: new Date(yield* Clock.currentTimeMillis).toISOString() }); transcript.push(entry); yield* print(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(entry)); });
@@ -202,6 +201,7 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   // Effect cannot signal arbitrary PIDs recovered from a different supervisor's journal.
   for (const pid of [workerPid, uncertainPid]) if (pid) yield* Effect.try(() => process.kill(pid, "SIGTERM")).pipe(Effect.ignore);
   if (!(yield* broker.isRunning)) yield* dropPostgres(brokerConfig.databaseUrlFile).pipe(Effect.orDie);
+  for (const config of [runnerConfig, alternateConfig]) yield* dropPostgres(config.databaseUrlFile).pipe(Effect.orDie);
 }).pipe(Effect.orDie));
   yield* ready(brokerUrl);
   yield* rejects(rpc(brokerUrl, (yield* secret()), "task.get", { taskId: TaskId.make("missing") }), 401);
@@ -281,7 +281,7 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   const archived = yield* rpc(brokerUrl, coordinator, "archive.list", { sessionId: session.sessionId });
   assert.equal(archived.length, 1);
   assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(archived).includes(unsafePayload.text), false);
-  assert.equal((yield* postgresRows(brokerConfig.databaseUrlFile, "SELECT count(*)::integer AS count FROM archive WHERE payload LIKE $1", [`%${unsafePayload.text}%`]))[0]?.count, 0);
+  assert.deepEqual(yield* postgresRead(brokerConfig.databaseUrlFile, (db) => db.execute(db.client.selectFrom("archive").select("sequence").where("payload", "like", `%${unsafePayload.text}%`))), []);
   yield* rejects(rpc(brokerUrl, writer, "archive.delete", { sessionId: session.sessionId }), 403);
   assert.deepEqual(yield* rpc(brokerUrl, outsider, "archive.list", { sessionId: session.sessionId }), []);
   const snapshotNames = new Set(yield* (fileSystem.readDirectory(brokerConfig.backupDirectory)));
@@ -291,8 +291,8 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   yield* fileSystem.makeDirectory(snapshotDirectory, { mode: 0o700 });
   const snapshotUrlFile = yield* provisionPostgres(snapshotDirectory);
   yield* restoreBrokerDatabase({ ...brokerConfig, databaseUrlFile: snapshotUrlFile }, snapshot, true);
-  for (const table of ["archive", "consents", "participant_consents"]) assert.equal((yield* postgresRows(snapshotUrlFile, `SELECT count(*)::integer AS count FROM ${table}`))[0]?.count, 0);
-  assert.ok((yield* postgresRows(snapshotUrlFile, "SELECT id FROM tasks WHERE id=$1", [work.taskId]))[0]);
+  for (const table of Array.of<"archive" | "consents" | "participant_consents">("archive", "consents", "participant_consents")) assert.deepEqual(yield* postgresRead(snapshotUrlFile, (db) => db.execute(db.client.selectFrom(table).select("owner").limit(1))), []);
+  assert.ok((yield* postgresRead(snapshotUrlFile, (db) => db.execute(db.client.selectFrom("tasks").select("id").where("id", "=", work.taskId))))[0]);
   yield* dropPostgres(snapshotUrlFile);
   assert.equal((yield* rpc(brokerUrl, coordinator, "archive.list", { sessionId: session.sessionId })).length, 1);
   yield* rejects(rpc(brokerUrl, outsider, "archive.participantConsent", { owner: OwnerId.make("owner"), sessionId: session.sessionId, enabled: false }), 403);
@@ -315,8 +315,7 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   yield* rejects(rpc(brokerUrl, coordinator, "task.submit", { ...worker, prompt: "different" }), 409);
   const accepted = yield* until(() => rpc(brokerUrl, coordinator, "task.get", { taskId: worker.taskId }), (task) => Boolean(task.readback), 120000);
   assert.equal(accepted.address?.sha, sha); assert.equal(accepted.runnerId, "homelab-runner");
-  const runnerDb = join(runnerConfig.stateDirectory, "runner.sqlite");
-  const row = (yield* sqlRows(runnerDb, "SELECT pid FROM tasks WHERE taskId=?", [worker.taskId]))[0]; workerPid = Schema.decodeUnknownSync(ProcessId, { onExcessProperty: "error" })(row?.pid);
+  const row = (yield* postgresRead(runnerConfig.databaseUrlFile, (db) => db.execute(db.client.selectFrom("runner_tasks").select("pid").where("taskId", "=", worker.taskId))))[0]; workerPid = Schema.decodeUnknownSync(ProcessId, { onExcessProperty: "error" })(row?.pid);
   assert.ok(workerPid > 0);
   yield* rejects(rpc(runnerUrl, runnerToken, "acceptTask", worker), 401);
   assert.equal((yield* rpc(runnerUrl, runnerControl, "acceptTask", worker)).taskId, worker.taskId);
@@ -348,9 +347,10 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   yield* rpc(brokerUrl, coordinator, "task.confirm", { taskId: worker.taskId, revision: 2 });
   const finished = yield* until(() => rpc(brokerUrl, coordinator, "task.get", { taskId: worker.taskId }), (task) => ["SUCCEEDED", "FAILED", "HELD"].includes(task.state), 180000);
   assert.equal(finished.state, "SUCCEEDED", `Real host final state ${finished.state}: ${Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(finished.result ?? null)}`);
-  const finalDb = join(runnerConfig.stateDirectory, "runner.sqlite");
-  const one = (yield* sqlRows(finalDb, "SELECT count(*) AS count FROM tasks WHERE taskId=?", [worker.taskId]))[0]; const launches = (yield* sqlRows(finalDb, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.state')='LAUNCHING'", [worker.taskId]))[0]; assert.equal(one?.count, 1); assert.equal(launches?.count, 1);
-  assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(Schema.decodeUnknownSync(JsonValue, { onExcessProperty: "error" })((yield* sqlRows(finalDb, "SELECT payload FROM events WHERE taskId=?", [worker.taskId])))).includes("COORDINATOR_SMOKE_OK"), false);
+  const one = yield* postgresRead(runnerConfig.databaseUrlFile, (db) => db.execute(db.client.selectFrom("runner_tasks").select("taskId").where("taskId", "=", worker.taskId)));
+  const settledEvents = yield* runnerEvents(runnerConfig.databaseUrlFile, worker.taskId);
+  assert.equal(one.length, 1); assert.equal(settledEvents.filter((event) => event.state === "LAUNCHING").length, 1);
+  assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(settledEvents).includes("COORDINATOR_SMOKE_OK"), false);
   yield* evidence("real-owned-omp-child-duplicate-full-and-coordinator-exit", { sha, workerPid, nativeSession: accepted.address!.sessionId, duplicateConflict: true, fullSlotsRejectedWithoutAcceptance: true, brokerCrashAttachPreserved: true, finalState: finished.state, acceptanceRows: 1, launchEvents: 1, evidenceVerified: false });
   yield* rpc(brokerUrl, coordinator, "evidence.local", { taskId: worker.taskId, sha, commands: ["real socket smoke"], passed: true });
   yield* rpc(brokerUrl, coordinator, "evidence.deployment", { taskId: worker.taskId, sha: Sha.make("a".repeat(40)), environment: "independent-demo-environment", url: "https://example.invalid", observedState: "not deployed", provenance: "smoke distinct negative observation" });
@@ -359,7 +359,7 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   yield* rpc(brokerUrl, coordinator, "evidence.target", { taskId: worker.taskId, sha: Sha.make("b".repeat(40)), ref: "main", requiredLanes: ["CI/verify"] });
   const observed = yield* rpc(brokerUrl, coordinator, "task.get", { taskId: worker.taskId }); assert.equal(observed.state, "SUCCEEDED"); assert.ok(observed.evidence); assert.ok(observed.evidence.every((item) => item.stale));
   yield* evidence("independent-evidence-and-new-SHA-staleness", { runnerStateUnchanged: observed.state, oldLocalCiDeploymentReviewStale: true, reviewerAuthorizationSeparate: true });
-  yield* until(() => sqlRows(join(runnerConfig.stateDirectory, "runner.sqlite"), "SELECT sum(occupied) AS occupied FROM tasks").pipe(Effect.map((rows) => rows[0]?.occupied)), (occupied) => occupied === 0, 30000);
+  yield* until(() => postgresRead(runnerConfig.databaseUrlFile, (db) => db.execute(db.client.selectFrom("runner_tasks").select("occupied"))).pipe(Effect.map((rows) => rows.reduce((total, row) => total + row.occupied, 0))), (occupied) => occupied === 0, 30000);
   yield* Effect.sleep(5500);
   obstructJournal = true;
   const uncertainWork = { ...worker, taskId: TaskId.make(`uncertain-${(yield* uuid)}`) };
@@ -370,19 +370,17 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   const ambiguous = yield* until(() => rpc(brokerUrl, coordinator, "task.get", { taskId: uncertainWork.taskId }), (task) => task.state === "HELD", 45000);
   assert.equal(ambiguous.runnerId, "homelab-runner");
   yield* Effect.sleep(1500);
-  const alternateDb = join(alternateConfig.stateDirectory, "runner.sqlite");
-  assert.equal((yield* sqlRows(alternateDb, "SELECT count(*) AS count FROM tasks WHERE taskId=?", [uncertainWork.taskId]))[0]?.count, 0);
+  assert.deepEqual(yield* postgresRead(alternateConfig.databaseUrlFile, (db) => db.execute(db.client.selectFrom("runner_tasks").select("taskId").where("taskId", "=", uncertainWork.taskId))), []);
   obstructJournal = false;
   const reconciled = yield* until(() => rpc(brokerUrl, coordinator, "task.get", { taskId: uncertainWork.taskId }), (task) => task.state === "ACCEPTED" && Boolean(task.readback), 90000);
   assert.equal(reconciled.runnerId, "homelab-runner");
-  const journal = join(runnerConfig.stateDirectory, "runner.sqlite");
-  uncertainPid = Schema.decodeUnknownSync(ProcessId, { onExcessProperty: "error" })((yield* sqlRows(journal, "SELECT pid FROM tasks WHERE taskId=?", [uncertainWork.taskId]))[0]?.pid); assert.ok(uncertainPid > 0);
-  assert.equal((yield* sqlRows(journal, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.state')='LAUNCHING'", [uncertainWork.taskId]))[0]?.count, 1);
-  assert.equal((yield* sqlRows(journal, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.type')='prompt_intent'", [uncertainWork.taskId]))[0]?.count, 0);
+  uncertainPid = Schema.decodeUnknownSync(ProcessId, { onExcessProperty: "error" })((yield* postgresRead(runnerConfig.databaseUrlFile, (db) => db.execute(db.client.selectFrom("runner_tasks").select("pid").where("taskId", "=", uncertainWork.taskId))))[0]?.pid); assert.ok(uncertainPid > 0);
+  const acceptedEvents = yield* runnerEvents(runnerConfig.databaseUrlFile, uncertainWork.taskId);
+  assert.equal(acceptedEvents.filter((event) => event.state === "LAUNCHING").length, 1);
+  assert.equal(acceptedEvents.filter((event) => event.type === "prompt_intent").length, 0);
   yield* exit(runner!, "SIGKILL"); runner = yield* processFor("runner", runnerPath); yield* ready(runnerUrl);
   const recovered = yield* rpc(runnerUrl, runnerControl, "journal", { taskId: uncertainWork.taskId }); assert.equal(recovered.state, "HELD");
-  const restarted = join(runnerConfig.stateDirectory, "runner.sqlite");
-  assert.equal((yield* sqlRows(restarted, "SELECT count(*) AS count FROM events WHERE taskId=? AND json_extract(payload,'$.state')='LAUNCHING'", [uncertainWork.taskId]))[0]?.count, 1);
+  assert.equal((yield* runnerEvents(runnerConfig.databaseUrlFile, uncertainWork.taskId)).filter((event) => event.state === "LAUNCHING").length, 1);
   yield* evidence("ambiguous-socket-acceptance-and-runner-crash", { acceptanceCommittedBeforeReplyTimeout: true, journalOutageHeldSameRunner: true, freeAlternateHadNoAcceptance: true, reconciledOriginalAcceptance: true, launchEvents: 1, promptIntents: 0, restartState: recovered.state, automaticRelaunch: false });
   yield* (fileSystem.writeFileString(join(state, "transcript.json"), Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })({ brokerRuntime: process.version, host: (yield* exec(ChildProcess.make(launcher, ["--version"]))).trim(), privateRepository: identity.private, repositoryId: identity.id, sha, scenarios: transcript }), { mode: 0o600 }));
   yield* print(`Evidence: ${join(state, "transcript.json")}`);

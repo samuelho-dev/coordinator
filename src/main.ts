@@ -8,7 +8,7 @@ import { Mcp } from "./http.ts";
 
 const services = Layer.mergeAll(Platform.layer, Mcp.layer, NodeServices.layer);
 NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
-  // Effect has no process umask API; SQLite sidecars and adapter-created files must also be private.
+  // Effect has no process umask API; credentials and adapter-created files must be private.
   process.umask(0o077);
   const args = yield* (yield* Stdio.Stdio).args;
   if (args.length !== 1 || (args[0] !== "broker" && args[0] !== "runner")) return yield* new CommandError({ message: "Expected broker or runner" });
@@ -28,7 +28,8 @@ NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
     const context = yield* Layer.build(Runner.layer(config));
     const runner = Context.get(context, Runner);
     yield* Console.log(`coordinator runner listening on ${runner.config.host}:${runner.config.port}`);
-    return yield* runner.failure;
+    // Fenced PostgreSQL serving must not dispose accepted native work.
+    return yield* Effect.never;
   });
   const command = Commands[`program.${args[0]}`];
   return yield* command.executeDecoded({ runBroker, runRunner }, { configFile: configPath });

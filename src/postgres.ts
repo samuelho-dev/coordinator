@@ -34,18 +34,18 @@ export const readDatabaseUrl = Effect.fn("Postgres.databaseUrl")(function*(file:
   return Redacted.make(value);
 });
 
-export class BrokerPostgres extends Context.Service<BrokerPostgres, {
+export class Postgres extends Context.Service<Postgres, {
   readonly sql: Client.SqlClient;
   readonly failure: Effect.Effect<never, SqlError>;
-}>()("coordinator/BrokerPostgres") {
+}>()("coordinator/Postgres") {
   static layer(databaseUrlFile: string) {
     return Layer.effectContext(Effect.gen(function*() {
       const url = yield* readDatabaseUrl(databaseUrlFile);
       // ponytail: one physical owner, not a reconnecting pool; epoch fencing is needed only for multi-owner operation.
-      const base = yield* PgConnection.make({ url, applicationName: "coordinator-broker", startupParameters: { synchronous_commit: "on" } });
+      const base = yield* PgConnection.make({ url, applicationName: "coordinator", startupParameters: { synchronous_commit: "on" } });
       const pg = yield* base.pin;
       const lock = yield* pg.query("SELECT pg_try_advisory_lock($1::integer,$2::integer) AS owned, current_setting('fsync') AS fsync, current_setting('full_page_writes') AS full_page_writes", [0x434f4f52, 0x42524b52]);
-      if (lock.rows[0]?.owned !== true) return yield* new HttpError({ status: 409, message: "Broker PostgreSQL database already has an owner" });
+      if (lock.rows[0]?.owned !== true) return yield* new HttpError({ status: 409, message: "Coordinator PostgreSQL database already has an owner" });
       if (lock.rows[0]?.fsync !== "on" || lock.rows[0]?.full_page_writes !== "on") return yield* new HttpError({ status: 503, message: "Durable PostgreSQL fsync and full_page_writes required" });
       const lost = yield* Deferred.make<never, SqlError>();
       const notifications = yield* pg.listen("coordinator_owner");
@@ -87,7 +87,7 @@ export class BrokerPostgres extends Context.Service<BrokerPostgres, {
           : Effect.void)),
         spanAttributes: [["db.system.name", "postgresql"]],
       });
-      return Context.make(BrokerPostgres, { sql, failure: Deferred.await(lost) }).pipe(
+      return Context.make(Postgres, { sql, failure: Deferred.await(lost) }).pipe(
         Context.add(Client.SqlClient, sql),
         Context.add(Database, makeDatabase(sql)),
       );

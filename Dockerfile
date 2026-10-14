@@ -47,7 +47,6 @@ RUN mkdir -p /usr/local/share/coordinator/third-party \
     && cp node_modules/@oh-my-pi/pi-coding-agent/THIRD-PARTY-NOTICES.txt /usr/local/share/coordinator/third-party/OMP-THIRD-PARTY-NOTICES.txt \
     && cp LICENSE THIRD_PARTY_NOTICES.md /usr/local/share/coordinator/
 RUN chmod -R a+rX /app
-RUN node --import tsx --input-type=module -e "import{Context,Effect,Layer}from'effect';import*as S from'@effect/sql-sqlite-node/SqliteClient';await Effect.runPromise(Effect.scoped(Effect.gen(function*(){const c=yield*Layer.build(S.layer({filename:':memory:'}));yield*Context.get(c,S.SqliteClient).unsafe('SELECT 1')})))"
 USER node
 ENV NODE_ENV=production
 CMD ["node", "--import", "tsx", "src/main.ts", "broker"]

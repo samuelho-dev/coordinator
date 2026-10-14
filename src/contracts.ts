@@ -2,7 +2,7 @@ import { Deferred, Effect, Option, Schema, SchemaGetter } from "effect";
 import { Tool } from "effect/ai";
 import { ChildProcessSpawner } from "effect/process";
 import { NativeBinding, NativeRunId, NativeSubmissionId, NativeEventSequence, NativeState, NativeGetMessagesInput, NativeMessagesPage, NativeAbortResult } from "@samuelho/coordinator-native-control/contracts";
-import { TasksId, PeersId, SessionsId } from "./generated/database/types.ts";
+import { TasksId, PeersId, SessionsId, RunnerTasks } from "./generated/database/types.ts";
 
 const identifierPattern = Schema.isPattern(/^[a-zA-Z0-9_.:-]{1,160}$/);
 const identifier = Schema.String.check(identifierPattern);
@@ -110,7 +110,7 @@ export const BrokerConfig = Schema.Struct({ databaseUrlFile: Text, host: Text, p
 export type BrokerConfig = typeof BrokerConfig.Type;
 export const RunnerConfig = Schema.Struct({
   id: RunnerId, brokerUrl: Schema.String, tokenFile: Schema.String, host: Schema.String, port, controlTokenHash: Hash,
-  stateDirectory: Schema.String, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 128 })),
+  databaseUrlFile: Schema.String, stateDirectory: Schema.String, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 128 })),
   repositories: Schema.Record(Schema.String.pipe(Schema.brand("@samuelho/coordinator/Repo")), Schema.String), launchers: Schema.Record(Schema.String, Schema.String),
   modelDirectory: Schema.String, childDirectory: Schema.String,
   childUidBase: UserId.check(Schema.isBetween({ minimum: 1000000, maximum: 0xffffffff - 1000000 })),
@@ -191,7 +191,7 @@ export type DeploymentEvidence = typeof DeploymentEvidence.Type;
 export const ReviewEvidence = Schema.Struct({ taskId: TaskId, sha: Sha, decision: Schema.Literals(["approved", "changes-requested"]), note: Text });
 export type ReviewEvidence = typeof ReviewEvidence.Type;
 
-export const RunnerRow = Schema.Struct({ taskId: TaskId, childUid: UserId, fingerprint: Hash, work: Schema.String, worktree: Schema.String, state: Schema.String, occupied: Schema.Int, pid: Schema.NullOr(ProcessId), incarnation: IncarnationId, address: Schema.NullOr(Schema.String), promptId: Schema.NullOr(NativeSubmissionId), nativeBinding: Schema.NullOr(Schema.String), nativeRunId: Schema.NullOr(NativeRunId), nativeCursor: NativeEventSequence, reason: Schema.NullOr(Schema.String), result: Schema.NullOr(Schema.String), detached: Schema.Int });
+export const RunnerRow = Schema.Struct({ ...RunnerTasks.fields, childUid: UserId });
 export type RunnerRow = typeof RunnerRow.Type;
 export const NativeIdentity = Schema.Struct({ sessionId: SessionId, incarnation: IncarnationId, machineId: MachineId, repo: Repo, ref: Text, sha: Sha, workerId: WorkerId, workerIdentitySource: Schema.Literal("native-session") });
 export type NativeIdentity = typeof NativeIdentity.Type;

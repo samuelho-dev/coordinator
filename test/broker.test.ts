@@ -25,6 +25,14 @@ test("native release fences and independent evidence survive stale peers and CI 
   const platform = await setup.runPromise(Platform);
   const root = await setup.runPromise(platform.fs.makeTempDirectory({ prefix: "coordinator-broker-" }));
   const now = await setup.runPromise(Clock.currentTimeMillis);
+  const clock = await setup.runPromise(Clock.Clock);
+  // Protocol time is fixed; real PostgreSQL/HTTP latency must not expire unrelated offer assertions.
+  const policyClock: Clock.Clock = {
+    currentTimeMillis: Effect.succeed(now), currentTimeMillisUnsafe: () => now,
+    currentTimeNanos: clock.currentTimeNanos, currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
+    monotonicTimeNanos: clock.monotonicTimeNanos, monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+    sleep: duration => clock.sleep(duration),
+  };
   let respond = (_url: string): Response => response({});
   const client = HttpClient.make((request, url) => Effect.sync(() => HttpClientResponse.fromWeb(request, respond(url.toString()))));
   const config = Schema.decodeUnknownSync(BrokerConfig, { onExcessProperty: "error" })({ databaseUrlFile: await setup.runPromise(provisionPostgres(root)), host: "127.0.0.1", port: 0, backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
@@ -33,7 +41,7 @@ test("native release fences and independent evidence survive stale peers and CI 
       { id: "peer", owner: "owner", roles: ["session"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(peer)) },
       { id: "reviewer", owner: "owner", roles: ["reviewer"], repos: [repo], tokenHash: await setup.runPromise(platform.digest(reviewer)) },
     ] });
-  const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(Layer.merge(base, Layer.succeed(HttpClient.HttpClient, client)))));
+  const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(Layer.mergeAll(base, Layer.succeed(HttpClient.HttpClient, client), Layer.succeed(Clock.Clock, policyClock)))));
   const broker = await runtime.runPromise(Broker);
   const { client: db, execute } = makeDatabase(broker.sql);
   const mcp = await setup.runPromise(Mcp);
@@ -84,7 +92,7 @@ test("native release fences and independent evidence survive stale peers and CI 
       yield* Deferred.await(locked);
       const clock = yield* Clock.Clock;
       let commandTime = offerExpires - 1;
-      // Immediate start reaches the held SQLite semaphore before the clock advances.
+      // Immediate start reaches the held PostgreSQL semaphore before protocol time advances.
       const reply = yield* broker.handle(peerPrincipal, { method: "peer.reply", params: { ...key, taskId: expiring.taskId, decision: "accepted" } }).pipe(
         Effect.provideService(Clock.Clock, {
           currentTimeMillis: Effect.sync(() => commandTime), currentTimeMillisUnsafe: () => commandTime,
