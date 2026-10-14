@@ -3,6 +3,8 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 sourceSha: ""
+# ponytail: fence both owners during the offline database cutover.
+suspended: false
 imagePullSecrets: []
 nodeSelector:
   kubernetes.io/arch: amd64

@@ -31,6 +31,12 @@ export type PeersId = typeof PeersId.Type;
 export const RecoveryGateId = Schema.Int.pipe(Schema.brand('RecoveryGateId'));
 export type RecoveryGateId = typeof RecoveryGateId.Type;
 
+export const RunnerEventsId = Schema.Int.pipe(Schema.brand('RunnerEventsId'));
+export type RunnerEventsId = typeof RunnerEventsId.Type;
+
+export const RunnerTasksId = Schema.Int.pipe(Schema.brand('RunnerTasksId'));
+export type RunnerTasksId = typeof RunnerTasksId.Type;
+
 export const SessionsId = Schema.String.pipe(Schema.brand('SessionsId'));
 export type SessionsId = typeof SessionsId.Type;
 
@@ -375,6 +381,134 @@ export type RecoveryGateInsert = typeof RecoveryGateInsert.Type;
 export const RecoveryGateUpdate = DatabaseSchema.extract(RecoveryGateFields, 'update');
 export type RecoveryGateUpdate = typeof RecoveryGateUpdate.Type;
 
+const RunnerEventsFields = DatabaseSchema.Struct({
+  payload: DatabaseSchema.Field({
+    select: Schema.String,
+    insert: Schema.String,
+    update: Schema.optionalKey(Schema.String),
+  }),
+  seq: DatabaseSchema.Field({
+    select: RunnerEventsId,
+    insert: Schema.optionalKey(RunnerEventsId),
+  }),
+  taskId: DatabaseSchema.Field({
+    select: Schema.String.pipe(Schema.brand('TasksId')),
+    insert: Schema.String.pipe(Schema.brand('TasksId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('TasksId'))),
+  }),
+});
+
+export const RunnerEvents = DatabaseSchema.extract(RunnerEventsFields, 'select');
+export type RunnerEvents = typeof RunnerEvents.Type;
+
+export const RunnerEventsInsert = DatabaseSchema.extract(RunnerEventsFields, 'insert');
+export type RunnerEventsInsert = typeof RunnerEventsInsert.Type;
+
+export const RunnerEventsUpdate = DatabaseSchema.extract(RunnerEventsFields, 'update');
+export type RunnerEventsUpdate = typeof RunnerEventsUpdate.Type;
+
+const RunnerTasksFields = DatabaseSchema.Struct({
+  address: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  }),
+  detached: DatabaseSchema.Field({
+    select: Schema.Int,
+    insert: Schema.optionalKey(Schema.Int),
+    update: Schema.optionalKey(Schema.Int),
+  }),
+  fingerprint: DatabaseSchema.Field({
+    select: Schema.String.pipe(Schema.brand('@samuelho/coordinator/Hash')),
+    insert: Schema.String.pipe(Schema.brand('@samuelho/coordinator/Hash')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('@samuelho/coordinator/Hash'))),
+  }),
+  incarnation: DatabaseSchema.Field({
+    select: Schema.String.pipe(Schema.brand('@samuelho/coordinator/IncarnationId')),
+    insert: Schema.String.pipe(Schema.brand('@samuelho/coordinator/IncarnationId')),
+    update: Schema.optionalKey(
+      Schema.String.pipe(Schema.brand('@samuelho/coordinator/IncarnationId'))
+    ),
+  }),
+  nativeBinding: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  }),
+  nativeCursor: DatabaseSchema.Field({
+    select: Schema.Int.pipe(Schema.brand('NativeEventSequence')),
+    insert: Schema.optionalKey(Schema.Int.pipe(Schema.brand('NativeEventSequence'))),
+    update: Schema.optionalKey(Schema.Int.pipe(Schema.brand('NativeEventSequence'))),
+  }),
+  nativeRunId: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String.pipe(Schema.brand('NativeRunId'))),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String.pipe(Schema.brand('NativeRunId')))),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String.pipe(Schema.brand('NativeRunId')))),
+  }),
+  occupied: DatabaseSchema.Field({
+    select: Schema.Int,
+    insert: Schema.Int,
+    update: Schema.optionalKey(Schema.Int),
+  }),
+  pid: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.Int.pipe(Schema.brand('ProcessId'))),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.Int.pipe(Schema.brand('ProcessId')))),
+    update: Schema.optionalKey(Schema.NullOr(Schema.Int.pipe(Schema.brand('ProcessId')))),
+  }),
+  promptId: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String.pipe(Schema.brand('NativeSubmissionId'))),
+    insert: Schema.optionalKey(
+      Schema.NullOr(Schema.String.pipe(Schema.brand('NativeSubmissionId')))
+    ),
+    update: Schema.optionalKey(
+      Schema.NullOr(Schema.String.pipe(Schema.brand('NativeSubmissionId')))
+    ),
+  }),
+  reason: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  }),
+  result: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  }),
+  sequence: DatabaseSchema.Field({
+    select: RunnerTasksId,
+    insert: Schema.optionalKey(RunnerTasksId),
+  }),
+  state: DatabaseSchema.Field({
+    select: Schema.String,
+    insert: Schema.String,
+    update: Schema.optionalKey(Schema.String),
+  }),
+  taskId: DatabaseSchema.Field({
+    select: Schema.String.pipe(Schema.brand('TasksId')),
+    insert: Schema.String.pipe(Schema.brand('TasksId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('TasksId'))),
+  }),
+  work: DatabaseSchema.Field({
+    select: Schema.String,
+    insert: Schema.String,
+    update: Schema.optionalKey(Schema.String),
+  }),
+  worktree: DatabaseSchema.Field({
+    select: Schema.String,
+    insert: Schema.String,
+    update: Schema.optionalKey(Schema.String),
+  }),
+});
+
+export const RunnerTasks = DatabaseSchema.extract(RunnerTasksFields, 'select');
+export type RunnerTasks = typeof RunnerTasks.Type;
+
+export const RunnerTasksInsert = DatabaseSchema.extract(RunnerTasksFields, 'insert');
+export type RunnerTasksInsert = typeof RunnerTasksInsert.Type;
+
+export const RunnerTasksUpdate = DatabaseSchema.extract(RunnerTasksFields, 'update');
+export type RunnerTasksUpdate = typeof RunnerTasksUpdate.Type;
+
 const SessionsFields = DatabaseSchema.Struct({
   data: DatabaseSchema.Field({
     select: Schema.String,
@@ -669,6 +803,112 @@ export interface RecoveryGateTable {
   >;
 }
 
+export interface RunnerEventsTable {
+  'payload': ColumnType<
+    (typeof RunnerEvents.Type)['payload'],
+    (typeof RunnerEventsInsert.Type)['payload'],
+    Exclude<(typeof RunnerEventsUpdate.Type)['payload'], undefined>
+  >;
+  'seq': ColumnType<
+    (typeof RunnerEvents.Type)['seq'],
+    (typeof RunnerEventsInsert.Type)['seq'],
+    never
+  >;
+  'taskId': ColumnType<
+    (typeof RunnerEvents.Type)['taskId'],
+    (typeof RunnerEventsInsert.Type)['taskId'],
+    Exclude<(typeof RunnerEventsUpdate.Type)['taskId'], undefined>
+  >;
+}
+
+export interface RunnerTasksTable {
+  'address': ColumnType<
+    (typeof RunnerTasks.Type)['address'],
+    (typeof RunnerTasksInsert.Type)['address'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['address'], undefined>
+  >;
+  'detached': ColumnType<
+    (typeof RunnerTasks.Type)['detached'],
+    (typeof RunnerTasksInsert.Type)['detached'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['detached'], undefined>
+  >;
+  'fingerprint': ColumnType<
+    (typeof RunnerTasks.Type)['fingerprint'],
+    (typeof RunnerTasksInsert.Type)['fingerprint'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['fingerprint'], undefined>
+  >;
+  'incarnation': ColumnType<
+    (typeof RunnerTasks.Type)['incarnation'],
+    (typeof RunnerTasksInsert.Type)['incarnation'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['incarnation'], undefined>
+  >;
+  'nativeBinding': ColumnType<
+    (typeof RunnerTasks.Type)['nativeBinding'],
+    (typeof RunnerTasksInsert.Type)['nativeBinding'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['nativeBinding'], undefined>
+  >;
+  'nativeCursor': ColumnType<
+    (typeof RunnerTasks.Type)['nativeCursor'],
+    (typeof RunnerTasksInsert.Type)['nativeCursor'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['nativeCursor'], undefined>
+  >;
+  'nativeRunId': ColumnType<
+    (typeof RunnerTasks.Type)['nativeRunId'],
+    (typeof RunnerTasksInsert.Type)['nativeRunId'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['nativeRunId'], undefined>
+  >;
+  'occupied': ColumnType<
+    (typeof RunnerTasks.Type)['occupied'],
+    (typeof RunnerTasksInsert.Type)['occupied'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['occupied'], undefined>
+  >;
+  'pid': ColumnType<
+    (typeof RunnerTasks.Type)['pid'],
+    (typeof RunnerTasksInsert.Type)['pid'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['pid'], undefined>
+  >;
+  'promptId': ColumnType<
+    (typeof RunnerTasks.Type)['promptId'],
+    (typeof RunnerTasksInsert.Type)['promptId'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['promptId'], undefined>
+  >;
+  'reason': ColumnType<
+    (typeof RunnerTasks.Type)['reason'],
+    (typeof RunnerTasksInsert.Type)['reason'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['reason'], undefined>
+  >;
+  'result': ColumnType<
+    (typeof RunnerTasks.Type)['result'],
+    (typeof RunnerTasksInsert.Type)['result'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['result'], undefined>
+  >;
+  'sequence': ColumnType<
+    (typeof RunnerTasks.Type)['sequence'],
+    (typeof RunnerTasksInsert.Type)['sequence'],
+    never
+  >;
+  'state': ColumnType<
+    (typeof RunnerTasks.Type)['state'],
+    (typeof RunnerTasksInsert.Type)['state'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['state'], undefined>
+  >;
+  'taskId': ColumnType<
+    (typeof RunnerTasks.Type)['taskId'],
+    (typeof RunnerTasksInsert.Type)['taskId'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['taskId'], undefined>
+  >;
+  'work': ColumnType<
+    (typeof RunnerTasks.Type)['work'],
+    (typeof RunnerTasksInsert.Type)['work'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['work'], undefined>
+  >;
+  'worktree': ColumnType<
+    (typeof RunnerTasks.Type)['worktree'],
+    (typeof RunnerTasksInsert.Type)['worktree'],
+    Exclude<(typeof RunnerTasksUpdate.Type)['worktree'], undefined>
+  >;
+}
+
 export interface SessionsTable {
   'data': ColumnType<
     (typeof Sessions.Type)['data'],
@@ -697,6 +937,8 @@ export interface DB {
   'participant_consents': ParticipantConsentsTable;
   'peers': PeersTable;
   'recovery_gate': RecoveryGateTable;
+  'runner_events': RunnerEventsTable;
+  'runner_tasks': RunnerTasksTable;
   'sessions': SessionsTable;
   'tasks': TasksTable;
 }

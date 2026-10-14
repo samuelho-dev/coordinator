@@ -7,11 +7,20 @@ import { BrokerConfig, ObjectBackupConfig, Sha, type BrokerConfig as BrokerConfi
 import { decodeSnapshotList, dumpBrokerDatabase, privateRecoveryPath, recover, RecoveryMetadata, restoreBrokerDatabase, SnapshotStore } from "../src/backup.ts";
 import { Platform } from "../src/platform.ts";
 import { SqlClient } from "effect/sql";
-import { BrokerPostgres } from "../src/postgres.ts";
+import { Postgres } from "../src/postgres.ts";
 import { assertBrokerSchema } from "../src/database.ts";
 import { provisionPostgres, postgresAdmin, dropPostgres } from "./postgres-fixture.ts";
 import { makeDatabase } from "../src/kysely.ts";
 import * as Model from "../src/generated/database/types.ts";
+
+test("private recovery contract accepts PostgreSQL pair metadata and rejects SQLite-era versions", () => {
+  const file = { sha256: "a".repeat(64), schema: "exact-contract", rows: 1, pendingAccepted: 1 };
+  const metadata = { kind: "coordinator-private-recovery", version: 3, sourceSha: "a".repeat(40), createdAt: new Date(0).toISOString(), broker: file,
+    runner: { ...file, eventRows: 2, id: "recovery-runner", layout: "canonical-layout", entries: [] }, excluded: [] };
+  assert.equal(Schema.decodeUnknownSync(RecoveryMetadata)(metadata).runner?.eventRows, 2);
+  assert.throws(() => Schema.decodeUnknownSync(RecoveryMetadata)({ ...metadata, version: 2 }));
+  assert.throws(() => Schema.decodeUnknownSync(RecoveryMetadata)({ ...metadata, runner: { ...metadata.runner, eventRows: undefined } }));
+});
 
 test("snapshot expiry rejects foreign keys and malformed pagination pages", () => {
   const key = "sanitized/1788033801000.pgdump";
@@ -163,7 +172,7 @@ test("native PostgreSQL dump restore fences failed partial data and preserves ow
       yield* Effect.scoped(Effect.gen(function*() {
         assert.equal((yield* Effect.exit(recover("backup", config, platform.path.join(root, "owned"), Sha.make("a".repeat(40)))))._tag, "Failure");
         assert.equal(yield* platform.fs.exists(platform.path.join(root, "owned")), false);
-      }).pipe(Effect.provide(BrokerPostgres.layer(source))));
+      }).pipe(Effect.provide(Postgres.layer(source))));
       yield* Effect.scoped(Effect.gen(function*() {
         const sql = yield* SqlClient.SqlClient;
         const db = makeDatabase(sql);

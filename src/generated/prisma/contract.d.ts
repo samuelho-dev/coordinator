@@ -23,7 +23,7 @@ import type {
 } from '@prisma/orm-postgres/contract/types';
 
 export type StorageHash =
-  StorageHashBase<'49f50c6058b06c01949aa66f12f6598480d342bdb1a06fef1d4879760ddaf063'>;
+  StorageHashBase<'760c0ad54b65dc6f3098b00865c256f062047846de76dda5c9e3c53a65ba6825'>;
 export type ExecutionHash = ExecutionHashBase<string>;
 export type ProfileHash =
   ProfileHashBase<'3916f444a8a17ad749191acf9e08dad97d1a327b88c2f1d45d12f240296aa8b2'>;
@@ -302,6 +302,30 @@ export type FieldOutputTypes = {
       readonly id: CodecTypes['pg/int4@1']['output'];
       readonly ready: CodecTypes['pg/bool@1']['output'];
     };
+    readonly runner_events: {
+      readonly payload: CodecTypes['pg/text@1']['output'];
+      readonly seq: CodecTypes['pg/int4@1']['output'];
+      readonly taskId: CodecTypes['pg/text@1']['output'];
+    };
+    readonly runner_tasks: {
+      readonly address: CodecTypes['pg/text@1']['output'] | null;
+      readonly detached: CodecTypes['pg/int4@1']['output'];
+      readonly fingerprint: CodecTypes['pg/text@1']['output'];
+      readonly incarnation: CodecTypes['pg/text@1']['output'];
+      readonly nativeBinding: CodecTypes['pg/text@1']['output'] | null;
+      readonly nativeCursor: CodecTypes['pg/int4@1']['output'];
+      readonly nativeRunId: CodecTypes['pg/text@1']['output'] | null;
+      readonly occupied: CodecTypes['pg/int4@1']['output'];
+      readonly pid: CodecTypes['pg/int4@1']['output'] | null;
+      readonly promptId: CodecTypes['pg/text@1']['output'] | null;
+      readonly reason: CodecTypes['pg/text@1']['output'] | null;
+      readonly result: CodecTypes['pg/text@1']['output'] | null;
+      readonly sequence: CodecTypes['pg/int4@1']['output'];
+      readonly state: CodecTypes['pg/text@1']['output'];
+      readonly taskId: CodecTypes['pg/text@1']['output'];
+      readonly work: CodecTypes['pg/text@1']['output'];
+      readonly worktree: CodecTypes['pg/text@1']['output'];
+    };
     readonly sessions: {
       readonly data: CodecTypes['pg/text@1']['output'];
       readonly id: CodecTypes['pg/text@1']['output'];
@@ -377,6 +401,30 @@ export type FieldInputTypes = {
     readonly recovery_gate: {
       readonly id: CodecTypes['pg/int4@1']['input'];
       readonly ready: CodecTypes['pg/bool@1']['input'];
+    };
+    readonly runner_events: {
+      readonly payload: CodecTypes['pg/text@1']['input'];
+      readonly seq: CodecTypes['pg/int4@1']['input'];
+      readonly taskId: CodecTypes['pg/text@1']['input'];
+    };
+    readonly runner_tasks: {
+      readonly address: CodecTypes['pg/text@1']['input'] | null;
+      readonly detached: CodecTypes['pg/int4@1']['input'];
+      readonly fingerprint: CodecTypes['pg/text@1']['input'];
+      readonly incarnation: CodecTypes['pg/text@1']['input'];
+      readonly nativeBinding: CodecTypes['pg/text@1']['input'] | null;
+      readonly nativeCursor: CodecTypes['pg/int4@1']['input'];
+      readonly nativeRunId: CodecTypes['pg/text@1']['input'] | null;
+      readonly occupied: CodecTypes['pg/int4@1']['input'];
+      readonly pid: CodecTypes['pg/int4@1']['input'] | null;
+      readonly promptId: CodecTypes['pg/text@1']['input'] | null;
+      readonly reason: CodecTypes['pg/text@1']['input'] | null;
+      readonly result: CodecTypes['pg/text@1']['input'] | null;
+      readonly sequence: CodecTypes['pg/int4@1']['input'];
+      readonly state: CodecTypes['pg/text@1']['input'];
+      readonly taskId: CodecTypes['pg/text@1']['input'];
+      readonly work: CodecTypes['pg/text@1']['input'];
+      readonly worktree: CodecTypes['pg/text@1']['input'];
     };
     readonly sessions: {
       readonly data: CodecTypes['pg/text@1']['input'];
@@ -454,6 +502,30 @@ export type StorageColumnTypes = {
       readonly id: CodecTypes['pg/int4@1']['output'];
       readonly ready: CodecTypes['pg/bool@1']['output'];
     };
+    readonly runner_events: {
+      readonly payload: CodecTypes['pg/text@1']['output'];
+      readonly seq: CodecTypes['pg/int4@1']['output'];
+      readonly taskId: CodecTypes['pg/text@1']['output'];
+    };
+    readonly runner_tasks: {
+      readonly address: CodecTypes['pg/text@1']['output'] | null;
+      readonly detached: CodecTypes['pg/int4@1']['output'];
+      readonly fingerprint: CodecTypes['pg/text@1']['output'];
+      readonly incarnation: CodecTypes['pg/text@1']['output'];
+      readonly nativeBinding: CodecTypes['pg/text@1']['output'] | null;
+      readonly nativeCursor: CodecTypes['pg/int4@1']['output'];
+      readonly nativeRunId: CodecTypes['pg/text@1']['output'] | null;
+      readonly occupied: CodecTypes['pg/int4@1']['output'];
+      readonly pid: CodecTypes['pg/int4@1']['output'] | null;
+      readonly promptId: CodecTypes['pg/text@1']['output'] | null;
+      readonly reason: CodecTypes['pg/text@1']['output'] | null;
+      readonly result: CodecTypes['pg/text@1']['output'] | null;
+      readonly sequence: CodecTypes['pg/int4@1']['output'];
+      readonly state: CodecTypes['pg/text@1']['output'];
+      readonly taskId: CodecTypes['pg/text@1']['output'];
+      readonly work: CodecTypes['pg/text@1']['output'];
+      readonly worktree: CodecTypes['pg/text@1']['output'];
+    };
     readonly sessions: {
       readonly data: CodecTypes['pg/text@1']['output'];
       readonly id: CodecTypes['pg/text@1']['output'];
@@ -529,6 +601,30 @@ export type StorageColumnInputTypes = {
     readonly recovery_gate: {
       readonly id: CodecTypes['pg/int4@1']['input'];
       readonly ready: CodecTypes['pg/bool@1']['input'];
+    };
+    readonly runner_events: {
+      readonly payload: CodecTypes['pg/text@1']['input'];
+      readonly seq: CodecTypes['pg/int4@1']['input'];
+      readonly taskId: CodecTypes['pg/text@1']['input'];
+    };
+    readonly runner_tasks: {
+      readonly address: CodecTypes['pg/text@1']['input'] | null;
+      readonly detached: CodecTypes['pg/int4@1']['input'];
+      readonly fingerprint: CodecTypes['pg/text@1']['input'];
+      readonly incarnation: CodecTypes['pg/text@1']['input'];
+      readonly nativeBinding: CodecTypes['pg/text@1']['input'] | null;
+      readonly nativeCursor: CodecTypes['pg/int4@1']['input'];
+      readonly nativeRunId: CodecTypes['pg/text@1']['input'] | null;
+      readonly occupied: CodecTypes['pg/int4@1']['input'];
+      readonly pid: CodecTypes['pg/int4@1']['input'] | null;
+      readonly promptId: CodecTypes['pg/text@1']['input'] | null;
+      readonly reason: CodecTypes['pg/text@1']['input'] | null;
+      readonly result: CodecTypes['pg/text@1']['input'] | null;
+      readonly sequence: CodecTypes['pg/int4@1']['input'];
+      readonly state: CodecTypes['pg/text@1']['input'];
+      readonly taskId: CodecTypes['pg/text@1']['input'];
+      readonly work: CodecTypes['pg/text@1']['input'];
+      readonly worktree: CodecTypes['pg/text@1']['input'];
     };
     readonly sessions: {
       readonly data: CodecTypes['pg/text@1']['input'];
@@ -614,6 +710,32 @@ export namespace Models {
     ready: CodecTypes['pg/bool@1']['output'];
     readonly [RelationKeys]?: never;
   };
+  export type public_runner_events = {
+    payload: CodecTypes['pg/text@1']['output'];
+    seq: CodecTypes['pg/int4@1']['output'];
+    taskId: CodecTypes['pg/text@1']['output'];
+    readonly [RelationKeys]?: never;
+  };
+  export type public_runner_tasks = {
+    address: CodecTypes['pg/text@1']['output'] | null;
+    detached: CodecTypes['pg/int4@1']['output'];
+    fingerprint: CodecTypes['pg/text@1']['output'];
+    incarnation: CodecTypes['pg/text@1']['output'];
+    nativeBinding: CodecTypes['pg/text@1']['output'] | null;
+    nativeCursor: CodecTypes['pg/int4@1']['output'];
+    nativeRunId: CodecTypes['pg/text@1']['output'] | null;
+    occupied: CodecTypes['pg/int4@1']['output'];
+    pid: CodecTypes['pg/int4@1']['output'] | null;
+    promptId: CodecTypes['pg/text@1']['output'] | null;
+    reason: CodecTypes['pg/text@1']['output'] | null;
+    result: CodecTypes['pg/text@1']['output'] | null;
+    sequence: CodecTypes['pg/int4@1']['output'];
+    state: CodecTypes['pg/text@1']['output'];
+    taskId: CodecTypes['pg/text@1']['output'];
+    work: CodecTypes['pg/text@1']['output'];
+    worktree: CodecTypes['pg/text@1']['output'];
+    readonly [RelationKeys]?: never;
+  };
   export type public_sessions = {
     data: CodecTypes['pg/text@1']['output'];
     id: CodecTypes['pg/text@1']['output'];
@@ -636,6 +758,8 @@ export declare const models: {
     participant_consents: Models.public_participant_consents;
     peers: Models.public_peers;
     recovery_gate: Models.public_recovery_gate;
+    runner_events: Models.public_runner_events;
+    runner_tasks: Models.public_runner_tasks;
     sessions: Models.public_sessions;
     tasks: Models.public_tasks;
   };
@@ -1056,6 +1180,165 @@ type ContractBase = Omit<
               indexes: readonly [];
               foreignKeys: readonly [];
             };
+            readonly runner_events: {
+              columns: {
+                readonly payload: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+                readonly seq: {
+                  readonly dataType: 'pg/int4';
+                  readonly codecId: 'pg/int4@1';
+                  readonly nullable: false;
+                  readonly default: {
+                    readonly kind: 'function';
+                    readonly expression: 'autoincrement()';
+                  };
+                  readonly many: false;
+                };
+                readonly taskId: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+              };
+              primaryKey: { readonly columns: readonly ['seq'] };
+              uniques: readonly [];
+              indexes: readonly [
+                {
+                  readonly name: 'runner_events_taskId_seq_idx_de7fe5ec';
+                  readonly prefix: 'runner_events_taskId_seq_idx';
+                  readonly columns: readonly ['taskId', 'seq'];
+                  readonly unique: false;
+                },
+              ];
+              foreignKeys: readonly [];
+            };
+            readonly runner_tasks: {
+              columns: {
+                readonly address: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
+                readonly detached: {
+                  readonly dataType: 'pg/int4';
+                  readonly codecId: 'pg/int4@1';
+                  readonly nullable: false;
+                  readonly default: {
+                    readonly kind: 'literal';
+                    readonly value: DefaultLiteralValue<'pg/int4@1', 0>;
+                  };
+                  readonly many: false;
+                };
+                readonly fingerprint: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+                readonly incarnation: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+                readonly nativeBinding: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
+                readonly nativeCursor: {
+                  readonly dataType: 'pg/int4';
+                  readonly codecId: 'pg/int4@1';
+                  readonly nullable: false;
+                  readonly default: {
+                    readonly kind: 'literal';
+                    readonly value: DefaultLiteralValue<'pg/int4@1', 0>;
+                  };
+                  readonly many: false;
+                };
+                readonly nativeRunId: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
+                readonly occupied: {
+                  readonly dataType: 'pg/int4';
+                  readonly codecId: 'pg/int4@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+                readonly pid: {
+                  readonly dataType: 'pg/int4';
+                  readonly codecId: 'pg/int4@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
+                readonly promptId: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
+                readonly reason: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
+                readonly result: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
+                readonly sequence: {
+                  readonly dataType: 'pg/int4';
+                  readonly codecId: 'pg/int4@1';
+                  readonly nullable: false;
+                  readonly default: {
+                    readonly kind: 'function';
+                    readonly expression: 'autoincrement()';
+                  };
+                  readonly many: false;
+                };
+                readonly state: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+                readonly taskId: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+                readonly work: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+                readonly worktree: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+              };
+              primaryKey: { readonly columns: readonly ['sequence'] };
+              uniques: readonly [{ readonly columns: readonly ['taskId'] }];
+              indexes: readonly [];
+              foreignKeys: readonly [];
+            };
             readonly sessions: {
               columns: {
                 readonly data: {
@@ -1126,6 +1409,14 @@ type ContractBase = Omit<
     readonly recovery_gate: {
       readonly namespace: 'public' & NamespaceId;
       readonly model: 'recovery_gate';
+    };
+    readonly runner_events: {
+      readonly namespace: 'public' & NamespaceId;
+      readonly model: 'runner_events';
+    };
+    readonly runner_tasks: {
+      readonly namespace: 'public' & NamespaceId;
+      readonly model: 'runner_tasks';
     };
     readonly sessions: { readonly namespace: 'public' & NamespaceId; readonly model: 'sessions' };
     readonly tasks: { readonly namespace: 'public' & NamespaceId; readonly model: 'tasks' };
@@ -1491,6 +1782,128 @@ type ContractBase = Omit<
               readonly fields: {
                 readonly id: { readonly column: 'id' };
                 readonly ready: { readonly column: 'ready' };
+              };
+            };
+          };
+          readonly runner_events: {
+            readonly fields: {
+              readonly payload: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly seq: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
+              };
+              readonly taskId: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+            };
+            readonly relations: Record<string, never>;
+            readonly storage: {
+              readonly table: 'runner_events';
+              readonly namespaceId: 'public';
+              readonly fields: {
+                readonly payload: { readonly column: 'payload' };
+                readonly seq: { readonly column: 'seq' };
+                readonly taskId: { readonly column: 'taskId' };
+              };
+            };
+          };
+          readonly runner_tasks: {
+            readonly fields: {
+              readonly address: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly detached: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
+              };
+              readonly fingerprint: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly incarnation: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly nativeBinding: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly nativeCursor: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
+              };
+              readonly nativeRunId: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly occupied: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
+              };
+              readonly pid: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
+              };
+              readonly promptId: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly reason: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly result: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly sequence: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
+              };
+              readonly state: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly taskId: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly work: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly worktree: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+            };
+            readonly relations: Record<string, never>;
+            readonly storage: {
+              readonly table: 'runner_tasks';
+              readonly namespaceId: 'public';
+              readonly fields: {
+                readonly address: { readonly column: 'address' };
+                readonly detached: { readonly column: 'detached' };
+                readonly fingerprint: { readonly column: 'fingerprint' };
+                readonly incarnation: { readonly column: 'incarnation' };
+                readonly nativeBinding: { readonly column: 'nativeBinding' };
+                readonly nativeCursor: { readonly column: 'nativeCursor' };
+                readonly nativeRunId: { readonly column: 'nativeRunId' };
+                readonly occupied: { readonly column: 'occupied' };
+                readonly pid: { readonly column: 'pid' };
+                readonly promptId: { readonly column: 'promptId' };
+                readonly reason: { readonly column: 'reason' };
+                readonly result: { readonly column: 'result' };
+                readonly sequence: { readonly column: 'sequence' };
+                readonly state: { readonly column: 'state' };
+                readonly taskId: { readonly column: 'taskId' };
+                readonly work: { readonly column: 'work' };
+                readonly worktree: { readonly column: 'worktree' };
               };
             };
           };

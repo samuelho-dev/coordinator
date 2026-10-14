@@ -1,6 +1,7 @@
 import { Config, Console, Effect, Layer, Option, Schema, Stdio } from "effect";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
+import { X509Certificate } from "node:crypto";
 import { PluginConfig, RunnerConfig, InstallPlan, JsonValue, Commands, CommandError, HttpError, UserId, type CommandInput, type InstallCommand } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
 
@@ -32,9 +33,11 @@ const installHost = Effect.fnUntraced(function*(flags: CommandInput<"program.ins
   const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   if (flags["--remote"]) {
     const destination = flags["--remote"], remoteRoot = flags["--remote-root"]!;
+    const publicCa = runnerOnly ? yield* Config.option(Config.String("NODE_EXTRA_CA_CERTS")) : Option.none<string>();
     const remoteArgs = [runtime, "--import", join(remoteRoot, "node_modules/tsx/dist/loader.mjs"), join(remoteRoot, "scripts/install.ts"),
       "--runtime", runtime, "--host-binary", binary, ...(pluginPath ? ["--plugin-only", "--host", host!, "--plugin-config", pluginPath] : ["--runner-only", "--runner-config", runnerPath!]), ...(dry ? ["--dry-run"] : [])];
-    const output = yield* platform.exec(ChildProcess.make("/usr/bin/ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination, remoteArgs.map(shellQuote).join(" ")]), 120000).pipe(
+    const remoteCommand = `${Option.isSome(publicCa) ? `env ${shellQuote(`NODE_EXTRA_CA_CERTS=${publicCa.value}`)} ` : ""}${remoteArgs.map(shellQuote).join(" ")}`;
+    const output = yield* platform.exec(ChildProcess.make("/usr/bin/ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination, remoteCommand]), 120000).pipe(
       Effect.mapError(() => new CommandError({ message: "Remote coordinator install unavailable; repository, dependencies and private configs must already exist at remote absolute paths. No local installation applied." })),
     );
     const plan = Schema.decodeUnknownSync(Schema.fromJsonString(InstallPlan), { onExcessProperty: "error" })(output);
@@ -62,9 +65,7 @@ const installHost = Effect.fnUntraced(function*(flags: CommandInput<"program.ins
       Effect.mapError(() => new CommandError({ message: `Bundled public extension missing: dist/plugins/${entry}.js; build the release before registration` })),
     );
   }
-  const sqliteProbe = "import{Context,Effect,Layer}from'effect';import*as SqliteClient from'@effect/sql-sqlite-node/SqliteClient';await Effect.runPromise(Effect.scoped(Effect.gen(function*(){const context=yield*Layer.build(SqliteClient.layer({filename:':memory:'}));yield*Context.get(context,SqliteClient.SqliteClient).unsafe('SELECT 1')})));";
   if (pluginOnly) {
-    yield* platform.exec(ChildProcess.make(runtime, ["--import", loader, "--input-type=module", "-e", sqliteProbe], { cwd: root }));
     yield* platform.exec(ChildProcess.make(binary, ["--version"]));
   }
   const pluginContents = pluginPath ? yield* installerPrivateFile(pluginPath) : undefined;
@@ -103,7 +104,22 @@ const installHost = Effect.fnUntraced(function*(flags: CommandInput<"program.ins
         if (current === "/") break;
       }
     });
-    for (const path of [runnerPath, runner.tokenFile, root]) yield* securePath(path);
+    const databaseUrlOwner = yield* fs.stat(runner.databaseUrlFile);
+    if (databaseUrlOwner.type !== "File" || (databaseUrlOwner.mode & 0o7777) !== 0o600 ||
+      Option.getOrThrow(databaseUrlOwner.uid) !== uid || Option.getOrThrow(databaseUrlOwner.gid) !== gid ||
+      Option.getOrThrow(databaseUrlOwner.nlink) !== 1) return yield* new CommandError({ message: "Runner database URL must be a private regular file owned by the service account" });
+    for (const path of [runnerPath, runner.tokenFile, runner.databaseUrlFile, root]) yield* securePath(path);
+    const publicCa = yield* Config.option(Config.String("NODE_EXTRA_CA_CERTS"));
+    if (Option.isSome(publicCa)) {
+      yield* securePath(publicCa.value);
+      const pem = yield* fs.readFileString(publicCa.value);
+      yield* Effect.try({
+        try: () => {
+          if (/-----BEGIN [^-]*PRIVATE KEY-----/.test(pem) || !new X509Certificate(pem).ca) throw new Error("Public CA required");
+        },
+        catch: () => new CommandError({ message: "NODE_EXTRA_CA_CERTS must contain a valid public CA certificate, never a private key" }),
+      });
+    }
     yield* securePath(yield* fs.realPath(runtime));
     yield* securePath(dirname(runtime));
     const visited = new Set<string>();
@@ -120,14 +136,13 @@ const installHost = Effect.fnUntraced(function*(flags: CommandInput<"program.ins
       const info = yield* fs.stat(path);
       if (info.type !== "File" || !(info.mode & 0o111)) return yield* new CommandError({ message: "Native executable required" });
     }
-    for (const path of [dirname(runnerPath), dirname(runner.tokenFile), runner.stateDirectory, runner.modelDirectory, ...Object.values(runner.repositories)]) yield* securePath(path, true);
+    for (const path of [dirname(runnerPath), dirname(runner.tokenFile), dirname(runner.databaseUrlFile), runner.stateDirectory, runner.modelDirectory, ...Object.values(runner.repositories)]) yield* securePath(path, true);
     if (!isAbsolute(runner.childDirectory) || resolve(runner.childDirectory) !== runner.childDirectory || /[\r\n\u0000]/.test(runner.childDirectory)) return yield* new CommandError({ message: "Canonical absolute child directory required" });
     yield* securePath(dirname(runner.childDirectory));
     if (!((yield* fs.stat("/usr/bin/flock")).mode & 0o111)) return yield* new CommandError({ message: "Executable flock required" });
     const caps = "-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap";
     const moduleUrl = Effect.fnUntraced(function*(file: string) { return Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })((yield* platform.path.toFileUrl(join(root, file))).href); });
-    const isolationProbe = `${sqliteProbe}
-import { Config, Effect as E, Layer as L, Schema } from "effect";
+    const isolationProbe = `import { Config, Effect as E, Layer as L, Schema } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import { requireIsolation } from ${yield* moduleUrl("src/runner.ts")};
 import { Platform } from ${yield* moduleUrl("src/platform.ts")};
@@ -148,7 +163,7 @@ await E.runPromise(E.gen(function*() {
     service = "/etc/systemd/system/coordinator-runner.service";
     const quote = (text: string) => `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
     const capabilities = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP";
-    content = `[Unit]\nDescription=Coordinator approved-work runner\nAfter=network-online.target\n[Service]\nType=simple\nUser=${uid}\nGroup=${gid}\nSupplementaryGroups=\nWorkingDirectory=${quote(root)}\nEnvironment=${quote(`COORDINATOR_CONFIG=${runnerPath}`)}\nExecStart=${program.map(quote).join(" ")}\nAmbientCapabilities=${capabilities}\nCapabilityBoundingSet=${capabilities}\nRestart=on-failure\nRestartSec=10\nUMask=0077\nNoNewPrivileges=true\n[Install]\nWantedBy=multi-user.target\n`;
+    content = `[Unit]\nDescription=Coordinator approved-work runner\nAfter=network-online.target\n[Service]\nType=simple\nUser=${uid}\nGroup=${gid}\nSupplementaryGroups=\nWorkingDirectory=${quote(root)}\nEnvironment=${quote(`COORDINATOR_CONFIG=${runnerPath}`)}\n${Option.isSome(publicCa) ? `Environment=${quote(`NODE_EXTRA_CA_CERTS=${publicCa.value}`)}\n` : ""}ExecStart=${program.map(quote).join(" ")}\nAmbientCapabilities=${capabilities}\nCapabilityBoundingSet=${capabilities}\nRestart=on-failure\nRestartSec=10\nUMask=0077\nNoNewPrivileges=true\n[Install]\nWantedBy=multi-user.target\n`;
     commands.push({ binary: "/usr/bin/systemctl", args: ["daemon-reload"] }, { binary: "/usr/bin/systemctl", args: ["enable", "--now", "coordinator-runner.service"] });
   }
   if (!dry) {

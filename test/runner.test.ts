@@ -1,20 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, watch } from "node:fs";
 import { Clock, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema } from "effect";
-import { ChildProcess, type ChildProcessSpawner } from "effect/process";
+import { ChildProcess } from "effect/process";
 import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
-import { Reactivity } from "effect/reactivity";
-import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import { Runner } from "../src/runner.ts";
 import { Broker } from "../src/broker.ts";
 import { makeDatabase } from "../src/kysely.ts";
 import { Mcp, serverLayer } from "../src/http.ts";
 import { Platform } from "../src/platform.ts";
-import { Address, BrokerRequest, CommandError, HttpError, Json, JsonValue, RunnerEvent, RunnerResult, RunnerNativeState, RunnerRequest, RunnerRow, Task, TaskId, RunnerId, Repo, Hash, GitHubRepositoryId, Principal, RunnerConfig, Work } from "../src/contracts.ts";
-import { NativeBinding, NativeEventSequence, NativeGeneration, NativeIncarnationId, NativeSessionId, NativeMessagesPage } from "@samuelho/coordinator-native-control/contracts";
+import { Address, BrokerRequest, CommandError, HttpError, Json, JsonValue, RunnerEvent, RunnerResult, RunnerNativeState, RunnerRequest, Task, TaskId, RunnerId, Repo, Hash, GitHubRepositoryId, Principal, RunnerConfig, UserId, Work } from "../src/contracts.ts";
+import { NativeBinding, NativeEventSequence, NativeGeneration, NativeIncarnationId, NativeSessionId, NativeSubmissionId, NativeMessagesPage } from "@samuelho/coordinator-native-control/contracts";
 import { NativeLifecycleJournal } from "@samuelho/coordinator-native-control/lifecycle";
-import { provisionPostgres, dropPostgres } from "./postgres-fixture.ts";
+import { provisionPostgres, dropPostgres, postgresAdmin } from "./postgres-fixture.ts";
+import { ProcessId, IncarnationId } from "../src/contracts.ts";
+import { SqlClient } from "effect/sql";
 
 const enrollment = "regression-only-enrollment-000000000000";
 const control = "regression-only-control-000000000000000";
@@ -28,7 +28,7 @@ async function fixture(slots = 1, hostMode = "complete", phase: (name: string) =
   const rpc = await services.runPromise(Mcp);
   const client = await services.runPromise(HttpClient.HttpClient);
   const fs = platform.fs, join = platform.path.join;
-  const run = <A, E>(effect: Effect.Effect<A, E>) => services.runPromise(effect);
+  const run = <A, E>(effect: Effect.Effect<A, E, Platform>) => services.runPromise(effect);
   const root = await run(fs.realPath(await run(fs.makeTempDirectory({ prefix: "coordinator-runner-" }))));
   await run(fs.chmod(root, 0o711));
   const repo = join(root, "repo"); await run(fs.makeDirectory(repo, { mode: 0o700 }));
@@ -40,6 +40,9 @@ async function fixture(slots = 1, hostMode = "complete", phase: (name: string) =
   const tokenFile = join(credentials, "token"); await run(fs.writeFileString(tokenFile, enrollment, { mode: 0o600 }));
   const principal = Schema.decodeUnknownSync(Principal, { onExcessProperty: "error" })({ id: "runner-test", owner: "owner", roles: ["runner"], repos: ["github.com/test/runner"], tokenHash: await run(platform.digest(enrollment)), controlTokenHash: await run(platform.digest(control)) });
   const databaseUrlFile = await services.runPromise(provisionPostgres(credentials));
+  const runnerCredentials = join(root, "runner-credentials");
+  await run(fs.makeDirectory(runnerCredentials, { mode: 0o700 }));
+  const runnerDatabaseUrlFile = await services.runPromise(provisionPostgres(runnerCredentials));
   const brokerRuntime = ManagedRuntime.make(Broker.layer({ databaseUrlFile, backupDirectory: join(root, "backups"), host: "127.0.0.1", port: 0,
     archiveRetentionMs: 60000, backupRetentionMs: 60000, repositoryIds: { [Repo.make("github.com/test/runner")]: GitHubRepositoryId.make(1) }, principals: [principal] }).pipe(Layer.provide(common)));
   const broker = await brokerRuntime.runPromise(Broker);
@@ -82,7 +85,7 @@ import { NativeBinding, NativeControlError, NativePluginConfig, NativeTools, Nat
 import { NativeLifecycleJournal } from ${JSON.stringify(import.meta.resolve("@samuelho/coordinator-native-control/lifecycle"))};
 import { nativeControlHttpLayer, nativeTool } from ${JSON.stringify(import.meta.resolve("@samuelho/coordinator-native-control/server"))};
 import { createNativePresentation } from ${JSON.stringify(import.meta.resolve("@samuelho/coordinator-native-control/interaction"))};
-import { realpathSync, writeFileSync, readFileSync, renameSync, statSync } from "node:fs";
+import { realpathSync, writeFileSync, readFileSync, renameSync, statSync, existsSync, watch } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -139,13 +142,22 @@ if (process.argv.includes("--version")) {
       return { binding, messages: messages.slice(start, end), nextCursor: end < messages.length ? String(end) : null, more: end < messages.length };
     }),
     "native.abort": input => Effect.sync(() => { validate(input); return { binding, runId: currentRunId, disposition: currentRunId === null ? "already_settled" : "requested" }; }),
-    "native.prompt": input => Effect.sync(() => {
+    "native.prompt": input => Effect.promise(async () => {
       validate(input);
       if (${JSON.stringify(hostMode)} === "transport") process.exit(23);
       currentRunId = randomUUID();
       const seq = ${JSON.stringify(hostMode)} === "missing-admission" ? journal.highWater : emit("submission_admitted", { submissionId: input.submissionId, disposition: "started" }).seq;
       const admission = { binding, submissionId: input.submissionId, runId: currentRunId, disposition: "started", eventsUri: nativeEventsUri(binding), seq };
       emit("run_started");
+      if (${JSON.stringify(hostMode)} === "pending") {
+        const gate = Promise.withResolvers();
+        const observer = watch(process.env.HOME, () => { if (existsSync(process.env.HOME + "/settle")) gate.resolve(); });
+        try {
+          if (existsSync(process.env.HOME + "/settle")) gate.resolve();
+          await gate.promise;
+        } finally { observer.close(); }
+        writeFileSync(process.env.HOME + "/settled-run", currentRunId, { mode: 0o600 });
+      }
       if (${JSON.stringify(hostMode)} !== "missing-terminal") emit("run_settled", { outcome: "completed" });
       const result = Schema.decodeUnknownSync(NativePromptResult)({ admission, disposition: "settled", final: { binding, runId: currentRunId, outcome: "completed" } });
       currentRunId = null;
@@ -173,7 +185,7 @@ if (process.argv.includes("--version")) {
   await run(fs.chmod(launcher, 0o755));
   const runnerId = RunnerId.make(principal.id);
   const config = Schema.decodeUnknownSync(RunnerConfig, { onExcessProperty: "error" })({ id: runnerId, brokerUrl, tokenFile, controlTokenHash: principal.controlTokenHash!, host: "127.0.0.1", port: 0,
-    stateDirectory: join(root, "state"), slots, repositories: { "github.com/test/runner": repo }, launchers: { omp: launcher }, modelDirectory, childDirectory: join(root, "children"), childUidBase: 1000000 });
+    databaseUrlFile: runnerDatabaseUrlFile, stateDirectory: join(root, "state"), slots, repositories: { "github.com/test/runner": repo }, launchers: { omp: launcher }, modelDirectory, childDirectory: join(root, "children"), childUidBase: 1000000 });
   const work = Schema.decodeUnknownSync(Work, { onExcessProperty: "error" })({ taskId: "one", repo: "github.com/test/runner", ref: "HEAD", sha: await git("rev-parse", "HEAD"), launcher: "omp", prompt: "approved prompt", scope: "scope", restrictions: "no deployment", expectedEvidence: ["checks"], deadline: await run(Clock.currentTimeMillis) + 60000,
     workerId: "native-worker", githubRepoId: 1, requiredLanes: [], bypassPeer: false, approved: true });
   async function save(work: Work, overrides: Partial<Task> = {}) {
@@ -198,12 +210,7 @@ if (process.argv.includes("--version")) {
       yield* Effect.sleep("10 millis");
     }
   }).pipe(Effect.timeout("15 seconds")));
-  const seed = (directory: string, action: (sql: SqliteClient.SqliteClient) => Effect.Effect<void, unknown>) => run(Effect.gen(function*() {
-    yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
-    const sql = yield* SqliteClient.make({ filename: join(directory, "runner.sqlite") });
-    yield* action(sql);
-  }).pipe(Effect.provide(Reactivity.layer), Effect.scoped));
-  return { root, broker, config, work, save, open, ready, seed, run, fs, platform, rpc, client, join,
+  return { root, broker, config, work, save, open, ready, run, fs, platform, rpc, client, join,
     outage(value: boolean) { unavailable = value; },
     async fence() { gate = { reached: await run(Deferred.make<void>()), proceed: await run(Deferred.make<void>()) }; taskReads = 0; return gate; },
     async close() {
@@ -220,6 +227,7 @@ if (process.argv.includes("--version")) {
       phase("fixture.broker.dispose.start");
       await brokerRuntime.dispose();
       await services.runPromise(dropPostgres(databaseUrlFile));
+      await services.runPromise(dropPostgres(runnerDatabaseUrlFile));
       phase("fixture.broker.dispose.done");
       phase("fixture.root.remove.start");
       await run(fs.remove(root, { recursive: true, force: true }));
@@ -259,65 +267,64 @@ test("typed lifecycle derivation preserves retained gaps, binding generations an
 
 
 
-test("kernel ownership loss interrupts blocked startup before recovery can overwrite a replacement", async () => {
-  const f = await fixture();
-  const reached = await f.run(Deferred.make<void>());
-  const proceed = await f.run(Deferred.make<void>());
-  const lost = await f.run(Deferred.make<void>());
-  let ownership: ChildProcessSpawner.ChildProcessHandle | undefined;
-  const guardedPlatform = {
-    ...f.platform,
-    acquireJournalOwnership: (file: string) => f.platform.acquireJournalOwnership(file).pipe(Effect.tap((guard) => Effect.sync(() => { ownership = guard; }))),
-    fs: {
-      ...f.fs,
-      chmod: (path: string, mode: number) => path === f.join(f.config.stateDirectory, "runner.sqlite")
-        ? Effect.gen(function*() {
-          yield* Deferred.succeed(reached, undefined);
-          yield* Deferred.await(proceed);
-          return yield* f.fs.chmod(path, mode);
-        }).pipe(Effect.onInterrupt(() => Deferred.succeed(lost, undefined).pipe(Effect.asVoid)))
-        : f.fs.chmod(path, mode),
-    },
-  };
-  const starting = f.open(f.config, Layer.merge(Layer.succeed(Platform, guardedPlatform), Mcp.layer));
-  // Attach rejection handling before killing the actual flock helper.
-  const outcome = starting.then(() => undefined, (error: unknown) => error);
+test("PostgreSQL loss fences serving while an admitted unsigned-UID native run finishes without replay", async () => {
+  const f = await fixture(1, "pending");
   try {
-    await Promise.race([f.run(Deferred.await(reached).pipe(Effect.timeout("15 seconds"))), starting]);
-    assert.ok(ownership);
-    await f.run(ownership.kill());
-    await f.run(ownership.exitCode.pipe(Effect.ignore));
-    await f.run(Deferred.await(lost).pipe(Effect.timeout("5 seconds")));
-    const replacement = await f.open();
-    await replacement.call("acceptTask", f.work);
-    const row = await f.ready(replacement.service);
-    await f.run(Deferred.succeed(proceed, undefined));
-    const error = await outcome;
-    assert.ok(error instanceof CommandError);
-    assert.deepEqual(await f.run(replacement.service.row(f.work.taskId)), row);
-    assert.equal((await f.run(replacement.service.row(f.work.taskId)))!.state, "READY");
-  } finally {
-    await f.run(Deferred.succeed(proceed, undefined));
-    await f.close();
-    await outcome;
-  }
+    const runner = await f.open({ ...f.config, childUidBase: UserId.make(3000000000) });
+    await runner.call("acceptTask", f.work);
+    const row = await f.ready(runner.service);
+    assert.equal(row.childUid, 3000000001);
+    const address = Schema.decodeUnknownSync(Schema.fromJsonString(Address))(row.address!);
+    await f.save(f.work, { address, readback: address, confirmedRevision: address.revision, disposition: "ready" });
+    await runner.call("release", { taskId: f.work.taskId, address, prompt: f.work.prompt });
+    const admitted = (await f.run(runner.service.row(f.work.taskId)))!;
+    assert.equal(admitted.state, "RUNNING");
+    if (admitted.pid === null || admitted.nativeRunId === null) assert.fail("Native admission must retain the actual process and run");
+    await f.run(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql.unsafe("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=current_database() AND application_name='coordinator' AND pid<>pg_backend_pid()");
+    }).pipe(Effect.provide(postgresAdmin(f.config.databaseUrlFile)), Effect.scoped));
+    await assert.rejects(f.run(runner.service.failure));
+    assert.equal(await runner.status("acceptTask", f.work), 503);
+    assert.equal(await runner.status("release", { taskId: f.work.taskId, address, prompt: f.work.prompt }), 503);
+    const bearer = await f.run(f.fs.readFileString(f.config.tokenFile));
+    const endpoint = HttpServer.formatAddress(runner.service.server.address);
+    assert.equal(await f.run(f.client.get(`${endpoint}/readyz`, { headers: { authorization: `Bearer ${bearer}` } })).then(response => response.status), 503);
+    assert.equal(await f.run(f.client.get(`${endpoint}/livez`)).then(response => response.status), 200);
+    process.kill(admitted.pid, 0);
+    const home = f.join(f.config.childDirectory, await f.run(f.platform.digest(f.work.taskId)), "home");
+    const settlement = Promise.withResolvers<void>();
+    const observer = watch(home, (event, filename) => { if (event === "change" && filename === "settled-run") settlement.resolve(); });
+    try {
+      await f.run(f.fs.writeFileString(f.join(home, "settle"), "", { mode: 0o644 }));
+      await f.run(Effect.promise(() => settlement.promise).pipe(Effect.timeout("10 seconds")));
+      assert.equal(await f.run(f.fs.readFileString(f.join(home, "settled-run"))), admitted.nativeRunId);
+    } finally { observer.close(); }
+    await runner.close();
+    const replacement = await f.open({ ...f.config, childUidBase: UserId.make(3000000000) });
+    const recovered = (await f.run(replacement.service.row(f.work.taskId)))!;
+    assert.equal(recovered.state, "HELD");
+    assert.equal(recovered.promptId, admitted.promptId);
+    assert.equal(recovered.nativeRunId, admitted.nativeRunId);
+    await assert.rejects(replacement.call("release", { taskId: f.work.taskId, address, prompt: f.work.prompt }));
+  } finally { await f.close(); }
 });
 
-test("real broker-bound SQLite acceptance is unique, conflict-safe and reserves uncertain capacity", async () => {
+test("real broker-bound PostgreSQL acceptance is unique, conflict-safe and reserves uncertain capacity", async () => {
   const f = await fixture();
   try {
-    await f.seed(f.config.stateDirectory, (sql) => Effect.gen(function*() {
-      yield* sql.unsafe("CREATE TABLE owner (id INTEGER PRIMARY KEY, pid INTEGER)");
-      yield* sql.unsafe("INSERT INTO owner(id,pid) VALUES (1,?)", [process.pid]);
-    }));
     let runner = await f.open();
-    assert.equal((await f.run(runner.service.sql.unsafe<Json>("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name='owner'")))[0]!.count, 0);
+    const otherCredentials = f.join(f.root, "other-runner-credentials");
+    await f.run(f.fs.makeDirectory(otherCredentials, { mode: 0o700 }));
+    const otherDatabaseUrlFile = await f.run(provisionPostgres(otherCredentials));
+    try { await assert.rejects(f.open({ ...f.config, databaseUrlFile: otherDatabaseUrlFile })); }
+    finally { await f.run(dropPostgres(otherDatabaseUrlFile)); }
     await runner.call("acceptTask", f.work); await f.ready(runner.service);
     const first = await runner.call("journal", { taskId: "one" }); assert.deepEqual(await runner.call("acceptTask", f.work), first);
     await assert.rejects(runner.call("acceptTask", { ...f.work, prompt: "changed" }));
     const two = { ...f.work, taskId: TaskId.make("two") }; await f.save(two);
     assert.partialDeepStrictEqual(await runner.call("acceptTask", two), { accepted: false, state: "full" });
-    await f.run(runner.service.sql.unsafe("UPDATE tasks SET state='PROMPT_INTENT',promptId='uncertain',pid=? WHERE taskId='one'", [process.pid]));
+    await f.run(runner.service.db.execute(runner.service.db.client.updateTable("runner_tasks").set({ state: "PROMPT_INTENT", promptId: NativeSubmissionId.make("uncertain"), pid: ProcessId.make(process.pid) }).where("taskId", "=", f.work.taskId).returning("taskId")));
     await runner.close(); runner = await f.open();
     assert.equal((await f.run(runner.service.row(f.work.taskId)))!.state, "HELD"); assert.equal((await f.run(runner.service.row(f.work.taskId)))!.occupied, 1);
     assert.partialDeepStrictEqual(await runner.call("acceptTask", two), { accepted: false, state: "full" });
@@ -325,15 +332,23 @@ test("real broker-bound SQLite acceptance is unique, conflict-safe and reserves 
     assert.partialDeepStrictEqual(await runner.call("journal", { taskId: "missing" }), { accepted: false, state: "not-accepted" });
     await runner.close();
     const expired = { ...f.work, taskId: TaskId.make("expired"), deadline: 12345 }; await f.save(expired);
-    runner = await f.open({ ...f.config, stateDirectory: f.join(f.root, "expired-state") });
-    await assert.rejects(runner.call("acceptTask", expired));
-    assert.equal((await f.run(runner.service.sql.unsafe<Json>("SELECT count(*) AS count FROM tasks")))[0]!.count, 0);
-    await f.run(runner.service.sql.unsafe("INSERT INTO tasks(taskId,fingerprint,work,worktree,state,occupied,incarnation) VALUES (?,?,?,?,'ACCEPTED',1,?)", [expired.taskId, await f.run(f.platform.fingerprint(expired)), Schema.encodeUnknownSync(Schema.fromJsonString(Task.fields.request))(expired), f.join(f.config.childDirectory, "expired", "repo"), "expired-incarnation"]));
-    await runner.close(); runner = await f.open({ ...f.config, stateDirectory: f.join(f.root, "expired-state") });
-    await f.run(Effect.gen(function*() {
-      for (;;) { const row = yield* runner.service.row(expired.taskId); if (row?.state === "FAILED") return; yield* Effect.sleep("10 millis"); }
-    }).pipe(Effect.timeout("10 seconds")));
-    assert.equal((await f.run(runner.service.row(expired.taskId)))!.pid, null);
+    const expiredCredentials = f.join(f.root, "expired-credentials");
+    await f.run(f.fs.makeDirectory(expiredCredentials, { mode: 0o700 }));
+    const expiredConfig = { ...f.config, databaseUrlFile: await f.run(provisionPostgres(expiredCredentials)), stateDirectory: f.join(f.root, "expired-state"), childUidBase: UserId.make(2000000) };
+    try {
+      runner = await f.open(expiredConfig);
+      await assert.rejects(runner.call("acceptTask", expired));
+      assert.equal((await f.run(runner.service.row(expired.taskId))), undefined);
+      await f.run(runner.service.db.execute(runner.service.db.client.insertInto("runner_tasks").values({ taskId: expired.taskId, fingerprint: await f.run(f.platform.fingerprint(expired)), work: Schema.encodeUnknownSync(Schema.fromJsonString(Task.fields.request))(expired), worktree: f.join(f.config.childDirectory, "expired", "repo"), state: "ACCEPTED", occupied: 1, incarnation: IncarnationId.make("expired-incarnation") }).returning("taskId")));
+      await runner.close(); runner = await f.open(expiredConfig);
+      await f.run(Effect.gen(function*() {
+        for (;;) { const row = yield* runner.service.row(expired.taskId); if (row?.state === "FAILED") return; yield* Effect.sleep("10 millis"); }
+      }).pipe(Effect.timeout("10 seconds")));
+      assert.equal((await f.run(runner.service.row(expired.taskId)))!.pid, null);
+    } finally {
+      await runner.close();
+      await f.run(dropPostgres(expiredConfig.databaseUrlFile));
+    }
   } finally { await f.close(); }
 });
 
@@ -401,7 +416,7 @@ test("deadline expiry during owned SQL admission and prompt transactions never d
         ? originalTransaction(effect).pipe(Effect.tap(() => Effect.sync(() => { commandTime = f.work.deadline + 1; })))
         : Effect.gen(function*() {
           const locked = yield* Deferred.make<void>();
-          // Keep the real SQLite permit/BEGIN until the waiting command has crossed its deadline.
+          // Keep the real PostgreSQL owner permit/BEGIN until the waiting command has crossed its deadline.
           const holder = yield* originalTransaction(Effect.gen(function*() {
             yield* Deferred.succeed(locked, undefined);
             yield* Deferred.await(unlock);
@@ -496,7 +511,7 @@ test("native event and result projection omits secret content from durable journ
     await f.run(Effect.gen(function*() {
       for (;;) { const current = yield* runner.service.row(f.work.taskId); if (current?.state === "SUCCEEDED") return; if (current?.state === "HELD" || current?.state === "FAILED") return yield* Effect.fail(new CommandError({ message: "Fixture prompt did not settle" })); yield* Effect.sleep("10 millis"); }
     }).pipe(Effect.timeout("15 seconds")));
-    const events = await f.run(runner.service.sql.unsafe<Json>("SELECT payload FROM events"));
+    const events = await f.run(runner.service.db.execute(runner.service.db.client.selectFrom("runner_events").select("payload")));
     const originalIdentities = events.map((event) => Schema.decodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(String(event.payload)))
       .filter((event) => event.type === "readback" || event.type === "native_lifecycle")
       .map(({ type, address, binding, runId, nativeCursor, kind }) => ({ type, address, binding, runId, nativeCursor, kind }));
@@ -506,57 +521,33 @@ test("native event and result projection omits secret content from durable journ
     assert.equal(JSON.stringify(events).includes(secret), false);
     assert.deepEqual(Schema.decodeUnknownSync(Schema.fromJsonString(RunnerResult), { onExcessProperty: "error" })((await f.run(runner.service.row(f.work.taskId)))!.result!), { hostSettled: true, evidenceVerified: false });
     assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await runner.call("inspect", { taskId: "one" })).includes(secret), false);
-    await f.run(runner.service.sql.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", [f.work.taskId, Schema.encodeUnknownSync(Schema.fromJsonString(Json))({ type: "message_end", message: secret })]));
-    await f.run(runner.service.sql.unsafe("UPDATE tasks SET result=?,reason=? WHERE taskId='one'", [Schema.encodeUnknownSync(Schema.fromJsonString(Json))({ hostSettled: true, credentials: secret }), secret]));
-    await f.run(runner.service.sql.unsafe("PRAGMA user_version=0"));
     await runner.close(); runner = await f.open();
-    const migratedIdentities = (await f.run(runner.service.sql.unsafe<Json>("SELECT payload FROM events")))
+    const migratedIdentities = (await f.run(runner.service.db.execute(runner.service.db.client.selectFrom("runner_events").select("payload"))))
       .map((event) => Schema.decodeUnknownSync(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(String(event.payload)))
       .filter((event) => event.type === "readback" || event.type === "native_lifecycle")
       .map(({ type, address, binding, runId, nativeCursor, kind }) => ({ type, address, binding, runId, nativeCursor, kind }));
     assert.deepEqual(migratedIdentities, originalIdentities);
-    assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await f.run(runner.service.sql.unsafe("SELECT payload FROM events"))).includes(secret), false);
-    assert.equal(Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await f.run(runner.service.sql.unsafe("SELECT result,reason FROM tasks"))).includes(secret), false);
-    const database = await f.run(f.fs.readFile(f.join(f.config.stateDirectory, "runner.sqlite")));
-    assert.equal(new TextDecoder().decode(database).includes(secret), false);
+    assert.equal(JSON.stringify(await f.run(runner.service.db.execute(runner.service.db.client.selectFrom("runner_events").select("payload")))).includes(secret), false);
+    assert.equal(JSON.stringify(await f.run(runner.service.db.execute(runner.service.db.client.selectFrom("runner_tasks").select(["result", "reason"])))).includes(secret), false);
+    assert.equal(existsSync(f.join(f.config.stateDirectory, "runner.sqlite")), false);
   } finally { await f.close(); }
 });
 
-test("legacy journal migration rejects missing and invalid readback addresses and native bindings", async (t) => {
-  const f = await fixture();
-  try {
-    const cases: { name: string; payload: Json }[] = [
-      { name: "missing readback address", payload: { type: "readback" } },
-      { name: "invalid readback address", payload: { type: "readback", address: {} } },
-      { name: "missing native binding", payload: { type: "native_lifecycle", runId: null, nativeCursor: 1, kind: "session_started" } },
-      { name: "invalid native binding", payload: { type: "native_lifecycle", binding: {}, runId: null, nativeCursor: 1, kind: "session_started" } },
-    ];
-    for (const [index, { name, payload }] of cases.entries()) await t.test(name, async () => {
-      const config = { ...f.config, stateDirectory: f.join(f.root, `legacy-${index}`) };
-      const runner = await f.open(config);
-      await runner.close();
-      await f.seed(config.stateDirectory, (sql) => Effect.gen(function*() {
-        yield* sql.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", [f.work.taskId, Schema.encodeUnknownSync(Schema.fromJsonString(Json))(payload)]);
-        yield* sql.unsafe("PRAGMA user_version=0");
-      }));
-      await assert.rejects(f.open(config));
-    });
-  } finally { await f.close(); }
-});
 
 test("obsolete handed-off report reconciles durably without starving later live reports", async () => {
   const f = await fixture(2);
   try {
     let runner = await f.open(); const live = { ...f.work, taskId: TaskId.make("two") }; await f.save(live);
     await runner.call("acceptTask", f.work); await runner.call("acceptTask", live); await f.ready(runner.service); await f.ready(runner.service, live.taskId);
-    await f.run(runner.service.sql.unsafe("UPDATE tasks SET state='RUNNING',promptId='reserved',pid=? WHERE taskId='one'", [process.pid]));
-    await f.run(runner.service.sql.unsafe("UPDATE tasks SET state='SUCCEEDED',occupied=0,result='{}' WHERE taskId='two'"));
+    await f.run(runner.service.db.execute(runner.service.db.client.updateTable("runner_tasks").set({ state: "RUNNING", promptId: NativeSubmissionId.make("reserved"), pid: ProcessId.make(process.pid) }).where("taskId", "=", f.work.taskId).returning("taskId")));
+    await f.run(runner.service.db.execute(runner.service.db.client.updateTable("runner_tasks").set({ state: "SUCCEEDED", occupied: 0, result: "{}" }).where("taskId", "=", live.taskId).returning("taskId")));
     await f.save(f.work, { runnerId: undefined });
-    const rows = (await f.run(runner.service.sql.unsafe("SELECT ?+rowid AS childUid,* FROM tasks ORDER BY taskId", [f.config.childUidBase]))).map((row) => Schema.decodeUnknownSync(RunnerRow, { onExcessProperty: "error" })(row));
+    const rows = [(await f.run(runner.service.row(f.work.taskId)))!, (await f.run(runner.service.row(live.taskId)))!];
     await f.run(runner.service.reports(rows));
-    const obsolete = (await f.run(runner.service.sql.unsafe<Json>("SELECT state,detached,occupied,promptId FROM tasks WHERE taskId='one'")))[0]!;
+    const obsolete = (await f.run(runner.service.db.execute(runner.service.db.client.selectFrom("runner_tasks").select(["state", "detached", "occupied", "promptId"]).where("taskId", "=", f.work.taskId))))[0]!;
     assert.deepEqual({ ...obsolete }, { state: "HELD", detached: 1, occupied: 1, promptId: "reserved" });
-    assert.equal(Schema.decodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(String((await f.run(f.broker.sql.unsafe<Json>("SELECT data FROM tasks WHERE id='two'")))[0]!.data)).state, "SUCCEEDED");
+    const brokerDb = makeDatabase(f.broker.sql);
+    assert.equal(Schema.decodeUnknownSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })((await f.run(brokerDb.execute(brokerDb.client.selectFrom("tasks").select("data").where("id", "=", live.taskId))))[0]!.data).state, "SUCCEEDED");
     await runner.close(); runner = await f.open(); assert.equal((await f.run(runner.service.row(f.work.taskId)))!.detached, 1); assert.equal((await f.run(runner.service.row(f.work.taskId)))!.occupied, 1);
     await f.save(live, { state: "FAILED" }); await f.run(runner.service.reports([(await f.run(runner.service.row(live.taskId)))!])); assert.equal((await f.run(runner.service.row(live.taskId)))!.detached, 0);
     f.outage(true); await f.run(runner.service.reports([(await f.run(runner.service.row(live.taskId)))!])); assert.equal((await f.run(runner.service.row(live.taskId)))!.detached, 0);
@@ -581,7 +572,7 @@ test("ownership lost before durable admission refuses acceptance and pending dup
     const refusedJournal = await runner.call("journal", { taskId: "one" });
     if (!refusedJournal || typeof refusedJournal !== "object" || !("accepted" in refusedJournal) || !("state" in refusedJournal)) throw new Error("Expected journal result");
     assert.equal(refusedJournal.accepted, false); assert.equal(refusedJournal.state, "not-accepted");
-    assert.equal((await f.run(runner.service.sql.unsafe<Json>("SELECT count(*) AS count FROM tasks")))[0]!.count, 0);
+    assert.equal((await f.run(runner.service.db.execute(runner.service.db.client.selectFrom("runner_tasks").select("taskId")))).length, 0);
   } finally { await f.close(); }
 });
 
@@ -685,7 +676,7 @@ test("abort acknowledgement and idle snapshots cannot replace a missing whole-ru
     assert.equal(held.state, "HELD");
     assert.equal(held.occupied, 1);
     assert.equal(held.result, null);
-    assert.equal((await f.run(runner.service.sql.unsafe<{ absent: number }>("SELECT result IS NULL AS absent FROM tasks WHERE taskId=?", [f.work.taskId])))[0]!.absent, 1);
+    assert.equal((await f.run(runner.service.db.execute(runner.service.db.client.selectFrom("runner_tasks").select("result").where("taskId", "=", f.work.taskId))))[0]!.result, null);
     if (held.pid === null) assert.fail("Held physical ownership must retain the native child PID");
     process.kill(held.pid, "SIGTERM");
     await f.run(Effect.gen(function*() {
@@ -695,16 +686,6 @@ test("abort acknowledgement and idle snapshots cannot replace a missing whole-ru
     assert.equal(closed.state, "HELD");
     assert.equal(closed.promptId, admitted.promptId);
     assert.equal(closed.nativeRunId, admitted.nativeRunId);
-    await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
-    // Exercise readback of the old persisted JSON-null encoding without changing owned intent.
-    await f.run(runner.service.sql.unsafe("UPDATE tasks SET result='null' WHERE taskId=?", [f.work.taskId]));
-    await runner.close();
-    runner = await f.open();
-    const recovered = (await f.run(runner.service.row(f.work.taskId)))!;
-    assert.equal(recovered.result, null);
-    assert.equal(recovered.promptId, admitted.promptId);
-    assert.equal(recovered.nativeRunId, admitted.nativeRunId);
-    assert.equal(recovered.state, "HELD");
     await assert.rejects(runner.call("release", { taskId: "one", address, prompt: f.work.prompt }));
   } finally {
     await f.close();

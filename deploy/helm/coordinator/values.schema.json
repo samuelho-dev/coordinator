@@ -13,6 +13,7 @@
       }
     },
     "sourceSha": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "suspended": {"type": "boolean"},
     "tolerations": {"type": "array", "items": {"type": "object"}},
     "tls": {
       "type": "object",

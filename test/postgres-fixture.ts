@@ -6,7 +6,7 @@ import { Platform } from "../src/platform.ts";
 import { readDatabaseUrl } from "../src/postgres.ts";
 import { migrateBrokerPostgres } from "../scripts/migrate.ts";
 
-/** Independent administration connection; never takes the broker owner lock. */
+/** Independent administration connection; never takes the runtime owner lock. */
 export const postgresAdmin = (urlFile: string) => Layer.unwrap(Effect.gen(function*() {
   const url = yield* readDatabaseUrl(urlFile);
   return PgClient.layer({ url, maxConnections: 1 }).pipe(Layer.provide(Reactivity.layer));
@@ -22,16 +22,20 @@ export const provisionPostgres = (directory: string) => Effect.gen(function*() {
   const baseFile = yield* adminFile;
   const base = yield* readDatabaseUrl(baseFile);
   const name = `coordinator_test_${(yield* platform.crypto.randomUUIDv4()).replaceAll("-", "")}`;
+  const password = yield* platform.crypto.randomUUIDv4();
   yield* Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient;
     const version = yield* sql.unsafe<{ server_version_num: string }>("SHOW server_version_num");
     if (!(Number(version[0]?.server_version_num) >= 180000 && Number(version[0]?.server_version_num) < 190000)) {
       return yield* Effect.fail(new Error("Disposable PostgreSQL 18 is required"));
     }
-    yield* sql.unsafe(`CREATE DATABASE "${name}"`);
+    yield* sql.unsafe(`CREATE ROLE "${name}" LOGIN PASSWORD '${password}'`);
+    yield* sql.unsafe(`CREATE DATABASE "${name}" OWNER "${name}"`);
   }).pipe(Effect.provide(postgresAdmin(baseFile)), Effect.scoped);
   const url = new URL(Redacted.value(base));
   url.pathname = `/${name}`;
+  url.username = name;
+  url.password = password;
   const urlFile = platform.path.join(directory, "database.url");
   yield* platform.fs.writeFileString(urlFile, url.href, { mode: 0o600 });
   yield* platform.fs.chmod(urlFile, 0o600);
@@ -39,7 +43,7 @@ export const provisionPostgres = (directory: string) => Effect.gen(function*() {
   return urlFile;
 });
 
-/** Run after broker runtimes close and before removing the URL file. */
+/** Run after runtime owners close and before removing the URL file. */
 export const dropPostgres = (urlFile: string) => Effect.gen(function*() {
   const url = new URL(Redacted.value(yield* readDatabaseUrl(urlFile)));
   const name = url.pathname.slice(1);
@@ -48,5 +52,6 @@ export const dropPostgres = (urlFile: string) => Effect.gen(function*() {
   yield* Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient;
     yield* sql.unsafe(`DROP DATABASE "${name}" WITH (FORCE)`);
+    yield* sql.unsafe(`DROP ROLE "${name}"`);
   }).pipe(Effect.provide(postgresAdmin(baseFile)), Effect.scoped);
 });

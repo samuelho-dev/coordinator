@@ -2,25 +2,27 @@
 
 ## Status and boundaries
 
-This guide describes **private beta 0.2.0-beta.3: prepared, not yet deployed or accepted**, not public production certification. Source, image and chart remain private. The separate beta needs fresh exact-source CI, signed image/chart/private prerelease and disposable install/TLS/rotation/disaster-recovery/observed MCP-streaming gates; historical October12 SQLite/native/KIND and pre-cutover Effect checks do not prove PostgreSQL. Production Coordinator/Hindsight data/resources/endpoints remain untouched. No completed beta deployment is claimed here.
+This guide describes **private0.2.0-beta.4: authorized existing live broker/homelab runner cutover prepared, not published, deployed or accepted**, not public production certification. Both runtime roles require PostgreSQL18; source/image/chart remain private. Fresh exact-source CI, signed same-source image/chart/private prerelease, stopped-owner migration and actual private-route/rotation/recovery acceptance remain required. Historical beta.3/SQLite/native/KIND results do not certify beta.4. No live mutation or Hindsight/public visibility change is claimed; no separate beta activation is authorized.
 
-The first [beta.1 publication attempt](https://github.com/samuelho-dev/coordinator/actions/runs/38373742895) verified the exact main image, SLSA provenance and SPDX inventory, then uploaded the chart but failed cosign signing because Helm login did not populate Docker authentication. [Beta.2 publication](https://github.com/samuelho-dev/coordinator/actions/runs/38380085130) used the corrected scoped Docker login, signed and verified its chart, then failed SLSA attestation because `cosign attest` rejects the sign-only `--registry-referrers-mode` flag. Neither incomplete chart is a release; do not replace or promote either. Beta.3 reuses the already successful image-CI attestation command, without that unsupported flag, and requires its own exact-source CI plus complete signed publication. No resume/overwrite bypass is added.
+Bounded current local proof: `pnpm check`, privacy-aware actual committed-WAL import (queuev1/v2, scalar/null projection, identity rejects, sequence floor/BigInt) and paired PG recovery passed. Stock Pi/OMP used56 fixture model calls and zero external calls. Actual native PG backend death preserved a completed admitted run under childUID3000000001, ready503/live200; restart retained the same prompt/run HELD without replay. Full121-test suite, exact-source CI/publication and live acceptance remain pending.
+
+Historical [beta.1](https://github.com/samuelho-dev/coordinator/actions/runs/38373742895) and [beta.2](https://github.com/samuelho-dev/coordinator/actions/runs/38380085130) publication attempts failed chart signing/attestation respectively; neither incomplete artifact may be promoted. [Beta.3 publication](https://github.com/samuelho-dev/coordinator/actions/runs/38388115672) subsequently completed privately. Those immutable source/image/chart coordinates belong to beta.3, not the unpublished beta.4 cutover; no overwrite/resume or old-green bypass is permitted.
 
 MIT is selected in [LICENSE](../LICENSE). Source, image and chart remain private until a separate owner release/visibility decision. [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) records incomplete redistribution review; inspect source history, dependencies, native binary and notices before any public release. Current image builds no longer include the historical complete Git source bundle; old images/bundles need their own audit before redistribution. A license label or metadata spot-check does not certify that audit. Do not publish credentials, protected recovery artifacts or operator configuration.
 
-There is one PostgreSQL broker owner session and optionally one runner with its durable local SQLite journal. No pool, reconnect/retry, HA, safe replay of uncertain native work, automatic promotion, database rollback or automatic apply/merge is promised. The generic chart requires external PostgreSQL18; it never provisions a database server. Start broker-only to establish schema/storage/authentication, then enable a runner only after its TLS, repository, model and isolation prerequisites are ready.
+Broker and each enabled runner require separate PostgreSQL databases/logins, each with one session-advisory-fenced owner; runner filesystem state additionally has kernel flock. No pool, reconnect/retry, HA, safe replay of uncertain native work, automatic promotion or rollback is promised. The generic chart requires external PostgreSQL18 and provisions no database server. Start broker-only, then enable the runner after independent database/TLS/repository/model/isolation prerequisites are ready. SQLite exists only as historical state and offline import input.
 
-### Private beta channel, not production replacement
+### Existing live cutover, reserved inactive beta
 
-The maintainer's isolated operator overlay uses namespace `coordinator-beta`, private Tailnet TLS `coordinator-beta-homelab.taile99f5b.ts.net` and `coordinator-beta-runner-homelab.taile99f5b.ts.net`, no Funnel/public ingress. Database is separate CNPG `cloudnative-pg/coordinator-beta`, app database/role `coordinator_beta`, service `coordinator-beta-rw.cloudnative-pg.svc.cluster.local`. These are downstream operator coordinates, not required independent self-host identities.
+The target is the existing `coordinator` release/namespace and broker/homelab runner endpoints. CNPG `cloudnative-pg/coordinator-beta` retains its internal name and private RW endpoint `coordinator-beta-rw.cloudnative-pg.svc.cluster.local`; live broker database/role is `coordinator`, homelab runner is `coordinator_runner`, reserved inactive beta is `coordinator_beta`, each separately credentialed. Preserve public `ca.crt`, TLS hostname verification, matching HBA and exact Cilium identities. Actual paired Mac inspection found Darwin, no Coordinator process and only the buildx builder container: the Mac plugin talks to the broker and needs no direct PostgreSQL. Native host SDK history is not a Coordinator SQLite journal. No Mac SQL role/Service/ACL workflow or staging is part of this cutover; existing broker/plugin/Tailscale8443/Orca6768 routes and unrelated ACL grants remain unchanged.
 
-Provision new independent credentials through the existing registry/ESO backend item `Dev/coordinator-beta`: DB basicAuth `coordinator-beta-db-credentials` and backup `coordinator-beta-backup` (`ACCESS_KEY_ID`/`ACCESS_SECRET_KEY`). Never copy production/Hindsight secrets or write them in Git/transcripts. Barman target is the operator's actual backend `s3://ai-dev-env/postgres/coordinator-beta/` at `https://s3.us-east-005.backblazeb2.com`; scoped key authentication and capabilities were proven by the bootstrap below, but actual backup/restore remains required before acceptance. It is not the generic chart's application snapshot interface. Production Coordinator and existing Hindsight shared CNPG `ai-dev-env-dev` stay unchanged.
+Preserve the existing owned `Dev/coordinator-beta` item: live broker uses `production-database-username=coordinator`/`production-database-password`, homelab runner uses `runner-database-username=coordinator_runner`/`runner-database-password`, reserved inactive beta retains `database-username=coordinator_beta`/`database-password`. Three independent pairs plus five preexisting tokens are11 core fields; `backup-access-key-id`/`backup-secret-access-key` make13 total. Existing production enrollment bearers and broker backup fields remain selected from `Dev/coordinator` through per-field overrides. Never truncate/rotate existing tokens or export credentials to Git/transcripts. CNPG backup `coordinator-beta-backup` uses scoped B2 keys at `s3://ai-dev-env/postgres/coordinator-beta/`, endpoint `https://s3.us-east-005.backblazeb2.com`; provisioning evidence does not prove current backup/restore.
 
 Hindsight is **PostgreSQL with pgvector/selected vector extension**, or embedded **pg0 PostgreSQL** for local use, not SQLite; current documentation also names Oracle AI Database as an enterprise alternative. Its public product/private operator overlay is a useful release-ownership comparison, not authorization to reuse its shared database, credentials or automatic worker retries. See [primary-source Hindsight findings](deployment-research.md#postgresql-sqlite-and-embedded-pg0), [official storage](https://hindsight.vectorize.io/developer/storage) and [external PostgreSQL installation guidance](https://hindsight.vectorize.io/developer/installation#postgresql).
 
-The beta's required `homelab-cp` affinity/control-plane NoSchedule toleration excludes bulk CI/DIND on both ordinary CI worker nodes, **not all CI**: operator `github-actions-runners/values.yaml`371–376 explicitly places the scoped, capacity-one `gha-rs-maintenance` runner on CP with that toleration. The operator must resolve/accept its execution constraints and verify actual admission/templates/node placement before live beta acceptance; this beta does not alter CI placement. **One instance/local-path shares CP root I/O with maintenance CI, etcd and other workloads, no dedicated disk or HA.** Production self-hosting needs dedicated data node/device or external managed PG and measured durability/latency/restore; another PVC/PG alone is not reserved bandwidth or a guaranteed poll-timeout fix. Do not format disks, move existing DBs or reschedule CI in this beta ([CNPG storage](https://cloudnative-pg.io/docs/1.28/storage/), [Kubernetes affinity](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)).
+The database's required `homelab-cp` affinity/control-plane NoSchedule toleration excludes bulk CI/DIND on ordinary workers, not all CI: the scoped capacity-one `gha-rs-maintenance` remains on CP. Verify actual placement and accept its constraints before live acceptance. One CNPG instance requires `primaryUpdateStrategy: unsupervised`; local-path shares CP root I/O with etcd/other workloads, so this is neither physical isolation nor HA/automatic failover.
 
-**Activation order:** first review/bootstrap only the beta policy/trust scope, without activating an ApplicationSet, product wrapper, CNPG Cluster/ObjectStore/backup, secret registry or Hindsight/production changes. Then provision the narrow private source Reader and explicit private-package Actions read grants, alongside independent nine-field `Dev/coordinator-beta` 1Password/scoped B2 provisioning through approved main/dev operator tooling (actual provisioning evidence below). Reader remains absent and package permissions remain external prerequisites. Require recorded owner review or owner-configured supported protections; observed infrastructure `dev` is unprotected. Bootstrap dispatch must name exact main SHA and successful normal CI push at that SHA. Only then publish same-source private prerelease, review trusted **beta-only** chart/image/source pins, reconcile ESO/CNPG with verified TLS, stop old owner before migration, reconcile application and perform acceptance. Do not promote stable production wrapper/Hindsight or treat `prepare-private` as promotable.
+**Cutover order:** reviewed existing-wrapper policy/trust → secure environment-only private source Reader and package read grants → preservation-only13-field credential provisioning/public CA/internal CNPG readiness → exact-source normal CI and actual private prerelease → reviewed suspended existing-wrapper pins → raw broker and existing homelab runner SQLite/WAL capture and verified offline import → explicit drained restart/activation → actual private-route/rotation/recovery acceptance. No separate beta activation, Mac runner capture or SQL exposure is authorized. Reader remains a missing secure-publication prerequisite; `prepare-private` alone is not promotable.
 
 **Policy/provisioning evidence:** private infrastructure [PR1297](https://github.com/samuelho-dev/ai-dev-env/pull/1297) passed normal CI and merged at `df650e09c7cfc98920bbf9457f20fcf9a1be00d5`, without beta activation. Exact-main-push [normal CI38362192158](https://github.com/samuelho-dev/ai-dev-env/actions/runs/38362192158) succeeded. Approved Dev bootstrap dispatched once at that SHA; [run38364590812](https://github.com/samuelho-dev/ai-dev-env/actions/runs/38364590812) succeeded. Bounded results prove nine independent `Dev/coordinator-beta` fields saved/read back: database-username/password, HOMELAB_SESSION_TOKEN, HOMELAB_RUNNER_TOKEN, HOMELAB_RUNNER_CONTROL_TOKEN, REVIEWER_TOKEN, ARCHIVE_WRITER_TOKEN and backup-access-key-id/backup-secret-access-key. User `coordinator_beta`, independent256-bit password/five bearer-control tokens and B2 key pair were stored; vault writes and actual B2 authentication/prefix `ai-dev-env/postgres/coordinator-beta/` were proven with deleteFiles/listAllBucketNames/listBuckets/listFiles/readFiles/writeFiles capabilities. No credential values were printed. This is provisioning/backend-scope evidence, not Reader/package access, database creation/off-cluster restore or deployment.
 
@@ -41,7 +43,7 @@ An operator image needs verified TLS443 to `deb.debian.org`, `apt.postgresql.org
 | Admission | Cluster owner trusts exact image producer/OIDC issuer, signature subject digest and attested repository/commit; reject unsigned or mismatched artifacts. |
 | Secrets | Operator provisions least-privilege credentials outside plaintext Git, encrypted at rest with restricted Secret/Pod access. |
 | TLS/network | Operator provides private verified HTTPS routes, certificates/trust, DNS and default-deny policies with explicit necessary flows. |
-| Storage | Operator owns external PostgreSQL18, least-privilege database role, verified TLS, durable server backup/recovery, and backup/runner-work PVCs with Retain policy and off-cluster protection. Runner work storage must support SQLite WAL/FULL. |
+| Storage | Operator owns external PostgreSQL18, separate broker/runner databases and least-privilege logins, verified TLS, durable server backup/recovery, and backup/runner-work PVCs with Retain/off-cluster protection. Work files require durable private filesystem semantics, not SQLite WAL. |
 | Native clients | Each host owner installs/reloads the exact Coordinator client with the supported SDK; Kubernetes cannot reload an existing TUI. |
 
 The investigation observed unprotected source and infrastructure `main` branches and a rulesets API 403 under the private plan. Those are historical observations, not proof of current settings or permission to change visibility. Configure review/required checks with an authorized owner when the platform/plan allows; if unreachable, record the missing enforcement and use explicit owner review without claiming branch enforcement. Do not bypass admission or change a plan/repository's visibility as an installation side effect.
@@ -53,7 +55,7 @@ The product chart creates ordinary Deployments, ClusterIP Services and PVCs only
 * Server/native runner image: Linux **amd64**, Node **24.21.0**; stock image installs checksum-pinned OMP **18.6.1** at `/usr/local/bin/omp`.
 * Supported native SDK/client hosts: Pi **1.0.4**, OMP **18.6.1**. The stock production image installs the real Pi CLI through its production dependency at `/app/node_modules/.bin/pi`; that exact installed CLI passed host smoke. Configure the actual absolute executable in RunnerConfig `launchers` and independently prove pinned repository, model/provider and runner isolation prerequisites before enabling Pi work. Any derivative image still needs its own tested/signed provenance, not a borrowed stock-image digest.
 * Broker/runner command transport: stateless MCP **2026-07-28**, official client **2.3.1**. Plugin-owned interactive native control remains stateful **2025-11-25**. Do not combine incompatible command clients/servers.
-* Chart/app version `0.2.0-beta.3`; **Effect4.0.3 is stable**, but Prisma **8.0.0-rc.22** and transitive `@prisma/orm-postgres` **8.0.0-rc.17** remain release candidates. This is explicitly a private beta, not a stable Prisma/public production release.
+* Chart/app version `0.2.0-beta.4` is prepared but unpublished; **Effect4.0.3 is stable**, while Prisma **8.0.0-rc.22** and `@prisma/orm-postgres` **8.0.0-rc.17** are release candidates. This remains private beta, not stable/public certification.
 * Full 40-hex source SHA, image `sha256:` digest and chart artifact checksum/OCI digest identify different things. A package version or configured readiness source header does not prove provenance; verify the immutable producer/source linkage.
 * Both interfaces use native MCP Streamable HTTP, not deprecated standalone HTTP+SSE. Stateless2026-07-28 commands use **POST-scoped** JSON/SSE (including `subscriptions/listen`), no protocol sessions or GET stream; stateful2025-11-25 plugin control remains separate. Preserve incremental delivery, cancellation/backpressure and individual-message limits, not whole-event-stream buffering/limits. Proxy TLS routes must not silently buffer SSE. Six actual SDK HTTP/SSE/auth/abort tests and a bounded real concurrent POST/SSE progress/cleanup proof passed locally; live-route acceptance remains required. Record actual progress/completions and latency, not configured handler count, saturated-producer backpressure or promised sustained capacity ([exact official specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http.md)).
 
@@ -66,7 +68,7 @@ pnpm install --frozen-lockfile
 pnpm native:build
 ```
 
-For a prepared release obtain `release-manifest.json`, `coordinator-0.2.0-beta.3.tgz`, license/notices and verification evidence from the release owner. Its source SHA, image repository/digest, CI run, producer and platform must agree. Verify archive SHA-256 against `chartArchiveSha256`; a private archive checksum is not an OCI digest.
+After actual beta.4 publication, obtain `release-manifest.json`, `coordinator-0.2.0-beta.4.tgz`, license/notices and verification evidence from the release owner. Source SHA/image digest/CI producer/platform must agree; verify archive SHA-256 against `chartArchiveSha256`, not an OCI digest. These artifacts are not claimed to exist yet.
 
 The [release workflow](../.github/workflows/release.yaml) must accept the exact source beta version and pass same-source supplementary/chart/image gates before private preparation. `prepare-private` is only artifact preparation, not a published/promotable release. The release owner must subsequently complete actual same-source `publish` at existing private visibility before beta GitOps promotion. Do not borrow old successful CI or infer a release from this document.
 
@@ -74,7 +76,7 @@ The [release workflow](../.github/workflows/release.yaml) must accept the exact 
 
 ### One declarative schema owner
 
-Prisma8's `prisma/contract.prisma` owns the broker tables, constraints, native Effect queue schema and seeded migration versions. Committed `src/generated/prisma/contract.json`, generated Effect/Kysely types, `prisma.config.ts` and attested `migrations/**` are immutable source/image inputs. Broker startup verifies identity; it never creates/updates schema itself. The image copies those assets and uses the production native Prisma CLI, not a runtime generator. Runner-only SQLite migrations remain separate.
+Prisma8's `prisma/contract.prisma` owns broker tables, native queue seeds and runner journal tables `runner_tasks`/`runner_events`. Committed generated contracts/types, `prisma.config.ts` and both attested broker/runner migrations are immutable image inputs. Both roles verify identity/history/queue/recovery gate at startup and never apply DDL. Apply the same exact package separately to each runtime database; no runner SQLite migrations remain.
 
 Generated `src/generated/database/types.ts` database/ID/select/insert/update types are authoritative internally. Typed Kysely results are not decoded again. Decode unknown network/config/filesystem/legacy SQLite and serialized TEXT-JSON exactly once at those seams, then carry typed values; schema codecs never replace domain authorization/CAS/fingerprints/recovery fences.
 
@@ -100,7 +102,7 @@ NODE_EXTRA_CA_CERTS="$PRIVATE/ca.crt" \
   node --import tsx scripts/migrate.ts
 ```
 
-The script acquires the same PostgreSQL owner as the broker and applies native `db migrate --no-interactive` to the exact emitted `contract.storage.storageHash`. Startup and post-migration checks use generated-type Kysely queries executed through the existing Effect SQL client (no second connection pool), verify the actual `prisma_contract.marker` profile/core identity, immutable ledger, native queue v1/v2 seeds and durable recovery gate, and never apply application DDL. It must run with no old broker owner and before new broker serving. Authoring/generation does not apply the package.
+The script acquires the PostgreSQL session owner and applies native `db migrate --no-interactive` to exact `contract.storage.storageHash`, then verifies both broker and runner schemas. Generated Kysely queries check actual Prisma marker/history, queue v1/v2 seeds and recovery gate through the existing Effect SQL client. Run it separately with each private URL file, with every old owner stopped; it is not a runtime generator, skip flag or PreSync hook.
 
 
 ## 3. Create private schema-valid configuration
@@ -152,17 +154,21 @@ Retention values here are explicit one-day archive/three-day sanitized-backup ch
 
 ### External PostgreSQL URL and CA
 
-Provision a dedicated empty PostgreSQL18 database and scoped operator-owned login outside the chart; obtain the actual URL through your private secret backend. Do not use a server superuser or expose passwords in shell arguments/Git. Export DATABASE_URL_SOURCE_FILE as the backend's private local export path, then copy without printing bytes:
+Provision dedicated PostgreSQL18 broker and runner databases with separate scoped logins outside the chart. Obtain actual URLs from your private backend; never manufacture credentials or use a server superuser. Export DATABASE_URL_SOURCE_FILE and, when enabling a runner, RUNNER_DATABASE_URL_SOURCE_FILE as genuine private backend exports. Keep tracing off and stage without printing:
 
 ```sh
 umask 077
 install -m 600 "$DATABASE_URL_SOURCE_FILE" "$PRIVATE/database.url"
+# Enabled runner only; omit for a genuinely broker-only install:
+install -m 600 "$RUNNER_DATABASE_URL_SOURCE_FILE" "$PRIVATE/runner-database.url"
 chmod 700 "$PRIVATE"
 ```
 
 The file contains a PostgreSQL URL with nonempty user/password/database; percent-encode credentials. Remote requires `?sslmode=verify-full`, the only accepted query setting. Plaintext disable is permitted only loopback disposable proofs, never remote Docker/cluster databases. Supply trusted roots as `$PRIVATE/ca.crt`; configure the chart CA Secret to trust PostgreSQL and private HTTPS.
 
-For host migration/recovery/inspection export COORDINATOR_DATABASE_URL_FILE="$PRIVATE/database.url" and NODE_EXTRA_CA_CERTS="$PRIVATE/ca.crt" before startup. Create separate private **host-broker.json/host-runner.json** with actual absolute host paths and the same identities: host databaseUrlFile points at that private file, not Kubernetes-only `/config`; host backupDirectory/state/repository/model/child roots must match the stopped pair. The runtime user owns private0700 parents/0600 files without links. Do not change cluster configs to host paths.
+When supplied, `NODE_EXTRA_CA_CERTS` must name a valid public CA bundle at a canonical trusted path; invalid/missing/noncanonical trust fails rather than silently falling back. Systemd installation persists that path, remote SSH forwards it as a quoted path, and native children do not receive it. Fully restart owner/client processes after trust rotation; never export CNPG `ca.key`.
+
+The runner copy is required only when enabling a runner and must name its separate database/login. For host migration/recovery/inspection, set `NODE_EXTRA_CA_CERTS="$PRIVATE/ca.crt"` before startup. Create private host-broker.json/host-runner.json with actual absolute paths: broker databaseUrlFile is `$PRIVATE/database.url`; runner databaseUrlFile is `$PRIVATE/runner-database.url`, never Kubernetes-only `/config`. Keep matching identities and stopped pair's backup/repository/model/child roots. Use a fresh canonical private runner stateDirectory for PostgreSQL cutover; retain old runner.sqlite/WAL and work/model/children/native sessions untouched until verified offline import. Runtime owns private0700 parents/0600 files without links.
 
 
 ### Runner extension of this configuration
@@ -174,6 +180,7 @@ RunnerConfig contains exactly these required fields:
 | Field | Required operator value |
 | --- | --- |
 | `id`, `brokerUrl`, `tokenFile` | Enrolled runner ID, verified private HTTPS broker authority, `/config/runner.token`. |
+| `databaseUrlFile` | `/config/database.url` staged from the runner's independent private URL, never the broker URL. |
 | `host`, `port`, `controlTokenHash` | `0.0.0.0`, normally `8788`, SHA-256 of the separate control token. |
 | `stateDirectory`, `modelDirectory`, `childDirectory` | `/work/runner`, `/work/home`, `/work/children` respectively, or distinct nonoverlapping canonical descendants of `/work`. |
 | `slots`, `childUidBase` | Integer 1–128 and reserved UID base at least 1000000; allocate nonoverlapping UID ranges among runners. |
@@ -182,7 +189,7 @@ RunnerConfig contains exactly these required fields:
 
 `repositories.json` maps **every and only** configured repository to its exact full commit SHA. Init fetches public GitHub repositories via unauthenticated HTTPS and detaches that pin, without running setup scripts. For private/offline repositories, stop the runner and pre-provision a clean exact checkout on the work PVC using a trusted job and separately scoped clone credentials. Init accepts that checkout without fetching, rejects dirt/mismatch and never resets operator data. Neither image source files nor historical Git bundles are task-repository seeds. Changing pins is an explicit stopped-runner provisioning operation.
 
-For the conventional **one-repository OMP runner**, the following produces actual config/tokens, not a maintainer seed. Export your independently selected `RUNNER_ID`, verified private `RUNNER_URL`, `TASK_REPO`, exact `TASK_SHA`, and actual numeric `TASK_REPO_ID`. This extends the broker-only file **before first install**; an existing install must use the controlled maintenance/rotation procedure below. The million-UID base used here must be reserved on your host.
+For the conventional **one-repository OMP runner**, first stage the real runner URL above, then export your selected `RUNNER_ID`, verified private `RUNNER_URL`, `TASK_REPO`, exact `TASK_SHA` and positive `TASK_REPO_ID`. This extends broker config before first install; existing installs require maintenance below. Reserve the million-UID base on your host. No database credential is generated by this example.
 
 ```sh
 export RUNNER_ID RUNNER_URL TASK_REPO TASK_SHA TASK_REPO_ID
@@ -202,6 +209,7 @@ await Effect.runPromise(Effect.gen(function*() {
     return yield* new CommandError({message:'Invalid repository identity/pin'});
   const broker = Schema.decodeUnknownSync(Schema.fromJsonString(BrokerConfig),
     {onExcessProperty:'error'})(yield* p.privateFile(p.path.join(e.PRIVATE,'broker.json')));
+  yield* p.privateFile(p.path.join(e.PRIVATE,'runner-database.url'));
   if (broker.principals.some(principal => principal.id === e.RUNNER_ID))
     return yield* new CommandError({message:'Runner identity already enrolled'});
   const bearer = Hex.encode(yield* p.crypto.randomBytes(32));
@@ -213,7 +221,8 @@ await Effect.runPromise(Effect.gen(function*() {
       repos:[e.TASK_REPO],tokenHash,controlTokenHash,runnerUrl:e.RUNNER_URL}],
     repositoryIds:{...broker.repositoryIds,[e.TASK_REPO]:Number(e.TASK_REPO_ID)}});
   const runner = encode(RunnerConfig)({id:e.RUNNER_ID,brokerUrl:e.BROKER_URL,
-    tokenFile:'/config/runner.token',host:'0.0.0.0',port:8788,controlTokenHash,
+    tokenFile:'/config/runner.token',databaseUrlFile:'/config/database.url',
+    host:'0.0.0.0',port:8788,controlTokenHash,
     stateDirectory:'/work/runner',slots:1,repositories:{[e.TASK_REPO]:'/work/repos/task'},
     launchers:{omp:'/usr/local/bin/omp'},modelDirectory:'/work/home',
     childDirectory:'/work/children',childUidBase:1000000});
@@ -236,7 +245,7 @@ Prepare the real private `omp.config.yml` and any required `omp.auth.json`/`omp.
 | --- | --- | --- |
 | Both | `config.json` | Full BrokerConfig or RunnerConfig JSON. |
 | Both | `health.token` | Raw 64-lowercase-hex token; broker matches an enrolled principal hash, runner equals `runner.token`; optional trailing whitespace. |
-| Broker | `database.url` | External PostgreSQL URL with nonempty user/password/database, staged at `/config/database.url`; remote URL requires `?sslmode=verify-full`, no other query setting/fragments/control bytes. |
+| Both | `database.url` | Role-specific PostgreSQL URL with nonempty user/password/database, staged at `/config/database.url`; separate broker/runner database/login; remote verify-full only, no other query/fragments/control bytes. |
 | Broker with runner | `control.<base64url UTF-8 principal.id without padding>` | Raw control token matching that principal's control hash; staged at `/config/tokens/<principal.id>`. |
 | Broker with object backup | `backup.access-key`, `backup.secret-key` | Genuine provider credentials; configured destinations must be descendants of `/config`. |
 | Runner | `runner.token` | Enrolled runner bearer, **not** the control token. |
@@ -273,6 +282,7 @@ For the one-repository OMP runner above, create its Secret with the required fil
 ```sh
 kubectl -n "$NAMESPACE" create secret generic "$RUNNER_SECRET" \
   --from-file=config.json="$PRIVATE/runner.json" \
+  --from-file=database.url="$PRIVATE/runner-database.url" \
   --from-file=runner.token="$PRIVATE/runner.token" \
   --from-file=health.token="$PRIVATE/runner.token" \
   --from-file=repositories.json="$PRIVATE/repositories.json" \
@@ -313,12 +323,12 @@ kubectl -n "$NAMESPACE" create secret generic "$CA_SECRET" \
   --from-file=ca.crt="$PRIVATE/ca.crt"
 ```
 
-Set `tls.existingCaSecret: <your CA_SECRET name>` in reviewed values before install. Extend default-deny policy to the exact PostgreSQL endpoint/port for **both broker init and runtime**, not only HTTP flows.
+Set `tls.existingCaSecret` before install; extend default-deny policy to the exact PostgreSQL destination/port for broker and runner migration init and runtime. Mac access needs its pinned private endpoint/host ACL and trusted native CNPG public CA, not wildcard arbitrary-device SQL grants.
 
 
 Each role exposes `broker.deploymentAnnotations`, `broker.podAnnotations`, `runner.deploymentAnnotations` and `runner.podAnnotations`, all defaulting to `{}` and accepting string maps. Deployment annotations target the Deployment; pod annotations target its pod template. Put operator-owned Secret-reloader or Velero-exclusion annotations at the scope required by your installed controller in the downstream overlay. No provider controller is installed by these maps, and annotations do not replace fenced recovery or the controlled restart procedure.
 
-Default PVCs are `${RELEASE}-backups` (10Gi) and `-work` (20Gi, runner only), RWO. `persistence.backups|work` accepts existingClaim, storageClass, size and accessModes; null storageClass uses cluster default, empty string selects no provisioner. RWOP is supported. The broker has **no data PVC or SQLite runtime flag**. Keep runner WAL on suitable local/block storage. Chart-created PVCs carry Helm keep; existing claims are not Helm-owned. Set PV reclaim policy Retain and protect against GitOps pruning. Independently protect external PostgreSQL storage; keep/Retain/RWO are not backups.
+Default PVCs are `${RELEASE}-backups` (10Gi) and `-work` (20Gi, runner only), RWO. `persistence.backups|work` accepts existingClaim/storageClass/size/accessModes; null storageClass uses cluster default, empty selects no provisioner; RWOP supported. Neither role has a SQLite runtime flag. Work PVC retains repositories/model/children/native files and private runner.lock, not a new SQL journal. Chart PVC keep/Retain/RWO are not backups; independently protect both external databases and work files.
 
 Initializer commands are exactly:
 
@@ -327,7 +337,7 @@ node --import tsx scripts/deploy-init.ts broker --input /input --config /config
 node --import tsx scripts/deploy-init.ts runner --input /input --config /config
 ```
 
-Root staging has only CHOWN/FOWNER/DAC_OVERRIDE. Secret input is read-only0400; config is memory-backed. Staged files are UID/GID1000 mode0600, private directories0700 and runner child-chain ancestors0711. Broker requires **databaseUrlFile `/config/database.url`** and backupDirectory at/below `/backups`. The fixed second broker init executes `node --import tsx scripts/migrate.ts` on the **same immutable image**, UID1000/capability0, read-only config/CA and writable tmp. `COORDINATOR_DATABASE_URL_FILE=/config/database.url` selects the private secret; failed migration prevents broker startup. There is no skip flag. Both roles use Recreate: the old broker owner stops before migration acquires its lock. Never use an Argo PreSync migration hook against a live owner—it deadlocks rollout ordering.
+Root staging has only CHOWN/FOWNER/DAC_OVERRIDE. Secret input is read-only0400; config is memory-backed. Both roles require **databaseUrlFile `/config/database.url`**, staged from their own Secret, UID/GID1000 mode0600 with private0700 parents. Broker backupDirectory is at/below `/backups`. Each role's migration init runs `scripts/migrate.ts` on the same immutable image UID1000/cap0 with `COORDINATOR_DATABASE_URL_FILE=/config/database.url`, read-only config/CA and writable tmp. Failure blocks startup; Recreate stops old owner before migration. No skip/live-owner PreSync. Generic product chart **`suspended: true`** holds both Deployments at zero; maintainer operator wrapper **`runtime.suspended: true`** maps to it and disables its acceptance hook. Keep suspension/reconciliation controls until fenced offline migration completes; then perform controlled activation and acceptance.
 
 Runtime root/config filesystems are read-only, tmp writable, service-account automount disabled. Broker runs UID1000/capability0. Runner setpriv becomes UID1000 with exactly CHOWN/DAC_OVERRIDE/KILL/SETUID/SETGID/SETPCAP, **no FOWNER**; children have distinct UIDs, zero capabilities/groups and NoNewPrivs. Do not weaken isolation for admission.
 
@@ -377,7 +387,7 @@ Create default-deny policies using labels `app.kubernetes.io/name=coordinator`, 
 
 ## 5. Disposable install and GitOps promotion
 
-First render/review and run a disposable install using `CHART` as the verified local `coordinator-0.2.0-beta.3.tgz` or exact-source chart directory. Do not invent a public remote release.
+First render/review and run a disposable install using `CHART` as the verified `coordinator-0.2.0-beta.4.tgz` after publication, or exact-source chart directory for local preparation. Do not invent public artifacts or borrow beta.3 pins.
 
 ```sh
 helm lint "$CHART" -f "$OPERATOR_VALUES"
@@ -407,7 +417,7 @@ Set `RENDERED_MANIFEST` to a private review file first. `deployment-smoke` requi
 
 When that route uses a private CA, launch host acceptance with the same trusted public CA bundle: `NODE_EXTRA_CA_CERTS="$PRIVATE/ca.crt" node --import tsx scripts/deployment-smoke.ts --config "$PRIVATE/plugin.json" --source-sha "$SOURCE_SHA" --cycles 5`. Obtain the bundle through the operator's trusted channel; the host environment does not inherit Kubernetes mounts. Set `NODE_EXTRA_CA_CERTS` before starting ordinary `omp`/`pi` clients too, and fully restart them when trust changes. Node loads additional roots at process startup. Do not replace the real HTTPS authority with an IP/internal Service name merely to bypass routing; preserve certificate hostname/SNI verification.
 
-Broker `/livez` is cheap unauthenticated process liveness; broker `/readyz` is authenticated, performs SELECT1 and reports `x-coordinator-source-sha`. Broker startup/liveness use `/livez` and readiness exec reads `/config/health.header`, not a token argv. Runner has **no `/livez` or `/readyz`**: startup/liveness/readiness all use authenticated curl exec against its existing `/healthz` with the mounted header; journal-ownership loss still fails health. Neither role's `/healthz` becomes unauthenticated/public, and MCP health remains unchanged. A healthy pod does not prove provider auth, repository pins, isolation or no-replay.
+Broker `/livez` is cheap unauthenticated process liveness; authenticated `/readyz` checks database ownership/SELECT1 and reports `x-coordinator-source-sha`. PostgreSQL ownership loss stops database serving/writes/readiness (503), not cheap liveness (200), so admitted native work can survive until validated completion. Do not use readiness failure as an automatic destructive restart: drain explicitly, then restart without PostgreSQL reconnect/replay. The local kernel ownership fence remains hard; no role's authenticated health becomes public.
 
 Before routing real work, additionally prove runner readiness, clean pinned public/private checkout behavior, a real selected SDK/provider model turn, child credential/UID isolation, broker lock fencing, durable restart/no-replay and protected recovery rehearsal. Do not narrow those to mocks or call successful no-dispatch smoke full runner acceptance.
 
@@ -421,7 +431,7 @@ Install the exact-source client on each native host with `pnpm install --frozen-
 
 For every change, stop task submission/approved release at all coordinator clients and restrict submission-capable ingress/principals as necessary. There is **no dedicated maintenance-mode/drain endpoint**. A quiet heartbeat or empty no-dispatch smoke is not proof of no work. Inspect known tasks with authorized `task.get`/`task.attach`, reconcile runner state and native children, then stop runner and broker before offline state operations. Retain uncertain/occupied HELD rows; do not clear capacity by editing the database.
 
-Exactly one PostgreSQL broker/migration/recovery owner holds the fixed session advisory lock. Duplicate owners fail closed; owner-session loss fences serving/writes, never reconnects or replays work. This fences the same database, not independent copied databases. Recreate stops the old owner before the migration init; it is not HA. Do not scale replicas or run competing recovery/source brokers. Runner journals retain kernel flock. Reconcile native children independently of pod deletion.
+Each separate PostgreSQL database has exactly one runtime/migration/recovery session-advisory owner. Duplicates fail closed; PG owner loss permanently revokes database serving/writes/readiness, with no automatic reconnect/replay, while admitted native work survives to validated completion and cheap liveness stays200. Drain explicitly before restart; retain uncertain accepted work HELD. Locks do not fence copied databases. Recreate stops old owners before migration; no HA/replica scaling. Runner filesystem kernel flock remains a hard fence. Reconcile native children independently of pod deletion.
 
 For GitOps reconcile namespace/private Secrets/CA/external database connectivity first, then the digest-pinned Recreate broker Deployment. Await its ordinary migration init/readiness before enabling runner or submission routes. No PreSync migration hook against a live owner. Suspend self-heal before offline recovery; premature desired-replica restoration is unsafe. Secret reload controllers must follow controlled downtime.
 For maintenance, suspend operator reconciliation first (especially Argo self-heal), record desired pins and storage ownership, then explicitly stop workloads. Imperative scale-to-zero alone is not durable under reconciliation:
@@ -450,11 +460,11 @@ node --import tsx --input-type=module <<'JS'
 import { Console, Effect, Layer, Schema } from 'effect';
 import { NodeServices } from '@effect/platform-node';
 import { Platform } from './src/platform.ts';
-import { BrokerPostgres } from './src/postgres.ts';
+import { Postgres } from './src/postgres.ts';
 import { makeDatabase } from './src/kysely.ts';
 import { Task } from './src/contracts.ts';
 await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-  const { sql } = yield* BrokerPostgres;
+  const { sql } = yield* Postgres;
   const db = makeDatabase(sql);
   const counts = new Map();
   for (const row of yield* db.execute(db.client.selectFrom('tasks').select('data'))) {
@@ -462,18 +472,17 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     counts.set(task.state, (counts.get(task.state) ?? 0) + 1);
   }
   yield* Console.log(Object.fromEntries(counts));
+  const runnerRows = yield* db.execute(db.client.selectFrom('runner_tasks')
+    .select(['taskId','state','occupied','pid']).orderBy('taskId'));
+  yield* Console.log(runnerRows);
 })).pipe(
-  Effect.provide(BrokerPostgres.layer(process.env.COORDINATOR_DATABASE_URL_FILE)),
+  Effect.provide(Postgres.layer(process.env.COORDINATOR_DATABASE_URL_FILE)),
   Effect.provide(Layer.merge(Platform.layer, NodeServices.layer))
 ));
 JS
-sqlite3 -readonly /work/runner/runner.sqlite \
-  "SELECT state,occupied,count(*),sum(pid IS NOT NULL) AS recorded_pids FROM tasks GROUP BY state,occupied;"
-sqlite3 -readonly /work/runner/runner.sqlite \
-  "SELECT taskId,state,occupied,pid FROM tasks WHERE occupied=1 OR state='HELD' ORDER BY taskId;"
 ```
 
-Set COORDINATOR_DATABASE_URL_FILE to the canonical private600 file with private700 parent before inspection. Runner paths correspond to this guide's conventional stateDirectory; sqlite3 is an operator-host tool, not bundled. Use the normal owner-accessible filesystem: `-readonly` prevents database writes, but a read-only volume can prevent SQLite from opening WAL support files; never substitute `immutable` against a live journal. Protect inventory output. PIDs do not prove identity or outcome; inspect actual native processes/workspaces/external effects. QUEUED/ASSIGNING/ACCEPTED/RUNNING or occupied rows prevent idle claims; HELD is uncertain, not completed. Preserve fingerprints/incarnations and never force-free/reissue through SQL edits.
+Run this once with COORDINATOR_DATABASE_URL_FILE="$PRIVATE/database.url" and again with "$PRIVATE/runner-database.url", both canonical private0600 files/0700 parents; the other role's tables should be empty. Protect output. PIDs do not prove outcome; inspect actual native processes/workspaces/effects. QUEUED/ASSIGNING/ACCEPTED/RUNNING or occupied rows prevent idle claims; HELD remains uncertain. Preserve fingerprints/incarnations; never force-free/reissue by editing SQL.
 
 ## 8. Protected backup and fenced restore
 
@@ -483,7 +492,7 @@ The existing online **application pg_dump snapshots** remove archive/consent/par
 
 CNPG/Barman **physical base backups and WAL/PITR are a separate operator-owned product**, not these archive-sanitized application exports or the paired recovery artifact below. A database restore does not reconcile runner files or fence uncertain accepted work; use the stopped-owner/paired recovery procedure for that boundary. The beta backend's scoped backup/read/restore proof remains required independently of local application recovery.
 
-Protected offline recovery contains **full private** broker/consent/task/session data and paired runner journals/repositories/native files. Its v2 recovery.json binds source/schema identity/counts, runner absolute layout, hashes, UID/GID/modes/internal links. Data files are **broker.pgdump**, optional runner.sqlite and blobs/<decimal index>. PostgreSQL native schema marker/history and recovery_gate data are excluded: restore first applies the **same committed migration package** to a fresh empty target. Artifacts are private600/700, not automatically encrypted; encrypt/off-cluster protect and independently escrow excluded credentials.
+Protected recovery contains full private broker/consent/task/session data, paired PostgreSQL runner journal and repository/native files. **v3 recovery.json** binds source/schema/counts/runner layout/hashes/UID/GID/modes/internal links; files are **broker.pgdump**, optional **runner.pgdump** and blobs/<decimal index>. Native Prisma history/queue migrations/recovery_gate are excluded; apply the same committed package to each fresh target first. Artifacts are private0600/0700, not automatically encrypted; independently escrow excluded credentials.
 
 Operator configs/enrollment/control tokens/model seed and known copied child model-auth/config/native-control token/plugin/endpoint files are excluded. External native host plugin journals/history are **operator-owned and excluded**: no resumed/recovered peer session or native-control reattachment is promised. Other application files can contain secrets: treat **every byte** of the protected artifact as confidential. Reconstruct excluded credentials/model seed independently from the private secret backend; keep config files outside archived repository/child roots.
 
@@ -501,12 +510,12 @@ node --import tsx scripts/recover.ts backup \
   --offline-maintenance
 ```
 
-Omit runner config only for genuine broker-only topology; nonterminal assigned work needs its matching runner. Multi-runner paired recovery is unsupported by this single-runner command. Helpers acquire the PostgreSQL owner and runner.lock, reject live/unknown children and unsafe paths/links/files. They never stop services, delete source state or replay work. No credentials appear in native client argv; temporary pgpass files are private scoped600 files.
+Omit runner config only for genuine broker-only topology; nonterminal assigned work requires its matching runner. Multi-runner recovery is unsupported by this single-runner command. Helpers acquire both PostgreSQL owners plus runner.lock, reject live/unknown children/unsafe paths and stateDirectory files other than runner.lock. They never stop services/delete source/replay work. Native clients use scoped private0600 pgpass, never credential argv.
 
 ### Restore command and explicit accepted-work hold
 
 1. Keep source services/children offline and independently fence old endpoints/databases/volumes, including copies on other machines. An advisory lock cannot fence another copied database.
-2. Provision a **fresh empty external PostgreSQL database** and fresh runner volumes at identical absolute paths/runner identity/UID base; retain old state untouched. Reconstruct private target BrokerConfig/URL/model credentials. Apply the exact committed migration package using the command below **before restore**, not by starting the broker. Runner SQLite target must remain absent without stale sidecars.
+2. Provision **separate fresh empty PostgreSQL broker/runner databases** and fresh runner volumes at identical absolute paths/identity/UID base, retaining old state. Reconstruct private target BrokerConfig/RunnerConfig and both URLs/model credentials. Apply the exact committed package separately to each database before restore; runner stateDirectory may contain only runner.lock, never old SQLite/sidecars. Retain legacy files elsewhere unchanged.
 3. Recover the protected artifact securely. Recovery/import durably sets recovery_gate false before mutation and only true after the paired operation completes. Any partial failure stays fenced: quarantine it and retry into a separately fresh target, never bypass the gate.
 4. Inspect protected manifest `broker.pendingAccepted` and optional `runner.pendingAccepted` offline. Broker ACCEPTED/RUNNING tasks could redeliver peer release and pending occupied runner ACCEPTED rows would ordinarily auto-launch. Restore requires explicit **`--hold-accepted-work`** acknowledgment when either count is nonzero; it parks copied broker ACCEPTED/RUNNING tasks and pending runner ACCEPTED rows HELD before startup, preserving acceptance/release IDs, fingerprints, work/incarnations and offer decisions. This is not consent to execute them, and external host journals remain excluded.
 
@@ -514,6 +523,9 @@ Apply the exact source package to the fresh target using its host private URL:
 
 ```sh
 COORDINATOR_DATABASE_URL_FILE="$PRIVATE/database.url" \
+NODE_EXTRA_CA_CERTS="$PRIVATE/ca.crt" \
+  node --import tsx scripts/migrate.ts
+COORDINATOR_DATABASE_URL_FILE="$PRIVATE/runner-database.url" \
 NODE_EXTRA_CA_CERTS="$PRIVATE/ca.crt" \
   node --import tsx scripts/migrate.ts
 ```
@@ -548,21 +560,25 @@ Image reverts never downgrade/mend data or undo external effects. Incompatible s
 
 ### Offline legacy SQLite import
 
-One-time offline conversion, not a dual broker backend/flag. Stop/fence the legacy broker, paired runner and native children; retain original SQLite files/work unchanged. Prepare a fresh exactly migrated PostgreSQL target and private host configs. The CLI locks/checkpoints the canonical private source, requires no stale sidecars/unproven writer, verifies supported legacy schema and preserves IDs/queue/acceptance/fingerprints through paired protected recovery:
+One-time offline conversion of the existing broker ledger and homelab runner journal, not a dual backend/flag. No Mac Coordinator runner exists; native host SDK history is not an import source. Suspend reconciliation/runtime/acceptance, close submissions, drain native work and stop/fence legacy broker/homelab runner/native children. Retain old files/work; use a fresh private PG stateDirectory with existing repository/model/child roots. Supply canonical private LEGACY_SQLITE_FILE and LEGACY_RUNNER_SQLITE_FILE explicitly. Prepare two fresh exactly migrated targets and private host configs. Source flock plus exclusive checkpoint protects committed WAL; sanitized snapshots are not migration sources.
 
 ```sh
 COORDINATOR_DATABASE_URL_FILE="$PRIVATE/database.url" \
 NODE_EXTRA_CA_CERTS="$PRIVATE/ca.crt" \
   node --import tsx scripts/migrate.ts
+COORDINATOR_DATABASE_URL_FILE="$PRIVATE/runner-database.url" \
+NODE_EXTRA_CA_CERTS="$PRIVATE/ca.crt" \
+  node --import tsx scripts/migrate.ts
 node --import tsx scripts/import-sqlite.ts \
   --source "$LEGACY_SQLITE_FILE" \
+  --runner-source "$LEGACY_RUNNER_SQLITE_FILE" \
   --broker-config "$PRIVATE/host-broker.json" \
   --runner-config "$PRIVATE/host-runner.json" \
   --artifact "$IMPORT_ARTIFACT" --source-sha "$SOURCE_SHA" \
   --offline-maintenance --hold-accepted-work
 ```
 
-LEGACY_SQLITE_FILE is the canonical private original; IMPORT_ARTIFACT is a new private700-parent path. Omit runner config only for actual broker-only data. Explicit hold acknowledgment parks copied accepted work HELD; never clears occupied uncertainty or grants execution. Failed partial targets stay recovery-fenced; never bypass the gate/delete source. Inventory preserved outcomes and prove private no-dispatch acceptance before reopening.
+IMPORT_ARTIFACT is a new private0700-parent path; both legacy inputs must remain outside archived runner roots. Omit **both** runner-source/runner-config and the runner migration only for genuinely broker-only data. Explicit hold parks accepted work HELD without clearing occupied uncertainty. Partial targets remain recovery-fenced: quarantine and retry only separately fresh targets, never bypass gate/delete source. Verify paired PG journal/workspace/native state and actual private no-dispatch acceptance before retiring retained SQLite files or reopening.
 
 For the parent/operator **disposable** real-PostgreSQL import gate, with a private dedicated admin URL file (never production credentials):
 
@@ -579,7 +595,7 @@ Use the same isolated Linux/tooling/six-capability conditions as recovery smoke.
 
 Record exact source SHA, successful trusted-source CI run, image digest/signature/provenance/SBOM, chart version and archive checksum (OCI digest only after actual publication), supported client/SDK versions and freshly reloaded client identity. Separately record disposable clean install, private TLS/auth rejection/SELECT1/no-dispatch evidence, runner independent pinned checkouts/real provider model turn/isolation, duplicate broker fencing, durable restart/no-replay, protected recovery rehearsal and actual off-cluster retrieval/secret reconstruction. Do not print raw config/tokens/DB contents or publicize full recovery metadata.
 
-Current beta remains **prepared, not live**. See the [current gate ledger](deployment-research.md#current-gate-ledger-requirements-not-unobserved-success): generator9.0.2 publication/root generation/native ESM and latest local Effect/generated/native build checks passed; corrected filtered32 broker/runner tests passed; actual stock Pi1.0.4/OMP18.6.1 host controls passed54 fixture model calls/zero external calls; protected offline paired recovery and committed-WAL SQLite→PostgreSQL v1/v2 import passed, preserving BigInt/microseconds/0–1/UUID/no replay. The corrected complete unfiltered native suite **passed89/89 with zero failures/cancellations/skips/todos in575.17s**, superseding the earlier62pass/27fail run. Current source/fresh-dist disposable snapshot is not a release source SHA. PostgreSQL18.6/tmpfs/Node24/UID1000/six-capability fixtures do not establish physical-disk/PVC, off-cluster retrieval, production-image, live TLS/credential/CA-rotation or reconciliation acceptance. Bounded real SDK POST/SSE progress/cleanup passed, not sustained capacity/saturated-backpressure/exact private-scope counts. Reader remains absent and must be environment-only in `coordinator-beta-promotion`; package Actions read grants remain unverified external prerequisites.
+Current beta.4 is **prepared, unpublished and not live**. Observed local `pnpm check` passed. Under disposable PG18.6/Node24.21/Bun1.4.2, UID/GID1000/six caps/noFOWNER/NoNewPrivs/privateHOME, real stock Pi1.0.4/OMP18.6.1 smoke made56 fixture calls/zero external calls, recovered poll503 via heartbeat/poll and paused presence403 traffic for11s, with one held provider request/completion and zero retired traffic. Broker+runner offline import passed committed WAL/queuev1/v2/BigInt/sequence floors/microseconds/booleans/empty-target/flock/accepted HELD/no replay. Real PG paired recovery reopened both roles retaining workspace/native state, excluding credentials, preserving occupied uncertainty and zero launcher invocations. No full-suite/review/CI/publication/live migration success is claimed.
 
 Outstanding prerequisites are concrete: authorized private artifacts/source access; completed source/history/redistribution review for any public release; owner-controlled source/deployment branch protection where platform permits; cluster admission trust configuration; operator Secret/TLS/DNS/model/repository/storage inputs; and recorded main/operator gates. None is supplied by a fake sample credential, `.invalid` model, historical homelab Healthy status or unexecuted command.
 
@@ -607,7 +623,7 @@ Operator acceptance then uses the explicit commands in sections4–8: Helm stric
 | Generator normal release/pin + regenerated contracts | Published9.0.2, exact root pin/install/generation/native ESM and latest local checks passed; committed-output/same-source normal CI remains required. |
 | Exact-source normal CI + production image migration + signed image/chart/private prerelease | Prepared gates; intended-source success/artifact coordinates must be recorded. |
 | Isolated CNPG/independent secret/CA/backup + CP placement | Prepared operator intent; actual backend access/restore/node placement must be accepted. |
-| Disposable PostgreSQL install/native/MCP/rotation/paired recovery/import | Complete unfiltered89/89 with zero skips, filtered32, stock-host54/zero-external, offline paired recovery and v1/v2 WAL import passed locally. Physical-storage/off-cluster/live rotation/install gates remain required. |
+| Disposable PostgreSQL install/native/MCP/rotation/paired recovery/import | Local stock-host56/zero-external, paired PG recovery and broker+runner WAL import passed as above; full-suite/image/install/physical-storage/off-cluster/live rotation gates remain required. |
 | Beta GitOps reconcile/private route | **Prepared, not yet deployed/accepted**; production/public/Hindsight unchanged. |
 | Public/open-source distribution | Separate owner release: MIT selected, history/redistribution review, branch governance and anonymous source/image/chart install still required. |
 

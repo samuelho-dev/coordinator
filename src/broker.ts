@@ -1,6 +1,6 @@
 import { Cause, Clock, Config, Context, Deferred, Effect, Exit, Layer, Option, Schedule, Schema, Scope, Semaphore } from "effect";
 import * as PersistedQueue from "effect/persistence/PersistedQueue";
-import { BrokerPostgres } from "./postgres.ts";
+import { Postgres } from "./postgres.ts";
 import * as SqlClient from "effect/sql/SqlClient";
 import { HttpClient, HttpServer } from "effect/http";
 import { Commands, Address, Work, TaskId, SessionId, IncarnationId, PrincipalId, ArchiveEntryId, RunnerId, WorkerId, Repo, Sha, Hash, BrokerConfig, Task, LiveSession, ArchivePayload, ArchiveEntry, ArchiveRow, JournalState, Json, JsonValue, Poll, Delivery, EvidenceObservation, HttpError, type CommandCapabilities, type CommandInput, type CommandOutput, type BrokerRequest, type Principal, type Role, type SessionKey, type LiveRunner } from "./contracts.ts";
@@ -39,8 +39,8 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       yield* Deferred.fail(fatal, new HttpError({ status: 503, message: "Broker database ownership unavailable" }));
       yield* Scope.close(ledgerScope, Exit.void);
     });
-    const databaseContext = yield* owned(Layer.build(BrokerPostgres.layer(config.databaseUrlFile)).pipe(Effect.provideService(Scope.Scope, ledgerScope)));
-    const database = Context.get(databaseContext, BrokerPostgres);
+    const databaseContext = yield* owned(Layer.build(Postgres.layer(config.databaseUrlFile)).pipe(Effect.provideService(Scope.Scope, ledgerScope)));
+    const database = Context.get(databaseContext, Postgres);
     const sql = database.sql;
     const { client: db, execute } = Context.get(databaseContext, Database);
     yield* database.failure.pipe(

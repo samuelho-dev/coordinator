@@ -1,62 +1,42 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Effect, Layer } from "effect";
-import { Reactivity } from "effect/reactivity";
-import * as SqliteClient from "@effect/sql-sqlite-node/SqliteClient";
 import type { ContractMarkerRow } from "@prisma/orm-postgres/family/verify";
 import type { LedgerEntryRecord } from "@prisma/orm-postgres/contract/types";
-import { assertBrokerSchema, brokerSchemaIdentity, brokerStorageHash, migrateRunner } from "../src/database.ts";
+import { assertBrokerSchema, assertRunnerSchema, brokerSchemaIdentity, brokerStorageHash } from "../src/database.ts";
 import { Platform } from "../src/platform.ts";
 import { SqlClient } from "effect/sql";
 import { dropPostgres, postgresAdmin, provisionPostgres } from "./postgres-fixture.ts";
 import { migrateBrokerPostgres } from "../scripts/migrate.ts";
 import { makeDatabase } from "../src/kysely.ts";
+import { Hash, IncarnationId } from "../src/contracts.ts";
 import {
   type ArchiveInsert, EffectQueueMigrationsId, RecoveryGateId, type RecoveryGateInsert, type TasksInsert, TasksId
 } from "../src/generated/database/types.ts";
 
-test("runner legacy rows preserve HELD occupancy through repeated native binding migration", () => Effect.runPromise(
+test("runner committed PostgreSQL schema preserves held occupancy and rolls back uncertain changes", () => Effect.runPromise(
   Effect.scoped(Effect.gen(function*() {
     const platform = yield* Platform;
-    const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-migrations-" });
-    const filename = platform.path.join(directory, "runner.sqlite");
-    yield* Effect.scoped(Effect.gen(function*() {
-      const runner = yield* SqliteClient.make({ filename });
-      yield* runner.unsafe(`CREATE TABLE tasks (taskId TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, work TEXT NOT NULL,
-        worktree TEXT NOT NULL, state TEXT NOT NULL, occupied INTEGER NOT NULL, pid INTEGER,
-        incarnation TEXT NOT NULL, address TEXT, promptId TEXT, reason TEXT, result TEXT)`);
-      yield* runner.unsafe("CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL, payload TEXT NOT NULL)");
-      yield* runner.unsafe("CREATE TABLE owner (id INTEGER PRIMARY KEY, pid INTEGER)");
-      yield* runner.unsafe("INSERT INTO owner VALUES (1,123)");
-      yield* runner.unsafe("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ["legacy", "fingerprint", "work", "worktree", "HELD", 1, 123, "incarnation", "address", "prompt", "diagnostic", "result"]);
-      yield* runner.unsafe("INSERT INTO events(taskId,payload) VALUES (?,?)", ["legacy", "metadata"]);
-      const tasks = yield* runner.unsafe("SELECT * FROM tasks");
-      const events = yield* runner.unsafe("SELECT * FROM events");
-      yield* migrateRunner(runner);
-      // Node all() reads column count before sqlite3_step reparses cached SELECT * after ALTER.
-      assert.deepEqual(yield* runner.unsafe("SELECT taskId,fingerprint,work,worktree,state,occupied,pid,incarnation,address,promptId,reason,result FROM tasks"), tasks);
-      assert.deepEqual(yield* runner.unsafe("SELECT taskId,detached FROM tasks").values, [["legacy", 0]]);
-      yield* migrateRunner(runner);
-      assert.deepEqual(yield* runner.unsafe("SELECT taskId,detached FROM tasks").values, [["legacy", 0]]);
-      assert.deepEqual(yield* runner.unsafe("SELECT * FROM events"), events);
-      assert.deepEqual(yield* runner.unsafe("SELECT name FROM sqlite_master WHERE type='table' AND name='owner'"), []);
-      assert.deepEqual(yield* runner.unsafe("SELECT nativeBinding,nativeRunId,nativeCursor FROM tasks").values, [[null, null, 0]]);
-      const binding = JSON.stringify({ host: "omp", sessionId: "native-session", incarnation: "native-incarnation", generation: 2 });
-      yield* runner.unsafe("UPDATE tasks SET detached=1,nativeBinding=?,nativeRunId='run-1',nativeCursor=7 WHERE taskId='legacy'", [binding]);
-      const rollback = yield* runner.withTransaction(Effect.gen(function*() {
-        yield* runner.unsafe("UPDATE tasks SET nativeRunId='uncertain',nativeCursor=8,occupied=0 WHERE taskId='legacy'");
-        return yield* Effect.fail("rollback");
+    const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-runner-schema-" });
+    const urlFile = yield* provisionPostgres(directory);
+    yield* Effect.addFinalizer(() => dropPostgres(urlFile).pipe(Effect.orDie));
+    yield* Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient, db = makeDatabase(sql);
+      yield* assertRunnerSchema(sql);
+      yield* db.execute(db.client.insertInto("runner_tasks").values({
+        taskId: TasksId.make("held"), fingerprint: Hash.make("a".repeat(64)), work: "{}", worktree: "/held",
+        state: "HELD", occupied: 1, incarnation: IncarnationId.make("incarnation"),
+      }).returning("taskId"));
+      const before = yield* db.execute(db.client.selectFrom("runner_tasks").selectAll());
+      const rollback = yield* sql.withTransaction(Effect.gen(function*() {
+        yield* db.execute(db.client.updateTable("runner_tasks").set({ occupied: 0 }).where("taskId", "=", TasksId.make("held")).returning("taskId"));
+        return yield* Effect.fail("uncertain");
       })).pipe(Effect.result);
       assert.equal(rollback._tag, "Failure");
-      assert.deepEqual(yield* runner.unsafe("SELECT nativeBinding,nativeRunId,nativeCursor,occupied FROM tasks").values, [[binding, "run-1", 7, 1]]);
-    }));
-    const runner = yield* SqliteClient.make({ filename });
-    yield* migrateRunner(runner);
-    yield* migrateRunner(runner);
-    assert.deepEqual(yield* runner.unsafe("SELECT taskId,fingerprint,work,worktree,state,occupied,pid,incarnation,address,promptId,reason,result,detached FROM tasks").values, [["legacy", "fingerprint", "work", "worktree", "HELD", 1, 123, "incarnation", "address", "prompt", "diagnostic", "result", 1]]);
-    assert.deepEqual(yield* runner.unsafe("SELECT seq,taskId,payload FROM events").values, [[1, "legacy", "metadata"]]);
-    assert.deepEqual(yield* runner.unsafe("SELECT nativeBinding,nativeRunId,nativeCursor FROM tasks").values, [[JSON.stringify({ host: "omp", sessionId: "native-session", incarnation: "native-incarnation", generation: 2 }), "run-1", 7]]);
-  })).pipe(Effect.provide(Layer.merge(Reactivity.layer, Platform.layer)))
+      yield* assertRunnerSchema(sql);
+      assert.deepEqual(yield* db.execute(db.client.selectFrom("runner_tasks").selectAll()), before);
+    }).pipe(Effect.provide(postgresAdmin(urlFile)), Effect.scoped);
+  })).pipe(Effect.provide(Platform.layer))
 ));
 
 test("committed PostgreSQL migrations preserve opaque rows and reject version or recovery uncertainty", () => Effect.runPromise(
@@ -101,6 +81,7 @@ test("committed PostgreSQL migrations preserve opaque rows and reject version or
         .values({ ...archive, payload: "changed", created: 2 }).returning("sequence")).pipe(Effect.result))._tag, "Failure");
       yield* db.execute(db.client.insertInto("recovery_gate").values({ id: gateId, ready: false }).returning("id"));
       assert.equal((yield* assertBrokerSchema(sql).pipe(Effect.result))._tag, "Failure");
+      assert.equal((yield* assertRunnerSchema(sql).pipe(Effect.result))._tag, "Failure");
       assert.match(yield* brokerSchemaIdentity(sql), new RegExp(`^${brokerStorageHash}:queue=`));
       yield* db.execute(db.client.updateTable("recovery_gate").set({ ready: true }).where("id", "=", gateId).returning("id"));
       yield* db.execute(db.client.updateTable("effect_queue_migrations")
@@ -120,10 +101,10 @@ test("committed PostgreSQL migrations preserve opaque rows and reject version or
       yield* db.execute(metadata.updateTable("prisma_contract.marker")
         .set({ profile_hash: marker.profile_hash }).where("space", "=", "app").returning("space"));
       yield* db.execute(metadata.updateTable("prisma_contract.ledger")
-        .set({ migration_hash: "wrong" }).where("space", "=", "app").returning("space"));
+        .set({ migration_hash: "wrong" }).where("space", "=", "app").where("migration_hash", "=", ledger.migration_hash).returning("space"));
       assert.equal((yield* assertBrokerSchema(sql).pipe(Effect.result))._tag, "Failure");
       yield* db.execute(metadata.updateTable("prisma_contract.ledger")
-        .set({ migration_hash: ledger.migration_hash }).where("space", "=", "app").returning("space"));
+        .set({ migration_hash: ledger.migration_hash }).where("space", "=", "app").where("migration_hash", "=", "wrong").returning("space"));
       yield* db.execute(metadata.updateTable("prisma_contract.marker")
         .set({ core_hash: "wrong" }).where("space", "=", "app").returning("space"));
       assert.equal((yield* assertBrokerSchema(sql).pipe(Effect.result))._tag, "Failure");

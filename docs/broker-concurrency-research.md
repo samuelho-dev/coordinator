@@ -1,4 +1,8 @@
-# Broker concurrency and durable SQLite transactions
+# Historical broker concurrency and durable SQLite transactions
+
+**Superseded runtime:** this records the October12 SQLite investigation and worker correction, not the current beta.4 architecture. Broker and runner now require separate private external PostgreSQL18 databases with session-advisory ownership; the SQLite runtime adapter/dependency and worker files were deleted. Only the offline legacy importer uses `node:sqlite`. Historical measurements below remain evidence of scheduling versus physical I/O, not new PostgreSQL acceptance or proof that production contention is fixed. See [current operator procedures](self-hosting.md).
+
+The authorized cutover is the existing live broker and homelab runner, not a separate beta or Mac runner. Mac plugin access remains through the broker; native SDK history is not Coordinator SQLite runtime. PostgreSQL ownership loss fences database serving/writes/readiness but preserves admitted native work until validated completion and cheap liveness200. Explicitly drain before restart; no automatic PostgreSQL reconnect or replay. Local kernel ownership loss remains a hard fence. Bounded current proof completed an actual native run under childUID3000000001 after PG backend death with ready503/live200 and retained the same prompt/run HELD without replay on restart; full suite/CI/publication/live acceptance are pending.
 
 ## Question and conclusion
 
@@ -18,7 +22,7 @@ Can Coordinator retain concurrent requests and Effect fibers while keeping corre
 
 ## Historical inspected adapter and runtime facts
 
-At the **2026-10-12 investigation**, repository dependencies pinned `@effect/sql-sqlite-node` and `@effect/platform-node` to **4.0.2**, with `effect` at commit **d6082a25a3779f7e2abba2787323d5d9c7e1d24a**, and Node >=22.16. The **2026-10-13 follow-up** upgrades the repository to published **Effect/platform-node/sql-sqlite-node 4.0.3** and Node >=22.19 ([package.json](../package.json)); the image remains Node **24.21.0** ([Dockerfile](../Dockerfile)). Preserve the investigation's versioned source citations and measurements below as historical, not a fresh measurement of the deployed process or acceptance of the new runtime. The local mechanism check below ran on Node **26.4.0**; Node24 documentation establishes the synchronous API contract.
+At the **2026-10-12 investigation**, dependencies pinned `@effect/sql-sqlite-node` and `@effect/platform-node` to **4.0.2**, with `effect` at commit **d6082a25a3779f7e2abba2787323d5d9c7e1d24a**, and Node >=22.16. The **2026-10-13 historical follow-up** used published Effect/platform-node/sql-sqlite-node4.0.3. The current PostgreSQL cutover removes sql-sqlite-node entirely. Preserve the versioned citations below; current package/source files do not reproduce that historical adapter.
 
 The official 4.0.2 SQLite adapter source confirms: [7]
 
@@ -28,7 +32,7 @@ The official 4.0.2 SQLite adapter source confirms: [7]
 - WAL is enabled by default on writable clients; `busyTimeout` defaults to five seconds and is applied with `PRAGMA busy_timeout`.
 - There is **no async/worker mode option for query execution**. `backup()` uses Node's Promise-returning backup API, an exception that does not make normal queries asynchronous. [7]
 
-Current broker source explicitly sets WAL, FULL, and a 5,000ms busy timeout and wraps non-remote command execution in `sql.withTransaction`: [src/broker.ts](../src/broker.ts). Current repository source differs from deployed image source; the prior investigation recorded matching local/deployed adapter SHA-256 `a3c53f5ab983ed5338c3f829cc9d8f11e54f55182f119720f83c1aea3a0c7820`. That is inherited incident evidence, not a fresh production verification in this research.
+The inspected historical broker explicitly set WAL, FULL and a5,000ms busy timeout and wrapped non-remote commands in `sql.withTransaction`. This is not current broker wiring. The prior investigation recorded matching local/deployed adapter SHA-256 `a3c53f5ab983ed5338c3f829cc9d8f11e54f55182f119720f83c1aea3a0c7820`; inherited incident evidence, not fresh production verification.
 
 Node24 documents all `DatabaseSync` APIs as synchronous. The pinned Effect runtime evaluates synchronous thunks directly; Effect fibers, `runPromise`, or a Promise wrapper do not automatically offload those thunks. **Inference from these implementations:** while a SQLite native call waits on a lock or storage on the HTTP thread, that thread cannot service unrelated HTTP/timer work until the call returns. [4][7][9]
 
@@ -81,9 +85,9 @@ Next discriminating evidence should be gathered locally or during an explicitly 
 
 **Research-phase decision:** retain concurrency and FULL durability; distinguish event-loop blocking from physical-storage latency before choosing worker execution, narrower read/write transaction routing, checkpoint changes, or workload/storage isolation. Storage migration and reduced CI concurrency are not prerequisites.
 
-## Implemented scheduling isolation
+## Historical implemented scheduling isolation (deleted runtime)
 
-`src/sqlite.ts` and `src/sqlite-worker.ts` use the installed Effect worker/RPC infrastructure and native SQLite adapter. Each database has one worker owner. The broker ledger and snapshot sanitizer execute SQLite outside the HTTP thread; the runner is unchanged. Scoped permits cover asynchronous statement completion, whole transactions and backup. Native savepoints, COMMIT failure cleanup, interruption rollback and FULL durability remain intact.
+The now-deleted `src/sqlite.ts` and `src/sqlite-worker.ts` used the installed Effect worker/RPC infrastructure and native SQLite adapter. Each database had one worker owner. Broker ledger/snapshot sanitization executed outside HTTP; the then-current runner stayed SQLite. Scoped permits covered asynchronous statement completion, transactions and backup; savepoints, COMMIT cleanup, interruption rollback and FULL durability remained intact. PostgreSQL ownership now supersedes this implementation.
 
 Worker loss permanently fences the connection and revokes broker authorization/serving; there is no worker replacement or work replay. RPC uses `Schema.toCodecIso` on both ends: it reconstructs exits/errors while preserving native bigint/blob values through structured clone. The default worker JSON codec rejects bigint inside `Unknown`; passing schemas through unchanged loses `Exit` reconstruction.
 
@@ -99,7 +103,7 @@ The worker isolates scheduling, not storage latency: DB-dependent requests still
 The actual `src/main.ts broker` CLI also ran under Node24.21.0: authenticated health returned in28 ms while an MCP heartbeat waited1,869 ms for an external writer. The session lease renewed after release, the same bound session polled successfully, and SIGTERM closed the process. The permanent real-broker regression failed on the original synchronous wiring with a500 ms health timeout and passed after cutover. Separate native checks exercised bigint/blob/SafeIntegers, transaction visibility, savepoint rollback, interrupted transaction cleanup, failed COMMIT/inactive-transaction recovery, backup reopening and fail-closed owner termination. Terminating the actual ledger worker revoked HTTP serving rather than leaving health green.
 
 
-Development-worktree verification: native plugin build and pinned-Node24 typecheck passed; the complete serial suite passed all96 tests under UID1000, six supervisor capabilities, NoNewPrivs and private HOME. Deployment isolation intentionally excludes unrelated pending changes. Its pinned-Node24 build/typecheck and real HTTP contention regression passed separately; normal full same-source CI/signing remains the publication gate. The regression remains in `test/broker.test.ts`. Diagnostic state was removed. No storage migration, CI concurrency reduction or dispatched-work replay was performed.
+Historical development-worktree verification: native build and pinned-Node24 typecheck passed; the complete serial suite passed96 tests under UID1000/six capabilities/NoNewPrivs/private HOME. Its isolated deployment correction passed typecheck and real HTTP contention separately. These are worker-era results, not beta.4 gates; current PostgreSQL tests supersede that regression wiring. Diagnostic state was removed. No storage migration, CI concurrency reduction or replay was performed in that investigation.
 
 ## Primary sources
 

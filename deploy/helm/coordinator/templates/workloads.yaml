@@ -25,7 +25,7 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  replicas: 1
+  replicas: {{ ternary 0 1 $.Values.suspended }}
   strategy:
     type: Recreate
   selector:
@@ -84,7 +84,6 @@ spec:
             {{- else }}
             - {name: work, mountPath: /work}
             {{- end }}
-        {{- if eq $role "broker" }}
         - name: migrate
           image: {{ printf "%s@%s" $repository $digest | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
@@ -109,7 +108,6 @@ spec:
             {{- if $caSecret }}
             - {name: ca, mountPath: /etc/coordinator/ca, readOnly: true}
             {{- end }}
-        {{- end }}
       containers:
         - name: {{ $role }}
           image: {{ printf "%s@%s" $repository $digest | quote }}
@@ -154,27 +152,15 @@ spec:
           ports:
             - {name: http, containerPort: {{ $settings.port }}, protocol: TCP}
           startupProbe:
-            {{- if eq $role "broker" }}
             httpGet: {path: /livez, port: http}
-            {{- else }}
-            exec:
-              command: [curl, --fail, --silent, --show-error, --max-time, "3", --header, "@/config/health.header", {{ printf "http://127.0.0.1:%v/healthz" $settings.port | quote }}]
-            timeoutSeconds: 5
-            {{- end }}
             periodSeconds: 5
             failureThreshold: 60
           livenessProbe:
-            {{- if eq $role "broker" }}
             httpGet: {path: /livez, port: http}
-            {{- else }}
-            exec:
-              command: [curl, --fail, --silent, --show-error, --max-time, "3", --header, "@/config/health.header", {{ printf "http://127.0.0.1:%v/healthz" $settings.port | quote }}]
-            timeoutSeconds: 5
-            {{- end }}
             periodSeconds: 20
           readinessProbe:
             exec:
-              command: [curl, --fail, --silent, --show-error, --max-time, "3", --header, "@/config/health.header", {{ printf "http://127.0.0.1:%v/%s" $settings.port (ternary "readyz" "healthz" (eq $role "broker")) | quote }}]
+              command: [curl, --fail, --silent, --show-error, --max-time, "3", --header, "@/config/health.header", {{ printf "http://127.0.0.1:%v/readyz" $settings.port | quote }}]
             periodSeconds: 5
             timeoutSeconds: 5
           resources:

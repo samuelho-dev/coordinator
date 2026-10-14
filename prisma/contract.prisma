@@ -79,3 +79,36 @@ model recovery_gate {
   ready Boolean
   @@check(expression: "id = 1", name: "recovery_gate_singleton")
 }
+model runner_tasks {
+  sequence Int @id @default(autoincrement())
+  /// @customType(Schema.String.pipe(Schema.brand("TasksId")))
+  taskId String @unique
+  /// @customType(Schema.String.pipe(Schema.brand("@samuelho/coordinator/Hash")))
+  fingerprint String
+  work String
+  worktree String
+  state String
+  occupied Int
+  /// @customType(Schema.Int.pipe(Schema.brand("ProcessId")))
+  pid Int?
+  /// @customType(Schema.String.pipe(Schema.brand("@samuelho/coordinator/IncarnationId")))
+  incarnation String
+  address String?
+  /// @customType(Schema.String.pipe(Schema.brand("NativeSubmissionId")))
+  promptId String?
+  nativeBinding String?
+  /// @customType(Schema.String.pipe(Schema.brand("NativeRunId")))
+  nativeRunId String?
+  /// @customType(Schema.Int.pipe(Schema.brand("NativeEventSequence")))
+  nativeCursor Int @default(0)
+  reason String?
+  result String?
+  detached Int @default(0)
+}
+model runner_events {
+  seq Int @id @default(autoincrement())
+  /// @customType(Schema.String.pipe(Schema.brand("TasksId")))
+  taskId String
+  payload String
+  @@index([taskId, seq])
+}
