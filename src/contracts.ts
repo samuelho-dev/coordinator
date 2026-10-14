@@ -234,6 +234,8 @@ export const Context = Schema.Struct({
   ui: Schema.Struct({
     notify: Schema.declare<(text: string, level?: "info" | "warning" | "error") => void>((value): value is (text: string, level?: "info" | "warning" | "error") => void => typeof value === "function"),
     confirm: Schema.declare<(title: string, text: string) => Promise<boolean>>((value): value is (title: string, text: string) => Promise<boolean> => typeof value === "function"),
+    setStatus: Schema.optional(Schema.declare<(key: string, text: string | undefined) => void>((value): value is (key: string, text: string | undefined) => void => typeof value === "function")),
+    onTerminalInput: Schema.optional(Schema.declare<(handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void>((value): value is (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void => typeof value === "function")),
   }),
 });
 export type Context = typeof Context.Type;
@@ -464,7 +466,12 @@ export type McpEndpoint = {
   readonly handle: (principal: string, request: RunnerRequest) => Effect.Effect<CommandOutput<RunnerRequest["method"]>, unknown>;
 };
 
-export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", { status: Schema.Int, message: Schema.String }) {}
-export class CommandError extends Schema.TaggedError<CommandError>()("CommandError", { message: Schema.String }) {}
+export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", {
+  status: Schema.Int, message: Schema.String,
+  retryAfter: Schema.optional(Schema.String.check(Schema.isMaxLength(512))),
+  wwwAuthenticate: Schema.optional(Schema.String.check(Schema.isMaxLength(512))),
+  protocolCode: Schema.optional(Schema.Int),
+}) {}
+export class CommandError extends Schema.TaggedError<CommandError>()("CommandError", { message: Schema.String, reason: Schema.optional(Schema.Literals(["transport", "protocol"])) }) {}
 export class BackupError extends Schema.TaggedError<BackupError>()("BackupError", { message: Schema.String }) {}
 export class PluginDeclined extends Schema.TaggedError<PluginDeclined>()("PluginDeclined", { message: Schema.String }) {}

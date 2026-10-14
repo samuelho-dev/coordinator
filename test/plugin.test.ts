@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Cause, Clock, ConfigProvider, Context as EffectContext, Deferred, Effect, Layer, Schema, Sink, Stdio } from "effect";
+import { Cause, Clock, ConfigProvider, Context as EffectContext, Deferred, Duration, Effect, Layer, Schema, Sink, Stdio } from "effect";
 import { ChildProcess } from "effect/process";
+import { TestClock } from "effect/testing";
 import { HttpServer } from "effect/http";
 import { NativeBinding, NativeEventSequence, NativeRunId } from "@samuelho/coordinator-native-control/contracts";
 import { Mcp, serverLayer } from "../src/http.ts";
 import { Platform, redactedCause } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
-import { CommandError, Delivery, HttpError, Task, Principal, PluginConfig, JournalReleaseKey } from "../src/contracts.ts";
+import { CommandError, Delivery, HttpError, Task, Principal, PluginConfig, JournalReleaseKey, SessionId } from "../src/contracts.ts";
 import type { Context, BrokerRequest, CommandOutput } from "../src/contracts.ts";
 import { Plugin } from "../src/plugin.ts";
 
@@ -33,14 +34,18 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
   yield* platform.fs.makeDirectory(configDirectory, { recursive: true, mode: 0o700 });
   yield* platform.fs.writeFileString(tokenFile, "test-token", { mode: 0o600 });
   const terminalOutput: string[] = [], notifications: string[] = [];
+  let terminalInput: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
   const ctx: Context = { cwd: directory, mode: "tui", hasUI: true, model: { provider: "coordinator-unavailable", id: "unavailable" },
     sessionManager: { getSessionId: () => "surrounding-host-session" },
-    ui: { notify: (text) => { notifications.push(text); }, confirm: async () => false } };
+    ui: { notify: (text) => { notifications.push(text); }, confirm: async () => false,
+      onTerminalInput: (handler) => { terminalInput = handler; return () => { terminalInput = undefined; }; } } };
   let identity: { sessionId: string; incarnation: string; workerId?: string | undefined } | undefined;
   let task: Task | undefined;
   let attempts = 0;
   let brokerRequests = 0;
-  const reported = yield* Deferred.make<void>();
+  let delivered = false, conflictPolls = 0;
+  let polled = yield* Deferred.make<void>();
+  const admitted = yield* Deferred.make<void>();
   const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
   yield* mcp.serve(server, { target: "broker",
     authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
@@ -58,19 +63,28 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
           task = Schema.decodeUnknownSync(Task)({ taskId: "task", owner: "owner", fingerprint: yield* platform.fingerprint(work), state: "ACCEPTED", createdAt: now, updatedAt: now,
             address, readback: address, confirmedRevision: 1, disposition: "ready", request: work });
         }
-        return { liveUntil: now + 30000 };
+        return { liveUntil: now + 30000 } satisfies CommandOutput<typeof request.method>;
       }
-      if (request.method === "session.poll") return { messages: [], offers: [], releases: task === undefined ? [] : [task] };
-      if (request.method === "session.stop") return { stopped: true } satisfies CommandOutput<"session.stop">;
+      if (request.method === "session.poll") {
+        yield* Deferred.succeed(polled, undefined);
+        const messages = delivered ? [Schema.decodeUnknownSync(Delivery)({ messageId: "delivery-conflict", incarnation: request.params.incarnation,
+          payload: ++conflictPolls, expiresAt: now + 60000 })] : [];
+        return { messages, offers: [], releases: task === undefined ? [] : [task] } satisfies CommandOutput<typeof request.method>;
+      }
+      if (request.method === "peer.ack") return { handled: true } satisfies CommandOutput<typeof request.method>;
+      if (request.method === "session.stop") return { stopped: true } satisfies CommandOutput<typeof request.method>;
       if (request.method === "task.report" && task !== undefined) {
         const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, request.params.sessionId)), Journal);
         assert.equal(persisted.state.releases[JournalReleaseKey.make("task:1")], "sent", "SDK admission must follow durable intent before reporting");
-        if (request.params.state === "RUNNING") attempts++;
-        else {
-          assert.equal(request.params.state, "FAILED");
-          yield* Deferred.succeed(reported, undefined);
+        if (request.params.state === "RUNNING") {
+          attempts++;
+          yield* Deferred.succeed(admitted, undefined);
+          return yield* new HttpError({ status: 503, message: "PRIVATE_LOST_ADMISSION_REPORT" });
+        } else {
+          assert.ok(request.params.state === "FAILED" || request.params.state === "HELD");
+          delivered = true;
         }
-        return { ...task, state: request.params.state, result: request.params.result };
+        return { ...task, state: request.params.state, result: request.params.result } satisfies CommandOutput<typeof request.method>;
       }
       return yield* new CommandError({ message: "Unexpected broker route" });
     }).pipe(Effect.scoped, Effect.provideService(Platform, platform)),
@@ -83,14 +97,20 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
   const service = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
     Layer.provide(Layer.succeed(Platform, platform)),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ XDG_CONFIG_HOME: platform.path.join(directory, "config") }))),
-    Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(true), stdout: () => Sink.forEach((chunk: string | Uint8Array) => Effect.sync(() => { if (typeof chunk === "string") terminalOutput.push(chunk); })) })),
+    Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(true), stdout: () => Sink.forEach((chunk: string | Uint8Array) => Effect.sync(() => {
+      if (typeof chunk !== "string") return;
+      terminalOutput.push(chunk);
+      if (chunk.includes("7501;?")) queueMicrotask(() => terminalInput?.("\x1b]7501;?\x1b\\"));
+    })) })),
   )), Plugin);
   assert.ok(service);
   yield* service.command("hi", ctx);
   assert.match(notifications.at(-1) ?? "", /\/coordinator help/, "Unknown actions must give a usable help command");
   assert.equal(brokerRequests, 0, "Unknown actions must not reach the broker or enroll a session");
   yield* service.start(ctx);
-  yield* Deferred.await(reported).pipe(Effect.timeout("15 seconds"));
+  yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
+  yield* Deferred.await(admitted).pipe(Effect.timeout("15 seconds"));
+  polled = yield* Deferred.make<void>();
   assert.ok(identity);
   assert.notEqual(identity.sessionId, ctx.sessionManager.getSessionId());
   assert.equal(identity.workerId, identity.sessionId);
@@ -102,21 +122,33 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
   assert.match(terminalOutput.at(-1) ?? "", /state=working/, "A continuation boundary is not settlement");
   yield* service.native({ type: "native_lifecycle", kind: "run_settled", binding, runId, at: 3, seq, outcome: "completed" }, ctx);
   assert.match(terminalOutput.at(-1) ?? "", /state=done/);
+  yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
+  assert.equal(attempts, 1, "A lost admission report cannot replay an already admitted native prompt during recovery");
+  const retained = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, SessionId.make(identity.sessionId))), Journal);
+  assert.equal(retained.state.releases[JournalReleaseKey.make("task:1")], "sent", "Journal pause cannot clear admitted release uncertainty");
+  for (const frame of terminalOutput.filter(frame => !frame.includes("7501;?"))) {
+    assert.match(frame, /id=coordinator/);
+    assert.match(frame, /app=coordinator/);
+  }
   const beforeMalformed = notifications.length;
   assert.equal((yield* Effect.exit(service.command('report {"secret":"private-command-content"', ctx)))._tag, "Failure");
   assert.ok(notifications.length > beforeMalformed);
   assert.ok(!notifications.some((text) => text.includes("private-command-content")));
   yield* service.command('confirm {"taskId":"task","revision":1}', ctx);
   yield* service.stop();
+  assert.ok(terminalOutput.some(frame => /id=coordinator/.test(frame) && /state=clear/.test(frame)), "Retirement clears only the owned PSP record");
   assert.equal((yield* Effect.exit(service.command("identity", ctx)))._tag, "Failure");
+  polled = yield* Deferred.make<void>();
   yield* service.start(ctx);
-  yield* Effect.sleep("1200 millis");
+  yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
   assert.equal(attempts, 1, "A new actual SDK identity cannot replay the prior addressed revision");
   for (const frame of terminalOutput) assert.ok(!/consumer-run|surrounding-host-session|private|test-token/.test(frame), "Terminal status contains only constant metadata");
 })).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer)))));
 
 test("a refused startup heartbeat retains scoped enrollment until its lease fence clears", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform, mcp = yield* Mcp;
+  const clock = yield* TestClock.make({ warningDelay: "1 minute" });
+  yield* clock.setTime(Date.now());
   const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-enrollment-" });
   yield* platform.fs.chmod(directory, 0o700);
   const agentDir = platform.path.join(directory, "agent");
@@ -129,49 +161,99 @@ test("a refused startup heartbeat retains scoped enrollment until its lease fenc
   const stateDirectory = platform.path.join(directory, "state"), tokenFile = platform.path.join(directory, "token"), config = platform.path.join(directory, "config.json");
   yield* platform.fs.writeFileString(tokenFile, "test-token", { mode: 0o600 });
   const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
-  const polled = yield* Deferred.make<void>();
-  const journalHeld = yield* Deferred.make<void>();
-  let heartbeatAttempts = 0, polls = 0;
+  const polled = yield* Deferred.make<void>(), retrying = yield* Deferred.make<void>();
+  const received = yield* Deferred.make<void>(), journalHeld = yield* Deferred.make<void>();
+  const retrySleeping = yield* Deferred.make<void>(), pollSleeping = yield* Deferred.make<void>();
+  const traffic: { method: string; sessionId: string; incarnation: string }[] = [];
+  let heartbeatAttempts = 0, polls = 0, liveUntil = 0, polledAt: number | undefined;
+  const eligible = () => polledAt !== undefined && clock.currentTimeMillisUnsafe() < liveUntil && clock.currentTimeMillisUnsafe() - polledAt < 10000;
+  const ownerClock: Clock.Clock = { ...clock, sleep: duration => Effect.gen(function*() {
+    // Synchronize socket completion with the loop's next virtual sleep, not wall time.
+    if (Duration.toMillis(duration) <= 1250) {
+      if (heartbeatAttempts === 1 && polls === 0) yield* Deferred.succeed(retrySleeping, undefined);
+      if (polls === 1) yield* Deferred.succeed(pollSleeping, undefined);
+    }
+    yield* clock.sleep(duration);
+  }) };
   yield* mcp.serve(server, { target: "broker", authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
     handle: (_principal, request: BrokerRequest) => Effect.gen(function*() {
-      if (request.method === "session.heartbeat") { heartbeatAttempts++; if (heartbeatAttempts === 1) return yield* new HttpError({ status: 409, message: "PRIVATE_ENDPOINT_TOKEN_PATH" }); return { liveUntil: (yield* Clock.currentTimeMillis) + 30000 }; }
+      if (request.method === "session.heartbeat") {
+        traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
+        heartbeatAttempts++;
+        if (heartbeatAttempts === 1) return yield* new HttpError({ status: 409, message: "PRIVATE_ENDPOINT_TOKEN_PATH" });
+        liveUntil = clock.currentTimeMillisUnsafe() + 30000;
+        return { liveUntil } satisfies CommandOutput<typeof request.method>;
+      }
       if (request.method === "session.poll") {
+        traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
+        polledAt = clock.currentTimeMillisUnsafe();
         polls++;
         yield* Deferred.succeed(polled, undefined);
         return { messages: [Schema.decodeUnknownSync(Delivery)({ messageId: "private-fixture-message", incarnation: request.params.incarnation,
-          payload: polls === 1 ? "PRIVATE_INITIAL_PAYLOAD" : "PRIVATE_CONFLICT_PAYLOAD", expiresAt: (yield* Clock.currentTimeMillis) + 60000 })], offers: [], releases: [] };
+          payload: polls === 1 ? "PRIVATE_INITIAL_PAYLOAD" : "PRIVATE_CONFLICT_PAYLOAD", expiresAt: clock.currentTimeMillisUnsafe() + 60000 })], offers: [], releases: [] } satisfies CommandOutput<typeof request.method>;
       }
-      if (request.method === "peer.ack") return { handled: true };
-      if (request.method === "session.stop") return { stopped: true };
+      if (request.method === "peer.ack") return { handled: true } satisfies CommandOutput<typeof request.method>;
+      if (request.method === "session.stop") {
+        traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
+        return { stopped: true } satisfies CommandOutput<typeof request.method>;
+      }
       return yield* new CommandError({ message: "Unexpected broker route" });
     }),
   });
   if (server.address._tag !== "InetAddressV4") return yield* new CommandError({ message: "Expected TCP server" });
   yield* platform.fs.writeFileString(config, Schema.encodeUnknownSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
-  const notifications: string[] = [];
-  const ctx: Context = { cwd: directory, mode: "rpc", hasUI: false,
+  const notifications: string[] = [], statuses = new Map<string, string>();
+  const ctx: Context = { cwd: directory, mode: "rpc", hasUI: true,
     sessionManager: { getSessionId: () => "parent-session" }, ui: { notify: (text) => {
       notifications.push(text);
-      if (text.includes("journal write") && text.includes("command failure")) Effect.runSync(Deferred.succeed(journalHeld, undefined));
+      if (text.includes("control paused")) Effect.runSync(Deferred.succeed(journalHeld, undefined));
+      if (text.includes("durably received")) Effect.runSync(Deferred.succeed(received, undefined));
+    }, setStatus: (key, value) => {
+      if (value === undefined) statuses.delete(key); else statuses.set(key, value);
+      if (key === "coordinator.network" && value === "Coordinator reconnecting") Effect.runSync(Deferred.succeed(retrying, undefined));
     }, confirm: async () => false } };
   const plugin = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
     Layer.provide(Layer.succeed(Platform, platform)),
+    Layer.provide(Layer.succeed(Clock.Clock, ownerClock)),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
     Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(false) })),
   )), Plugin);
   assert.ok(plugin);
-  assert.equal((yield* Effect.exit(plugin.start(ctx)))._tag, "Failure");
+  assert.equal((yield* Effect.exit(plugin.start(ctx).pipe(Effect.provideService(Clock.Clock, ownerClock), Effect.timeout("5 seconds"))))._tag, "Success", "Startup returns without waiting for broker recovery");
+  yield* Deferred.await(retrying).pipe(Effect.timeout("15 seconds"));
+  yield* Deferred.await(retrySleeping).pipe(Effect.timeout("15 seconds"));
+  assert.ok(!notifications.some(text => text.includes("PRIVATE_ENDPOINT_TOKEN_PATH") || text.includes(directory) || text.includes("test-token")), "Startup diagnostics do not expose broker secrets or private paths");
   assert.equal(heartbeatAttempts, 1);
-  assert.ok(notifications.some((text) => text.includes("session.heartbeat") && text.includes("409")), "Held startup identifies the failed broker operation and status");
-  assert.ok(!notifications.some((text) => text.includes("PRIVATE_ENDPOINT_TOKEN_PATH") || text.includes(directory) || text.includes("test-token")));
+  assert.equal(polls, 0);
+  assert.equal(eligible(), false, "A refused heartbeat cannot make the retained owner delivery eligible");
+  assert.equal((yield* Effect.exit(plugin.command("identity", ctx)))._tag, "Failure", "Broker control remains unavailable while enrollment is fenced; the retained scope must still recover below");
+  const refused = traffic[0];
+  assert.ok(refused);
+  yield* clock.adjust(999);
+  assert.deepEqual(traffic, [refused], "No polling or owner retirement occurs before the retry fence");
+  assert.equal(eligible(), false);
+  yield* clock.adjust(251);
   yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
   assert.equal(heartbeatAttempts, 2);
+  const recovered = traffic.find(call => call.method === "session.poll");
+  assert.ok(recovered);
+  assert.notEqual(recovered.incarnation, refused.incarnation, "Recovery must not reuse the refused native incarnation");
+  assert.deepEqual(traffic.map(call => call.method), ["session.heartbeat", "session.stop", "session.heartbeat", "session.poll"], "The old enrollment retires before a fresh heartbeat permits delivery");
+  assert.equal(traffic[1]?.incarnation, refused.incarnation);
+  assert.equal(traffic[2]?.incarnation, recovered.incarnation);
+  assert.equal(eligible(), true, "An actual fresh heartbeat and poll restore delivery eligibility");
+  yield* Deferred.await(received).pipe(Effect.timeout("15 seconds"));
+  yield* Deferred.await(pollSleeping).pipe(Effect.timeout("15 seconds"));
+  yield* clock.adjust(1000);
   yield* Deferred.await(journalHeld).pipe(Effect.timeout("15 seconds"));
-  assert.ok(notifications.some((text) => text.includes("journal write") && text.includes("command failure")), "A real inbox conflict identifies the journal failure stage");
+  assert.equal(polls, 2, "The repeated message reaches the real journal conflict fence");
+  yield* clock.adjust(2200);
+  assert.equal(polls, 2, "A latched inbox conflict pauses unchanged polling until reconciliation");
+  assert.equal(statuses.get("coordinator.paused"), "Coordinator network paused", "A local journal failure remains visibly paused");
   assert.ok(!notifications.some((text) => /PRIVATE_|test-token/.test(text)), "Private causal messages and inbox payloads stay redacted");
   yield* plugin.stop();
   const stoppedPolls = polls;
-  yield* Effect.sleep("1200 millis");
+  yield* clock.adjust(1200);
   assert.equal(polls, stoppedPolls, "Retirement cancels periodic polling");
 })).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer)))));
 
