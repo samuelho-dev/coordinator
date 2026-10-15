@@ -49,36 +49,31 @@ jobs:
           umask 077
           mkdir "$RUNNER_TEMP/coordinator-postgres"
           node --import tsx --input-type=module <<'NODE'
-          import { Effect } from 'effect';
-          import { Hex } from 'effect/encoding';
-          import { Platform } from './src/platform.ts';
-          await Effect.runPromise(Effect.gen(function*() {
-            const platform = yield* Platform;
-            const directory = platform.path.join(process.env.RUNNER_TEMP, 'coordinator-postgres');
-            const password = Hex.encode(yield* platform.crypto.randomBytes(32));
-            yield* platform.fs.writeFileString(platform.path.join(directory, 'password'), password, { flag: 'wx', mode: 0o600 });
-            yield* platform.fs.writeFileString(platform.path.join(directory, 'database.url'), `postgresql://postgres:${password}@127.0.0.1:55432/postgres?sslmode=disable`, { flag: 'wx', mode: 0o600 });
-          }).pipe(Effect.provide(Platform.layer))).catch(() => {
-            console.error('Disposable PostgreSQL credential provisioning failed; diagnostics withheld');
-            process.exitCode = 1;
-          });
+          import { randomBytes } from 'node:crypto';
+          import { appendFileSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const password = randomBytes(32).toString('hex');
+          const url = `postgresql://postgres:${password}@127.0.0.1:55432/postgres?sslmode=disable`;
+          console.log(`::add-mask::${password}`);
+          console.log(`::add-mask::${url}`);
+          writeFileSync(join(process.env.RUNNER_TEMP, 'coordinator-postgres/password'), password, { flag: 'wx', mode: 0o600 });
+          appendFileSync(process.env.GITHUB_ENV, `COORDINATOR_TEST_POSTGRES_URL=${url}\n`);
           NODE
           /usr/lib/postgresql/18/bin/initdb -D "$RUNNER_TEMP/coordinator-postgres/data" --username=postgres --auth-local=trust --auth-host=scram-sha-256 --pwfile="$RUNNER_TEMP/coordinator-postgres/password"
           /usr/lib/postgresql/18/bin/pg_ctl -D "$RUNNER_TEMP/coordinator-postgres/data" -l "$RUNNER_TEMP/coordinator-postgres/server.log" -o "-h 127.0.0.1 -p 55432 -k ''" -w start
           rm "$RUNNER_TEMP/coordinator-postgres/password"
-          printf 'COORDINATOR_TEST_POSTGRES_URL_FILE=%s/coordinator-postgres/database.url\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - name: Run isolated native suite outside private runner home
+      - name: Run isolated agent suite outside private runner home
         run: |
           TEST_ROOT="$(mktemp -d /tmp/coordinator-test.XXXXXX)"
           trap 'rm -rf -- "$TEST_ROOT"' EXIT
           chmod 0755 "$TEST_ROOT"
-          cp -a package.json tsconfig.json prisma.config.ts prisma migrations packages src scripts test dist node_modules "$TEST_ROOT/"
+          cp -a package.json tsconfig.json tsconfig.build.json vitest.config.ts prisma.config.ts prisma migrations src scripts test dist node_modules "$TEST_ROOT/"
           chmod -R a+rX "$TEST_ROOT"
           mkdir -m 0700 "$TEST_ROOT/private-home"
           export HOME="$TEST_ROOT/private-home"
           cd "$TEST_ROOT"
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL_FILE /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx --test --test-concurrency=1 test/*.test.ts
-      - name: Run stock public controls, broker plugin, offline recovery and legacy import smokes
+          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" node_modules/vitest/vitest.mjs run --configLoader native
+      - name: Run stock public controls, broker plugin and offline recovery smokes
         run: |
           TEST_ROOT="$(mktemp -d /tmp/coordinator-hosts.XXXXXX)"
           trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -87,7 +82,7 @@ jobs:
           git clone --no-hardlinks --no-checkout . "$TEST_ROOT"
           git -C "$TEST_ROOT" remote set-url origin "$(git remote get-url origin)"
           git -C "$TEST_ROOT" update-ref --no-deref HEAD "$(git rev-parse HEAD)"
-          cp -a package.json tsconfig.json prisma.config.ts prisma migrations packages src scripts test dist node_modules "$TEST_ROOT/"
+          cp -a package.json tsconfig.json tsconfig.build.json prisma.config.ts prisma migrations src scripts test dist node_modules "$TEST_ROOT/"
           chmod -R a+rX "$TEST_ROOT"
           mkdir -m 0700 "$TEST_ROOT/private-home"
           export HOME="$TEST_ROOT/private-home"
@@ -96,9 +91,8 @@ jobs:
           export COORDINATOR_TEST_PI_VERSION='1.0.4'
           export COORDINATOR_TEST_OMP_VERSION='omp/18.6.1'
           cd "$TEST_ROOT"
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL_FILE,COORDINATOR_TEST_PI,COORDINATOR_TEST_OMP,COORDINATOR_TEST_PI_VERSION,COORDINATOR_TEST_OMP_VERSION /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx scripts/host-smoke.ts
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL_FILE /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx scripts/recovery-smoke.ts
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL_FILE /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx scripts/import-smoke.ts
+          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL,COORDINATOR_TEST_PI,COORDINATOR_TEST_OMP,COORDINATOR_TEST_PI_VERSION,COORDINATOR_TEST_OMP_VERSION /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx scripts/host-smoke.ts
+          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx scripts/recovery-smoke.ts
       - name: Remove disposable PostgreSQL and credentials
         if: always()
         run: |
@@ -134,10 +128,11 @@ jobs:
           helm lint --strict "$CHART" -f "$VALUES"
           helm template acceptance "$CHART" -f "$VALUES" > "$RUNNER_TEMP/chart-render.yaml"
           ruby -ryaml -e 'docs=YAML.load_stream(File.read(ARGV[0])).compact; deployments=docs.select{|d| d["kind"]=="Deployment"}; abort "missing broker/runner" unless deployments.map{|d| d.dig("metadata","name")}.sort==["acceptance-broker","acceptance-runner"]; deployments.each{|d| s=d.dig("spec","template","spec"); abort "mutable image or missing init" unless (s["containers"]+s["initContainers"]).all?{|c| c["image"]==ARGV[1]}; abort "source mismatch" unless s["containers"][0]["env"].any?{|e| e["name"]=="COORDINATOR_IMAGE_SHA" && e["value"]==ARGV[2]}}; abort "missing persistence" unless docs.count{|d| d["kind"]=="PersistentVolumeClaim"}==2' "$RUNNER_TEMP/chart-render.yaml" "ghcr.io/${REPOSITORY,,}@sha256:$(printf 'a%.0s' {1..64})" "$SOURCE_SHA"
+          ruby -ryaml -e 'YAML.load_stream(File.read(ARGV[0])).compact.select{|d| d["kind"]=="Deployment"}.each{|d| role=d.dig("metadata","name").delete_prefix("acceptance-"); s=d.dig("spec","template","spec"); targets=s["containers"]+s["initContainers"].select{|c| c["name"]=="migrate"}; targets.each{|c| env=c.fetch("env",[]).select{|e| e["name"]=="COORDINATOR_DATABASE_URL"}; abort "database must use role Secret environment" unless env==[{"name"=>"COORDINATOR_DATABASE_URL","valueFrom"=>{"secretKeyRef"=>{"name"=>"#{role}-input","key"=>"database.url"}}}]}}' "$RUNNER_TEMP/chart-render.yaml"
           helm template broker-only "$CHART" -f "$VALUES" --set runner.enabled=false > "$RUNNER_TEMP/broker-render.yaml"
           ruby -ryaml -e 'd=YAML.load_stream(File.read(ARGV[0])).compact; abort "runner unexpectedly enabled" unless d.select{|x| x["kind"]=="Deployment"}.map{|x| x.dig("metadata","name")}==["broker-only-broker"]' "$RUNNER_TEMP/broker-render.yaml"
           if helm template invalid "$CHART" >/dev/null 2>&1; then echo 'Missing required inputs accepted' >&2; exit 1; fi
-          for override in 'image.repository=' 'image.digest=' 'image.digest=latest' 'sourceSha=' 'sourceSha=abc' 'broker.existingSecret=' 'broker.existingSecret=Bad/Name' 'runner.existingSecret='; do
+          for override in 'image.repository=' 'image.digest=' 'image.digest=latest' 'sourceSha=' 'sourceSha=abc' 'broker.existingSecret=' 'broker.existingSecret=Bad/Name' 'runner.existingSecret=' 'broker.extraEnv[0].name=COORDINATOR_DATABASE_URL' 'runner.extraEnv[0].name=COORDINATOR_DATABASE_URL'; do
             if helm template invalid "$CHART" -f "$VALUES" --set-string "$override" >/dev/null 2>&1; then echo "Invalid input accepted: $override" >&2; exit 1; fi
           done
           for port in 0 65536; do
@@ -207,7 +202,6 @@ jobs:
             sudo rm -rf -- "$PG_ROOT"
           }
           trap cleanup EXIT
-          mkdir "$PG_ROOT/config"
           timeout --signal=TERM --kill-after=5s 120s docker run --rm --interactive --name "$IMAGE_CONTAINER" --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --mount "type=bind,src=$PG_ROOT,dst=/proof" --env HOME=/tmp "$IMAGE" node --import tsx --input-type=module <<'NODE'
           import { Effect } from 'effect';
           import { Hex } from 'effect/encoding';
@@ -216,14 +210,17 @@ jobs:
             const platform = yield* Platform;
             const password = Hex.encode(yield* platform.crypto.randomBytes(32));
             yield* platform.fs.writeFileString('/proof/password', password, { flag: 'wx', mode: 0o600 });
-            yield* platform.fs.writeFileString('/proof/config/database.url', `postgresql://postgres:${password}@127.0.0.1:55433/postgres?sslmode=disable`, { flag: 'wx', mode: 0o600 });
           }).pipe(Effect.provide(Platform.layer))).catch(() => {
             console.error('Production image PostgreSQL credential provisioning failed; diagnostics withheld');
             process.exitCode = 1;
           });
           NODE
+          PASSWORD="$(cat "$PG_ROOT/password")"
+          printf '::add-mask::%s\n' "$PASSWORD"
+          export COORDINATOR_DATABASE_URL="postgresql://postgres:${PASSWORD}@127.0.0.1:55433/postgres?sslmode=disable"
+          printf '::add-mask::%s\n' "$COORDINATOR_DATABASE_URL"
+          unset PASSWORD
           sudo chown 999:999 "$PG_ROOT/password"
-          sudo chown -R 1000:1000 "$PG_ROOT/config"
           docker run --detach --rm --name "$PG_CONTAINER" --publish 127.0.0.1:55433:5432 --mount "type=bind,src=$PG_ROOT/password,dst=/run/secrets/postgres-password,readonly" --env POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password postgres:18 >/dev/null
           ready=false
           for attempt in {1..60}; do
@@ -232,7 +229,7 @@ jobs:
           done
           if [ "$ready" != true ]; then echo 'Disposable PostgreSQL did not become ready' >&2; exit 1; fi
           image_run() {
-            timeout --signal=TERM --kill-after=5s 120s docker run --rm --interactive --name "$IMAGE_CONTAINER" --network host --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --mount "type=bind,src=$PG_ROOT/config,dst=/config,readonly" --env HOME=/tmp --env COORDINATOR_DATABASE_URL_FILE=/config/database.url "$IMAGE" "$@"
+            timeout --signal=TERM --kill-after=5s 120s docker run --rm --interactive --name "$IMAGE_CONTAINER" --network host --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --env HOME=/tmp --env COORDINATOR_DATABASE_URL "$IMAGE" "$@"
           }
           image_run node --import tsx scripts/migrate.ts
           image_run node --import tsx scripts/migrate.ts
@@ -242,17 +239,17 @@ jobs:
           import { Broker } from './src/broker.ts';
           import { BrokerConfig } from './src/contracts.ts';
           import { assertBrokerSchema } from './src/database.ts';
-          import { Mcp } from './src/http.ts';
+          import { Mcp } from './src/mcp.ts';
           import { Platform } from './src/platform.ts';
           const config = Schema.decodeUnknownSync(BrokerConfig)({
-            databaseUrlFile: '/config/database.url', host: '127.0.0.1', port: 0,
+            host: '127.0.0.1', port: 0,
             principals: [], repositoryIds: {}, backupDirectory: '/tmp/backups',
             archiveRetentionMs: 86400000, backupRetentionMs: 3600000
           });
           const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(Layer.merge(Platform.layer, Mcp.layer))));
           try {
             const broker = await runtime.runPromise(Broker);
-            await runtime.runPromise(assertBrokerSchema(broker.sql));
+            await runtime.runPromise(assertBrokerSchema(broker.database));
             const address = broker.server.address;
             assert.equal(address._tag, 'InetAddressV4');
             const response = await fetch(`http://127.0.0.1:${address.port}/livez`);

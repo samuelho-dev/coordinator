@@ -1,6 +1,7 @@
-import { ByteSize, Clock, Context, Effect, Graph, Layer, Option, Schema, Semaphore } from "effect";
-import { ArchiveEntry, ArchiveEntryId, CommandError, HostJournalEntry, JournalHandledKey, JournalReleaseKey, JournalState, type JsonValue, type Hash, type MessageId, type PrincipalId, type SessionId, type ObservedFile } from "./contracts.ts";
-import { LIMIT } from "./http.ts";
+import { ByteSize, Clock, Context, Effect, Graph, Layer, Option, Record, Schema, Semaphore } from "effect";
+import { ArchiveEntry, CommandError, HostJournalEntry, JournalHandledKey, JournalReleaseKey, JournalReleaseStateEnum, JournalState, type ArchivePayload, type JsonValue, type ObservedFile } from "./contracts.ts";
+import { Archive, Peer, RunnerTask, type PeerId, type SessionId } from "./generated/database/types.ts";
+import { LIMIT } from "./mcp.ts";
 import { Platform } from "./platform.ts";
 
 const parseHostEntry = Schema.decodeEffect(Schema.fromJsonString(HostJournalEntry));
@@ -13,7 +14,7 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
   if (((yield* fs.stat(directory)).mode & 0o077) !== 0) return yield* Effect.fail(new CommandError({ message: "Private journal directory required" }));
   const exists = yield* fs.exists(path);
   if (exists && ((yield* fs.stat(path)).mode & 0o077) !== 0) return yield* Effect.fail(new CommandError({ message: "Private journal file required" }));
-  const state: JournalState = exists ? Schema.decodeUnknownSync(Schema.fromJsonString(JournalState), { onExcessProperty: "error" })(yield* fs.readFileString(path)) : {
+  const state: JournalState = exists ? yield* Schema.decodeEffect(Schema.fromJsonString(JournalState), { onExcessProperty: "error" })(yield* fs.readFileString(path)) : {
     handled: {}, releases: {}, consent: false, participants: [], seen: {}, spool: [], gaps: [], inbox: {},
   };
   const semaphore = yield* Semaphore.make(1);
@@ -24,7 +25,7 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
     yield* file.sync;
   }));
   const persist = Effect.fn("Journal.persist")(function*() {
-    const text = Schema.encodeUnknownSync(Schema.fromJsonString(JournalState), { onExcessProperty: "error" })(state);
+    const text = yield* Schema.encodeEffect(Schema.fromJsonString(JournalState), { onExcessProperty: "error" })(state);
     const temporary = `${path}.tmp`;
     yield* Effect.scoped(Effect.gen(function*() {
       const file = yield* fs.open(temporary, { flag: "w", mode: 0o600 });
@@ -42,7 +43,7 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
   const save = Effect.fn("Journal.save")(() => serial(persist()));
   const handle = Effect.fn("Journal.handle")((id: JournalHandledKey) => serial(Effect.gen(function*() { state.handled[id] = true; yield* persist(); })));
   const clearInbox = Effect.fn("Journal.clearInbox")(() => serial(Effect.gen(function*() { state.inbox = {}; yield* persist(); })));
-  const receive = Effect.fn("Journal.receive")((messageId: MessageId, payload: JsonValue) => serial(Effect.gen(function*() {
+  const receive = Effect.fn("Journal.receive")((messageId: PeerId, payload: JsonValue) => serial(Effect.gen(function*() {
     const hash = yield* platform.fingerprint(payload);
     const prior = state.inbox[messageId];
     if (prior) {
@@ -52,7 +53,7 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
     const handledKey = JournalHandledKey.make(`peer:${messageId}`);
     if (state.handled[handledKey]) return false;
     const entry = { payload, digest: hash, receivedAt: yield* Clock.currentTimeMillis };
-    if (new TextEncoder().encode(Schema.encodeUnknownSync(Schema.fromJsonString(JournalState.fields.inbox), { onExcessProperty: "error" })({ ...state.inbox, [messageId]: entry })).length > 128 * 1024) return yield* Effect.fail(new CommandError({ message: "Local inbox full; handling acknowledgement withheld" }));
+    if (new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(JournalState.fields.inbox), { onExcessProperty: "error" })({ ...state.inbox, [messageId]: entry })).length > 128 * 1024) return yield* Effect.fail(new CommandError({ message: "Local inbox full; handling acknowledgement withheld" }));
     state.inbox[messageId] = entry;
     state.handled[handledKey] = true;
     yield* persist();
@@ -63,17 +64,17 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
     const intent = `${path}.${yield* platform.digest(key)}.intent`;
     const created = yield* Effect.scoped(Effect.gen(function*() {
       const file = yield* fs.open(intent, { flag: "wx", mode: 0o600 });
-      yield* file.writeAll(new TextEncoder().encode("intent"));
+      yield* file.writeAll(new TextEncoder().encode(JournalReleaseStateEnum.intent));
       yield* file.sync;
       yield* syncDirectory;
       return true;
     })).pipe(Effect.catch((error) => error.reason._tag === "AlreadyExists" ? Effect.succeed(false) : Effect.fail(error)), Effect.onError(() => Effect.sync(() => { writeFailed = true; })));
-    state.releases[key] = "intent";
+    state.releases[key] = JournalReleaseStateEnum.intent;
     yield* persist();
     return created;
   })));
-  const releaseSent = Effect.fn("Journal.releaseSent")((key: JournalReleaseKey) => serial(Effect.gen(function*() { state.releases[key] = "sent"; yield* persist(); })));
-  const consent = Effect.fn("Journal.consent")((participants: PrincipalId[]) => serial(Effect.gen(function*() { state.consent = true; state.participants = participants; yield* persist(); })));
+  const releaseSent = Effect.fn("Journal.releaseSent")((key: JournalReleaseKey) => serial(Effect.gen(function*() { state.releases[key] = JournalReleaseStateEnum.sent; yield* persist(); })));
+  const consent = Effect.fn("Journal.consent")((participants: Array<typeof Peer.fields.sender.Type>) => serial(Effect.gen(function*() { state.consent = true; state.participants = participants; yield* persist(); })));
   const erase = Effect.fn("Journal.erase")(() => serial(Effect.gen(function*() {
     state.consent = false; state.participants = []; state.spool = []; state.seen = {}; state.gaps = []; delete state.fileDigest; observedFile = undefined;
     // Delivery dedup/intent records survive opt-out: never admit a duplicate prompt.
@@ -81,9 +82,9 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
   })));
   const coverage = Effect.fn("Journal.coverage")(function*() {
     if (!state.gaps.length) return;
-    const payload = { coverageOnly: true as const, gaps: [...state.gaps] };
+    const payload: ArchivePayload = { coverageOnly: true, gaps: [...state.gaps] };
     const hash = yield* platform.fingerprint(payload);
-    if (state.fileDigest !== hash) { state.spool.push({ entryId: ArchiveEntryId.make(`coverage:${hash}`), digest: hash, payload, gaps: [...state.gaps] }); state.fileDigest = hash; }
+    if (state.fileDigest !== hash) { state.spool.push({ entryId: Archive.fields.entry.make(`coverage:${hash}`), digest: hash, payload, gaps: [...state.gaps] }); state.fileDigest = hash; }
   });
   const scan = Effect.fn("Journal.scan")((file: string | undefined) => serial(Effect.gen(function*() {
     if (!state.consent) return;
@@ -99,9 +100,9 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
     if (mtimeMs !== undefined && observedFile?.path === file && observedFile.size === size && observedFile.mtimeMs === mtimeMs) return;
     const text = yield* fs.readFileString(file);
     const lines = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean);
-    const present = new Set<Hash>();
-    const graph = Graph.beginMutation(Graph.directed<{ entry: HostJournalEntry; digest: Hash }, undefined>());
-    const nodes = new Map<ArchiveEntryId, Graph.NodeIndex>();
+    const present = new Set<typeof RunnerTask.fields.fingerprint.Type>();
+    const graph = Graph.beginMutation(Graph.directed<{ entry: HostJournalEntry; digest: typeof RunnerTask.fields.fingerprint.Type }, undefined>());
+    const nodes = new Map<typeof Archive.fields.entry.Type, Graph.NodeIndex>();
     for (const line of lines) {
       if (new TextEncoder().encode(line).length > LIMIT) { gap("overflow"); continue; }
       const decoded = yield* parseHostEntry(line).pipe(Effect.option);
@@ -119,10 +120,10 @@ const makeJournal = Effect.fn("Journal.make")(function*(directory: string, sessi
       if (state.seen[entryKey]) gap("rewrite");
       if (Graph.inDegree(graph, index) === 0) gap("unlinked");
       const item = { entryId: safe.id, digest: yield* platform.fingerprint(safe), payload: safe, gaps: [...state.gaps] };
-      if (new TextEncoder().encode(Schema.encodeUnknownSync(Schema.fromJsonString(JournalState.fields.spool), { onExcessProperty: "error" })([...state.spool, item])).length > 510 * 1024) { gap("overflow"); break; }
+      if (new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(JournalState.fields.spool), { onExcessProperty: "error" })([...state.spool, item])).length > 510 * 1024) { gap("overflow"); break; }
       state.seen[entryKey] = originalDigest; state.spool.push(item);
     }
-    if (Object.keys(state.seen).some((id) => !present.has(Schema.decodeUnknownSync(JournalState.fields.seen.schema.key, { onExcessProperty: "error" })(id)))) gap("rewrite");
+    if (Record.keys(state.seen).some((id) => !present.has(id))) gap("rewrite");
     yield* coverage(); yield* persist();
     observedFile = mtimeMs === undefined ? undefined : { path: file, size, mtimeMs };
   })));

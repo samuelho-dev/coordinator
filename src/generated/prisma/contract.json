@@ -5,59 +5,144 @@
   "profileHash": "3916f444a8a17ad749191acf9e08dad97d1a327b88c2f1d45d12f240296aa8b2",
   "roots": {
     "archive": {
-      "model": "archive",
+      "model": "Archive",
       "namespace": "public"
     },
     "consents": {
-      "model": "consents",
+      "model": "Consent",
       "namespace": "public"
     },
-    "effect_queue": {
-      "model": "effect_queue",
-      "namespace": "public"
-    },
-    "effect_queue_migrations": {
-      "model": "effect_queue_migrations",
+    "dispatch_queue": {
+      "model": "DispatchQueue",
       "namespace": "public"
     },
     "evidence": {
-      "model": "evidence",
+      "model": "Evidence",
       "namespace": "public"
     },
     "participant_consents": {
-      "model": "participant_consents",
+      "model": "ParticipantConsent",
       "namespace": "public"
     },
     "peers": {
-      "model": "peers",
+      "model": "Peer",
       "namespace": "public"
     },
     "recovery_gate": {
-      "model": "recovery_gate",
+      "model": "RecoveryGate",
       "namespace": "public"
     },
     "runner_events": {
-      "model": "runner_events",
+      "model": "RunnerEvent",
       "namespace": "public"
     },
     "runner_tasks": {
-      "model": "runner_tasks",
+      "model": "RunnerTask",
       "namespace": "public"
     },
     "sessions": {
-      "model": "sessions",
+      "model": "Session",
       "namespace": "public"
     },
     "tasks": {
-      "model": "tasks",
+      "model": "Task",
       "namespace": "public"
     }
   },
   "domain": {
     "namespaces": {
       "public": {
+        "enum": {
+          "DispatchState": {
+            "codecId": "pg/text@1",
+            "members": [
+              {
+                "name": "pending",
+                "value": "pending"
+              },
+              {
+                "name": "failed",
+                "value": "failed"
+              },
+              {
+                "name": "completed",
+                "value": "completed"
+              }
+            ]
+          },
+          "RunnerState": {
+            "codecId": "pg/text@1",
+            "members": [
+              {
+                "name": "ACCEPTED",
+                "value": "ACCEPTED"
+              },
+              {
+                "name": "LAUNCHING",
+                "value": "LAUNCHING"
+              },
+              {
+                "name": "READY",
+                "value": "READY"
+              },
+              {
+                "name": "PROMPT_INTENT",
+                "value": "PROMPT_INTENT"
+              },
+              {
+                "name": "RUNNING",
+                "value": "RUNNING"
+              },
+              {
+                "name": "SUCCEEDED",
+                "value": "SUCCEEDED"
+              },
+              {
+                "name": "FAILED",
+                "value": "FAILED"
+              },
+              {
+                "name": "HELD",
+                "value": "HELD"
+              }
+            ]
+          },
+          "TaskState": {
+            "codecId": "pg/text@1",
+            "members": [
+              {
+                "name": "QUEUED",
+                "value": "QUEUED"
+              },
+              {
+                "name": "ASSIGNING",
+                "value": "ASSIGNING"
+              },
+              {
+                "name": "ACCEPTED",
+                "value": "ACCEPTED"
+              },
+              {
+                "name": "RUNNING",
+                "value": "RUNNING"
+              },
+              {
+                "name": "SUCCEEDED",
+                "value": "SUCCEEDED"
+              },
+              {
+                "name": "FAILED",
+                "value": "FAILED"
+              },
+              {
+                "name": "HELD",
+                "value": "HELD"
+              }
+            ]
+          }
+        },
         "models": {
-          "archive": {
+          "Archive": {
             "fields": {
               "created": {
                 "nullable": false,
@@ -148,7 +233,7 @@
               "table": "archive"
             }
           },
-          "consents": {
+          "Consent": {
             "fields": {
               "enabled": {
                 "nullable": false,
@@ -199,30 +284,23 @@
               "table": "consents"
             }
           },
-          "effect_queue": {
+          "DispatchQueue": {
             "fields": {
-              "acquired_at": {
-                "nullable": true,
+              "attempts": {
+                "nullable": false,
+                "type": {
+                  "codecId": "pg/int4@1",
+                  "kind": "scalar"
+                }
+              },
+              "available_at": {
+                "nullable": false,
                 "type": {
                   "codecId": "pg/timestamp-string@1",
                   "kind": "scalar",
                   "typeParams": {
                     "precision": 6
                   }
-                }
-              },
-              "acquired_by": {
-                "nullable": true,
-                "type": {
-                  "codecId": "pg/uuid@1",
-                  "kind": "scalar"
-                }
-              },
-              "attempts": {
-                "nullable": false,
-                "type": {
-                  "codecId": "pg/int4@1",
-                  "kind": "scalar"
                 }
               },
               "created_at": {
@@ -235,8 +313,8 @@
                   }
                 }
               },
-              "element": {
-                "nullable": false,
+              "failure": {
+                "nullable": true,
                 "type": {
                   "codecId": "pg/text@1",
                   "kind": "scalar"
@@ -252,14 +330,31 @@
                   }
                 }
               },
-              "last_failure": {
+              "lease_id": {
                 "nullable": true,
+                "type": {
+                  "codecId": "pg/uuid@1",
+                  "kind": "scalar"
+                }
+              },
+              "leased_at": {
+                "nullable": true,
+                "type": {
+                  "codecId": "pg/timestamp-string@1",
+                  "kind": "scalar",
+                  "typeParams": {
+                    "precision": 6
+                  }
+                }
+              },
+              "payload": {
+                "nullable": false,
                 "type": {
                   "codecId": "pg/text@1",
                   "kind": "scalar"
                 }
               },
-              "queue_name": {
+              "queue": {
                 "nullable": false,
                 "type": {
                   "codecId": "sql/varchar@1",
@@ -279,11 +374,14 @@
               "state": {
                 "nullable": false,
                 "type": {
-                  "codecId": "sql/varchar@1",
-                  "kind": "scalar",
-                  "typeParams": {
-                    "length": 10
-                  }
+                  "codecId": "pg/text@1",
+                  "kind": "scalar"
+                },
+                "valueSet": {
+                  "entityKind": "enum",
+                  "entityName": "DispatchState",
+                  "namespaceId": "public",
+                  "plane": "domain"
                 }
               },
               "updated_at": {
@@ -295,44 +393,37 @@
                     "precision": 6
                   }
                 }
-              },
-              "visible_at": {
-                "nullable": false,
-                "type": {
-                  "codecId": "pg/timestamp-string@1",
-                  "kind": "scalar",
-                  "typeParams": {
-                    "precision": 6
-                  }
-                }
               }
             },
             "relations": {},
             "storage": {
               "fields": {
-                "acquired_at": {
-                  "column": "acquired_at"
-                },
-                "acquired_by": {
-                  "column": "acquired_by"
-                },
                 "attempts": {
                   "column": "attempts"
+                },
+                "available_at": {
+                  "column": "available_at"
                 },
                 "created_at": {
                   "column": "created_at"
                 },
-                "element": {
-                  "column": "element"
+                "failure": {
+                  "column": "failure"
                 },
                 "id": {
                   "column": "id"
                 },
-                "last_failure": {
-                  "column": "last_failure"
+                "lease_id": {
+                  "column": "lease_id"
                 },
-                "queue_name": {
-                  "column": "queue_name"
+                "leased_at": {
+                  "column": "leased_at"
+                },
+                "payload": {
+                  "column": "payload"
+                },
+                "queue": {
+                  "column": "queue"
                 },
                 "sequence": {
                   "column": "sequence"
@@ -342,60 +433,13 @@
                 },
                 "updated_at": {
                   "column": "updated_at"
-                },
-                "visible_at": {
-                  "column": "visible_at"
                 }
               },
               "namespaceId": "public",
-              "table": "effect_queue"
+              "table": "dispatch_queue"
             }
           },
-          "effect_queue_migrations": {
-            "fields": {
-              "created_at": {
-                "nullable": false,
-                "type": {
-                  "codecId": "pg/timestamptz-string@1",
-                  "kind": "scalar",
-                  "typeParams": {
-                    "precision": 6
-                  }
-                }
-              },
-              "migration_id": {
-                "nullable": false,
-                "type": {
-                  "codecId": "pg/int4@1",
-                  "kind": "scalar"
-                }
-              },
-              "name": {
-                "nullable": false,
-                "type": {
-                  "codecId": "pg/text@1",
-                  "kind": "scalar"
-                }
-              }
-            },
-            "relations": {},
-            "storage": {
-              "fields": {
-                "created_at": {
-                  "column": "created_at"
-                },
-                "migration_id": {
-                  "column": "migration_id"
-                },
-                "name": {
-                  "column": "name"
-                }
-              },
-              "namespaceId": "public",
-              "table": "effect_queue_migrations"
-            }
-          },
-          "evidence": {
+          "Evidence": {
             "fields": {
               "data": {
                 "nullable": false,
@@ -476,7 +520,7 @@
               "table": "evidence"
             }
           },
-          "participant_consents": {
+          "ParticipantConsent": {
             "fields": {
               "enabled": {
                 "nullable": false,
@@ -527,7 +571,7 @@
               "table": "participant_consents"
             }
           },
-          "peers": {
+          "Peer": {
             "fields": {
               "expires": {
                 "nullable": false,
@@ -618,7 +662,7 @@
               "table": "peers"
             }
           },
-          "recovery_gate": {
+          "RecoveryGate": {
             "fields": {
               "id": {
                 "nullable": false,
@@ -649,7 +693,7 @@
               "table": "recovery_gate"
             }
           },
-          "runner_events": {
+          "RunnerEvent": {
             "fields": {
               "payload": {
                 "nullable": false,
@@ -690,9 +734,30 @@
               "table": "runner_events"
             }
           },
-          "runner_tasks": {
+          "RunnerTask": {
             "fields": {
               "address": {
+                "nullable": true,
+                "type": {
+                  "codecId": "pg/text@1",
+                  "kind": "scalar"
+                }
+              },
+              "agentBinding": {
+                "nullable": true,
+                "type": {
+                  "codecId": "pg/text@1",
+                  "kind": "scalar"
+                }
+              },
+              "agentCursor": {
+                "nullable": false,
+                "type": {
+                  "codecId": "pg/int4@1",
+                  "kind": "scalar"
+                }
+              },
+              "agentRunId": {
                 "nullable": true,
                 "type": {
                   "codecId": "pg/text@1",
@@ -715,27 +780,6 @@
               },
               "incarnation": {
                 "nullable": false,
-                "type": {
-                  "codecId": "pg/text@1",
-                  "kind": "scalar"
-                }
-              },
-              "nativeBinding": {
-                "nullable": true,
-                "type": {
-                  "codecId": "pg/text@1",
-                  "kind": "scalar"
-                }
-              },
-              "nativeCursor": {
-                "nullable": false,
-                "type": {
-                  "codecId": "pg/int4@1",
-                  "kind": "scalar"
-                }
-              },
-              "nativeRunId": {
-                "nullable": true,
                 "type": {
                   "codecId": "pg/text@1",
                   "kind": "scalar"
@@ -788,6 +832,12 @@
                 "type": {
                   "codecId": "pg/text@1",
                   "kind": "scalar"
+                },
+                "valueSet": {
+                  "entityKind": "enum",
+                  "entityName": "RunnerState",
+                  "namespaceId": "public",
+                  "plane": "domain"
                 }
               },
               "taskId": {
@@ -818,6 +868,15 @@
                 "address": {
                   "column": "address"
                 },
+                "agentBinding": {
+                  "column": "agentBinding"
+                },
+                "agentCursor": {
+                  "column": "agentCursor"
+                },
+                "agentRunId": {
+                  "column": "agentRunId"
+                },
                 "detached": {
                   "column": "detached"
                 },
@@ -826,15 +885,6 @@
                 },
                 "incarnation": {
                   "column": "incarnation"
-                },
-                "nativeBinding": {
-                  "column": "nativeBinding"
-                },
-                "nativeCursor": {
-                  "column": "nativeCursor"
-                },
-                "nativeRunId": {
-                  "column": "nativeRunId"
                 },
                 "occupied": {
                   "column": "occupied"
@@ -871,7 +921,7 @@
               "table": "runner_tasks"
             }
           },
-          "sessions": {
+          "Session": {
             "fields": {
               "data": {
                 "nullable": false,
@@ -902,7 +952,7 @@
               "table": "sessions"
             }
           },
-          "tasks": {
+          "Task": {
             "fields": {
               "data": {
                 "nullable": false,
@@ -1040,21 +1090,15 @@
               },
               "uniques": []
             },
-            "effect_queue": {
+            "dispatch_queue": {
+              "checks": [
+                {
+                  "expression": "\"state\" IN ('pending', 'failed', 'completed')",
+                  "name": "dispatch_queue_state_check_7cf91d99",
+                  "prefix": "dispatch_queue_state_check"
+                }
+              ],
               "columns": {
-                "acquired_at": {
-                  "codecId": "pg/timestamp-string@1",
-                  "dataType": "pg/timestamp",
-                  "nullable": true,
-                  "typeParams": {
-                    "precision": 6
-                  }
-                },
-                "acquired_by": {
-                  "codecId": "pg/uuid@1",
-                  "dataType": "pg/uuid",
-                  "nullable": true
-                },
                 "attempts": {
                   "codecId": "pg/int4@1",
                   "dataType": "pg/int4",
@@ -1064,6 +1108,14 @@
                   },
                   "nullable": false
                 },
+                "available_at": {
+                  "codecId": "pg/timestamp-string@1",
+                  "dataType": "pg/timestamp",
+                  "nullable": false,
+                  "typeParams": {
+                    "precision": 6
+                  }
+                },
                 "created_at": {
                   "codecId": "pg/timestamp-string@1",
                   "dataType": "pg/timestamp",
@@ -1072,10 +1124,10 @@
                     "precision": 6
                   }
                 },
-                "element": {
+                "failure": {
                   "codecId": "pg/text@1",
                   "dataType": "pg/text",
-                  "nullable": false
+                  "nullable": true
                 },
                 "id": {
                   "codecId": "sql/varchar@1",
@@ -1085,12 +1137,25 @@
                     "length": 255
                   }
                 },
-                "last_failure": {
-                  "codecId": "pg/text@1",
-                  "dataType": "pg/text",
+                "lease_id": {
+                  "codecId": "pg/uuid@1",
+                  "dataType": "pg/uuid",
                   "nullable": true
                 },
-                "queue_name": {
+                "leased_at": {
+                  "codecId": "pg/timestamp-string@1",
+                  "dataType": "pg/timestamp",
+                  "nullable": true,
+                  "typeParams": {
+                    "precision": 6
+                  }
+                },
+                "payload": {
+                  "codecId": "pg/text@1",
+                  "dataType": "pg/text",
+                  "nullable": false
+                },
+                "queue": {
                   "codecId": "sql/varchar@1",
                   "dataType": "pg/varchar",
                   "nullable": false,
@@ -1108,22 +1173,17 @@
                   "nullable": false
                 },
                 "state": {
-                  "codecId": "sql/varchar@1",
-                  "dataType": "pg/varchar",
+                  "codecId": "pg/text@1",
+                  "dataType": "pg/text",
                   "nullable": false,
-                  "typeParams": {
-                    "length": 10
+                  "valueSet": {
+                    "entityKind": "valueSet",
+                    "entityName": "DispatchState",
+                    "namespaceId": "public",
+                    "plane": "storage"
                   }
                 },
                 "updated_at": {
-                  "codecId": "pg/timestamp-string@1",
-                  "dataType": "pg/timestamp",
-                  "nullable": false,
-                  "typeParams": {
-                    "precision": 6
-                  }
-                },
-                "visible_at": {
                   "codecId": "pg/timestamp-string@1",
                   "dataType": "pg/timestamp",
                   "nullable": false,
@@ -1136,20 +1196,20 @@
               "indexes": [
                 {
                   "columns": [
-                    "queue_name",
-                    "visible_at"
+                    "queue",
+                    "available_at"
                   ],
-                  "name": "idx_effect_queue_take_3179164e",
-                  "prefix": "idx_effect_queue_take",
+                  "name": "idx_dispatch_queue_take_d4c7b4d1",
+                  "prefix": "idx_dispatch_queue_take",
                   "unique": false,
                   "where": "state = 'pending'"
                 },
                 {
                   "columns": [
                     "sequence",
-                    "acquired_by"
+                    "lease_id"
                   ],
-                  "name": "idx_effect_queue_update",
+                  "name": "idx_dispatch_queue_update",
                   "unique": false
                 }
               ],
@@ -1162,45 +1222,11 @@
                 {
                   "columns": [
                     "id",
-                    "queue_name"
+                    "queue"
                   ],
-                  "name": "idx_effect_queue_id"
+                  "name": "idx_dispatch_queue_id"
                 }
               ]
-            },
-            "effect_queue_migrations": {
-              "columns": {
-                "created_at": {
-                  "codecId": "pg/timestamptz-string@1",
-                  "dataType": "pg/timestamptz",
-                  "default": {
-                    "expression": "now()",
-                    "kind": "function"
-                  },
-                  "nullable": false,
-                  "typeParams": {
-                    "precision": 6
-                  }
-                },
-                "migration_id": {
-                  "codecId": "pg/int4@1",
-                  "dataType": "pg/int4",
-                  "nullable": false
-                },
-                "name": {
-                  "codecId": "pg/text@1",
-                  "dataType": "pg/text",
-                  "nullable": false
-                }
-              },
-              "foreignKeys": [],
-              "indexes": [],
-              "primaryKey": {
-                "columns": [
-                  "migration_id"
-                ]
-              },
-              "uniques": []
             },
             "evidence": {
               "columns": {
@@ -1410,8 +1436,34 @@
               "uniques": []
             },
             "runner_tasks": {
+              "checks": [
+                {
+                  "expression": "\"state\" IN ('ACCEPTED', 'LAUNCHING', 'READY', 'PROMPT_INTENT', 'RUNNING', 'SUCCEEDED', 'FAILED', 'HELD')",
+                  "name": "runner_tasks_state_check_40691796",
+                  "prefix": "runner_tasks_state_check"
+                }
+              ],
               "columns": {
                 "address": {
+                  "codecId": "pg/text@1",
+                  "dataType": "pg/text",
+                  "nullable": true
+                },
+                "agentBinding": {
+                  "codecId": "pg/text@1",
+                  "dataType": "pg/text",
+                  "nullable": true
+                },
+                "agentCursor": {
+                  "codecId": "pg/int4@1",
+                  "dataType": "pg/int4",
+                  "default": {
+                    "kind": "literal",
+                    "value": 0
+                  },
+                  "nullable": false
+                },
+                "agentRunId": {
                   "codecId": "pg/text@1",
                   "dataType": "pg/text",
                   "nullable": true
@@ -1434,25 +1486,6 @@
                   "codecId": "pg/text@1",
                   "dataType": "pg/text",
                   "nullable": false
-                },
-                "nativeBinding": {
-                  "codecId": "pg/text@1",
-                  "dataType": "pg/text",
-                  "nullable": true
-                },
-                "nativeCursor": {
-                  "codecId": "pg/int4@1",
-                  "dataType": "pg/int4",
-                  "default": {
-                    "kind": "literal",
-                    "value": 0
-                  },
-                  "nullable": false
-                },
-                "nativeRunId": {
-                  "codecId": "pg/text@1",
-                  "dataType": "pg/text",
-                  "nullable": true
                 },
                 "occupied": {
                   "codecId": "pg/int4@1",
@@ -1491,7 +1524,13 @@
                 "state": {
                   "codecId": "pg/text@1",
                   "dataType": "pg/text",
-                  "nullable": false
+                  "nullable": false,
+                  "valueSet": {
+                    "entityKind": "valueSet",
+                    "entityName": "RunnerState",
+                    "namespaceId": "public",
+                    "plane": "storage"
+                  }
                 },
                 "taskId": {
                   "codecId": "pg/text@1",
@@ -1568,13 +1607,48 @@
               },
               "uniques": []
             }
+          },
+          "valueSet": {
+            "DispatchState": {
+              "kind": "valueSet",
+              "values": [
+                "pending",
+                "failed",
+                "completed"
+              ]
+            },
+            "RunnerState": {
+              "kind": "valueSet",
+              "values": [
+                "ACCEPTED",
+                "LAUNCHING",
+                "READY",
+                "PROMPT_INTENT",
+                "RUNNING",
+                "SUCCEEDED",
+                "FAILED",
+                "HELD"
+              ]
+            },
+            "TaskState": {
+              "kind": "valueSet",
+              "values": [
+                "QUEUED",
+                "ASSIGNING",
+                "ACCEPTED",
+                "RUNNING",
+                "SUCCEEDED",
+                "FAILED",
+                "HELD"
+              ]
+            }
           }
         },
         "id": "public",
         "kind": "postgres-schema"
       }
     },
-    "storageHash": "760c0ad54b65dc6f3098b00865c256f062047846de76dda5c9e3c53a65ba6825"
+    "storageHash": "8a45665e4f7f16574e423fa23578c2cd161a2a1c75d00e68dfd7f63bfdff3ef2"
   },
   "capabilities": {
     "postgres": {

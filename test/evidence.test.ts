@@ -1,4 +1,6 @@
-import test from "node:test";
+import { CiVerdictEnum } from "../src/contracts.ts";
+import { AgentHostEnum } from "../src/agent/contracts.ts";
+import { it } from "@effect/vitest"
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { NodeHttpClient } from "@effect/platform-node";
@@ -6,19 +8,20 @@ import { Clock, Effect, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { pollCi } from "../src/evidence.ts";
-import { JsonValue, Work, Sha } from "../src/contracts.ts";
+import { JsonValue, Work } from "../src/contracts.ts";
+import { Evidence } from "../src/generated/database/types.ts";
 
-function response(value: JsonValue): Response { return new Response(Schema.encodeUnknownSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(value), { headers: { "content-type": "application/json" } }); }
+function response(value: JsonValue): Response { return new Response(Schema.encodeSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(value), { headers: { "content-type": "application/json" } }); }
 
-const sha = Sha.make("1".repeat(40));
-const work = Schema.decodeUnknownSync(Work, { onExcessProperty: "error" })({ taskId: "evidence-task", repo: "github.com/owner/repo", ref: "main", sha, launcher: "omp", prompt: "approved", scope: "scope", restrictions: "no merge", expectedEvidence: ["CI/verify"], deadline: (await Effect.runPromise(Clock.currentTimeMillis)) + 60000, workerId: "worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: true, approved: true });
+const sha = Evidence.fields.sha.make("1".repeat(40));
+const work = Schema.decodeUnknownSync(Work, { onExcessProperty: "error" })({ taskId: "evidence-task", repo: "github.com/owner/repo", ref: "main", sha, launcher: AgentHostEnum.omp, prompt: "approved", scope: "scope", restrictions: "no merge", expectedEvidence: ["CI/verify"], deadline: (await Effect.runPromise(Clock.currentTimeMillis)) + 60000, workerId: "worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: true, approved: true });
 
-test("exact-SHA latest-attempt CI refuses prior green, missing/skipped/cancelled lanes and polling races", async () => {
+it("exact-SHA latest-attempt CI refuses prior green, missing/skipped/cancelled lanes and polling races", async () => {
   let respond = (_url: string): Response => response({});
   const client = HttpClient.make((request, url) => Effect.sync(() => HttpClientResponse.fromWeb(request, respond(url.toString()))));
   const runtime = ManagedRuntime.make(Layer.succeed(HttpClient.HttpClient, client));
   try {
-    for (const scenario of ["green", "heads-green", "rerun-pending", "skipped", "cancelled", "missing", "wrong-sha", "attempt-race", "api-loss"] as const) {
+    for (const scenario of ["green", "heads-green", "rerun-pending", "skipped", "cancelled", "missing", "wrong-sha", "attempt-race", "api-loss"]) {
       const current = { id: 200, workflow_id: 1000, name: "CI", head_sha: scenario === "wrong-sha" ? "2".repeat(40) : sha, head_branch: "main", run_attempt: 2, status: scenario === "rerun-pending" ? "in_progress" : "completed", conclusion: scenario === "rerun-pending" ? null : "success", html_url: "https://github.com/owner/repo/actions/runs/200", created_at: "2026-10-06T01:00:00Z" };
       const old = { ...current, id: 100, run_attempt: 1, status: "completed", conclusion: "success", head_sha: sha };
       respond = (input) => {
@@ -32,20 +35,20 @@ test("exact-SHA latest-attempt CI refuses prior green, missing/skipped/cancelled
         return response({ id: 42, full_name: "owner/repo", private: true });
       };
       const result = await runtime.runPromise(pollCi({ ...work, ref: scenario === "heads-green" ? "refs/heads/main" : work.ref }));
-      const expected = ["green", "heads-green"].includes(scenario) ? "green" : ["rerun-pending", "attempt-race"].includes(scenario) ? "pending" : ["skipped", "cancelled"].includes(scenario) ? "failed" : "unknown";
+      const expected = ["green", "heads-green"].includes(scenario) ? CiVerdictEnum.green : ["rerun-pending", "attempt-race"].includes(scenario) ? CiVerdictEnum.pending : ["skipped", "cancelled"].includes(scenario) ? CiVerdictEnum.failed : CiVerdictEnum.unknown;
       assert.equal(result.verdict, expected, scenario);
       if (scenario === "green" || scenario === "heads-green") { assert.equal(result.lanes[0]?.runId, 200); assert.equal(result.lanes[0]?.attempt, 2); }
     }
   } finally { await runtime.dispose(); }
 });
 
-test("PR merge-ref CI requires the exact current merge SHA and authenticated matching PR association", async () => {
+it("PR merge-ref CI requires the exact current merge SHA and authenticated matching PR association", async () => {
   let respond = (_url: string): Response => response({});
   const client = HttpClient.make((request, url) => Effect.sync(() => HttpClientResponse.fromWeb(request, respond(url.toString()))));
   const runtime = ManagedRuntime.make(Layer.succeed(HttpClient.HttpClient, client));
-  const headSha = Sha.make("2".repeat(40));
+  const headSha = Evidence.fields.sha.make("2".repeat(40));
   try {
-    for (const scenario of ["green", "wrong-pr", "head-sha-run", "head-sha-request", "merge-mismatch", "ref-race", "association-race", "api-loss", "unauthenticated"] as const) {
+    for (const scenario of ["green", "wrong-pr", "head-sha-run", "head-sha-request", "merge-mismatch", "ref-race", "association-race", "api-loss", "unauthenticated"]) {
       let refReads = 0;
       const current = { id: 200, workflow_id: 1000, name: "CI", head_sha: scenario === "head-sha-run" || scenario === "head-sha-request" ? headSha : sha, head_branch: "feature/review", pull_requests: [{ number: scenario === "wrong-pr" ? 8 : 7, url: "https://api.github.com/repos/owner/repo/pulls/7" }], run_attempt: 2, status: "completed", conclusion: "success", html_url: "https://github.com/owner/repo/actions/runs/200", created_at: "2026-10-06T01:00:00Z" };
       respond = (input) => {
@@ -62,7 +65,7 @@ test("PR merge-ref CI requires the exact current merge SHA and authenticated mat
         return response({ id: 42, full_name: "owner/repo", private: true });
       };
       const result = await runtime.runPromise(pollCi({ ...work, ref: "refs/pull/7/merge", sha: scenario === "head-sha-request" ? headSha : sha }, scenario === "unauthenticated" ? undefined : "github-token"));
-      assert.equal(result.verdict, scenario === "green" ? "green" : scenario === "association-race" ? "pending" : "unknown", scenario);
+      assert.equal(result.verdict, scenario === "green" ? CiVerdictEnum.green : scenario === "association-race" ? CiVerdictEnum.pending : CiVerdictEnum.unknown, scenario);
       if (scenario === "green") {
         assert.equal(result.lanes[0]?.runId, 200);
         assert.equal(result.lanes[0]?.attempt, 2);
@@ -71,7 +74,7 @@ test("PR merge-ref CI requires the exact current merge SHA and authenticated mat
   } finally { await runtime.dispose(); }
 });
 
-test("GitHub response body deadline returns unknown and closes the stalled request scope", { timeout: 5000 }, async () => {
+it("GitHub response body deadline returns unknown and closes the stalled request scope", async () => {
   let headersReceived!: () => void;
   let requestClosed!: () => void;
   const headers = new Promise<void>((resolve) => { headersReceived = resolve; });
@@ -98,10 +101,10 @@ test("GitHub response body deadline returns unknown and closes the stalled reque
       yield* TestClock.adjust("15 seconds");
       return yield* Fiber.join(fiber);
     }));
-    assert.equal(result.verdict, "unknown");
+    assert.equal(result.verdict, CiVerdictEnum.unknown);
     await closed;
   } finally {
     await runtime.dispose();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
-});
+}, 5000);

@@ -1,19 +1,19 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
-import { Context, Effect, Layer, ManagedRuntime, Schema } from "effect";
+import { it } from "@effect/vitest"
+import { Context, Effect, Layer, ManagedRuntime, Redacted, Schema } from "effect";
 import { createServer } from "node:http";
 import { NodeHttpClient } from "@effect/platform-node";
-import { BrokerConfig, ObjectBackupConfig, Sha, type BrokerConfig as BrokerConfigType } from "../src/contracts.ts";
+import { BrokerConfig, ObjectBackupConfig, type BrokerConfig as BrokerConfigType } from "../src/contracts.ts";
 import { decodeSnapshotList, dumpBrokerDatabase, privateRecoveryPath, recover, RecoveryMetadata, restoreBrokerDatabase, SnapshotStore } from "../src/backup.ts";
 import { Platform } from "../src/platform.ts";
-import { SqlClient } from "effect/sql";
-import { Postgres } from "../src/postgres.ts";
-import { assertBrokerSchema } from "../src/database.ts";
-import { provisionPostgres, postgresAdmin, dropPostgres } from "./postgres-fixture.ts";
-import { makeDatabase } from "../src/kysely.ts";
-import * as Model from "../src/generated/database/types.ts";
 
-test("private recovery contract accepts PostgreSQL pair metadata and rejects SQLite-era versions", () => {
+
+import { assertBrokerSchema } from "../src/database.ts";
+import { provisionPostgres, postgresAdmin, postgresConfig, dropPostgres } from "./postgres-fixture.ts";
+import { DatabaseService } from "../src/database-service.ts";
+import { Archive, Consent, Evidence, SessionId, TaskId } from "../src/generated/database/types.ts";
+
+it("private recovery contract accepts PostgreSQL pair metadata and rejects unsupported versions", () => {
   const file = { sha256: "a".repeat(64), schema: "exact-contract", rows: 1, pendingAccepted: 1 };
   const metadata = { kind: "coordinator-private-recovery", version: 3, sourceSha: "a".repeat(40), createdAt: new Date(0).toISOString(), broker: file,
     runner: { ...file, eventRows: 2, id: "recovery-runner", layout: "canonical-layout", entries: [] }, excluded: [] };
@@ -22,7 +22,7 @@ test("private recovery contract accepts PostgreSQL pair metadata and rejects SQL
   assert.throws(() => Schema.decodeUnknownSync(RecoveryMetadata)({ ...metadata, runner: { ...metadata.runner, eventRows: undefined } }));
 });
 
-test("snapshot expiry rejects foreign keys and malformed pagination pages", () => {
+it("snapshot expiry rejects foreign keys and malformed pagination pages", () => {
   const key = "sanitized/1788033801000.pgdump";
   const page = `<ListBucketResult><IsTruncated>false</IsTruncated><KeyCount>1</KeyCount><MaxKeys>256</MaxKeys><Contents><Key>${key}</Key></Contents></ListBucketResult>`;
   const truncated = page.replace("<IsTruncated>false</IsTruncated>", "<IsTruncated>true</IsTruncated>").replace("</ListBucketResult>", "<NextContinuationToken>TOKEN</NextContinuationToken></ListBucketResult>");
@@ -57,17 +57,17 @@ test("snapshot expiry rejects foreign keys and malformed pagination pages", () =
   ]) assert.throws(() => decodeSnapshotList(invalid));
 });
 
-test("deployed broker config requires HTTPS while explicit local snapshot config permits loopback HTTP", () => {
+it("deployed broker config requires HTTPS while explicit local snapshot config permits loopback HTTP", () => {
   const objectBackup = { endpoint: "http://localhost:9000", region: "garage", bucket: "coordinator-backup-proof", accessKeyFile: "/private/access", secretKeyFile: "/private/secret" };
-  const config: BrokerConfigType = { databaseUrlFile: "/config/database.url", host: "0.0.0.0", port: 8787, principals: [], backupDirectory: "/backups", archiveRetentionMs: 1, backupRetentionMs: 1, objectBackup, repositoryIds: {} };
+  const config: BrokerConfigType = { host: "0.0.0.0", port: 8787, principals: [], backupDirectory: "/backups", archiveRetentionMs: 1, backupRetentionMs: 1, objectBackup, repositoryIds: {} };
   assert.equal(Schema.decodeUnknownSync(ObjectBackupConfig, { onExcessProperty: "error" })(objectBackup).endpoint, objectBackup.endpoint);
-  assert.throws(() => Schema.decodeUnknownSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(JSON.stringify(config)));
-  assert.throws(() => Schema.encodeUnknownSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(config));
-  assert.throws(() => Schema.encodeUnknownSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })({ ...config, objectBackup: { ...objectBackup, endpoint: "https://backup.example.test\\private" } }));
+  assert.throws(() => Schema.decodeSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(JSON.stringify(config)));
+  assert.throws(() => Schema.encodeSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(config));
+  assert.throws(() => Schema.encodeSync(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })({ ...config, objectBackup: { ...objectBackup, endpoint: "https://backup.example.test\\private" } }));
   assert.equal(Schema.decodeUnknownSync(BrokerConfig, { onExcessProperty: "error" })({ ...config, objectBackup: { ...objectBackup, endpoint: "https://backup.example.test" } }).objectBackup?.endpoint, "https://backup.example.test");
 });
 
-test("snapshot expiry carries opaque pagination through real HTTP and never deletes before all pages validate", async () => {
+it("snapshot expiry carries opaque pagination through real HTTP and never deletes before all pages validate", async () => {
   const key = "sanitized/1788033801000.pgdump";
   const lastPage = `<ListBucketResult><IsTruncated>false</IsTruncated><KeyCount>1</KeyCount><MaxKeys>256</MaxKeys><Contents><Key>${key}</Key></Contents></ListBucketResult>`;
   let firstPage = "", secondPage = "";
@@ -124,7 +124,7 @@ test("snapshot expiry carries opaque pagination through real HTTP and never dele
   }
 });
 
-test("private recovery refuses insecure artifacts, symlinks, hardlinks and overwrite paths", async () => {
+it("private recovery refuses insecure artifacts, symlinks, hardlinks and overwrite paths", async () => {
   const runtime = ManagedRuntime.make(Platform.layer);
   const platform = await runtime.runPromise(Platform);
   const root = await runtime.runPromise(platform.fs.makeTempDirectory({ prefix: "coordinator-private-recovery-test-" }));
@@ -154,50 +154,43 @@ test("private recovery refuses insecure artifacts, symlinks, hardlinks and overw
   }
 });
 
-test("native PostgreSQL dump restore fences failed partial data and preserves owner/overwrite gates", async () => {
+it("native PostgreSQL dump restore fences failed partial data and preserves owner/overwrite gates", async () => {
   const runtime = ManagedRuntime.make(Platform.layer);
   try {
     await runtime.runPromise(Effect.scoped(Effect.gen(function*() {
       const platform = yield* Platform;
       const root = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-pg-backup-test-" });
-      const urls: string[] = [];
+      const urls: Redacted.Redacted<string>[] = [];
       yield* Effect.addFinalizer(() => Effect.forEach(urls, (url) => dropPostgres(url), { discard: true }).pipe(Effect.orDie));
-      for (const name of ["source", "target"]) {
-        const directory = platform.path.join(root, name);
-        yield* platform.fs.makeDirectory(directory, { mode: 0o700 });
-        urls.push(yield* provisionPostgres(directory));
-      }
+      for (let index = 0; index < 2; index++) urls.push(yield* provisionPostgres());
       const source = urls[0]!, target = urls[1]!;
-      const config: BrokerConfigType = { databaseUrlFile: source, host: "127.0.0.1", port: 0, principals: [], backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 1, backupRetentionMs: 1, repositoryIds: {} };
+      const config: BrokerConfigType = { host: "127.0.0.1", port: 0, principals: [], backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 1, backupRetentionMs: 1, repositoryIds: {} };
       yield* Effect.scoped(Effect.gen(function*() {
-        assert.equal((yield* Effect.exit(recover("backup", config, platform.path.join(root, "owned"), Sha.make("a".repeat(40)))))._tag, "Failure");
+        assert.equal((yield* Effect.exit(recover("backup", config, platform.path.join(root, "owned"), Evidence.fields.sha.make("a".repeat(40)))))._tag, "Failure");
         assert.equal(yield* platform.fs.exists(platform.path.join(root, "owned")), false);
-      }).pipe(Effect.provide(Postgres.layer(source))));
+      }).pipe(Effect.provide(DatabaseService.layer(source)), Effect.provide(postgresConfig(source))));
       yield* Effect.scoped(Effect.gen(function*() {
-        const sql = yield* SqlClient.SqlClient;
-        const db = makeDatabase(sql);
-        yield* db.execute(db.client.insertInto("tasks").values({ id: Model.TasksId.make("invalid-task"), data: "{}" }));
-        yield* db.execute(db.client.insertInto("archive").values({ owner: "owner", session: "session", entry: "entry", digest: "a".repeat(64), payload: "private transcript", gaps: "[]", created: 1 }));
-        yield* db.execute(db.client.insertInto("consents").values({ owner: "owner", session: "session", enabled: 1, participants: "[]" }));
+        const db = yield* DatabaseService;
+        yield* db.query(client => client.insertInto("tasks").values({ id: TaskId.make("invalid-task"), data: "{}" }));
+        yield* db.query(client => client.insertInto("archive").values({ owner: Archive.fields.owner.make("owner"), session: SessionId.make("session"), entry: Archive.fields.entry.make("entry"), digest: Archive.fields.digest.make("a".repeat(64)), payload: "private transcript", gaps: "[]", created: 1 }));
+        yield* db.query(client => client.insertInto("consents").values({ owner: Consent.fields.owner.make("owner"), session: SessionId.make("session"), enabled: 1, participants: "[]" }));
       }).pipe(Effect.provide(postgresAdmin(source))));
       const dump = platform.path.join(root, "1788033801000.pgdump");
-      yield* dumpBrokerDatabase(config, dump, true);
+      yield* dumpBrokerDatabase(dump, true).pipe(Effect.provide(DatabaseService.layer(source)), Effect.provide(postgresConfig(target)));
       const original = yield* platform.fs.readFile(dump);
-      assert.equal((yield* Effect.exit(dumpBrokerDatabase(config, dump, true)))._tag, "Failure", "dump overwrote an existing artifact");
+      assert.equal((yield* Effect.exit(dumpBrokerDatabase(dump, true).pipe(Effect.provide(DatabaseService.layer(source)))))._tag, "Failure", "dump overwrote an existing artifact");
       assert.deepEqual(yield* platform.fs.readFile(dump), original);
       assert.equal(new TextDecoder().decode(original).includes("private transcript"), false);
-      const targetConfig = { ...config, databaseUrlFile: target };
-      assert.equal((yield* Effect.exit(restoreBrokerDatabase(targetConfig, dump)))._tag, "Failure", "invalid task must fail after restore");
+      assert.equal((yield* Effect.exit(restoreBrokerDatabase(dump).pipe(Effect.provide(postgresConfig(target)))))._tag, "Failure", "invalid task must fail after restore");
       yield* Effect.scoped(Effect.gen(function*() {
-        const sql = yield* SqlClient.SqlClient;
-        const db = makeDatabase(sql);
-        assert.equal((yield* db.execute(db.client.selectFrom("recovery_gate").selectAll()))[0]?.ready, false, "failed partial target must remain fenced");
-        assert.equal(Number((yield* db.execute(db.client.selectFrom("tasks").select((eb) => eb.fn.countAll<string>().as("count"))))[0]?.count), 1, "proof did not exercise post-mutation failure");
+        const db = yield* DatabaseService;
+        assert.equal((yield* db.query(client => client.selectFrom("recovery_gate").selectAll()))[0]?.ready, false, "failed partial target must remain fenced");
+        assert.equal(Number((yield* db.query(client => client.selectFrom("tasks").select((eb) => eb.fn.countAll<string>().as("count"))))[0]?.count), 1, "proof did not exercise post-mutation failure");
         const excluded: ReadonlyArray<"archive" | "consents" | "participant_consents"> = ["archive", "consents", "participant_consents"];
-        for (const table of excluded) assert.equal(Number((yield* db.execute(db.client.selectFrom(table).select((eb) => eb.fn.countAll<string>().as("count"))))[0]?.count), 0);
-        assert.equal((yield* Effect.exit(assertBrokerSchema(sql)))._tag, "Failure", "fenced target must not serve");
+        for (const table of excluded) assert.equal(Number((yield* db.query(client => client.selectFrom(table).select((eb) => eb.fn.countAll<string>().as("count"))))[0]?.count), 0);
+        assert.equal((yield* Effect.exit(assertBrokerSchema(db)))._tag, "Failure", "fenced target must not serve");
       }).pipe(Effect.provide(postgresAdmin(target))));
-      assert.equal((yield* Effect.exit(restoreBrokerDatabase(targetConfig, dump)))._tag, "Failure", "partial/occupied target must refuse reuse");
+      assert.equal((yield* Effect.exit(restoreBrokerDatabase(dump).pipe(Effect.provide(postgresConfig(target)))))._tag, "Failure", "partial/occupied target must refuse reuse");
       assert.deepEqual(yield* platform.fs.readFile(dump), original);
     })));
   } finally {

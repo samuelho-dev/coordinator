@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./src/agent",
+    "outDir": "./dist/agent",
+    "noEmit": false,
+    "noEmitOnError": true,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true
+  },
+  "include": ["src/agent/**/*.ts"]
+}

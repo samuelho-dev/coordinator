@@ -1,18 +1,24 @@
+import { JournalReleaseStateEnum } from "../src/contracts.ts";
+import { Commands, type CommandOutput, RoleEnum, DispositionEnum } from "../src/contracts.ts";
+import { AgentRunOutcomeEnum, AgentRunPhaseEnum, AgentPhaseTransitionEnum } from "../src/agent/contracts.ts";
+import { TaskStateEnum } from "../src/generated/database/enums.ts";
+import { AgentHostEnum } from "../src/agent/contracts.ts";
 import assert from "node:assert/strict";
-import test from "node:test";
+import { it } from "@effect/vitest";
 import { Cause, Clock, ConfigProvider, Context as EffectContext, Deferred, Duration, Effect, Layer, Schema, Sink, Stdio } from "effect";
 import { ChildProcess } from "effect/process";
 import { TestClock } from "effect/testing";
 import { HttpServer } from "effect/http";
-import { NativeBinding, NativeEventSequence, NativeRunId } from "@samuelho/coordinator-native-control/contracts";
-import { Mcp, serverLayer } from "../src/http.ts";
+import { AgentBinding, AgentEventSequence, AgentRunId } from "../src/agent/contracts.ts";
+import { Mcp, serverLayer } from "../src/mcp.ts";
 import { Platform, redactedCause } from "../src/platform.ts";
 import { Journal } from "../src/journal.ts";
-import { CommandError, Delivery, HttpError, Task, Principal, PluginConfig, JournalReleaseKey, SessionId } from "../src/contracts.ts";
-import type { Context, BrokerRequest, CommandOutput } from "../src/contracts.ts";
+import { CommandError, Delivery, HttpError, MachineId, Task, Principal, PluginConfig, JournalReleaseKey } from "../src/contracts.ts";
+import { SessionId } from "../src/generated/database/types.ts";
+import type { Context, BrokerRequest } from "../src/contracts.ts";
 import { Plugin } from "../src/plugin.ts";
 
-test("ordinary host startup discovers private plugin config and fences owned SDK delivery", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+it.live("ordinary host startup discovers private plugin config and fences owned SDK delivery", () => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
   const mcp = yield* Mcp;
   const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-plugin-" });
@@ -48,43 +54,43 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
   const admitted = yield* Deferred.make<void>();
   const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
   yield* mcp.serve(server, { target: "broker",
-    authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
+    authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: RoleEnum.session, owner: "owner", tokenHash: "a".repeat(64), roles: [RoleEnum.session], repos: ["github.com/example/repo"] })),
     handle: (_principal, request) => Effect.gen(function*() {
       brokerRequests++;
       const now = yield* Clock.currentTimeMillis;
-      if (request.method === "session.heartbeat") {
+      if (request.method === Commands.heartbeatSession.name) {
         identity = request.params;
         if (task === undefined) {
           const address = { messageId: "message", revision: 1, sessionId: identity.sessionId, incarnation: identity.incarnation, workerId: identity.workerId,
             repo: "github.com/example/repo", ref: "refs/heads/main", sha, scope: "test", restrictions: "none", expectedEvidence: [], deadline: now + 60000 };
           const work = { taskId: "task", prompt: "SDK_UNAVAILABLE_PROVIDER", repo: address.repo, ref: address.ref, sha,
-            launcher: "pi", scope: address.scope, restrictions: address.restrictions, expectedEvidence: [], deadline: address.deadline, workerId: address.workerId,
+            launcher: AgentHostEnum.pi, scope: address.scope, restrictions: address.restrictions, expectedEvidence: [], deadline: address.deadline, workerId: address.workerId,
             githubRepoId: 1, requiredLanes: [], bypassPeer: false, approved: true };
-          task = Schema.decodeUnknownSync(Task)({ taskId: "task", owner: "owner", fingerprint: yield* platform.fingerprint(work), state: "ACCEPTED", createdAt: now, updatedAt: now,
-            address, readback: address, confirmedRevision: 1, disposition: "ready", request: work });
+          task = Schema.decodeUnknownSync(Task)({ taskId: "task", owner: "owner", fingerprint: yield* platform.fingerprint(work), state: TaskStateEnum.ACCEPTED, createdAt: now, updatedAt: now,
+            address, readback: address, confirmedRevision: 1, disposition: DispositionEnum.ready, request: work });
         }
-        return { liveUntil: now + 30000 } satisfies CommandOutput<typeof request.method>;
+        const output: CommandOutput<typeof Commands.heartbeatSession> = { liveUntil: now + 30000 }; return output;
       }
-      if (request.method === "session.poll") {
+      if (request.method === Commands.pollSession.name) {
         yield* Deferred.succeed(polled, undefined);
         const messages = delivered ? [Schema.decodeUnknownSync(Delivery)({ messageId: "delivery-conflict", incarnation: request.params.incarnation,
           payload: ++conflictPolls, expiresAt: now + 60000 })] : [];
-        return { messages, offers: [], releases: task === undefined ? [] : [task] } satisfies CommandOutput<typeof request.method>;
+        const output: CommandOutput<typeof Commands.pollSession> = { messages, offers: [], releases: task === undefined ? [] : [task] }; return output;
       }
-      if (request.method === "peer.ack") return { handled: true } satisfies CommandOutput<typeof request.method>;
-      if (request.method === "session.stop") return { stopped: true } satisfies CommandOutput<typeof request.method>;
-      if (request.method === "task.report" && task !== undefined) {
+      if (request.method === Commands.acknowledgePeer.name) { const output: CommandOutput<typeof Commands.acknowledgePeer> = { handled: true }; return output; }
+      if (request.method === Commands.stopSession.name) { const output: CommandOutput<typeof Commands.stopSession> = { stopped: true }; return output; }
+      if (request.method === Commands.reportTask.name && task !== undefined) {
         const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, request.params.sessionId)), Journal);
-        assert.equal(persisted.state.releases[JournalReleaseKey.make("task:1")], "sent", "SDK admission must follow durable intent before reporting");
-        if (request.params.state === "RUNNING") {
+        assert.equal(persisted.state.releases[JournalReleaseKey.make("task:1")], JournalReleaseStateEnum.sent, "SDK admission must follow durable intent before reporting");
+        if (request.params.state === TaskStateEnum.RUNNING) {
           attempts++;
           yield* Deferred.succeed(admitted, undefined);
           return yield* new HttpError({ status: 503, message: "PRIVATE_LOST_ADMISSION_REPORT" });
         } else {
-          assert.ok(request.params.state === "FAILED" || request.params.state === "HELD");
+          assert.ok(request.params.state === TaskStateEnum.FAILED || request.params.state === TaskStateEnum.HELD);
           delivered = true;
         }
-        return { ...task, state: request.params.state, result: request.params.result } satisfies CommandOutput<typeof request.method>;
+        const output: CommandOutput<typeof Commands.reportTask> = { ...task, state: request.params.state, result: request.params.result }; return output;
       }
       return yield* new CommandError({ message: "Unexpected broker route" });
     }).pipe(Effect.scoped, Effect.provideService(Platform, platform)),
@@ -93,7 +99,7 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
   yield* platform.fs.writeFileString(platform.path.join(agentDir, "models.json"), JSON.stringify({ providers: {
     "coordinator-unavailable": { baseUrl: `http://127.0.0.1:${server.address.port}/unavailable/v1`, api: "openai-completions", apiKey: "isolated-fixture-only", models: [{ id: "unavailable" }] },
   } }), { mode: 0o600 });
-  yield* platform.fs.writeFileString(config, Schema.encodeUnknownSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
+  yield* platform.fs.writeFileString(config, Schema.encodeSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: MachineId.make("workstation/東京"), host: AgentHostEnum.pi }), { mode: 0o600 });
   const service = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
     Layer.provide(Layer.succeed(Platform, platform)),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ XDG_CONFIG_HOME: platform.path.join(directory, "config") }))),
@@ -114,18 +120,18 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
   assert.ok(identity);
   assert.notEqual(identity.sessionId, ctx.sessionManager.getSessionId());
   assert.equal(identity.workerId, identity.sessionId);
-  const binding = Schema.decodeUnknownSync(NativeBinding)({ host: "pi", sessionId: identity.sessionId, incarnation: identity.incarnation, generation: 1 });
-  const runId = NativeRunId.make("consumer-run"), seq = NativeEventSequence.make(1);
-  yield* service.native({ type: "native_lifecycle", kind: "run_started", binding, runId, at: 1, seq }, ctx);
+  const binding = Schema.decodeUnknownSync(AgentBinding)({ host: AgentHostEnum.pi, sessionId: identity.sessionId, incarnation: identity.incarnation, generation: 1 });
+  const runId = AgentRunId.make("consumer-run"), seq = AgentEventSequence.make(1);
+  yield* service.agent({ type: "agent_lifecycle", kind: "run_started", binding, runId, at: 1, seq }, ctx);
   assert.match(terminalOutput.at(-1) ?? "", /state=working/);
-  yield* service.native({ type: "native_lifecycle", kind: "run_phase", binding, runId, at: 2, seq, phase: "continuation", transition: "ended" }, ctx);
+  yield* service.agent({ type: "agent_lifecycle", kind: "run_phase", binding, runId, at: 2, seq, phase: AgentRunPhaseEnum.continuation, transition: AgentPhaseTransitionEnum.ended }, ctx);
   assert.match(terminalOutput.at(-1) ?? "", /state=working/, "A continuation boundary is not settlement");
-  yield* service.native({ type: "native_lifecycle", kind: "run_settled", binding, runId, at: 3, seq, outcome: "completed" }, ctx);
+  yield* service.agent({ type: "agent_lifecycle", kind: "run_settled", binding, runId, at: 3, seq, outcome: AgentRunOutcomeEnum.completed }, ctx);
   assert.match(terminalOutput.at(-1) ?? "", /state=done/);
   yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
   assert.equal(attempts, 1, "A lost admission report cannot replay an already admitted native prompt during recovery");
   const retained = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, SessionId.make(identity.sessionId))), Journal);
-  assert.equal(retained.state.releases[JournalReleaseKey.make("task:1")], "sent", "Journal pause cannot clear admitted release uncertainty");
+  assert.equal(retained.state.releases[JournalReleaseKey.make("task:1")], JournalReleaseStateEnum.sent, "Journal pause cannot clear admitted release uncertainty");
   for (const frame of terminalOutput.filter(frame => !frame.includes("7501;?"))) {
     assert.match(frame, /id=coordinator/);
     assert.match(frame, /app=coordinator/);
@@ -143,9 +149,9 @@ test("ordinary host startup discovers private plugin config and fences owned SDK
   yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
   assert.equal(attempts, 1, "A new actual SDK identity cannot replay the prior addressed revision");
   for (const frame of terminalOutput) assert.ok(!/consumer-run|surrounding-host-session|private|test-token/.test(frame), "Terminal status contains only constant metadata");
-})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer)))));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))));
 
-test("a refused startup heartbeat retains scoped enrollment until its lease fence clears", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+it.live("a refused startup heartbeat retains scoped enrollment until its lease fence clears", () => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform, mcp = yield* Mcp;
   const clock = yield* TestClock.make({ warningDelay: "1 minute" });
   yield* clock.setTime(Date.now());
@@ -175,33 +181,33 @@ test("a refused startup heartbeat retains scoped enrollment until its lease fenc
     }
     yield* clock.sleep(duration);
   }) };
-  yield* mcp.serve(server, { target: "broker", authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "session", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
+  yield* mcp.serve(server, { target: "broker", authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: RoleEnum.session, owner: "owner", tokenHash: "a".repeat(64), roles: [RoleEnum.session], repos: ["github.com/example/repo"] })),
     handle: (_principal, request: BrokerRequest) => Effect.gen(function*() {
-      if (request.method === "session.heartbeat") {
+      if (request.method === Commands.heartbeatSession.name) {
         traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
         heartbeatAttempts++;
         if (heartbeatAttempts === 1) return yield* new HttpError({ status: 409, message: "PRIVATE_ENDPOINT_TOKEN_PATH" });
         liveUntil = clock.currentTimeMillisUnsafe() + 30000;
-        return { liveUntil } satisfies CommandOutput<typeof request.method>;
+        const output: CommandOutput<typeof Commands.heartbeatSession> = { liveUntil }; return output;
       }
-      if (request.method === "session.poll") {
+      if (request.method === Commands.pollSession.name) {
         traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
         polledAt = clock.currentTimeMillisUnsafe();
         polls++;
         yield* Deferred.succeed(polled, undefined);
         return { messages: [Schema.decodeUnknownSync(Delivery)({ messageId: "private-fixture-message", incarnation: request.params.incarnation,
-          payload: polls === 1 ? "PRIVATE_INITIAL_PAYLOAD" : "PRIVATE_CONFLICT_PAYLOAD", expiresAt: clock.currentTimeMillisUnsafe() + 60000 })], offers: [], releases: [] } satisfies CommandOutput<typeof request.method>;
+          payload: polls === 1 ? "PRIVATE_INITIAL_PAYLOAD" : "PRIVATE_CONFLICT_PAYLOAD", expiresAt: clock.currentTimeMillisUnsafe() + 60000 })], offers: [], releases: [] };
       }
-      if (request.method === "peer.ack") return { handled: true } satisfies CommandOutput<typeof request.method>;
-      if (request.method === "session.stop") {
+      if (request.method === Commands.acknowledgePeer.name) { const output: CommandOutput<typeof Commands.acknowledgePeer> = { handled: true }; return output; }
+      if (request.method === Commands.stopSession.name) {
         traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
-        return { stopped: true } satisfies CommandOutput<typeof request.method>;
+        const output: CommandOutput<typeof Commands.stopSession> = { stopped: true }; return output;
       }
       return yield* new CommandError({ message: "Unexpected broker route" });
     }),
   });
   if (server.address._tag !== "InetAddressV4") return yield* new CommandError({ message: "Expected TCP server" });
-  yield* platform.fs.writeFileString(config, Schema.encodeUnknownSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
+  yield* platform.fs.writeFileString(config, Schema.encodeSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: MachineId.make("machine"), host: AgentHostEnum.pi }), { mode: 0o600 });
   const notifications: string[] = [], statuses = new Map<string, string>();
   const ctx: Context = { cwd: directory, mode: "rpc", hasUI: true,
     sessionManager: { getSessionId: () => "parent-session" }, ui: { notify: (text) => {
@@ -235,7 +241,7 @@ test("a refused startup heartbeat retains scoped enrollment until its lease fenc
   yield* clock.adjust(251);
   yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
   assert.equal(heartbeatAttempts, 2);
-  const recovered = traffic.find(call => call.method === "session.poll");
+  const recovered = traffic.find(call => call.method === Commands.pollSession.name);
   assert.ok(recovered);
   assert.notEqual(recovered.incarnation, refused.incarnation, "Recovery must not reuse the refused native incarnation");
   assert.deepEqual(traffic.map(call => call.method), ["session.heartbeat", "session.stop", "session.heartbeat", "session.poll"], "The old enrollment retires before a fresh heartbeat permits delivery");
@@ -255,15 +261,15 @@ test("a refused startup heartbeat retains scoped enrollment until its lease fenc
   const stoppedPolls = polls;
   yield* clock.adjust(1200);
   assert.equal(polls, stoppedPolls, "Retirement cancels periodic polling");
-})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer)))));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))));
 
-test("safe causal summaries never decode unknown defects as typed success", () => {
+it("safe causal summaries never decode unknown defects as typed success", () => {
   assert.match(redactedCause(Cause.die({ _tag: "HttpError", status: 200, message: "PRIVATE" })), /unknown defect/);
   assert.match(redactedCause(Cause.fail({ _tag: "UnknownPrivateTag", token: "PRIVATE" })), /unknown failure/);
   assert.ok(!redactedCause(Cause.fail(new HttpError({ status: 503, message: "PRIVATE" }))).includes("PRIVATE"));
 });
 
-test("unconfigured hosts stay disabled but present insecure or malformed plugin config fails closed", () => Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+it.live("unconfigured hosts stay disabled but present insecure or malformed plugin config fails closed", () => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
   const home = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-config-" });
   const directory = platform.path.join(home, ".config", "coordinator"), config = platform.path.join(directory, "plugin.json");
@@ -278,4 +284,4 @@ test("unconfigured hosts stay disabled but present insecure or malformed plugin 
   assert.equal((yield* Effect.exit(Layer.build(layer)))._tag, "Failure", "Present public-readable enrollment must not silently disable the plugin");
   yield* platform.fs.chmod(config, 0o600);
   assert.equal((yield* Effect.exit(Layer.build(layer)))._tag, "Failure", "Present malformed enrollment must not silently disable the plugin");
-})).pipe(Effect.provide(Platform.layer))));
+})).pipe(Effect.provide(Platform.layer)));

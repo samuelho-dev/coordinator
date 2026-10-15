@@ -8,7 +8,6 @@ overrides:
   effect: 4.0.3
   '@effect/platform-node': 4.0.3
   '@effect/platform-node-shared': 4.0.3
-  '@effect/sql-pg': 4.0.3
 
 importers:
 
@@ -20,9 +19,6 @@ importers:
       '@effect/platform-node':
         specifier: 4.0.3
         version: 4.0.3(effect@4.0.3)(redis@6.3.0(@opentelemetry/api@1.9.1))
-      '@effect/sql-pg':
-        specifier: 4.0.3
-        version: 4.0.3(effect@4.0.3)
       '@modelcontextprotocol/client':
         specifier: 2.3.1
         version: 2.3.1
@@ -32,15 +28,15 @@ importers:
       '@prisma/orm-postgres':
         specifier: 8.0.0-rc.17
         version: 8.0.0-rc.17(@prisma/cli-engine@0.7.0(@prisma/management-api-sdk@1.80.0)(magicast@0.5.5))(magicast@0.5.5)(temporal-polyfill@1.0.4)(typanion@3.14.0)(typescript@7.0.2)(vite@8.3.4(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0))
-      '@samuelho/coordinator-native-control':
-        specifier: workspace:*
-        version: link:packages/native-control
       effect:
         specifier: 4.0.3
         version: 4.0.3
       kysely:
         specifier: 0.29.6
         version: 0.29.6
+      pg:
+        specifier: 8.22.0
+        version: 8.22.0
       prisma:
         specifier: 8.0.0-rc.22
         version: 8.0.0-rc.22(@effect/platform-node@4.0.3(effect@4.0.3)(redis@6.3.0(@opentelemetry/api@1.9.1)))(@effect/sql-pg@4.0.3(effect@4.0.3))(@types/node@24.19.1)(@vercel/nft@1.11.0)(magicast@0.5.5)(pg@8.22.0)(typanion@3.14.0)(typescript@7.0.2)(vite@8.3.4(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0))(vitest@5.0.3(@opentelemetry/api@1.9.1)(@types/node@24.19.1)(vite@8.3.4(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0)))(ws@8.22.0)
@@ -50,13 +46,25 @@ importers:
       tsx:
         specifier: ^4.20.0
         version: 4.23.15
+      undici:
+        specifier: 8.11.2
+        version: 8.11.2
+      ws:
+        specifier: 8.22.0
+        version: 8.22.0
     devDependencies:
       '@effect/tsgo':
         specifier: 0.49.0
         version: 0.49.0
+      '@effect/vitest':
+        specifier: 4.0.3
+        version: 4.0.3(effect@4.0.3)(vitest@5.0.3(@opentelemetry/api@1.9.1)(@types/node@24.19.1)(vite@8.3.4(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0)))
       '@types/node':
         specifier: ^24.0.0
         version: 24.19.1
+      '@types/pg':
+        specifier: 8.20.0
+        version: 8.20.0
       esbuild:
         specifier: 0.28.2
         version: 0.28.2
@@ -66,22 +74,9 @@ importers:
       typescript:
         specifier: 7.0.2
         version: 7.0.2
-
-  packages/native-control:
-    dependencies:
-      '@effect/platform-node':
-        specifier: 4.0.3
-        version: 4.0.3(effect@4.0.3)(redis@6.3.0(@opentelemetry/api@1.9.1))
-      '@modelcontextprotocol/client':
-        specifier: 2.3.1
-        version: 2.3.1
-      effect:
-        specifier: 4.0.3
-        version: 4.0.3
-    devDependencies:
-      '@effect/tsgo':
-        specifier: 0.49.0
-        version: 0.49.0
+      vitest:
+        specifier: 5.0.3
+        version: 5.0.3(@opentelemetry/api@1.9.1)(@types/node@24.19.1)(vite@8.3.4(@types/node@24.19.1)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0))
 
 packages:
 
@@ -1641,6 +1636,9 @@ packages:
   '@types/node@26.1.2':
     resolution: {integrity: sha512-Vu4a5UFA9rIIFJ7rB/Vaafh9lrCQszopTCx6KjFboXTGQbPNasehVR5TEiithSDGyd1DEiUByggTZsg8jukeIg==}
 
+  '@types/pg@8.20.0':
+    resolution: {integrity: sha512-bEPFOaMAHTEP1EzpvHTbmwR8UsFyHSKsRisLIHVMXnpNefSbGA1bD6CVy+qKjGSqmZqNqBDV2azOBo8TgkcVow==}
+
   '@types/pg@8.20.4':
     resolution: {integrity: sha512-Jz7UDOlIiFJuacC0TlBoLyNtmwlA/wpIyPDd3tvUqlRM+HzkWy2xUgpFpaXtbfTAFF6sIGq5lsCDBdJnhky1Xg==}
 
@@ -1828,7 +1826,7 @@ packages:
       '@effect/platform-bun': '>=4.0.0-rc.115 || >=4.0.0'
       '@effect/platform-node': 4.0.3
       '@effect/sql-mysql2': '>=4.0.0-rc.115 || >=4.0.0'
-      '@effect/sql-pg': 4.0.3
+      '@effect/sql-pg': '>=4.0.0-rc.115 || >=4.0.0'
       '@vercel/nft': ^1.10.2
       drizzle-kit: 1.0.0-rc.5-ab785fc
       drizzle-orm: 1.0.0-rc.5-ab785fc
@@ -3995,6 +3993,7 @@ snapshots:
   '@effect/sql-pg@4.0.3(effect@4.0.3)':
     dependencies:
       effect: 4.0.3
+    optional: true
 
   '@effect/sql-sqlite-do@4.0.0-rc.115(effect@4.0.3)':
     dependencies:
@@ -5167,6 +5166,12 @@ snapshots:
   '@types/node@26.1.2':
     dependencies:
       undici-types: 8.3.0
+
+  '@types/pg@8.20.0':
+    dependencies:
+      '@types/node': 24.19.1
+      pg-protocol: 1.16.1
+      pg-types: 2.2.0
 
   '@types/pg@8.20.4':
     dependencies:

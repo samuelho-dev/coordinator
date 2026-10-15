@@ -1,50 +1,42 @@
+import { Commands, RoleEnum } from "../src/contracts.ts";
+import { AgentHostEnum } from "../src/agent/contracts.ts";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { pipeline } from "node:stream/promises";
-import test from "node:test";
+import { it } from "@effect/vitest";
 import { Clock, ConfigProvider, Context as EffectContext, Deferred, Duration, Effect, Fiber, Layer, Schema, Sink, Stdio } from "effect";
-import type { Scope } from "effect";
 import { TestClock } from "effect/testing";
 import { ChildProcess } from "effect/process";
 import { HttpServer } from "effect/http";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { NativePluginEndpoint } from "@samuelho/coordinator-native-control/contracts";
-import { CommandError, Delivery, PluginConfig, Principal } from "../src/contracts.ts";
+import { AgentEndpoint } from "../src/agent/contracts.ts";
+import { CommandError, Delivery, MachineId, PluginConfig, Principal } from "../src/contracts.ts";
 import type { Context } from "../src/contracts.ts";
-import { Mcp, serverLayer } from "../src/http.ts";
+import { Mcp, serverLayer } from "../src/mcp.ts";
 import { Platform } from "../src/platform.ts";
 import { Plugin } from "../src/plugin.ts";
 
-interface RecoveryFixture {
-  plugin: NonNullable<Plugin["Service"]>;
-  ctx: Context;
-  traffic: { method: string; at: number; sessionId?: string; incarnation?: string }[];
-  notifications: { text: string; level: string | undefined }[];
-  statuses: Map<string, string>;
-  frames: string[];
-  advance: (milliseconds: number) => Effect.Effect<void>;
-  settle: () => Effect.Effect<void>;
-  idleScheduled: Effect.Effect<void>;
-  idlePolled: Effect.Effect<void>;
-  nativeState: () => Effect.Effect<{ messageCount: number; isStreaming: boolean }, unknown, Scope.Scope>;
-  clock: TestClock.TestClock;
-  eligible: () => boolean;
-  fail: (value: { status: number; retryAfter?: string; method?: string } | undefined) => void;
-  hang: (value: boolean) => void;
-  holdPoll: () => { reached: Promise<void>; release: () => void };
-  cancelled: () => number;
-  conflict: () => void;
-  replace: () => void;
-}
 
-// Native startup mutates Pi's documented agent directory; node:test runs these top-level tests serially.
-const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown, Platform | Mcp | Scope.Scope> {
+// Agent startup mutates Pi's documented agent directory; keep these tests sequential.
+const fixture = Effect.fn(function*() {
   const platform = yield* Platform, mcp = yield* Mcp;
   const baseClock = yield* TestClock.make({ warningDelay: "1 minute" });
   const idleScheduled = yield* Deferred.make<void>(), idlePolled = yield* Deferred.make<void>();
+  let ownerFiber: number | undefined, ownerSleeping = true;
+  const commandSleeps = new Set<number>();
   const clock: TestClock.TestClock = { ...baseClock, sleep: duration => Effect.gen(function*() {
-    if (Duration.toMillis(duration) === 1000) yield* Deferred.succeed(idleScheduled, undefined);
-    yield* baseClock.sleep(duration);
+    const milliseconds = Duration.toMillis(duration), fiber = yield* Effect.fiberId;
+    // Command and private-I/O deadline timers run in child fibers, never the owner.
+    const owner = ownerFiber === fiber || (milliseconds >= 1000 && milliseconds !== 10000 && milliseconds !== 30000);
+    if (owner) { ownerFiber = fiber; ownerSleeping = true; }
+    else if (milliseconds === 10000 || milliseconds === 30000) commandSleeps.add(fiber);
+    if (milliseconds === 1000) yield* Deferred.succeed(idleScheduled, undefined);
+    yield* baseClock.sleep(duration).pipe(Effect.onExit(exit => Effect.sync(() => {
+      if (owner && ownerFiber === fiber) {
+        ownerSleeping = exit._tag === "Failure";
+        if (exit._tag === "Failure") ownerFiber = undefined;
+      } else commandSleeps.delete(fiber);
+    })));
   }) };
   yield* clock.setTime(Date.now());
   const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-recovery-" });
@@ -74,18 +66,18 @@ const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown
   let liveUntil = 0, polledAt = 0, conflict = false, polls = 0;
   const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
   yield* mcp.serve(server, { target: "broker",
-    authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "fixture", owner: "owner", tokenHash: "a".repeat(64), roles: ["session"], repos: ["github.com/example/repo"] })),
+    authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: "fixture", owner: "owner", tokenHash: "a".repeat(64), roles: [RoleEnum.session], repos: ["github.com/example/repo"] })),
     handle: (_principal, request) => Effect.gen(function*() {
       const now = clock.currentTimeMillisUnsafe();
-      if (request.method === "session.heartbeat") { liveUntil = now + 30000; return { liveUntil }; }
-      if (request.method === "session.poll") {
+      if (request.method === Commands.heartbeatSession.name) { liveUntil = now + 30000; return { liveUntil }; }
+      if (request.method === Commands.pollSession.name) {
         if (++polls === 2) yield* Deferred.succeed(idlePolled, undefined);
         polledAt = now;
         return { messages: conflict ? [Schema.decodeUnknownSync(Delivery)({ messageId: "same-message", incarnation: request.params.incarnation,
           payload: now, expiresAt: now + 60000 })] : [], offers: [], releases: [] };
       }
-      if (request.method === "peer.ack") return { handled: true };
-      if (request.method === "session.stop") return { stopped: true };
+      if (request.method === Commands.acknowledgePeer.name) return { handled: true };
+      if (request.method === Commands.stopSession.name) return { stopped: true };
       return yield* new CommandError({ message: "Unexpected fixture command" });
     }),
   });
@@ -93,8 +85,8 @@ const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown
   if (server.address._tag !== "InetAddressV4") throw new Error("Loopback required");
   const upstream = `http://127.0.0.1:${server.address.port}`;
   let failure: { status: number; retryAfter?: string; method?: string } | undefined;
-  let hanging = false, cancelled = 0;
-  let pollHold: { reached: ReturnType<typeof Promise.withResolvers<void>>; released: ReturnType<typeof Promise.withResolvers<void>> } | undefined;
+  let hanging = false, hangingRequests = 0, cancelled = 0, heldPolls = 0;
+  let pollHold: { reached: PromiseWithResolvers<void>; released: PromiseWithResolvers<void> } | undefined;
   const proxyFailures: string[] = [];
   const forwardingHeaders = (headers: Headers) => {
     const connection = headers.get("connection")?.split(",").map(name => name.trim()) ?? [];
@@ -122,15 +114,20 @@ const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown
       const rpc = body.length ? JSON.parse(body.toString("utf8")) : undefined;
       const method: string | undefined = rpc?.method === "tools/call" ? rpc.params.name : undefined;
       if (method) traffic.push({ method, at: clock.currentTimeMillisUnsafe(), sessionId: rpc.params.arguments?.sessionId, incarnation: rpc.params.arguments?.incarnation });
-      if (method && hanging && method !== "session.stop") { response.on("close", () => { cancelled++; }); return; }
+      if (method && hanging && method !== Commands.stopSession.name) {
+        hangingRequests++;
+        response.on("close", () => { hangingRequests--; cancelled++; });
+        return;
+      }
       if (method && failure && (failure.method === undefined || failure.method === method)) {
         response.writeHead(failure.status, { "content-type": "application/json", ...(failure.retryAfter ? { "retry-after": failure.retryAfter } : {}) });
         response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, error: { code: failure.status === 501 ? -32601 : -32000, message: "PRIVATE_FAULT_DETAIL" } }));
         return;
       }
-      if (method === "session.poll" && pollHold) {
+      if (method === Commands.pollSession.name && pollHold) {
         const hold = pollHold;
         pollHold = undefined;
+        heldPolls++;
         hold.reached.resolve();
         await hold.released.promise;
       }
@@ -178,7 +175,7 @@ const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown
   const address = proxy.address();
   assert.ok(address && typeof address === "object");
   const config = platform.path.join(directory, "config.json");
-  yield* platform.fs.writeFileString(config, Schema.encodeUnknownSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${address.port}`, tokenFile, stateDirectory, machineId: "machine", host: "pi" }), { mode: 0o600 });
+  yield* platform.fs.writeFileString(config, Schema.encodeSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${address.port}`, tokenFile, stateDirectory, machineId: MachineId.make("machine"), host: AgentHostEnum.pi }), { mode: 0o600 });
   const plugin = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
     Layer.provide(Layer.succeed(Platform, platform)),
     Layer.provide(Layer.succeed(Clock.Clock, clock)),
@@ -190,61 +187,71 @@ const fixture = Effect.fn(function*(): Effect.fn.Return<RecoveryFixture, unknown
     })) })),
   )), Plugin);
   assert.ok(plugin);
-  // Only Effect time is virtual. Give the actual socket and SDK microtasks time to settle at every step.
-  const settle = () => Effect.promise(() => new Promise<void>(resolve => setTimeout(resolve, 25)));
-  const advance = Effect.fn(function*(milliseconds: number) {
-    for (let remaining = milliseconds; remaining > 0; remaining -= 250) { yield* clock.adjust(Math.min(remaining, 250)); yield* settle(); }
+  // Never move virtual deadlines while a real response or the owner's durable work is unfinished.
+  const waitFor = (ready: () => boolean, message: string) => Effect.promise(async () => {
+    const deadline = performance.now() + 5000;
+    for (;;) {
+      // TestClock wakes Effect fibers; let their scheduled continuations run before observing readiness.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (ready()) return;
+      assert.ok(performance.now() < deadline, message);
+    }
   });
-  const nativeState = Effect.fn(function*() {
-    const nativeDirectory = platform.path.join(stateDirectory, `native-${yield* platform.digest(parentSession)}`);
-    const endpoint = Schema.decodeUnknownSync(Schema.fromJsonString(NativePluginEndpoint))(yield* platform.privateFile(platform.path.join(nativeDirectory, "endpoint.json")));
-    const token = yield* platform.privateFile(platform.path.join(nativeDirectory, "control.token"));
+  const settle = () => waitFor(() => hangingRequests > 0 || heldPolls > 0 ||
+    (commandSleeps.size === 0 && ownerSleeping), "Owner did not finish real I/O and return to its scheduled sleep");
+  const advance = Effect.fn(function*(milliseconds: number) {
+    yield* settle();
+    for (let remaining = milliseconds; remaining > 0; remaining -= 250) {
+      yield* clock.adjust(Math.min(remaining, 250));
+      yield* settle();
+    }
+  });
+  const agentState = Effect.fn(function*() {
+    const agentDirectory = platform.path.join(stateDirectory, `agent-${yield* platform.digest(parentSession)}`);
+    const endpoint = yield* Schema.decodeEffect(Schema.fromJsonString(AgentEndpoint))(yield* platform.privateFile(platform.path.join(agentDirectory, "endpoint.json")));
+    const token = yield* platform.privateFile(platform.path.join(agentDirectory, "control.token"));
     const client = yield* Effect.acquireRelease(Effect.sync(() => new Client({ name: "recovery-fixture", version: "1" })), client => Effect.promise(() => client.close()));
     yield* Effect.promise(() => client.connect(new StreamableHTTPClientTransport(new URL(endpoint.url), { requestInit: { headers: { authorization: `Bearer ${token}` } } })));
-    const result = yield* Effect.promise(() => client.callTool({ name: "native.get_state", arguments: { binding: endpoint.binding } }));
+    const result = yield* Effect.promise(() => client.callTool({ name: "agent.get_state", arguments: { binding: endpoint.binding } }));
     assert.notEqual(result.isError, true, "Paused broker traffic must not dispose the owned native endpoint");
-    return Schema.decodeUnknownSync(Schema.Struct({ result: Schema.Struct({ messageCount: Schema.Number, isStreaming: Schema.Boolean }) }))(result.structuredContent).result;
+    return (yield* Schema.decodeUnknownEffect(Schema.Struct({ result: Schema.Struct({ messageCount: Schema.Number, isStreaming: Schema.Boolean }) }))(result.structuredContent)).result;
   });
-  return { plugin, ctx, traffic, notifications, statuses, frames, advance, settle, nativeState, clock,
+  return { plugin, ctx, traffic, notifications, statuses, frames, advance, settle, waitFor, agentState, clock,
     idleScheduled: Deferred.await(idleScheduled), idlePolled: Deferred.await(idlePolled),
     eligible: () => clock.currentTimeMillisUnsafe() < liveUntil && clock.currentTimeMillisUnsafe() - polledAt < 10000,
     fail: (value: typeof failure) => { failure = value; }, hang: (value: boolean) => { hanging = value; }, cancelled: () => cancelled,
     holdPoll: () => {
       const hold = { reached: Promise.withResolvers<void>(), released: Promise.withResolvers<void>() };
       pollHold = hold;
-      return { reached: hold.reached.promise, release: () => hold.released.resolve() };
+      return { reached: hold.reached.promise, release: () => { heldPolls--; hold.released.resolve(); } };
     },
     conflict: () => { conflict = true; }, replace: () => { parentSession = "replacement-host-session"; } };
 });
 
-const run = (body: (f: RecoveryFixture) => Effect.Effect<void, unknown, Scope.Scope>) =>
-  Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-    const f = yield* fixture();
-    yield* body(f).pipe(Effect.provideService(Clock.Clock, f.clock));
-  })).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))));
+const warnings = (f: { notifications: { text: string; level: string | undefined }[] }) => f.notifications.filter(item => item.level === "warning");
 
-const warnings = (f: RecoveryFixture) => f.notifications.filter(item => item.level === "warning");
-
-test("idle presence survives one outage epoch, partial recovery, capped jitter and fresh reenrollment", { timeout: 60000 }, () => run(f => Effect.gen(function*() {
+it.live("idle presence survives one outage epoch, partial recovery, capped jitter and fresh reenrollment", () => Effect.scoped(Effect.gen(function*() {
+  const f = yield* fixture();
+  yield* Effect.gen(function*() {
   yield* f.plugin.start(f.ctx);
   yield* f.idleScheduled;
   yield* f.clock.adjust(1250);
   yield* f.idlePolled;
-  assert.ok(f.traffic.filter(call => call.method === "session.poll").length >= 2, "Idle enrollment continues without native prompts");
-  f.fail({ status: 503, method: "session.poll" });
+  assert.ok(f.traffic.filter(call => call.method === Commands.pollSession.name).length >= 2, "Idle enrollment continues without native prompts");
+  f.fail({ status: 503, method: Commands.pollSession.name });
   yield* f.advance(1500);
   assert.equal(warnings(f).length, 1, "A failed poll emits one outage transition notice");
   const notices = f.notifications.length;
   yield* f.advance(6000);
   assert.equal(f.notifications.length, notices, "Successful heartbeat alone cannot claim recovery or repeat outage notices");
-  assert.equal((yield* f.nativeState()).messageCount, 0, "Presence maintenance never admits a native prompt");
+  assert.equal((yield* f.agentState()).messageCount, 0, "Presence maintenance never admits a native prompt");
   assert.ok(f.statuses.has("coordinator.network"), "Connectivity remains in the native keyed footer");
   assert.ok(f.frames.some(frame => frame === `\x1b]7501;id=coordinator:app=coordinator:state=idle:msg=${Buffer.from("Coordinator reconnecting").toString("base64")}\x1b\\`), "Retrying connectivity composes the idle public coordinator PSP record");
   assert.ok(f.frames.filter(frame => frame.includes("id=")).every(frame => frame.startsWith("\x1b]7501;id=coordinator:")), "Task and network status share one PSP record identity");
   f.fail({ status: 503 });
   const started = f.traffic.length;
   yield* f.advance(150000);
-  const attempts = f.traffic.slice(started).filter(call => call.method === "session.heartbeat");
+  const attempts = f.traffic.slice(started).filter(call => call.method === Commands.heartbeatSession.name);
   assert.ok(attempts.length >= 4 && attempts.length < 14, "An offline idle owner retains bounded low-rate recovery");
   const gaps = attempts.slice(1).map((call, index) => call.at - attempts[index]!.at);
   assert.ok(gaps.every(gap => gap >= 750 && gap <= 30500), "Jitter is capped after application, not before");
@@ -258,56 +265,62 @@ test("idle presence survives one outage epoch, partial recovery, capped jitter a
   assert.equal(f.statuses.has("coordinator.network"), false);
   assert.equal(f.notifications.length, notices + 1, "Only the full successful pair announces recovery once");
   const nextOutage = f.traffic.length;
-  f.fail({ status: 503, method: "session.poll" });
+  f.fail({ status: 503, method: Commands.pollSession.name });
   yield* f.advance(1500);
-  const first = f.traffic.slice(nextOutage).find(call => call.method === "session.poll")!.at;
+  const first = f.traffic.slice(nextOutage).find(call => call.method === Commands.pollSession.name)!.at;
   yield* f.advance(1500);
-  assert.ok(f.traffic.some(call => call.method === "session.heartbeat" && call.at > first && call.at - first <= 1500), "A new outage resets to the initial jittered target");
+  assert.ok(f.traffic.some(call => call.method === Commands.heartbeatSession.name && call.at > first && call.at - first <= 1500), "A new outage resets to the initial jittered target");
   assert.equal(warnings(f).length, 2);
   yield* f.plugin.stop();
   const stopped = f.traffic.length;
   yield* f.advance(35000);
   assert.equal(f.traffic.length, stopped, "Stop interrupts recovery backoff");
-})));
+  }).pipe(Effect.provideService(Clock.Clock, f.clock));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 60000 });
 
-test("server delay exceeds the local cap while static authorization and configuration failures pause only broker traffic", { timeout: 60000 }, () => run(f => Effect.gen(function*() {
+it.live("server delay exceeds the local cap while static authorization and configuration failures pause only broker traffic", () => Effect.scoped(Effect.gen(function*() {
+  const f = yield* fixture();
+  yield* Effect.gen(function*() {
   yield* f.plugin.start(f.ctx);
-  f.fail({ status: 429, retryAfter: "45", method: "session.poll" });
+  f.fail({ status: 429, retryAfter: "45", method: Commands.pollSession.name });
   yield* f.advance(1500);
   const failureAt = f.traffic.at(-1)!.at, before = f.traffic.length;
   yield* f.advance(43000);
   assert.equal(f.traffic.length, before, "Retry-After seconds are a minimum, even beyond the 30-second cap");
   f.fail(undefined);
   yield* f.advance(3000);
-  assert.ok(f.traffic.some(call => call.method === "session.heartbeat" && call.at - failureAt >= 45000));
+  assert.ok(f.traffic.some(call => call.method === Commands.heartbeatSession.name && call.at - failureAt >= 45000));
   for (const status of [401, 403, 400, 404, 501]) {
     f.fail({ status });
     yield* f.advance(1500);
     const paused = f.traffic.length;
     yield* f.advance(35000);
     assert.equal(f.traffic.length, paused, `${status} cannot resend unchanged credentials/configuration`);
-    yield* f.nativeState();
+    yield* f.agentState();
     assert.ok(f.statuses.has("coordinator.paused"), `${status} exposes the permanent broker pause`);
     assert.equal(f.statuses.has("coordinator.network"), false, `${status} clears the retrying connectivity status`);
     f.fail(undefined);
     yield* f.plugin.start(f.ctx);
   }
   yield* f.plugin.stop();
-})));
+  }).pipe(Effect.provideService(Clock.Clock, f.clock));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 60000 });
 
-test("retirement cancels an in-flight poll and never resumes the old binding in a replacement host session", { timeout: 30000 }, () => run(f => Effect.gen(function*() {
+it.live("retirement cancels an in-flight poll and never resumes the old binding in a replacement host session", () => Effect.scoped(Effect.gen(function*() {
+  const f = yield* fixture();
+  yield* Effect.gen(function*() {
   yield* f.plugin.start(f.ctx);
-  const old = f.traffic.find(call => call.method === "session.heartbeat")!;
+  const old = f.traffic.find(call => call.method === Commands.heartbeatSession.name)!;
   f.hang(true);
   yield* f.advance(1500);
   const stop = yield* f.plugin.stop().pipe(Effect.forkChild);
-  yield* f.settle();
+  yield* f.waitFor(() => f.cancelled() > 0, "Retirement did not close the held HTTP request");
   assert.ok(f.cancelled() > 0, "Actual scoped retirement cancels the open HTTP request, not just future ticks");
   yield* Fiber.join(stop);
   f.replace();
   f.hang(false);
   yield* f.plugin.start(f.ctx);
-  const replacement = f.traffic.filter(call => call.method === "session.heartbeat").at(-1)!;
+  const replacement = f.traffic.filter(call => call.method === Commands.heartbeatSession.name).at(-1)!;
   assert.notEqual(replacement.sessionId, old.sessionId);
   assert.notEqual(replacement.incarnation, old.incarnation);
   const before = f.traffic.length;
@@ -315,15 +328,21 @@ test("retirement cancels an in-flight poll and never resumes the old binding in 
   assert.ok(f.traffic.length > before, "The new idle owner maintains its own presence");
   assert.ok(f.traffic.slice(before).every(call => call.incarnation !== old.incarnation));
   yield* f.plugin.stop();
-})));
+  }).pipe(Effect.provideService(Clock.Clock, f.clock));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 30000 });
 
-test("a structured heartbeat conflict obtains a fresh incarnation and a journal conflict pauses further admission", { timeout: 30000 }, () => run(f => Effect.gen(function*() {
-  f.fail({ status: 409, method: "session.heartbeat" });
+it.live("a structured heartbeat conflict obtains a fresh incarnation and a journal conflict pauses further admission", () => Effect.scoped(Effect.gen(function*() {
+  const f = yield* fixture();
+  yield* Effect.gen(function*() {
+  f.fail({ status: 409, method: Commands.heartbeatSession.name });
   yield* Effect.exit(f.plugin.start(f.ctx));
-  assert.equal(f.traffic.filter(call => call.method === "session.poll").length, 0);
-  const binding = f.traffic.find(call => call.method === "session.heartbeat")!;
+  assert.equal(f.traffic.filter(call => call.method === Commands.pollSession.name).length, 0);
+  const binding = f.traffic.find(call => call.method === Commands.heartbeatSession.name)!;
   f.fail(undefined);
   yield* f.advance(10000);
+  yield* f.waitFor(() => f.traffic.some(call => call.method === Commands.heartbeatSession.name && call.incarnation !== binding.incarnation),
+    "Conflict recovery did not start the replacement owner");
+  yield* f.settle();
   const replacement = f.traffic.filter(call => call.method === "session.heartbeat").at(-1)!;
   assert.notEqual(replacement.incarnation, binding.incarnation, "A structured conflict retires the fenced native incarnation");
   const stopped = f.traffic.findIndex(call => call.method === "session.stop" && call.incarnation === binding.incarnation);
@@ -332,16 +351,24 @@ test("a structured heartbeat conflict obtains a fresh incarnation and a journal 
   assert.ok(f.traffic.filter(call => call.method === "session.poll").every(call => call.incarnation === replacement.incarnation), "Only the fresh incarnation polls after a heartbeat fence");
   assert.equal(f.eligible(), true);
   f.conflict();
-  yield* f.advance(3000);
+  yield* f.advance(1000);
+  yield* f.waitFor(() => f.traffic.some(call => call.method === Commands.acknowledgePeer.name),
+    "First message delivery was not durably received");
+  yield* f.advance(1000);
+  yield* f.waitFor(() => f.statuses.has("coordinator.paused"),
+    "Conflicting durable content did not pause the owner");
   const paused = f.traffic.length;
   yield* f.advance(35000);
   assert.equal(f.traffic.length, paused, "A real repeated message id with different durable content latches admission/recovery");
-  yield* f.nativeState();
+  yield* f.agentState();
   assert.ok(!f.notifications.some(item => /PRIVATE_FAULT_DETAIL|fixture-token/.test(item.text)));
   yield* f.plugin.stop();
-})));
+  }).pipe(Effect.provideService(Clock.Clock, f.clock));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 30000 });
 
-test("poll and heartbeat deadlines share one outage notice and partial heartbeat success retains offline status", { timeout: 30000 }, () => run(f => Effect.gen(function*() {
+it.live("poll and heartbeat deadlines share one outage notice and partial heartbeat success retains offline status", () => Effect.scoped(Effect.gen(function*() {
+  const f = yield* fixture();
+  yield* Effect.gen(function*() {
   yield* f.plugin.start(f.ctx);
   f.hang(true);
   yield* f.advance(12500);
@@ -361,10 +388,13 @@ test("poll and heartbeat deadlines share one outage notice and partial heartbeat
   assert.equal(f.statuses.has("coordinator.network"), false);
   assert.equal(f.notifications.length, before + 1);
   yield* f.plugin.stop();
-})));
+  }).pipe(Effect.provideService(Clock.Clock, f.clock));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 30000 });
 
 for (const status of [403, 503]) {
-  test(`an older successful poll cannot clear a concurrent ${status} outage`, { timeout: 30000 }, () => run(f => Effect.gen(function*() {
+  it.live(`an older successful poll cannot clear a concurrent ${status} outage`, () => Effect.scoped(Effect.gen(function*() {
+    const f = yield* fixture();
+    yield* Effect.gen(function*() {
     yield* f.plugin.start(f.ctx);
     const hold = f.holdPoll();
     yield* f.advance(1000);
@@ -386,10 +416,13 @@ for (const status of [403, 503]) {
       assert.equal(f.statuses.has("coordinator.network"), false);
     }
     yield* f.plugin.stop();
-  })));
+    }).pipe(Effect.provideService(Clock.Clock, f.clock));
+  })).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 30000 });
 }
 
-test("a permanent command fault prevents a queued conflict restart", { timeout: 30000 }, () => run(f => Effect.gen(function*() {
+it.live("a permanent command fault prevents a queued conflict restart", () => Effect.scoped(Effect.gen(function*() {
+  const f = yield* fixture();
+  yield* Effect.gen(function*() {
   f.fail({ status: 409, method: "session.heartbeat" });
   yield* f.plugin.start(f.ctx);
   f.fail({ status: 403, method: "session.list" });
@@ -399,6 +432,7 @@ test("a permanent command fault prevents a queued conflict restart", { timeout: 
   yield* f.advance(15000);
   assert.equal(f.traffic.length, boundary, "Conflict recovery cannot bypass unchanged permanent authorization failure");
   assert.ok(f.statuses.has("coordinator.paused"));
-  yield* f.nativeState();
+  yield* f.agentState();
   yield* f.plugin.stop();
-})));
+  }).pipe(Effect.provideService(Clock.Clock, f.clock));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 30000 });
