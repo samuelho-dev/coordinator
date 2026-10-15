@@ -1,6 +1,6 @@
 apiVersion: v2
 name: coordinator
-description: Durable singleton Coordinator broker and optional isolated native runner
+description: Durable singleton Coordinator broker and optional isolated agent runner
 type: application
-version: 0.2.0-beta.4
-appVersion: 0.2.0-beta.4
+version: 0.2.0-beta.5
+appVersion: 0.2.0-beta.5

@@ -1,14 +1,16 @@
-import test from "node:test";
+import { RunnerRejectionStateEnum } from "../src/contracts.ts";
+import { it } from "@effect/vitest"
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest, type IncomingMessage } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
 import { Context, Deferred, Effect, Layer, ManagedRuntime } from "effect";
 import { HttpServer } from "effect/http";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { Acceptance, CommandError, HttpError, TaskId, type CommandInput } from "../src/contracts.ts";
-import { LIMIT, Mcp, serverLayer } from "../src/http.ts";
+import { Commands, Acceptance, CommandError, HttpError, type CommandInput } from "../src/contracts.ts";
+import { TaskId } from "../src/generated/database/types.ts";
+import { LIMIT, Mcp, serverLayer } from "../src/mcp.ts";
 
-test("Mcp.call closes its oversized real HTTP 401 body before releasing the body or disposing its layer", { timeout: 5000 }, async () => {
+it("Mcp.call closes its oversized real HTTP 401 body before releasing the body or disposing its layer", async () => {
   const releaseBody = await Effect.runPromise(Deferred.make<void>());
   const disconnected = Promise.withResolvers<void>();
   let bodyReleased = false;
@@ -27,7 +29,7 @@ test("Mcp.call closes its oversized real HTTP 401 body before releasing the body
     const address = nativeServer.address();
     assert.ok(address !== null && typeof address !== "string");
     const mcp = await runtime.runPromise(Mcp);
-    const status = await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("physical-401") }).pipe(Effect.match({
+    const status = await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", Commands.journalTask, { taskId: TaskId.make("physical-401") }).pipe(Effect.match({
       onSuccess: () => 200,
       onFailure: (error) => {
         assert.ok(error instanceof HttpError);
@@ -46,10 +48,10 @@ test("Mcp.call closes its oversized real HTTP 401 body before releasing the body
     await runtime.dispose();
     await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
   }
-});
+}, 5000);
 
-for (const variant of ["stalled-401", "stalled-503", "malformed-discovery"] as const) {
-  test(`Mcp.call preserves ${variant} failure instead of a retryable timeout`, { timeout: 5000 }, async () => {
+for (const variant of ["stalled-401", "stalled-503", "malformed-discovery"]) {
+  it(`Mcp.call preserves ${variant} failure instead of a retryable timeout`, async () => {
     let posts = 0;
     const disconnected = Promise.withResolvers<void>();
     const nativeServer = createServer((request, response) => {
@@ -72,7 +74,7 @@ for (const variant of ["stalled-401", "stalled-503", "malformed-discovery"] as c
       const address = nativeServer.address();
       assert.ok(address !== null && typeof address !== "string");
       const mcp = await runtime.runPromise(Mcp);
-      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("incomplete-response") }, 250).pipe(Effect.match({
+      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", Commands.journalTask, { taskId: TaskId.make("incomplete-response") }, 250).pipe(Effect.match({
         onSuccess: () => assert.fail("Invalid response must fail"),
         onFailure: (error) => {
           if (variant === "malformed-discovery") {
@@ -93,10 +95,10 @@ for (const variant of ["stalled-401", "stalled-503", "malformed-discovery"] as c
       await runtime.dispose();
       await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
     }
-  });
+  }, 5000);
 }
 
-test("Mcp.call timeout closes its real HTTP streaming body before disposing its layer", { timeout: 5000 }, async () => {
+it("Mcp.call timeout closes its real HTTP streaming body before disposing its layer", async () => {
   const releaseBody = await Effect.runPromise(Deferred.make<void>());
   const disconnected = Promise.withResolvers<void>();
   let bodyReleased = false;
@@ -115,7 +117,7 @@ test("Mcp.call timeout closes its real HTTP streaming body before disposing its 
     const address = nativeServer.address();
     assert.ok(address !== null && typeof address !== "string");
     const mcp = await runtime.runPromise(Mcp);
-    const result = await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("physical-timeout") }, 250).pipe(Effect.exit));
+    const result = await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", Commands.journalTask, { taskId: TaskId.make("physical-timeout") }, 250).pipe(Effect.exit));
     assert.equal(result._tag, "Failure");
     await Effect.runPromise(Effect.promise(() => disconnected.promise).pipe(Effect.timeout("1 second")));
     assert.equal(bodyReleased, false, "Timeout closes the peer without server EOF or layer disposal");
@@ -125,9 +127,9 @@ test("Mcp.call timeout closes its real HTTP streaming body before disposing its 
     await runtime.dispose();
     await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
   }
-});
+}, 5000);
 
-test("stateless MCP calls authorize every HTTP request and close without retaining sessions", { timeout: 15000 }, async () => {
+it("stateless MCP calls authorize every HTTP request and close without retaining sessions", async () => {
   let handled = 0;
   const slowEntered = Promise.withResolvers<void>();
   const releaseSlow = Promise.withResolvers<void>();
@@ -153,12 +155,12 @@ test("stateless MCP calls authorize every HTTP request and close without retaini
           : Effect.fail(new HttpError({ status: 401, message: "Credential required" })),
         handle: (caller, request) => Effect.gen(function*() {
           handled++;
-          if (request.method !== "journal" || request.params.taskId !== caller) return yield* new HttpError({ status: 403, message: "Task belongs to another caller", wwwAuthenticate: 'Bearer scope="journal"' });
+          if (request.method !== Commands.journalTask.name || request.params.taskId !== caller) return yield* new HttpError({ status: 403, message: "Task belongs to another caller", wwwAuthenticate: 'Bearer scope="journal"' });
           if (caller === "caller-a" && request.params.taskId === "caller-a") {
             slowEntered.resolve();
             yield* Effect.promise(() => releaseSlow.promise);
           }
-          return Acceptance.make({ taskId: request.params.taskId, accepted: false, state: "absent" });
+          return Acceptance.make({ taskId: request.params.taskId, accepted: false, state: RunnerRejectionStateEnum.notAccepted });
         }),
       });
       return { server, mcp };
@@ -171,7 +173,7 @@ test("stateless MCP calls authorize every HTTP request and close without retaini
   try {
     const { server, mcp } = await runtime.runPromise(Endpoint);
     const url = HttpServer.formatAddress(server.address);
-    const status = (token: string, params: CommandInput<"journal">) => runtime.runPromise(mcp.call(url, token, "journal", params).pipe(Effect.match({
+    const status = (token: string, params: CommandInput<typeof Commands.journalTask>) => runtime.runPromise(mcp.call(url, token, Commands.journalTask, params).pipe(Effect.match({
       onSuccess: () => 200,
       onFailure: (error) => {
         assert.ok(error instanceof HttpError);
@@ -216,9 +218,9 @@ test("stateless MCP calls authorize every HTTP request and close without retaini
     await runtime.dispose();
   }
   assert.equal(nativeServer.listening, false);
-});
+}, 15000);
 
-test("native MCP proxy disposes after its downstream runner closes during a tool call", async () => {
+it("native MCP proxy disposes after its downstream runner closes during a tool call", async () => {
   const entered = Promise.withResolvers<void>();
   let runnerFinalized = false;
   class RunnerEndpoint extends Context.Service<RunnerEndpoint>()("test/McpShutdownRunner", {
@@ -246,8 +248,8 @@ test("native MCP proxy disposes after its downstream runner closes during a tool
       yield* mcp.serve(server, {
         target: "runner",
         authorize: () => Effect.succeed("caller"),
-        handle: (_caller, request) => request.method === "journal"
-          ? mcp.call(runnerUrl, "caller", "journal", request.params)
+        handle: (_caller, request) => request.method === Commands.journalTask.name
+          ? mcp.call(runnerUrl, "caller", Commands.journalTask, request.params)
           : Effect.fail(new HttpError({ status: 400, message: "Unexpected test command" })),
       });
       return { server, mcp };
@@ -256,7 +258,7 @@ test("native MCP proxy disposes after its downstream runner closes during a tool
   const proxy = ManagedRuntime.make(Layer.effect(ProxyEndpoint, ProxyEndpoint.make).pipe(Layer.provide(Layer.merge(Mcp.layer, serverLayer("127.0.0.1", 0)))));
   try {
     const { server, mcp } = await proxy.runPromise(ProxyEndpoint);
-    const request = proxy.runPromise(mcp.call(HttpServer.formatAddress(server.address), "caller", "journal", { taskId: TaskId.make("closing-runner") }).pipe(Effect.exit));
+    const request = proxy.runPromise(mcp.call(HttpServer.formatAddress(server.address), "caller", Commands.journalTask, { taskId: TaskId.make("closing-runner") }).pipe(Effect.exit));
     await entered.promise;
     await runner.dispose();
     assert.equal(runnerFinalized, true);
@@ -267,7 +269,7 @@ test("native MCP proxy disposes after its downstream runner closes during a tool
   }
 });
 
-test("cancelled native MCP subscription releases its response and application scope", { timeout: 15000 }, async () => {
+it("cancelled native MCP subscription releases its response and application scope", async () => {
   const nativeServer = createServer({ requestTimeout: 15000 });
   class Endpoint extends Context.Service<Endpoint>()("test/McpSubscriptionShutdown", {
     make: Effect.gen(function*() {
@@ -276,8 +278,8 @@ test("cancelled native MCP subscription releases its response and application sc
       yield* mcp.serve(server, {
         target: "runner",
         authorize: () => Effect.succeed("caller"),
-        handle: (_caller, request) => request.method === "journal"
-          ? Effect.succeed(Acceptance.make({ taskId: request.params.taskId, accepted: false, state: "absent" }))
+        handle: (_caller, request) => request.method === Commands.journalTask.name
+          ? Effect.succeed(Acceptance.make({ taskId: request.params.taskId, accepted: false, state: RunnerRejectionStateEnum.notAccepted }))
           : Effect.fail(new HttpError({ status: 400, message: "Unexpected test command" })),
       });
       return { server, mcp };
@@ -303,7 +305,7 @@ test("cancelled native MCP subscription releases its response and application sc
     let ended = false;
     const closed = subscription.closed.then((reason) => { ended = true; return reason; });
     const fenceId = TaskId.make("after-listen-admission");
-    const fence = await runtime.runPromise(mcp.call(url, "caller", "journal", { taskId: fenceId }));
+    const fence = await runtime.runPromise(mcp.call(url, "caller", Commands.journalTask, { taskId: fenceId }));
     assert.equal(fence.taskId, fenceId);
     assert.equal(ended, false, "First SSE event is delivered before stream closure; independent requests keep progressing");
     await subscription.close();
@@ -313,9 +315,9 @@ test("cancelled native MCP subscription releases its response and application sc
     await runtime.dispose();
   }
   assert.equal(nativeServer.listening, false);
-});
+}, 15000);
 
-test("aborted unread MCP body cannot hold HTTP server cleanup", { timeout: 5000 }, async () => {
+it("aborted unread MCP body cannot hold HTTP server cleanup", async () => {
   const nativeServer = createServer({ requestTimeout: 15000 });
   const incoming = Promise.withResolvers<IncomingMessage>();
   const disconnected = Promise.withResolvers<void>();
@@ -367,10 +369,10 @@ test("aborted unread MCP body cannot hold HTTP server cleanup", { timeout: 5000 
     proceed.resolve();
     await runtime.dispose();
   }
-});
+}, 5000);
 
 for (const status of [400, 401, 403, 404, 429, 503]) {
-  test(`Mcp.call retains HTTP ${status}, bounded headers and protocol meaning without repeating POST`, { timeout: 5000 }, async () => {
+  it(`Mcp.call retains HTTP ${status}, bounded headers and protocol meaning without repeating POST`, async () => {
     let posts = 0;
     const challenge = 'Bearer error="insufficient_scope", scope="coordinator"';
     const nativeServer = createServer(async (request, response) => {
@@ -395,7 +397,7 @@ for (const status of [400, 401, 403, 404, 429, 503]) {
       const address = nativeServer.address();
       assert.ok(address !== null && typeof address !== "string");
       const mcp = await runtime.runPromise(Mcp);
-      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("typed-rejection") }).pipe(Effect.match({
+      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", Commands.journalTask, { taskId: TaskId.make("typed-rejection") }).pipe(Effect.match({
         onSuccess: () => assert.fail("Rejected RPC must fail"),
         onFailure: (error) => {
           assert.ok(error instanceof HttpError);
@@ -412,11 +414,11 @@ for (const status of [400, 401, 403, 404, 429, 503]) {
       await runtime.dispose();
       await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
     }
-  });
+  }, 5000);
 }
 
-for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-json", "unknown-sse", "interrupted", "valid-json", "valid-sse"] as const) {
-  test(`Mcp.call preserves ${variant} tool response semantics`, { timeout: 5000 }, async () => {
+for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-json", "unknown-sse", "interrupted", "valid-json", "valid-sse"]) {
+  it(`Mcp.call preserves ${variant} tool response semantics`, async () => {
     let tools = 0;
     const nativeServer = createServer(async (request, response) => {
       let body = "";
@@ -447,7 +449,7 @@ for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-jso
         response.end(variant === "unknown-sse" ? `data: ${envelope}\n\n` : envelope);
       }
       else if (variant === "valid-json" || variant === "valid-sse") {
-        const result = JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { resultType: "complete", content: [], structuredContent: { result: { taskId: "response-failure", accepted: false, state: "absent" } } } });
+        const result = JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { resultType: "complete", content: [], structuredContent: { result: { taskId: "response-failure", accepted: false, state: RunnerRejectionStateEnum.notAccepted } } } });
         response.end(variant === "valid-sse" ? `data: ${result}\n\n` : result);
       } else response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, error: { code: -32602, message: "Invalid input" } }));
     });
@@ -457,7 +459,7 @@ for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-jso
       const address = nativeServer.address();
       assert.ok(address !== null && typeof address !== "string");
       const mcp = await runtime.runPromise(Mcp);
-      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("response-failure") }, 1500).pipe(Effect.match({
+      await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", Commands.journalTask, { taskId: TaskId.make("response-failure") }, 1500).pipe(Effect.match({
         onSuccess: (result) => {
           assert.ok(variant === "valid-json" || variant === "valid-sse", "Invalid or interrupted RPC must fail");
           assert.equal(result.taskId, "response-failure");
@@ -481,10 +483,10 @@ for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-jso
       await runtime.dispose();
       await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
     }
-  });
+  }, 5000);
 }
 
-test("Mcp.call retains an actual native pre-response transport interruption without repeating POST", { timeout: 5000 }, async () => {
+it("Mcp.call retains an actual native pre-response transport interruption without repeating POST", async () => {
   let posts = 0;
   const nativeServer = createServer((request) => {
     posts++;
@@ -496,7 +498,7 @@ test("Mcp.call retains an actual native pre-response transport interruption with
     const address = nativeServer.address();
     assert.ok(address !== null && typeof address !== "string");
     const mcp = await runtime.runPromise(Mcp);
-    await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", "journal", { taskId: TaskId.make("transport-failure") }).pipe(Effect.match({
+    await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", Commands.journalTask, { taskId: TaskId.make("transport-failure") }).pipe(Effect.match({
       onSuccess: () => assert.fail("Interrupted transport must fail"),
       onFailure: (error) => {
         assert.ok(error instanceof CommandError);
@@ -509,4 +511,4 @@ test("Mcp.call retains an actual native pre-response transport interruption with
     await runtime.dispose();
     await new Promise<void>((resolve, reject) => nativeServer.close((error) => error ? reject(error) : resolve()));
   }
-});
+}, 5000);

@@ -1,17 +1,27 @@
 import { Deferred, Effect, Option, Scope, Stdio, Stream } from "effect";
 import { Base64 } from "effect/encoding";
 import { CommandError, type Context } from "./contracts.ts";
+import { AgentInputKindEnum, type AgentInputKind } from "./agent/contracts.ts";
 
 const prefix = "\x1b]7501;";
 const reply = /\x1b\]7501;\?[^\x00-\x1f\x7f]*(?:\x07|\x1b\\)/g;
-const messages = { permission: "Waiting for permission", question: "Waiting for an answer" };
-const networkMessages = { retrying: "Coordinator reconnecting", paused: "Coordinator network paused" };
-type State = "idle" | "working" | "done" | "error" | undefined;
-type Kind = "permission" | "question";
-type NetworkState = keyof typeof networkMessages | undefined;
+export const ProgramState = Object.freeze({ idle: "idle", working: "working", done: "done", error: "error" });
+export type ProgramState = typeof ProgramState[keyof typeof ProgramState];
+export const ProgramNetworkState = Object.freeze({ retrying: "retrying", paused: "paused" });
+export type ProgramNetworkState = typeof ProgramNetworkState[keyof typeof ProgramNetworkState];
+const inputStatus: Record<AgentInputKind, { kind: string; message: string }> = {
+  [AgentInputKindEnum.approval]: { kind: "permission", message: "Waiting for permission" },
+  [AgentInputKindEnum.question]: { kind: "question", message: "Waiting for an answer" },
+};
+const networkMessages: Record<ProgramNetworkState, string> = {
+  [ProgramNetworkState.retrying]: "Coordinator reconnecting",
+  [ProgramNetworkState.paused]: "Coordinator network paused",
+};
+type State = ProgramState | undefined;
+type NetworkState = ProgramNetworkState | undefined;
 
 export interface ProgramStatus {
-  report: (state: State, kind?: Kind) => Effect.Effect<void, CommandError>;
+  report: (state: State, kind?: AgentInputKind) => Effect.Effect<void, CommandError>;
   clear: () => Effect.Effect<void, CommandError>;
   network: (state: NetworkState) => Effect.Effect<void, CommandError>;
 }
@@ -22,7 +32,7 @@ export const makeProgramStatus = (ctx: Context): Effect.Effect<ProgramStatus, ne
   let retired = false;
   let last: string | undefined;
   let taskState: State;
-  let taskKind: Kind | undefined;
+  let taskKind: AgentInputKind | undefined;
   let networkState: NetworkState;
   let flushing = false;
   const write = (fields: string) => Stream.make(`${prefix}id=coordinator:app=coordinator:${fields}\x1b\\`).pipe(
@@ -31,8 +41,9 @@ export const makeProgramStatus = (ctx: Context): Effect.Effect<ProgramStatus, ne
   );
   const fields = () => {
     if (taskState === undefined && networkState === undefined) return undefined;
-    const state = taskKind ? `state=blocked:kind=${taskKind}` : `state=${taskState ?? (networkState === "paused" ? "error" : "working")}`;
-    const message = [taskKind ? messages[taskKind] : undefined, networkState ? networkMessages[networkState] : undefined].filter((value) => value !== undefined).join("; ");
+    const input = taskKind === undefined ? undefined : inputStatus[taskKind];
+    const state = input ? `state=blocked:kind=${input.kind}` : `state=${taskState ?? (networkState === ProgramNetworkState.paused ? ProgramState.error : ProgramState.working)}`;
+    const message = [input?.message, networkState ? networkMessages[networkState] : undefined].filter((value) => value !== undefined).join("; ");
     return message ? `${state}:msg=${Base64.encode(message)}` : state;
   };
   // One owner composes task and connectivity updates, including changes during a write.
@@ -52,8 +63,8 @@ export const makeProgramStatus = (ctx: Context): Effect.Effect<ProgramStatus, ne
     if (retired || networkState === state) return;
     networkState = state;
     if (ctx.hasUI) {
-      ctx.ui.setStatus?.("coordinator.network", state === "retrying" ? networkMessages.retrying : undefined);
-      ctx.ui.setStatus?.("coordinator.paused", state === "paused" ? networkMessages.paused : undefined);
+      ctx.ui.setStatus?.("coordinator.network", state === ProgramNetworkState.retrying ? networkMessages.retrying : undefined);
+      ctx.ui.setStatus?.("coordinator.paused", state === ProgramNetworkState.paused ? networkMessages.paused : undefined);
     }
     yield* flush();
   });
@@ -65,9 +76,10 @@ export const makeProgramStatus = (ctx: Context): Effect.Effect<ProgramStatus, ne
     yield* flush();
   });
   yield* Effect.addFinalizer(() => Effect.gen(function*() {
+    const transientError = taskState === ProgramState.error && networkState !== undefined;
     // Connectivity is transient; completed task results still survive process exit.
     yield* network(undefined).pipe(Effect.catchCause(() => Effect.void));
-    if (taskKind !== undefined || (taskState !== "done" && taskState !== "error")) {
+    if (transientError || taskKind !== undefined || (taskState !== ProgramState.done && taskState !== ProgramState.error)) {
       yield* clear().pipe(Effect.catchCause(() => Effect.void));
     }
     retired = true;
@@ -119,7 +131,7 @@ export const makeProgramStatus = (ctx: Context): Effect.Effect<ProgramStatus, ne
   return {
     clear,
     network,
-    report: (state: State, kind?: Kind) => Effect.gen(function*() {
+    report: (state: State, kind?: AgentInputKind) => Effect.gen(function*() {
       if (retired) return;
       taskState = state;
       taskKind = state === undefined ? undefined : kind;

@@ -54,7 +54,7 @@
         "podAnnotations": {"allOf": [{"$ref": "#/definitions/annotations"}], "properties": {"checksum/values": false}},
         "port": {"type": "integer", "minimum": 1, "maximum": 65535},
         "connectHosts": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
-        "extraEnv": {"type": "array", "items": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string", "not": {"enum": ["COORDINATOR_CONFIG", "COORDINATOR_IMAGE_SHA", "COORDINATOR_CONNECT_HOSTS_JSON", "COORDINATOR_RUNNER_TOKEN_DIRECTORY", "HOME", "NODE_EXTRA_CA_CERTS"]}}}}},
+        "extraEnv": {"type": "array", "items": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string", "not": {"enum": ["COORDINATOR_CONFIG", "COORDINATOR_IMAGE_SHA", "COORDINATOR_CONNECT_HOSTS_JSON", "COORDINATOR_RUNNER_TOKEN_DIRECTORY", "COORDINATOR_DATABASE_URL", "HOME", "NODE_EXTRA_CA_CERTS"]}}}}},
         "resources": {"type": "object"}
       }
     },

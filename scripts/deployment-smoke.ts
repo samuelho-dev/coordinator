@@ -2,8 +2,9 @@ import { parseArgs } from "node:util";
 import { ByteSize, ConfigProvider, Context, Effect, Layer, Schema, Stdio, Stream } from "effect";
 import { HttpClient, HttpClientRequest, HttpIncomingMessage } from "effect/http";
 import { NodeRuntime, NodeStdio } from "@effect/platform-node";
-import { CommandError, ConnectHosts, HttpError, IncarnationId, PluginConfig, Repo, SessionId, Sha } from "../src/contracts.ts";
-import { Mcp } from "../src/http.ts";
+import { Commands, CommandError, ConnectHosts, HttpError, PluginConfig, Repo } from "../src/contracts.ts";
+import { Evidence, RunnerTask, SessionId } from "../src/generated/database/types.ts";
+import { Mcp } from "../src/mcp.ts";
 import { Platform, redactedCause } from "../src/platform.ts";
 
 const help = `Usage: node --import tsx scripts/deployment-smoke.ts --config <private PluginConfig> --source-sha <full40hex> [--cycles <1-100>]
@@ -37,17 +38,17 @@ const program = Effect.gen(function*() {
   const cyclesText = flags.values.cycles ?? "5";
   // ponytail: cap acceptance at 100 cycles; sustained throughput belongs in a load-test harness.
   if (!configPath || !sourceSha || !/^[1-9][0-9]*$/.test(cyclesText) || !Number.isSafeInteger(Number(cyclesText)) || Number(cyclesText) > 100) return yield* fail("Invalid arguments");
-  const expectedSha = yield* Schema.decodeUnknownEffect(Sha)(sourceSha);
+  const expectedSha = yield* Schema.decodeUnknownEffect(Evidence.fields.sha)(sourceSha);
   const cycles = Number(cyclesText);
   const platform = yield* Platform;
-  const config = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(PluginConfig), { onExcessProperty: "error" })(yield* platform.privateFile(configPath));
+  const config = yield* Schema.decodeEffect(Schema.fromJsonString(PluginConfig), { onExcessProperty: "error" })(yield* platform.privateFile(configPath));
   if (!platform.path.isAbsolute(configPath) || !platform.path.isAbsolute(config.tokenFile) || !platform.path.isAbsolute(config.stateDirectory)) return yield* fail("Absolute private paths required");
   const token = yield* platform.privateFile(config.tokenFile);
   if (!token || token.length > 505 || /[\r\n]/.test(token)) return yield* fail("Invalid credential file");
   const endpoint = yield* Effect.try({ try: () => new URL(config.brokerUrl), catch: () => new CommandError({ message: "Invalid endpoint" }) });
   if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== "/") return yield* fail("Broker authority required");
   const hosts = config.connectHosts === undefined
-    ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectHosts))(process.env.COORDINATOR_CONNECT_HOSTS_JSON ?? "{}")
+    ? yield* Schema.decodeEffect(Schema.fromJsonString(ConnectHosts))(process.env.COORDINATOR_CONNECT_HOSTS_JSON ?? "{}")
     : config.connectHosts;
   if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]", "::1"].includes(endpoint.hostname) && ["127.0.0.1", "localhost", "[::1]", "::1"].includes(hosts[endpoint.hostname] ?? endpoint.hostname))) return yield* fail("TLS required except loopback fixtures");
   const context = yield* Layer.build(Mcp.layer.pipe(Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({
@@ -57,7 +58,7 @@ const program = Effect.gen(function*() {
   const http = Context.get(context, HttpClient.HttpClient);
   const invalidToken = `deployment-invalid-${yield* platform.crypto.randomUUIDv4()}`;
   const sessionId = SessionId.make(`deployment-smoke-${yield* platform.crypto.randomUUIDv4()}`);
-  const incarnation = IncarnationId.make(yield* platform.crypto.randomUUIDv4());
+  const incarnation = RunnerTask.fields.incarnation.make(yield* platform.crypto.randomUUIDv4());
   // .invalid cannot identify a routable repository; no workerId means no dispatch candidate.
   const repo = Repo.make(`deployment-smoke.invalid/no-dispatch/${yield* platform.crypto.randomUUIDv4()}`);
   const key = { sessionId, incarnation };
@@ -96,12 +97,12 @@ const program = Effect.gen(function*() {
     const text = yield* response.text.pipe(Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(1024)));
     return { status: response.status, sha: response.headers["x-coordinator-source-sha"], text };
   })).pipe(Effect.timeout(10000));
-  const rejectMcp = (credential: string) => mcp.call(config.brokerUrl, credential, "health", {}).pipe(Effect.matchEffect({
+  const rejectMcp = (credential: string) => mcp.call(config.brokerUrl, credential, Commands.health, {}).pipe(Effect.matchEffect({
     onSuccess: () => fail("Unauthenticated MCP accepted"),
     onFailure: (error) => error instanceof HttpError && (error.status === 401 || error.status === 403) ? Effect.void : fail("MCP authentication rejection not proven"),
   }));
   yield* Effect.scoped(Effect.gen(function*() {
-    yield* Effect.addFinalizer(() => attempted ? mcp.call(config.brokerUrl, token, "session.stop", key, 10000).pipe(
+    yield* Effect.addFinalizer(() => attempted ? mcp.call(config.brokerUrl, token, Commands.stopSession, key, 10000).pipe(
       Effect.flatMap((result) => result.stopped === true ? Effect.sync(() => { stopped = true; }) : fail("Session cleanup not proven")),
       Effect.orDie,
     ) : Effect.void);
@@ -114,15 +115,15 @@ const program = Effect.gen(function*() {
       yield* rejectMcp(invalidToken);
       const response = yield* ready(token);
       if (response.status !== 200 || response.sha !== expectedSha) return yield* fail("Release readiness mismatch");
-      const body = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Struct({ status: Schema.Literal("ok") })), { onExcessProperty: "error" })(response.text);
-      if (body.status !== "ok" || (yield* mcp.call(config.brokerUrl, token, "health", {})).status !== "ok") return yield* fail("Authenticated health mismatch");
+      const body = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ status: Schema.Literal("ok") })), { onExcessProperty: "error" })(response.text);
+      if (body.status !== "ok" || (yield* mcp.call(config.brokerUrl, token, Commands.health, {})).status !== "ok") return yield* fail("Authenticated health mismatch");
       const started = performance.now();
       function* cycleIndexes() { for (let cycle = 0; cycle < cycles; cycle++) yield cycle; }
       yield* Effect.forEach(cycleIndexes(), () => Effect.gen(function*() {
         attempted = true; // Arm before the write: a lost response may still have enrolled the session.
-        const heartbeat = yield* measured("heartbeat", mcp.call(config.brokerUrl, token, "session.heartbeat", { ...key, machineId: config.machineId, host: config.host, repo }));
+        const heartbeat = yield* measured("heartbeat", mcp.call(config.brokerUrl, token, Commands.heartbeatSession, { ...key, machineId: config.machineId, host: config.host, repo }));
         if (!Number.isFinite(heartbeat.liveUntil) || Object.keys(heartbeat).some((name) => name !== "liveUntil")) return yield* fail("Heartbeat isolation mismatch");
-        const poll = yield* measured("poll", mcp.call(config.brokerUrl, token, "session.poll", key));
+        const poll = yield* measured("poll", mcp.call(config.brokerUrl, token, Commands.pollSession, key));
         if (poll.messages.length || poll.offers.length || poll.releases.length || poll.archiveEnabled) return yield* fail("Session isolation mismatch");
       }), { concurrency, discard: true });
       probeElapsedMs = performance.now() - started;

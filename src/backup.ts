@@ -1,14 +1,13 @@
 import { Clock, Context, Effect, FileSystem, Layer, Option, PlatformError, Redacted, Schema, Stream } from "effect";
 import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientRequest, type HttpClientResponse } from "effect/http";
-import { isSqlError } from "effect/sql/SqlError";
-import { BackupError, BrokerConfig, ObjectBackupConfig, RunnerConfig, Sha, SnapshotKey, Task, Work } from "./contracts.ts";
+import { awaitDatabaseLoss, DatabaseError, DatabaseService } from "./database-service.ts";
+import { BackupError, BrokerConfig, ObjectBackupConfig, RunnerConfig, SnapshotKey, Task, Work } from "./contracts.ts";
 import { Platform } from "./platform.ts";
-import { ChildProcess } from "effect/process";
-import { Postgres, readDatabaseUrl } from "./postgres.ts";
+import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { brokerSchemaIdentity, assertRunnerSchema } from "./database.ts";
-import { makeDatabase } from "./kysely.ts";
-import * as Model from "./generated/database/types.ts";
+import { Evidence, RecoveryGateId, RunnerTaskId, type DB, type Task as StoredTask, type TaskId } from "./generated/database/types.ts";
+import { RunnerStateEnum, TaskStateEnum } from "./generated/database/enums.ts";
 
 const utf8 = new TextEncoder();
 const encode = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
@@ -90,7 +89,7 @@ export function decodeSnapshotList(text: string): typeof SnapshotList.Type {
   const next = [...text.matchAll(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/g)];
   const count = [...text.matchAll(/<KeyCount>([0-9]+)<\/KeyCount>/g)], maximum = [...text.matchAll(/<MaxKeys>([0-9]+)<\/MaxKeys>/g)];
   if ((text.match(/<\/?Key\b/g)?.length ?? 0) !== contents.length * 2 || (text.match(/<\/?Contents\b/g)?.length ?? 0) !== contents.length * 2 || keys.length > 256 || truncated.length !== 1 || next.length !== (truncated[0]![1] === "true" ? 1 : 0) || count.length !== 1 || Number(count[0]![1]) !== keys.length || maximum.length !== 1 || !Number.isSafeInteger(Number(maximum[0]![1])) || Number(maximum[0]![1]) < keys.length || Number(maximum[0]![1]) > 256) throw failure();
-  return Schema.decodeUnknownSync(SnapshotList, { onExcessProperty: "error" })({ keys, ...(next.length ? { next: decodeXmlText(next[0]![1]!) } : {}) });
+  return Schema.decodeSync(SnapshotList, { onExcessProperty: "error" })({ keys, ...(next.length ? { next: decodeXmlText(next[0]![1]!) } : {}) });
 }
 
 const contentLength = (response: HttpClientResponse.HttpClientResponse) => checked(() => {
@@ -103,7 +102,7 @@ const contentLength = (response: HttpClientResponse.HttpClientResponse) => check
 const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig) {
   const platform = yield* Platform;
   const client = HttpClient.withScope(yield* HttpClient.HttpClient);
-  const config = yield* checked(() => Schema.decodeUnknownSync(ObjectBackupConfig, { onExcessProperty: "error" })(input));
+  const config = input;
   const endpoint = yield* checked(() => {
     const url = new URL(config.endpoint);
     if (!/^https?:\/\/[^/?#@]+\/?$/i.test(config.endpoint)) throw failure();
@@ -164,7 +163,7 @@ const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig)
   });
 
   const put = Effect.fnUntraced(function*(file: string) {
-    const key = yield* checked(() => Schema.decodeUnknownSync(SnapshotKey, { onExcessProperty: "error" })(`sanitized/${platform.path.basename(file)}`));
+    const key = yield* checked(() => Schema.decodeSync(SnapshotKey, { onExcessProperty: "error" })(`sanitized/${platform.path.basename(file)}`));
     const request = yield* signed("PUT", key);
     // ponytail: native custom-format dumps stay on disk and stream directly to object storage.
     const body = yield* HttpClientRequest.bodyFile(request, file, { contentType: "application/vnd.postgresql.pgdump" }).pipe(Effect.provideService(FileSystem.FileSystem, platform.fs));
@@ -174,7 +173,7 @@ const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig)
   }, (effect) => Effect.scoped(effect).pipe(Effect.mapError(failure)));
 
   const restore = Effect.fnUntraced(function*(inputKey: SnapshotKey, destination: string) {
-    const key = yield* checked(() => Schema.decodeUnknownSync(SnapshotKey, { onExcessProperty: "error" })(inputKey));
+    const key = inputKey;
     const response = yield* client.execute(yield* signed("GET", key));
     if (response.status !== 200) return yield* failure();
     const expected = yield* contentLength(response);
@@ -247,7 +246,7 @@ const RecoveryStat = Schema.Struct({
 });
 export const RecoveryMetadata = Schema.Struct({
   kind: Schema.Literal("coordinator-private-recovery"), version: Schema.Literal(3),
-  sourceSha: Sha,
+  sourceSha: Evidence.fields.sha,
   createdAt: Schema.String, broker: RecoveryFile,
   runner: Schema.optional(Schema.Struct({ ...RecoveryFile.fields, eventRows: Schema.Number, id: RunnerConfig.fields.id, layout: Schema.String, entries: Schema.Array(RecoveryEntry) })),
   excluded: Schema.Array(Schema.String),
@@ -259,7 +258,7 @@ export const io = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effec
   if (error instanceof BackupError) return error;
   const reason = PlatformError.isPlatformError(error)
     ? `platform/${error.reason._tag}/${/^[A-Za-z]+$/.test(error.reason.method) ? error.reason.method : "operation"}`
-    : isSqlError(error) ? `sql/${error.reason._tag}` : Schema.isSchemaError(error) ? "schema/decode" : "unclassified";
+    : error instanceof DatabaseError ? `database/${error.operation}/${error.reason}` : Schema.isSchemaError(error) ? "schema/decode" : "unclassified";
   return recoveryError(`Recovery operation failed (${reason}); inspect private paths and partial output offline`);
 }));
 
@@ -307,11 +306,11 @@ const syncPath = (file: string) => Effect.scoped(Effect.gen(function*() {
   yield* (yield* fs.open(file)).sync;
 })).pipe(io);
 
-const brokerTables = ["tasks", "sessions", "peers", "consents", "participant_consents", "archive", "evidence", "effect_queue"] as const;
-// Only attested application tables are selected; Prisma history, queue migrations and recovery_gate never enter an archive.
-const nativePostgres = (config: Pick<BrokerConfig, "databaseUrlFile">, executable: "/usr/bin/pg_dump" | "/usr/bin/pg_restore", args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(function*() {
+const brokerTables: ReadonlyArray<keyof DB> = ["tasks", "sessions", "peers", "consents", "participant_consents", "archive", "evidence", "dispatch_queue"];
+// Only attested application tables are selected; Prisma history and recovery_gate never enter an archive.
+const nativePostgres = (owner: typeof DatabaseService.Service, executable: "/usr/bin/pg_dump" | "/usr/bin/pg_restore", args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
-  const url = new URL(Redacted.value(yield* readDatabaseUrl(config.databaseUrlFile)));
+  const url = new URL(Redacted.value(owner.url));
   const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-pgpass-" });
   yield* platform.fs.chmod(directory, 0o700);
   const passwordFile = platform.path.join(directory, "pgpass");
@@ -330,98 +329,98 @@ const nativePostgres = (config: Pick<BrokerConfig, "databaseUrlFile">, executabl
   }, extendEnv: false, stdin: "ignore" }), Infinity).pipe(io,
     Effect.mapError((error) => recoveryError(`Native ${executable === "/usr/bin/pg_dump" ? "pg_dump" : args.includes("--list") ? "pg_restore list" : "pg_restore"} execution: ${error.message}`)));
 })).pipe(io);
-const validateBrokerDump = (config: BrokerConfig, source: string, full: boolean) => Effect.gen(function*() {
-  const listing = yield* nativePostgres(config, "/usr/bin/pg_restore", ["--list", source]);
+const validateBrokerDump = (owner: typeof DatabaseService.Service, source: string, full: boolean) => Effect.gen(function*() {
+  const listing = yield* nativePostgres(owner, "/usr/bin/pg_restore", ["--list", source]);
   const tables = new Set<string>(), sequences = new Set<string>();
   for (const line of listing.split("\n").filter((line) => line && !line.startsWith(";"))) {
     const match = /^\d+; \d+ \d+ (TABLE DATA|SEQUENCE SET) public (\S+) .+$/.exec(line);
-    if (!match) return yield* recoveryError("Recovery dump contains unexpected executable/schema entries");
-    const name = match[2]!;
+    if (!match || match[2] === undefined) return yield* recoveryError("Recovery dump contains unexpected executable/schema entries");
+    const name = match[2];
     if (match[1] === "TABLE DATA") {
       if (!brokerTables.some((table) => table === name) || tables.has(name)) return yield* recoveryError("Recovery dump contains unexpected/duplicate table data");
       tables.add(name);
     } else {
-      if (!["archive_sequence_seq", "evidence_id_seq", "effect_queue_sequence_seq"].includes(name) || sequences.has(name)) return yield* recoveryError("Recovery dump contains unexpected/duplicate sequences");
+      if (!["archive_sequence_seq", "evidence_id_seq", "dispatch_queue_sequence_seq"].includes(name) || sequences.has(name)) return yield* recoveryError("Recovery dump contains unexpected/duplicate sequences");
       sequences.add(name);
     }
   }
   if (brokerTables.some((table) => (full || !["archive", "consents", "participant_consents"].includes(table)) && !tables.has(table)) || sequences.size !== 3) return yield* recoveryError("Recovery dump is missing required data/sequence entries");
 });
 
-export const dumpBrokerDatabase = (config: BrokerConfig, destination: string, sanitized: boolean) => Effect.scoped(Effect.gen(function*() {
+export const dumpBrokerDatabase = (destination: string, sanitized: boolean) => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
+  const database = yield* DatabaseService;
   yield* privateRecoveryPath(destination, "file", true);
   // O_EXCL reserves the destination; native output writes through the already private path.
   yield* platform.fs.writeFileString(destination, "", { flag: "wx", mode: 0o600 });
   let complete = false;
   yield* Effect.addFinalizer(() => complete ? Effect.void : platform.fs.remove(destination).pipe(Effect.orDie));
   const tables = brokerTables.filter((table) => !sanitized || !["archive", "consents", "participant_consents"].includes(table));
-  yield* nativePostgres(config, "/usr/bin/pg_dump", ["--format=custom", "--data-only", "--no-owner", "--no-privileges", "--file", destination,
-    "--exclude-schema=prisma_contract", ...tables.map((table) => `--table=public.${table}`), "--table=public.archive_sequence_seq", "--table=public.evidence_id_seq", "--table=public.effect_queue_sequence_seq"]);
+  yield* nativePostgres(database, "/usr/bin/pg_dump", ["--format=custom", "--data-only", "--no-owner", "--no-privileges", "--file", destination,
+    "--exclude-schema=prisma_contract", ...tables.map((table) => `--table=public.${table}`), "--table=public.archive_sequence_seq", "--table=public.evidence_id_seq", "--table=public.dispatch_queue_sequence_seq"]);
   yield* syncPath(destination);
   yield* syncPath(platform.path.dirname(destination));
   complete = true;
 })).pipe(io);
 
 const inspectBrokerDatabase = (runner?: RunnerConfig) => Effect.gen(function*() {
-  const { sql } = yield* Postgres;
-  const schema = yield* brokerSchemaIdentity(sql);
-  const db = makeDatabase(sql);
-  let after: Model.TasksId | null = null, rows = 0, pendingAccepted = 0;
+  const db = yield* DatabaseService;
+  const schema = yield* brokerSchemaIdentity(db);
+  let after: TaskId | null = null, rows = 0, pendingAccepted = 0;
   for (;;) {
-    const page: ReadonlyArray<Model.Tasks> = yield* db.execute(db.client.selectFrom("tasks").selectAll().$if(after !== null, (query) => query.where("id", ">", after!)).orderBy("id").limit(128));
+    const page: ReadonlyArray<StoredTask> = yield* db.query((client) => {
+      const query = client.selectFrom("tasks").selectAll().orderBy("id").limit(128);
+      return after === null ? query : query.where("id", ">", after);
+    });
     if (!page.length) break;
     for (const row of page) {
-      const task = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Task), { onExcessProperty: "error" })(row.data);
+      const task = yield* Schema.decodeEffect(Schema.fromJsonString(Task), { onExcessProperty: "error" })(row.data);
       if (task.taskId !== row.id) return yield* recoveryError("Broker task identifier mismatch");
-      if (task.state === "ACCEPTED" || task.state === "RUNNING") pendingAccepted++;
-      if (task.runnerId && !["SUCCEEDED", "FAILED"].includes(task.state) && task.runnerId !== runner?.id) return yield* recoveryError("Every nonterminal assigned runner task requires its paired runner recovery config");
+      if (task.state === TaskStateEnum.ACCEPTED || task.state === TaskStateEnum.RUNNING) pendingAccepted++;
+      if (task.runnerId !== undefined && ![TaskStateEnum.SUCCEEDED, TaskStateEnum.FAILED].includes(task.state) && task.runnerId !== runner?.id) return yield* recoveryError("Every nonterminal assigned runner task requires its paired runner recovery config");
       after = row.id; rows++;
     }
   }
   return { schema, rows, pendingAccepted };
 });
-const validateBrokerRunnerPair = (runner: RunnerConfig, owner: typeof Postgres.Service) => Effect.scoped(Effect.gen(function*() {
-  const db = makeDatabase((yield* Postgres).sql);
-  const tasks = yield* db.execute(db.client.selectFrom("tasks").selectAll());
-  yield* Effect.gen(function*() {
-    const journal = makeDatabase((yield* Postgres).sql);
-    for (const row of tasks) {
-      const task = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Task))(row.data);
-      if (task.runnerId === runner.id && !["SUCCEEDED", "FAILED"].includes(task.state)) {
-        const paired = yield* journal.execute(journal.client.selectFrom("runner_tasks").select("fingerprint").where("taskId", "=", task.taskId));
-        if (paired.length !== 1 || paired[0]?.fingerprint !== task.fingerprint) return yield* recoveryError("Broker/runner private recovery task pairing mismatch");
-      }
+const validateBrokerRunnerPair = (runner: RunnerConfig, owner: typeof DatabaseService.Service) => Effect.gen(function*() {
+  const db = yield* DatabaseService;
+  const tasks = yield* db.query((client) => client.selectFrom("tasks").selectAll());
+  for (const row of tasks) {
+    const task = yield* Schema.decodeEffect(Schema.fromJsonString(Task))(row.data);
+    if (task.runnerId === runner.id && ![TaskStateEnum.SUCCEEDED, TaskStateEnum.FAILED].includes(task.state)) {
+      const paired = yield* owner.query((client) => client.selectFrom("runner_tasks").select("fingerprint").where("taskId", "=", task.taskId));
+      if (paired.length !== 1 || paired[0]?.fingerprint !== task.fingerprint) return yield* recoveryError("Broker/runner private recovery task pairing mismatch");
     }
-  }).pipe(Effect.provideService(Postgres, owner));
-}));
-export const emptyBrokerDatabase = Effect.gen(function*() {
-  const { sql } = yield* Postgres;
-  yield* brokerSchemaIdentity(sql);
-  const db = makeDatabase(sql);
-  for (const table of brokerTables) {
-    if ((yield* db.execute(db.client.selectFrom(table).selectAll().limit(1))).length) return yield* recoveryError("Fresh empty migrated PostgreSQL target required");
   }
-  const gate = yield* db.execute(db.client.selectFrom("recovery_gate").selectAll().where("id", "=", Model.RecoveryGateId.make(1)));
+});
+export const emptyBrokerDatabase = Effect.gen(function*() {
+  const db = yield* DatabaseService;
+  yield* brokerSchemaIdentity(db);
+  for (const table of brokerTables) {
+    if ((yield* db.query((client) => client.selectFrom(table).selectAll().limit(1))).length) return yield* recoveryError("Fresh empty migrated PostgreSQL target required");
+  }
+  const gate = yield* db.query((client) => client.selectFrom("recovery_gate").selectAll().where("id", "=", RecoveryGateId.make(1)));
   if (gate.length) return yield* recoveryError("Recovery target has already been used or fenced; provision a fresh database");
 });
 export const fenceBroker = Effect.gen(function*() {
-  const { sql } = yield* Postgres;
-  const db = makeDatabase(sql);
-  yield* db.execute(db.client.insertInto("recovery_gate").values({ id: Model.RecoveryGateId.make(1), ready: false }));
+  const db = yield* DatabaseService;
+  yield* db.query((client) => client.insertInto("recovery_gate").values({ id: RecoveryGateId.make(1), ready: false }));
 });
 export const holdBrokerAccepted = Effect.gen(function*() {
-  const { sql } = yield* Postgres;
-  const db = makeDatabase(sql);
-  let after: Model.TasksId | null = null;
+  const db = yield* DatabaseService;
+  let after: TaskId | null = null;
   for (;;) {
-    const page: ReadonlyArray<Model.Tasks> = yield* db.execute(db.client.selectFrom("tasks").selectAll().$if(after !== null, (query) => query.where("id", ">", after!)).orderBy("id").limit(128));
+    const page: ReadonlyArray<StoredTask> = yield* db.query((client) => {
+      const query = client.selectFrom("tasks").selectAll().orderBy("id").limit(128);
+      return after === null ? query : query.where("id", ">", after);
+    });
     if (!page.length) break;
     for (const row of page) {
-      const task = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Task), { onExcessProperty: "error" })(row.data);
-      if (task.state === "ACCEPTED" || task.state === "RUNNING") {
-        const update = { data: Schema.encodeSync(Schema.fromJsonString(Task))({ ...task, state: "HELD", reason: "private recovery: accepted native outcome uncertain; operator journal reconciliation required; no replay" }) };
-        const changed = yield* db.execute(db.client.updateTable("tasks").set(update).where("id", "=", row.id).returning("id"));
+      const task = yield* Schema.decodeEffect(Schema.fromJsonString(Task), { onExcessProperty: "error" })(row.data);
+      if (task.state === TaskStateEnum.ACCEPTED || task.state === TaskStateEnum.RUNNING) {
+        const update = { data: Schema.encodeSync(Schema.fromJsonString(Task))({ ...task, state: TaskStateEnum.HELD, reason: "private recovery: accepted agent outcome uncertain; operator journal reconciliation required; no replay" }) };
+        const changed = yield* db.query((client) => client.updateTable("tasks").set(update).where("id", "=", row.id).returning("id"));
         if (changed.length !== 1) return yield* recoveryError("Recovered task vanished; target remains fenced");
       }
       after = row.id;
@@ -429,32 +428,31 @@ export const holdBrokerAccepted = Effect.gen(function*() {
   }
 });
 export const openBrokerGate = Effect.gen(function*() {
-  const { sql } = yield* Postgres;
-  const db = makeDatabase(sql);
-  const changed = yield* db.execute(db.client.updateTable("recovery_gate").set({ ready: true }).where("id", "=", Model.RecoveryGateId.make(1)).where("ready", "=", false).returningAll());
+  const db = yield* DatabaseService;
+  const changed = yield* db.query((client) => client.updateTable("recovery_gate").set({ ready: true }).where("id", "=", RecoveryGateId.make(1)).where("ready", "=", false).returningAll());
   if (changed.length !== 1) return yield* recoveryError("Recovery fence missing; refuse opening target");
 });
-export const restoreBrokerDatabase = (config: BrokerConfig, source: string, holdAcceptedWork = false) => Effect.scoped(Effect.gen(function*() {
-  const database = yield* Postgres;
+export const restoreBrokerDatabase = (source: string, holdAcceptedWork = false) => Effect.scoped(Effect.gen(function*() {
+  const database = yield* DatabaseService;
   return yield* Effect.gen(function*() {
     yield* privateRecoveryPath(source, "file");
     yield* emptyBrokerDatabase;
-    yield* validateBrokerDump(config, source, false);
+    yield* validateBrokerDump(database, source, false);
     yield* fenceBroker;
-    yield* nativePostgres(config, "/usr/bin/pg_restore", ["--data-only", "--no-owner", "--no-privileges", "--single-transaction", "--exit-on-error", source]);
+    yield* nativePostgres(database, "/usr/bin/pg_restore", ["--data-only", "--no-owner", "--no-privileges", "--single-transaction", "--exit-on-error", source]);
     const state = yield* inspectBrokerDatabase();
     if (state.pendingAccepted && !holdAcceptedWork) return yield* recoveryError("Restore requires explicit accepted-work HELD acknowledgment");
     yield* holdBrokerAccepted;
     yield* openBrokerGate;
-  }).pipe(Effect.raceFirst(database.failure));
-})).pipe(Effect.provide(Postgres.layer(config.databaseUrlFile)), io);
+  }).pipe(Effect.raceFirst(awaitDatabaseLoss(database)));
+})).pipe(Effect.provide(DatabaseService.layer()), io);
 const recoveryStat = (file: string) => Effect.gen(function*() {
   const platform = yield* Platform;
   // Effect FileSystem.stat follows links; recovery needs metadata of the link itself.
   const output = yield* platform.exec(ChildProcess.make("/usr/bin/stat", ["--printf=%f %u %g %h", "--", file], { env: {}, extendEnv: false }), Infinity);
   const match = /^([a-f0-9]+) ([0-9]+) ([0-9]+) ([0-9]+)$/.exec(output);
   if (!match) return yield* recoveryError("Invalid recovery filesystem metadata");
-  return yield* Schema.decodeUnknownEffect(RecoveryStat)({ mode: Number.parseInt(match[1]!, 16), uid: Number(match[2]), gid: Number(match[3]), nlink: Number(match[4]) });
+  return yield* Schema.decodeEffect(RecoveryStat)({ mode: Number.parseInt(match[1]!, 16), uid: Number(match[2]), gid: Number(match[3]), nlink: Number(match[4]) });
 }).pipe(io);
 const durableCopy = (source: string, destination: string) => Effect.gen(function*() {
   const { fs, path } = yield* Platform;
@@ -464,66 +462,63 @@ const durableCopy = (source: string, destination: string) => Effect.gen(function
   yield* syncPath(destination);
   yield* syncPath(path.dirname(destination));
 }).pipe(io);
-export const inspectRunnerDatabase = (runner: RunnerConfig, owner?: typeof Postgres.Service) => Effect.scoped(Effect.gen(function*() {
+export const inspectRunnerDatabase = (runner: RunnerConfig, owner: typeof DatabaseService.Service) => Effect.gen(function*() {
   const platform = yield* Platform;
-  const sql = (yield* Postgres).sql;
-  const db = makeDatabase(sql);
-  const schema = yield* brokerSchemaIdentity(sql);
+  const schema = yield* brokerSchemaIdentity(owner);
   let after = 0, rows = 0, pendingAccepted = 0;
   for (;;) {
-    const page = yield* db.execute(db.client.selectFrom("runner_tasks").selectAll().where("sequence", ">", Model.RunnerTasksId.make(after)).orderBy("sequence").limit(128));
+    const page = yield* owner.query((client) => client.selectFrom("runner_tasks").selectAll().where("sequence", ">", RunnerTaskId.make(after)).orderBy("sequence").limit(128));
     if (!page.length) break;
     for (const decoded of page) {
-      const work = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Work))(decoded.work);
+      const work = yield* Schema.decodeEffect(Schema.fromJsonString(Work))(decoded.work);
       if (decoded.taskId !== work.taskId || decoded.fingerprint !== (yield* platform.fingerprint(work))) return yield* recoveryError("Runner recovery task identity/fingerprint mismatch");
       if (decoded.worktree !== platform.path.join(runner.childDirectory, yield* platform.digest(decoded.taskId), "repo")) return yield* recoveryError("Runner worktree is outside its canonical task workspace");
-      if (decoded.pid !== null) yield* Effect.try({ try: () => {
-        try { process.kill(decoded.pid!, 0); }
+      const pid = decoded.pid;
+      if (pid !== null) yield* Effect.try({ try: () => {
+        try { process.kill(pid, 0); }
         catch (error) { if (typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH") return; throw error; }
-        throw recoveryError("Recorded native child is live; stop it offline before backup or restore");
-      }, catch: () => recoveryError("Native child liveness unsafe or unknown") });
-      if (decoded.state === "ACCEPTED" && decoded.occupied === 1 && decoded.detached === 0) pendingAccepted++;
+        throw recoveryError("Recorded agent child is live; stop it offline before backup or restore");
+      }, catch: () => recoveryError("Agent child liveness unsafe or unknown") });
+      if (decoded.state === RunnerStateEnum.ACCEPTED && decoded.occupied === 1 && decoded.detached === 0) pendingAccepted++;
       after = decoded.sequence; rows++;
     }
   }
-  const events = yield* db.execute(db.client.selectFrom("runner_events").select((eb) => eb.fn.countAll<string>().as("count")));
+  const events = yield* owner.query((client) => client.selectFrom("runner_events").select((eb) => eb.fn.countAll<bigint>().as("count")));
   return { schema, rows, pendingAccepted, eventRows: Number(events[0]?.count ?? "-1") };
-}).pipe(Effect.provide(owner ? Layer.succeed(Postgres, owner) : Postgres.layer(runner.databaseUrlFile))));
+});
 
-const runnerTables = ["runner_tasks", "runner_events"] as const;
-const runnerSequences = ["runner_tasks_sequence_seq", "runner_events_seq_seq"] as const;
-const validateRunnerDump = (runner: RunnerConfig, source: string) => Effect.gen(function*() {
-  const listing = yield* nativePostgres(runner, "/usr/bin/pg_restore", ["--list", source]);
+const runnerTables: ReadonlyArray<keyof DB> = ["runner_tasks", "runner_events"];
+const runnerSequences: ReadonlyArray<string> = ["runner_tasks_sequence_seq", "runner_events_seq_seq"];
+const validateRunnerDump = (owner: typeof DatabaseService.Service, source: string) => Effect.gen(function*() {
+  const listing = yield* nativePostgres(owner, "/usr/bin/pg_restore", ["--list", source]);
   const seen = new Set<string>();
   for (const line of listing.split("\n").filter((line) => line && !line.startsWith(";"))) {
     const match = /^\d+; \d+ \d+ (TABLE DATA|SEQUENCE SET) public (\S+) .+$/.exec(line);
-    if (!match || seen.has(match[2]!)) return yield* recoveryError("Unexpected runner dump entry");
+    if (!match || match[2] === undefined) return yield* recoveryError("Unexpected runner dump entry");
+    const name = match[2];
+    if (seen.has(name)) return yield* recoveryError("Unexpected runner dump entry");
     const allowed: ReadonlyArray<string> = match[1] === "TABLE DATA" ? runnerTables : runnerSequences;
-    if (!allowed.includes(match[2]!)) return yield* recoveryError("Unexpected runner dump entry");
-    seen.add(match[2]!);
+    if (!allowed.includes(name)) return yield* recoveryError("Unexpected runner dump entry");
+    seen.add(name);
   }
   if ([...runnerTables, ...runnerSequences].some((name) => !seen.has(name))) return yield* recoveryError("Runner dump is missing required entries");
 });
-const emptyRunnerDatabase = (owner: typeof Postgres.Service) => Effect.scoped(Effect.gen(function*() {
-  const pg = yield* Postgres;
-  yield* assertRunnerSchema(pg.sql);
+const emptyRunnerDatabase = (owner: typeof DatabaseService.Service) => Effect.scoped(Effect.gen(function*() {
+  const db = yield* DatabaseService;
+  yield* assertRunnerSchema(db);
   yield* emptyBrokerDatabase;
-  const db = makeDatabase(pg.sql);
-  for (const table of runnerTables) if ((yield* db.execute(db.client.selectFrom(table).selectAll().limit(1))).length) return yield* recoveryError("Fresh empty runner PostgreSQL target required");
-}).pipe(Effect.provideService(Postgres, owner)));
-export const holdRunnerAccepted = (runner: RunnerConfig, owner?: typeof Postgres.Service) => Effect.scoped(Effect.gen(function*() {
-  const db = makeDatabase((yield* Postgres).sql);
-  yield* db.execute(db.client.updateTable("runner_tasks").set({ state: "HELD", reason: "private recovery: accepted launch fenced; operator reconciliation required; no replay" }).where("state", "=", "ACCEPTED").where("occupied", "=", 1).where("detached", "=", 0));
-}).pipe(Effect.provide(owner ? Layer.succeed(Postgres, owner) : Postgres.layer(runner.databaseUrlFile))));
+  for (const table of runnerTables) if ((yield* db.query((client) => client.selectFrom(table).selectAll().limit(1))).length) return yield* recoveryError("Fresh empty runner PostgreSQL target required");
+}).pipe(Effect.provideService(DatabaseService, owner)));
+export const holdRunnerAccepted = (owner: typeof DatabaseService.Service) =>
+  owner.query((client) => client.updateTable("runner_tasks").set({ state: RunnerStateEnum.HELD, reason: "private recovery: accepted launch fenced; operator reconciliation required; no replay" }).where("state", "=", RunnerStateEnum.ACCEPTED).where("occupied", "=", 1).where("detached", "=", 0)).pipe(Effect.asVoid);
 
-export const recoverOwned = (operation: "backup" | "restore", config: BrokerConfig, artifact: string, sourceSha: Sha, runner?: RunnerConfig, holdAcceptedWork = false) => Effect.scoped(Effect.gen(function*() {
+export const recoverOwned = (operation: "backup" | "restore", config: BrokerConfig, artifact: string, sourceSha: typeof Evidence.fields.sha.Type, runner?: RunnerConfig, holdAcceptedWork = false) => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
   const { fs, path: paths } = platform;
-  const runnerOwner = runner ? Context.get(yield* Layer.build(Postgres.layer(runner.databaseUrlFile)), Postgres) : undefined;
-  yield* privateRecoveryPath(config.databaseUrlFile, "file");
-  const database = yield* Postgres;
+  const runnerOwner = runner ? Context.get(yield* Layer.build(DatabaseService.layer(yield* DatabaseService.connection("COORDINATOR_RUNNER_DATABASE_URL"))), DatabaseService) : undefined;
+  const database = yield* DatabaseService;
   if (operation === "restore") yield* emptyBrokerDatabase;
-  const locks: Array<{ readonly exitCode: Effect.Effect<number, unknown> }> = [];
+  const locks: Array<ChildProcessSpawner.ChildProcessHandle> = [];
   if (runner) {
     // /work is 0711 for isolated child traversal; runner state itself remains private 0700.
     yield* checkedRecoveryPath(runner.stateDirectory, "directory", false, true);
@@ -534,7 +529,6 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
     const lock = paths.join(runner.stateDirectory, "runner.lock");
     yield* privateRecoveryPath(lock, "file", !(yield* platform.fs.exists(lock)));
     locks.push(yield* platform.acquireJournalOwnership(lock));
-    yield* privateRecoveryPath(runner.databaseUrlFile, "file");
     if (operation === "restore" && runnerOwner) yield* emptyRunnerDatabase(runnerOwner);
   }
   const work = Effect.gen(function*() {
@@ -542,7 +536,7 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
     const layout = runner ? JSON.stringify({ stateDirectory: runner.stateDirectory, childDirectory: runner.childDirectory, repositories: runner.repositories, childUidBase: runner.childUidBase }) : "";
     if (roots.some((root, index) => root === "/" || !paths.isAbsolute(root) || paths.resolve(root) !== root ||
       roots.some((other, otherIndex) => index !== otherIndex && (root === other || root.startsWith(`${other}/`))) ||
-      [artifact, config.databaseUrlFile, config.backupDirectory, config.objectBackup?.accessKeyFile, config.objectBackup?.secretKeyFile, runner?.stateDirectory, runner?.databaseUrlFile, runner?.modelDirectory, runner?.tokenFile].some((privatePath) => privatePath && (privatePath === root || privatePath.startsWith(`${root}/`))))) return yield* recoveryError("Canonical disjoint runner recovery roots required");
+      [artifact, config.backupDirectory, config.objectBackup?.accessKeyFile, config.objectBackup?.secretKeyFile, runner?.stateDirectory, runner?.modelDirectory, runner?.tokenFile].some((privatePath) => privatePath && (privatePath === root || privatePath.startsWith(`${root}/`))))) return yield* recoveryError("Canonical disjoint runner recovery roots required");
     const inside = (file: string) => roots.some((root) => file === root || file.startsWith(`${root}/`));
     for (const root of roots) {
       const info = yield* io(fs.stat(root));
@@ -553,26 +547,26 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
       yield* io(fs.makeDirectory(artifact, { mode: 0o700 }));
       let runnerFile: (typeof RecoveryFile.Type & { eventRows: number }) | undefined;
       if (runner && runnerOwner) {
-        const journal = makeDatabase(runnerOwner.sql);
-        for (const table of brokerTables) if ((yield* journal.execute(journal.client.selectFrom(table).selectAll().limit(1))).length) return yield* recoveryError("Runner database contains broker ledger state; separate runtime databases required");
+        const journal = runnerOwner;
+        for (const table of brokerTables) if ((yield* journal.query((client) => client.selectFrom(table).selectAll().limit(1))).length) return yield* recoveryError("Runner database contains broker ledger state; separate runtime databases required");
         yield* validateBrokerRunnerPair(runner, runnerOwner);
         const state = yield* inspectRunnerDatabase(runner, runnerOwner);
         const destination = paths.join(artifact, "runner.pgdump");
         yield* io(fs.writeFileString(destination, "", { flag: "wx", mode: 0o600 }));
-        yield* nativePostgres(runner, "/usr/bin/pg_dump", ["--format=custom", "--data-only", "--no-owner", "--no-privileges", "--file", destination, ...[...runnerTables, ...runnerSequences].map((table) => `--table=public.${table}`)]);
+        yield* nativePostgres(runnerOwner, "/usr/bin/pg_dump", ["--format=custom", "--data-only", "--no-owner", "--no-privileges", "--file", destination, ...[...runnerTables, ...runnerSequences].map((table) => `--table=public.${table}`)]);
         yield* syncPath(destination);
         runnerFile = { ...state, sha256: yield* hashFile(destination) };
       }
       const brokerState = yield* inspectBrokerDatabase(runner);
       const brokerDump = paths.join(artifact, "broker.pgdump");
-      yield* dumpBrokerDatabase(config, brokerDump, false);
+      yield* dumpBrokerDatabase(brokerDump, false);
       const broker = { ...brokerState, sha256: yield* hashFile(brokerDump) };
       const entries: Array<typeof RecoveryEntry.Type> = [];
       if (runner) {
         yield* io(fs.makeDirectory(paths.join(artifact, "blobs"), { mode: 0o700 }));
         const visit = (file: string): Effect.Effect<void, BackupError, Platform> => Effect.gen(function*() {
           const relative = paths.relative(runner.childDirectory, file);
-          if (/^[^/]+\/(?:native\.token|native-plugin\.json|native-endpoint\.json)$/.test(relative) ||
+          if (/^[^/]+\/(?:agent\.token|agent-config\.json|agent-endpoint\.json)$/.test(relative) ||
             /^[^/]+\/home\/\.(?:omp|pi)\/agent\/(?:auth\.json|models\.json|config\.yml|settings\.json)$/.test(relative)) return;
           const info = yield* recoveryStat(file);
           const base = { path: file, uid: info.uid, gid: info.gid, mode: info.mode & 0o777 };
@@ -599,7 +593,7 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
       }
       const metadata: RecoveryMetadata = { kind: "coordinator-private-recovery", version: 3, sourceSha, createdAt: new Date().toISOString(), broker,
         ...(runner && runnerFile ? { runner: { ...runnerFile, id: runner.id, layout, entries } } : {}),
-        excluded: ["operator configs and enrollment/control tokens", "model seed and known copied child model config/auth files", "native control token/plugin/endpoint files (no native reattachment; retained journals remain uncertain)", "external host plugin journals/history (operator-owned; accepted broker work is restored HELD, never resumed)"] };
+        excluded: ["operator configs and enrollment/control tokens", "model seed and known copied child model config/auth files", "agent control token/config/endpoint files (no agent reattachment; retained journals remain uncertain)", "external host plugin journals/history (operator-owned; accepted broker work is restored HELD, never resumed)"] };
       yield* Effect.scoped(Effect.gen(function*() {
         const file = yield* fs.open(paths.join(artifact, "recovery.json"), { flag: "wx", mode: 0o600 });
         yield* file.writeAll(utf8.encode(yield* Schema.encodeEffect(Schema.fromJsonString(RecoveryMetadata))(metadata)));
@@ -611,21 +605,21 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
     yield* privateRecoveryPath(artifact, "directory");
     const manifest = paths.join(artifact, "recovery.json");
     yield* privateRecoveryPath(manifest, "file");
-    const metadata = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(RecoveryMetadata), { onExcessProperty: "error" })(yield* platform.fs.readFileString(manifest));
+    const metadata = yield* Schema.decodeEffect(Schema.fromJsonString(RecoveryMetadata), { onExcessProperty: "error" })(yield* platform.fs.readFileString(manifest));
     if (metadata.broker.pendingAccepted + (metadata.runner?.pendingAccepted ?? 0) > 0 && !holdAcceptedWork) return yield* recoveryError("Restore requires --hold-accepted-work: accepted/running work must be fenced HELD without replay");
     if (metadata.sourceSha !== sourceSha || !!metadata.runner !== !!runner || (metadata.runner && (metadata.runner.id !== runner?.id || metadata.runner.layout !== layout))) return yield* recoveryError("Recovery source revision or runner absolute-path/UID pairing mismatch");
     const expected = ["broker.pgdump", "recovery.json", ...(metadata.runner ? ["runner.pgdump", "blobs"] : [])].sort();
     if (JSON.stringify((yield* platform.fs.readDirectory(artifact)).sort()) !== JSON.stringify(expected)) return yield* recoveryError("Unexpected recovery artifact contents");
     const brokerDump = paths.join(artifact, "broker.pgdump");
     yield* privateRecoveryPath(brokerDump, "file");
-    if ((yield* hashFile(brokerDump)) !== metadata.broker.sha256 || (yield* brokerSchemaIdentity(database.sql)) !== metadata.broker.schema) return yield* recoveryError("Broker recovery digest/schema mismatch");
+    if ((yield* hashFile(brokerDump)) !== metadata.broker.sha256 || (yield* brokerSchemaIdentity(database)) !== metadata.broker.schema) return yield* recoveryError("Broker recovery digest/schema mismatch");
     const runnerDump = paths.join(artifact, "runner.pgdump");
-    if (metadata.runner && runner) {
+    if (metadata.runner && runner && runnerOwner) {
       yield* privateRecoveryPath(runnerDump, "file");
       if ((yield* hashFile(runnerDump)) !== metadata.runner.sha256) return yield* recoveryError("Runner recovery artifact digest mismatch");
       const current = yield* inspectRunnerDatabase(runner, runnerOwner);
       if (current.schema !== metadata.runner.schema) return yield* recoveryError("Runner recovery schema mismatch");
-      yield* validateRunnerDump(runner, runnerDump);
+      yield* validateRunnerDump(runnerOwner, runnerDump);
     }
     if (metadata.runner) {
       const seen = new Set<string>();
@@ -652,18 +646,18 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
         if (!directories.has(root) || (yield* io(fs.readDirectory(root))).length) return yield* recoveryError("Fresh empty runner child/repository roots required");
       }
     }
-    yield* validateBrokerDump(config, brokerDump, true);
+    yield* validateBrokerDump(database, brokerDump, true);
     yield* fenceBroker;
-    if (runnerOwner) yield* fenceBroker.pipe(Effect.provideService(Postgres, runnerOwner));
-    yield* nativePostgres(config, "/usr/bin/pg_restore", ["--data-only", "--no-owner", "--no-privileges", "--single-transaction", "--exit-on-error", brokerDump]);
+    if (runnerOwner) yield* fenceBroker.pipe(Effect.provideService(DatabaseService, runnerOwner));
+    yield* nativePostgres(database, "/usr/bin/pg_restore", ["--data-only", "--no-owner", "--no-privileges", "--single-transaction", "--exit-on-error", brokerDump]);
     const inspectedBroker = yield* inspectBrokerDatabase(runner);
     if (inspectedBroker.rows !== metadata.broker.rows || inspectedBroker.pendingAccepted !== metadata.broker.pendingAccepted || inspectedBroker.schema !== metadata.broker.schema) return yield* recoveryError("Restored broker state mismatch; target remains fenced");
-    if (runner && metadata.runner) {
-      yield* nativePostgres(runner, "/usr/bin/pg_restore", ["--data-only", "--no-owner", "--no-privileges", "--single-transaction", "--exit-on-error", runnerDump]);
+    if (runner && metadata.runner && runnerOwner) {
+      yield* nativePostgres(runnerOwner, "/usr/bin/pg_restore", ["--data-only", "--no-owner", "--no-privileges", "--single-transaction", "--exit-on-error", runnerDump]);
       const restored = yield* inspectRunnerDatabase(runner, runnerOwner);
       if (restored.rows !== metadata.runner.rows || restored.eventRows !== metadata.runner.eventRows || restored.pendingAccepted !== metadata.runner.pendingAccepted || restored.schema !== metadata.runner.schema) return yield* recoveryError("Restored runner state mismatch; broker remains fenced");
-      if (runnerOwner) yield* validateBrokerRunnerPair(runner, runnerOwner);
-      yield* holdRunnerAccepted(runner, runnerOwner);
+      yield* validateBrokerRunnerPair(runner, runnerOwner);
+      yield* holdRunnerAccepted(runnerOwner);
     }
     yield* holdBrokerAccepted;
     if (metadata.runner) {
@@ -688,14 +682,14 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
         })).pipe(io);
       }
     }
-    if (runnerOwner) yield* openBrokerGate.pipe(Effect.provideService(Postgres, runnerOwner));
+    if (runnerOwner) yield* openBrokerGate.pipe(Effect.provideService(DatabaseService, runnerOwner));
     yield* openBrokerGate;
     return metadata;
   });
   const lost = (lock: (typeof locks)[number]) => lock.exitCode.pipe(Effect.catch(() => Effect.succeed(undefined)), Effect.andThen(Effect.fail(recoveryError("Recovery ownership lost; fence partial output and do not start services"))));
-  const ownedWork = runnerOwner ? work.pipe(Effect.raceFirst(runnerOwner.failure)) : work;
-  return yield* locks.reduce((effect, lock) => effect.pipe(Effect.raceFirst(lost(lock))), ownedWork).pipe(Effect.raceFirst(database.failure));
+  const ownedWork = runnerOwner ? work.pipe(Effect.raceFirst(awaitDatabaseLoss(runnerOwner))) : work;
+  return yield* locks.reduce((effect, lock) => effect.pipe(Effect.raceFirst(lost(lock))), ownedWork).pipe(Effect.raceFirst(awaitDatabaseLoss(database)));
 })).pipe(io);
-export const recover = (operation: "backup" | "restore", config: BrokerConfig, artifact: string, sourceSha: Sha, runner?: RunnerConfig, holdAcceptedWork = false) =>
-  recoverOwned(operation, config, artifact, sourceSha, runner, holdAcceptedWork).pipe(Effect.provide(Postgres.layer(config.databaseUrlFile)));
+export const recover = (operation: "backup" | "restore", config: BrokerConfig, artifact: string, sourceSha: typeof Evidence.fields.sha.Type, runner?: RunnerConfig, holdAcceptedWork = false) =>
+  recoverOwned(operation, config, artifact, sourceSha, runner, holdAcceptedWork).pipe(Effect.provide(DatabaseService.layer()));
 

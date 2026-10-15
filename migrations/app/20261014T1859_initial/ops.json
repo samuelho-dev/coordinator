@@ -1,0 +1,691 @@
+[
+  {
+    "id": "schema.public",
+    "label": "Create schema \"public\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres"
+    },
+    "precheck": [],
+    "execute": [
+      {
+        "description": "Create schema \"public\"",
+        "sql": "CREATE SCHEMA IF NOT EXISTS \"public\"",
+        "params": []
+      }
+    ],
+    "postcheck": []
+  },
+  {
+    "id": "table.archive",
+    "label": "Create table \"archive\"",
+    "summary": "Creates table \"archive\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "archive"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"archive\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"archive\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"archive\"",
+        "sql": "CREATE TABLE \"public\".\"archive\" (\n  \"created\" float8 NOT NULL,\n  \"digest\" text NOT NULL,\n  \"entry\" text NOT NULL,\n  \"gaps\" text NOT NULL,\n  \"owner\" text NOT NULL,\n  \"payload\" text NOT NULL,\n  \"sequence\" BIGSERIAL NOT NULL,\n  \"session\" text NOT NULL,\n  PRIMARY KEY (\"sequence\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"archive\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"archive\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.consents",
+    "label": "Create table \"consents\"",
+    "summary": "Creates table \"consents\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "consents"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"consents\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"consents\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"consents\"",
+        "sql": "CREATE TABLE \"public\".\"consents\" (\n  \"enabled\" int4 NOT NULL,\n  \"owner\" text NOT NULL,\n  \"participants\" text NOT NULL,\n  \"session\" text NOT NULL,\n  PRIMARY KEY (\"owner\", \"session\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"consents\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"consents\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.dispatch_queue",
+    "label": "Create table \"dispatch_queue\"",
+    "summary": "Creates table \"dispatch_queue\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "dispatch_queue"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"dispatch_queue\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"dispatch_queue\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"dispatch_queue\"",
+        "sql": "CREATE TABLE \"public\".\"dispatch_queue\" (\n  \"attempts\" int4 DEFAULT 0 NOT NULL,\n  \"available_at\" timestamp(6) NOT NULL,\n  \"created_at\" timestamp(6) NOT NULL,\n  \"failure\" text,\n  \"id\" character varying(255) NOT NULL,\n  \"lease_id\" uuid,\n  \"leased_at\" timestamp(6),\n  \"payload\" text NOT NULL,\n  \"queue\" character varying(255) NOT NULL,\n  \"sequence\" BIGSERIAL NOT NULL,\n  \"state\" text NOT NULL,\n  \"updated_at\" timestamp(6) NOT NULL,\n  PRIMARY KEY (\"sequence\"),\n  CONSTRAINT \"dispatch_queue_state_check_7cf91d99\" CHECK (\"state\" IN ('pending', 'failed', 'completed'))\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"dispatch_queue\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"dispatch_queue\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.evidence",
+    "label": "Create table \"evidence\"",
+    "summary": "Creates table \"evidence\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "evidence"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"evidence\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"evidence\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"evidence\"",
+        "sql": "CREATE TABLE \"public\".\"evidence\" (\n  \"data\" text NOT NULL,\n  \"id\" BIGSERIAL NOT NULL,\n  \"kind\" text NOT NULL,\n  \"observed\" float8 NOT NULL,\n  \"principal\" text NOT NULL,\n  \"sha\" text NOT NULL,\n  \"task\" text NOT NULL,\n  PRIMARY KEY (\"id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"evidence\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"evidence\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.participant_consents",
+    "label": "Create table \"participant_consents\"",
+    "summary": "Creates table \"participant_consents\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "participant_consents"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"participant_consents\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"participant_consents\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"participant_consents\"",
+        "sql": "CREATE TABLE \"public\".\"participant_consents\" (\n  \"enabled\" int4 NOT NULL,\n  \"owner\" text NOT NULL,\n  \"participant\" text NOT NULL,\n  \"session\" text NOT NULL,\n  PRIMARY KEY (\"owner\", \"session\", \"participant\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"participant_consents\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"participant_consents\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.peers",
+    "label": "Create table \"peers\"",
+    "summary": "Creates table \"peers\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "peers"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"peers\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"peers\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"peers\"",
+        "sql": "CREATE TABLE \"public\".\"peers\" (\n  \"expires\" float8 NOT NULL,\n  \"fingerprint\" text NOT NULL,\n  \"id\" text NOT NULL,\n  \"incarnation\" text NOT NULL,\n  \"owner\" text NOT NULL,\n  \"payload\" text NOT NULL,\n  \"sender\" text NOT NULL,\n  \"session\" text NOT NULL,\n  PRIMARY KEY (\"id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"peers\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"peers\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.recovery_gate",
+    "label": "Create table \"recovery_gate\"",
+    "summary": "Creates table \"recovery_gate\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "recovery_gate"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"recovery_gate\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"recovery_gate\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"recovery_gate\"",
+        "sql": "CREATE TABLE \"public\".\"recovery_gate\" (\n  \"id\" int4 NOT NULL,\n  \"ready\" bool NOT NULL,\n  PRIMARY KEY (\"id\"),\n  CONSTRAINT \"recovery_gate_singleton_7faf435e\" CHECK (id = 1)\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"recovery_gate\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"recovery_gate\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.runner_events",
+    "label": "Create table \"runner_events\"",
+    "summary": "Creates table \"runner_events\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "runner_events"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"runner_events\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"runner_events\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"runner_events\"",
+        "sql": "CREATE TABLE \"public\".\"runner_events\" (\n  \"payload\" text NOT NULL,\n  \"seq\" SERIAL NOT NULL,\n  \"taskId\" text NOT NULL,\n  PRIMARY KEY (\"seq\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"runner_events\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"runner_events\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.runner_tasks",
+    "label": "Create table \"runner_tasks\"",
+    "summary": "Creates table \"runner_tasks\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "runner_tasks"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"runner_tasks\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"runner_tasks\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"runner_tasks\"",
+        "sql": "CREATE TABLE \"public\".\"runner_tasks\" (\n  \"address\" text,\n  \"agentBinding\" text,\n  \"agentCursor\" int4 DEFAULT 0 NOT NULL,\n  \"agentRunId\" text,\n  \"detached\" int4 DEFAULT 0 NOT NULL,\n  \"fingerprint\" text NOT NULL,\n  \"incarnation\" text NOT NULL,\n  \"occupied\" int4 NOT NULL,\n  \"pid\" int4,\n  \"promptId\" text,\n  \"reason\" text,\n  \"result\" text,\n  \"sequence\" SERIAL NOT NULL,\n  \"state\" text NOT NULL,\n  \"taskId\" text NOT NULL,\n  \"work\" text NOT NULL,\n  \"worktree\" text NOT NULL,\n  PRIMARY KEY (\"sequence\"),\n  CONSTRAINT \"runner_tasks_state_check_40691796\" CHECK (\"state\" IN ('ACCEPTED', 'LAUNCHING', 'READY', 'PROMPT_INTENT', 'RUNNING', 'SUCCEEDED', 'FAILED', 'HELD'))\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"runner_tasks\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"runner_tasks\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.sessions",
+    "label": "Create table \"sessions\"",
+    "summary": "Creates table \"sessions\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "sessions"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"sessions\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"sessions\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"sessions\"",
+        "sql": "CREATE TABLE \"public\".\"sessions\" (\n  \"data\" text NOT NULL,\n  \"id\" text NOT NULL,\n  PRIMARY KEY (\"id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"sessions\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"sessions\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "table.tasks",
+    "label": "Create table \"tasks\"",
+    "summary": "Creates table \"tasks\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "table",
+        "name": "tasks"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure table \"tasks\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"tasks\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create table \"tasks\"",
+        "sql": "CREATE TABLE \"public\".\"tasks\" (\n  \"data\" text NOT NULL,\n  \"id\" text NOT NULL,\n  PRIMARY KEY (\"id\")\n)",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify table \"tasks\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"tasks\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "unique.archive.archive_owner_session_entry_digest_key",
+    "label": "Add unique constraint on \"archive\" (owner, session, entry, digest)",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "unique",
+        "name": "archive_owner_session_entry_digest_key",
+        "table": "archive"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure constraint \"archive_owner_session_entry_digest_key\" does not exist",
+        "sql": "SELECT NOT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "archive_owner_session_entry_digest_key",
+          "public",
+          "\"public\".\"archive\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "add unique constraint \"archive_owner_session_entry_digest_key\"",
+        "sql": "ALTER TABLE \"public\".\"archive\" ADD CONSTRAINT \"archive_owner_session_entry_digest_key\" UNIQUE (\"owner\", \"session\", \"entry\", \"digest\")"
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify constraint \"archive_owner_session_entry_digest_key\" exists",
+        "sql": "SELECT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "archive_owner_session_entry_digest_key",
+          "public",
+          "\"public\".\"archive\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "unique.dispatch_queue.idx_dispatch_queue_id",
+    "label": "Add unique constraint on \"dispatch_queue\" (id, queue)",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "unique",
+        "name": "idx_dispatch_queue_id",
+        "table": "dispatch_queue"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure constraint \"idx_dispatch_queue_id\" does not exist",
+        "sql": "SELECT NOT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "idx_dispatch_queue_id",
+          "public",
+          "\"public\".\"dispatch_queue\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "add unique constraint \"idx_dispatch_queue_id\"",
+        "sql": "ALTER TABLE \"public\".\"dispatch_queue\" ADD CONSTRAINT \"idx_dispatch_queue_id\" UNIQUE (\"id\", \"queue\")"
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify constraint \"idx_dispatch_queue_id\" exists",
+        "sql": "SELECT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "idx_dispatch_queue_id",
+          "public",
+          "\"public\".\"dispatch_queue\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "unique.runner_tasks.runner_tasks_taskId_key",
+    "label": "Add unique constraint on \"runner_tasks\" (taskId)",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "unique",
+        "name": "runner_tasks_taskId_key",
+        "table": "runner_tasks"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure constraint \"runner_tasks_taskId_key\" does not exist",
+        "sql": "SELECT NOT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "runner_tasks_taskId_key",
+          "public",
+          "\"public\".\"runner_tasks\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "add unique constraint \"runner_tasks_taskId_key\"",
+        "sql": "ALTER TABLE \"public\".\"runner_tasks\" ADD CONSTRAINT \"runner_tasks_taskId_key\" UNIQUE (\"taskId\")"
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify constraint \"runner_tasks_taskId_key\" exists",
+        "sql": "SELECT EXISTS (SELECT 1 AS \"one\" FROM \"pg_constraint\" AS \"c\" INNER JOIN \"pg_namespace\" AS \"n\" ON \"n\".\"oid\" = \"c\".\"connamespace\" WHERE (\"c\".\"conname\" = $1 AND \"n\".\"nspname\" = $2 AND \"c\".\"conrelid\" = to_regclass($3))) AS \"result\"",
+        "params": [
+          "runner_tasks_taskId_key",
+          "public",
+          "\"public\".\"runner_tasks\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "index.dispatch_queue.idx_dispatch_queue_take_d4c7b4d1",
+    "label": "Create index \"idx_dispatch_queue_take_d4c7b4d1\" on \"dispatch_queue\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "index",
+        "name": "idx_dispatch_queue_take_d4c7b4d1",
+        "table": "dispatch_queue"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure index \"idx_dispatch_queue_take_d4c7b4d1\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"idx_dispatch_queue_take_d4c7b4d1\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create index \"idx_dispatch_queue_take_d4c7b4d1\"",
+        "sql": "CREATE INDEX \"idx_dispatch_queue_take_d4c7b4d1\" ON \"public\".\"dispatch_queue\" (\"queue\", \"available_at\") WHERE (state = 'pending')",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify index \"idx_dispatch_queue_take_d4c7b4d1\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"idx_dispatch_queue_take_d4c7b4d1\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "index.dispatch_queue.idx_dispatch_queue_update",
+    "label": "Create index \"idx_dispatch_queue_update\" on \"dispatch_queue\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "index",
+        "name": "idx_dispatch_queue_update",
+        "table": "dispatch_queue"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure index \"idx_dispatch_queue_update\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"idx_dispatch_queue_update\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create index \"idx_dispatch_queue_update\"",
+        "sql": "CREATE INDEX \"idx_dispatch_queue_update\" ON \"public\".\"dispatch_queue\" (\"sequence\", \"lease_id\")",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify index \"idx_dispatch_queue_update\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"idx_dispatch_queue_update\""
+        ]
+      }
+    ]
+  },
+  {
+    "id": "index.runner_events.runner_events_taskId_seq_idx_de7fe5ec",
+    "label": "Create index \"runner_events_taskId_seq_idx_de7fe5ec\" on \"runner_events\"",
+    "operationClass": "additive",
+    "target": {
+      "id": "postgres",
+      "details": {
+        "schema": "public",
+        "objectType": "index",
+        "name": "runner_events_taskId_seq_idx_de7fe5ec",
+        "table": "runner_events"
+      }
+    },
+    "precheck": [
+      {
+        "description": "ensure index \"runner_events_taskId_seq_idx_de7fe5ec\" does not exist",
+        "sql": "SELECT (to_regclass($1)) IS NULL AS \"result\"",
+        "params": [
+          "\"public\".\"runner_events_taskId_seq_idx_de7fe5ec\""
+        ]
+      }
+    ],
+    "execute": [
+      {
+        "description": "create index \"runner_events_taskId_seq_idx_de7fe5ec\"",
+        "sql": "CREATE INDEX \"runner_events_taskId_seq_idx_de7fe5ec\" ON \"public\".\"runner_events\" (\"taskId\", \"seq\")",
+        "params": []
+      }
+    ],
+    "postcheck": [
+      {
+        "description": "verify index \"runner_events_taskId_seq_idx_de7fe5ec\" exists",
+        "sql": "SELECT (to_regclass($1)) IS NOT NULL AS \"result\"",
+        "params": [
+          "\"public\".\"runner_events_taskId_seq_idx_de7fe5ec\""
+        ]
+      }
+    ]
+  }
+]

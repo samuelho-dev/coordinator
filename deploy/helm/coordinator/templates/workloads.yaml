@@ -14,6 +14,7 @@
 {{- if hasKey $settings.podAnnotations "checksum/values" }}{{ fail "podAnnotations must not override checksum/values" }}{{ end }}
 {{- range $env := $settings.extraEnv }}
 {{- if eq $env.name "NODE_EXTRA_CA_CERTS" }}{{ fail "NODE_EXTRA_CA_CERTS is reserved; use tls.existingCaSecret" }}{{ end }}
+{{- if eq $env.name "COORDINATOR_DATABASE_URL" }}{{ fail "COORDINATOR_DATABASE_URL is reserved; use existingSecret database.url" }}{{ end }}
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -97,13 +98,16 @@ spec:
             capabilities:
               drop: [ALL]
           env:
-            - {name: COORDINATOR_DATABASE_URL_FILE, value: /config/database.url}
+            - name: COORDINATOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret | quote }}
+                  key: database.url
             - {name: HOME, value: /tmp}
             {{- if $caSecret }}
             - {name: NODE_EXTRA_CA_CERTS, value: /etc/coordinator/ca/ca.crt}
             {{- end }}
           volumeMounts:
-            - {name: config, mountPath: /config, readOnly: true}
             - {name: tmp, mountPath: /tmp}
             {{- if $caSecret }}
             - {name: ca, mountPath: /etc/coordinator/ca, readOnly: true}
@@ -135,6 +139,11 @@ spec:
               add: [CHOWN, DAC_OVERRIDE, KILL, SETUID, SETGID, SETPCAP]
               {{- end }}
           env:
+            - name: COORDINATOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret | quote }}
+                  key: database.url
             - {name: COORDINATOR_CONFIG, value: {{ printf "/config/%s.json" $role | quote }}}
             - {name: COORDINATOR_IMAGE_SHA, value: {{ $sha | quote }}}
             - {name: COORDINATOR_CONNECT_HOSTS_JSON, value: {{ toJson $settings.connectHosts | quote }}}

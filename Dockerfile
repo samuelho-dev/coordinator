@@ -1,10 +1,9 @@
-FROM node:24.21.0-bookworm-slim AS native-build
+FROM node:24.21.0-bookworm-slim AS build
 RUN npm install --global pnpm@11.9.0
 WORKDIR /build
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
-COPY packages/native-control ./packages/native-control
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json tsconfig.build.json ./
 COPY src ./src
-RUN pnpm install --frozen-lockfile && pnpm run native:build && chmod -R a+rX /build
+RUN pnpm install --frozen-lockfile && pnpm run build && chmod -R a+rX /build
 
 FROM node:24.21.0-bookworm-slim
 LABEL org.opencontainers.image.licenses="MIT"
@@ -31,9 +30,7 @@ RUN curl --fail --silent --show-error --location https://github.com/can1357/oh-m
     && chmod 0755 /usr/local/bin/omp && omp --version
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY packages/native-control/package.json ./packages/native-control/package.json
-COPY --from=native-build /build/packages/native-control/dist ./packages/native-control/dist
-COPY --from=native-build /build/dist/plugins ./dist/plugins
+COPY --from=build /build/dist ./dist
 RUN pnpm install --prod --frozen-lockfile
 COPY src ./src
 COPY scripts ./scripts

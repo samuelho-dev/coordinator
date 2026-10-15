@@ -1,7 +1,9 @@
-import { Console, Effect, Layer, Schema, Stdio } from "effect";
+import { AgentHostEnum } from "../src/agent/contracts.ts";
+import { Console, Effect, Layer, PlatformError, Schema, Stdio } from "effect";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { BrokerConfig, RunnerConfig, Commands, CommandError, ModelProfile, Sha, UserId } from "../src/contracts.ts";
+import { RoleEnum, BrokerConfig, RunnerConfig, Commands, CommandError, ModelProfile, UserId } from "../src/contracts.ts";
+import { Evidence } from "../src/generated/database/types.ts";
 import { Platform } from "../src/platform.ts";
 import { ownChildDirectory } from "../src/runner.ts";
 
@@ -48,32 +50,30 @@ NodeRuntime.runMain(Effect.gen(function*() {
     if (!/^[a-f0-9]{64}$/.test(value)) return yield* fail(`Invalid deployment token: ${key}`);
     return value;
   });
-  const decode = <S extends Schema.Top>(schema: S, value: string) => Schema.decodeUnknownEffect(Schema.fromJsonString(schema), { onExcessProperty: "error" })(value).pipe(Effect.mapError(() => fail("Invalid deployment input schema")));
+  const decode = <S extends Schema.Top>(schema: S, value: string) => Schema.decodeEffect(Schema.fromJsonString(schema), { onExcessProperty: "error" })(value).pipe(Effect.mapError(() => fail("Invalid deployment input schema")));
   yield* directory(output);
   const health = yield* token("health.token");
   const initializeBrokerDeployment = Effect.fnUntraced(function*() {
     const config = yield* decode(BrokerConfig, yield* read("config.json"));
-    if (output !== "/config" || config.databaseUrlFile !== "/config/database.url" || !within("/backups", `${config.backupDirectory}/sentinel`) || config.host !== "0.0.0.0") return yield* fail("Broker requires /config/database.url, /backups backupDirectory and host 0.0.0.0");
-    yield* file(config.databaseUrlFile, yield* read("database.url"));
+    if (output !== "/config" || !within("/backups", `${config.backupDirectory}/sentinel`) || config.host !== "0.0.0.0") return yield* fail("Broker requires /config output, /backups backupDirectory and host 0.0.0.0");
     yield* directory(config.backupDirectory);
     if (!(yield* Effect.forEach(config.principals, (principal) => platform.checkToken(health, principal.tokenHash))).some(Boolean)) return yield* fail("Health token is not an enrolled broker principal");
-    for (const principal of config.principals.filter((p) => p.roles.includes("runner"))) {
+    for (const principal of config.principals.filter((p) => p.roles.includes(RoleEnum.runner))) {
       if (!principal.controlTokenHash || !principal.runnerUrl || !URL.canParse(principal.runnerUrl) || new URL(principal.runnerUrl).protocol !== "https:") return yield* fail("Runner principals require control hashes and private HTTPS endpoints");
       const control = yield* token(`control.${Buffer.from(principal.id).toString("base64url")}`);
       if (!(yield* platform.checkToken(control, principal.controlTokenHash))) return yield* fail("Runner control credential mismatch");
-      yield* file(platform.path.join(output, "tokens", principal.id), control);
+      yield* file(platform.path.join(output, "tokens", yield* platform.digest(principal.id)), control);
     }
     if (config.objectBackup) {
       if (!within(output, config.objectBackup.accessKeyFile) || !within(output, config.objectBackup.secretKeyFile)) return yield* fail("Backup credentials must use the config mount");
       yield* file(config.objectBackup.accessKeyFile, yield* read("backup.access-key"));
       yield* file(config.objectBackup.secretKeyFile, yield* read("backup.secret-key"));
     }
-    yield* file(platform.path.join(output, "broker.json"), Schema.encodeUnknownSync(Schema.fromJsonString(BrokerConfig))(config));
+    yield* file(platform.path.join(output, "broker.json"), Schema.encodeSync(Schema.fromJsonString(BrokerConfig))(config));
   });
   const initializeRunnerDeployment = Effect.fnUntraced(function*() {
     const config = yield* decode(RunnerConfig, yield* read("config.json"));
-    if (output !== "/config" || config.databaseUrlFile !== "/config/database.url" || !URL.canParse(config.brokerUrl) || new URL(config.brokerUrl).protocol !== "https:" || config.host !== "0.0.0.0" || !within(output, config.tokenFile)) return yield* fail("Runner requires /config/database.url, private HTTPS broker, host 0.0.0.0 and config-mounted tokenFile");
-    yield* file(config.databaseUrlFile, yield* read("database.url"));
+    if (output !== "/config" || !URL.canParse(config.brokerUrl) || new URL(config.brokerUrl).protocol !== "https:" || config.host !== "0.0.0.0" || !within(output, config.tokenFile)) return yield* fail("Runner requires /config output, private HTTPS broker, host 0.0.0.0 and config-mounted tokenFile");
     for (const path of [config.stateDirectory, config.modelDirectory, config.childDirectory, ...Object.values(config.repositories)]) {
       if (!within("/work", path)) return yield* fail("Runner data paths must be canonical descendants of /work");
     }
@@ -85,12 +85,12 @@ NodeRuntime.runMain(Effect.gen(function*() {
     const credential = yield* token("runner.token");
     if (health !== credential) return yield* fail("Runner health.token must equal runner.token");
     yield* file(config.tokenFile, credential);
-    const pins = yield* decode(Schema.Record(Schema.String, Sha), yield* read("repositories.json"));
+    const pins = yield* decode(Schema.Record(Schema.String, Evidence.fields.sha), yield* read("repositories.json"));
     if (Object.keys(pins).length !== Object.keys(config.repositories).length) return yield* fail("Provide exactly one commit pin per configured repository");
     for (const [repo, checkout] of Object.entries(config.repositories)) {
       const sha = pins[repo];
       if (!sha || !/^github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return yield* fail("Explicit GitHub public repository commit pin required");
-      const git = (argv: string[]) => platform.exec(ChildProcess.make("git", ["-c", `safe.directory=${checkout}`, ...argv], { cwd: checkout, env: { GIT_TERMINAL_PROMPT: "0" } }));
+      const git = (argv: string[]) => platform.exec(ChildProcess.make("git", ["-c", `safe.directory=${checkout}`, ...argv], { cwd: checkout, env: { PATH: "/usr/local/bin:/usr/bin:/bin", GIT_TERMINAL_PROMPT: "0" }, extendEnv: false }));
       if (!(yield* platform.fs.exists(platform.path.join(checkout, ".git")))) {
         if ((yield* platform.fs.readDirectory(checkout)).length !== 0) return yield* fail("Repository destination must be empty or a prepared checkout");
         yield* git(["init"]);
@@ -103,14 +103,14 @@ NodeRuntime.runMain(Effect.gen(function*() {
     }
     const seeds = { "omp.config.yml": ".omp/agent/config.yml", "omp.auth.json": ".omp/agent/auth.json", "omp.models.json": ".omp/agent/models.json", "pi.settings.json": ".pi/agent/settings.json", "pi.auth.json": ".pi/agent/auth.json", "pi.models.json": ".pi/agent/models.json" };
     for (const launcher of Object.keys(config.launchers)) {
-      if (launcher !== "omp" && launcher !== "pi") return yield* fail("Deployment seed supports only installed omp/pi launchers");
+      if (launcher !== AgentHostEnum.omp && launcher !== AgentHostEnum.pi) return yield* fail("Deployment seed supports only installed omp/pi launchers");
       const executable = config.launchers[launcher]!;
-      if (!platform.path.isAbsolute(executable) || !(yield* platform.fs.exists(executable)) || !((yield* platform.fs.stat(executable)).mode & 0o111)) return yield* fail("Configured native launcher must be installed and executable in the image");
-      for (const key of launcher === "omp" ? ["omp.config.yml"] : ["pi.settings.json"]) {
+      if (!platform.path.isAbsolute(executable) || !(yield* platform.fs.exists(executable)) || !((yield* platform.fs.stat(executable)).mode & 0o111)) return yield* fail("Configured agent launcher must be installed and executable in the image");
+      for (const key of launcher === AgentHostEnum.omp ? ["omp.config.yml"] : ["pi.settings.json"]) {
         if (!(yield* platform.fs.exists(platform.path.join(input, key)))) return yield* fail(`Required model seed missing: ${key}`);
       }
     }
-    if (Object.keys(config.launchers).length === 0) return yield* fail("At least one native launcher is required");
+    if (Object.keys(config.launchers).length === 0) return yield* fail("At least one agent launcher is required");
     for (const [key, destination] of Object.entries(seeds)) {
       if (yield* platform.fs.exists(platform.path.join(input, key))) {
         const value = yield* read(key);
@@ -125,7 +125,7 @@ NodeRuntime.runMain(Effect.gen(function*() {
         }
       }
     }
-    const checkSeed = Effect.fnUntraced(function*(directory: string): Effect.fn.Return<void, unknown> {
+    const checkSeed = Effect.fnUntraced(function*(directory: string): Effect.fn.Return<void, CommandError | PlatformError.PlatformError> {
       for (const entry of yield* platform.fs.readDirectory(directory)) {
         const path = platform.path.join(directory, entry);
         const name = platform.path.relative(config.modelDirectory, path);
@@ -136,9 +136,9 @@ NodeRuntime.runMain(Effect.gen(function*() {
       }
     });
     yield* checkSeed(config.modelDirectory);
-    yield* file(platform.path.join(output, "runner.json"), Schema.encodeUnknownSync(Schema.fromJsonString(RunnerConfig))(config));
+    yield* file(platform.path.join(output, "runner.json"), Schema.encodeSync(Schema.fromJsonString(RunnerConfig))(config));
   });
-  yield* Commands[`program.deploy-init.${mode}`].executeDecoded({ initializeBrokerDeployment, initializeRunnerDeployment }, {});
+  yield* (mode === "broker" ? Commands.initializeBrokerDeployment : Commands.initializeRunnerDeployment).executeDecoded({ initializeBrokerDeployment, initializeRunnerDeployment }, {});
   yield* file(platform.path.join(output, "health.header"), `authorization: Bearer ${health}`);
   yield* Console.log(`coordinator ${mode} deployment initialized`);
 }).pipe(Effect.provide(Layer.merge(Platform.layer, NodeServices.layer))));

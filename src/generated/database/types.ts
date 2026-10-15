@@ -6,6 +6,7 @@
 import { Schema } from 'effect';
 import { VariantSchema } from 'effect/schema';
 import type { ColumnType } from 'kysely';
+import { DispatchState, RunnerState, TaskState } from './enums.js';
 
 const DatabaseSchema = VariantSchema.make({
   variants: ['select', 'insert', 'update'],
@@ -16,32 +17,29 @@ const DatabaseSchema = VariantSchema.make({
 export const ArchiveId = Schema.BigInt.pipe(Schema.brand('ArchiveId'));
 export type ArchiveId = typeof ArchiveId.Type;
 
-export const EffectQueueId = Schema.BigInt.pipe(Schema.brand('EffectQueueId'));
-export type EffectQueueId = typeof EffectQueueId.Type;
-
-export const EffectQueueMigrationsId = Schema.Int.pipe(Schema.brand('EffectQueueMigrationsId'));
-export type EffectQueueMigrationsId = typeof EffectQueueMigrationsId.Type;
+export const DispatchQueueId = Schema.BigInt.pipe(Schema.brand('DispatchQueueId'));
+export type DispatchQueueId = typeof DispatchQueueId.Type;
 
 export const EvidenceId = Schema.BigInt.pipe(Schema.brand('EvidenceId'));
 export type EvidenceId = typeof EvidenceId.Type;
 
-export const PeersId = Schema.String.pipe(Schema.brand('PeersId'));
-export type PeersId = typeof PeersId.Type;
+export const PeerId = Schema.String.pipe(Schema.brand('PeerId'));
+export type PeerId = typeof PeerId.Type;
 
 export const RecoveryGateId = Schema.Int.pipe(Schema.brand('RecoveryGateId'));
 export type RecoveryGateId = typeof RecoveryGateId.Type;
 
-export const RunnerEventsId = Schema.Int.pipe(Schema.brand('RunnerEventsId'));
-export type RunnerEventsId = typeof RunnerEventsId.Type;
+export const RunnerEventId = Schema.Int.pipe(Schema.brand('RunnerEventId'));
+export type RunnerEventId = typeof RunnerEventId.Type;
 
-export const RunnerTasksId = Schema.Int.pipe(Schema.brand('RunnerTasksId'));
-export type RunnerTasksId = typeof RunnerTasksId.Type;
+export const RunnerTaskId = Schema.Int.pipe(Schema.brand('RunnerTaskId'));
+export type RunnerTaskId = typeof RunnerTaskId.Type;
 
-export const SessionsId = Schema.String.pipe(Schema.brand('SessionsId'));
-export type SessionsId = typeof SessionsId.Type;
+export const SessionId = Schema.String.pipe(Schema.brand('SessionId'));
+export type SessionId = typeof SessionId.Type;
 
-export const TasksId = Schema.String.pipe(Schema.brand('TasksId'));
-export type TasksId = typeof TasksId.Type;
+export const TaskId = Schema.String.pipe(Schema.brand('TaskId'));
+export type TaskId = typeof TaskId.Type;
 
 // ===== Model Schemas =====
 const ArchiveFields = DatabaseSchema.Struct({
@@ -51,14 +49,14 @@ const ArchiveFields = DatabaseSchema.Struct({
     update: Schema.optionalKey(Schema.Number),
   }),
   digest: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.pipe(Schema.brand('Hash')),
+    insert: Schema.String.pipe(Schema.brand('Hash')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('Hash'))),
   }),
   entry: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.pipe(Schema.brand('ArchiveEntryId')),
+    insert: Schema.String.pipe(Schema.brand('ArchiveEntryId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('ArchiveEntryId'))),
   }),
   gaps: DatabaseSchema.Field({
     select: Schema.String,
@@ -66,9 +64,9 @@ const ArchiveFields = DatabaseSchema.Struct({
     update: Schema.optionalKey(Schema.String),
   }),
   owner: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.pipe(Schema.brand('OwnerId')),
+    insert: Schema.String.pipe(Schema.brand('OwnerId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('OwnerId'))),
   }),
   payload: DatabaseSchema.Field({
     select: Schema.String,
@@ -80,9 +78,9 @@ const ArchiveFields = DatabaseSchema.Struct({
     insert: Schema.optionalKey(ArchiveId),
   }),
   session: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: SessionId,
+    insert: SessionId,
+    update: Schema.optionalKey(SessionId),
   }),
 });
 
@@ -95,15 +93,15 @@ export type ArchiveInsert = typeof ArchiveInsert.Type;
 export const ArchiveUpdate = DatabaseSchema.extract(ArchiveFields, 'update');
 export type ArchiveUpdate = typeof ArchiveUpdate.Type;
 
-const ConsentsFields = DatabaseSchema.Struct({
+const ConsentFields = DatabaseSchema.Struct({
   enabled: DatabaseSchema.Field({
     select: Schema.Int,
     insert: Schema.Int,
     update: Schema.optionalKey(Schema.Int),
   }),
   owner: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
+    select: Schema.String.pipe(Schema.brand('OwnerId')),
+    insert: Schema.String.pipe(Schema.brand('OwnerId')),
   }),
   participants: DatabaseSchema.Field({
     select: Schema.String,
@@ -111,122 +109,90 @@ const ConsentsFields = DatabaseSchema.Struct({
     update: Schema.optionalKey(Schema.String),
   }),
   session: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
+    select: SessionId,
+    insert: SessionId,
   }),
 });
 
-export const Consents = DatabaseSchema.extract(ConsentsFields, 'select');
-export type Consents = typeof Consents.Type;
+export const Consent = DatabaseSchema.extract(ConsentFields, 'select');
+export type Consent = typeof Consent.Type;
 
-export const ConsentsInsert = DatabaseSchema.extract(ConsentsFields, 'insert');
-export type ConsentsInsert = typeof ConsentsInsert.Type;
+export const ConsentInsert = DatabaseSchema.extract(ConsentFields, 'insert');
+export type ConsentInsert = typeof ConsentInsert.Type;
 
-export const ConsentsUpdate = DatabaseSchema.extract(ConsentsFields, 'update');
-export type ConsentsUpdate = typeof ConsentsUpdate.Type;
+export const ConsentUpdate = DatabaseSchema.extract(ConsentFields, 'update');
+export type ConsentUpdate = typeof ConsentUpdate.Type;
 
-const EffectQueueFields = DatabaseSchema.Struct({
-  acquired_at: DatabaseSchema.Field({
-    select: Schema.NullOr(Schema.Date),
-    insert: Schema.optionalKey(Schema.NullOr(Schema.Date)),
-    update: Schema.optionalKey(Schema.NullOr(Schema.Date)),
-  }),
-  acquired_by: DatabaseSchema.Field({
-    select: Schema.NullOr(Schema.String.check(Schema.isUUID())),
-    insert: Schema.optionalKey(Schema.NullOr(Schema.String.check(Schema.isUUID()))),
-    update: Schema.optionalKey(Schema.NullOr(Schema.String.check(Schema.isUUID()))),
-  }),
+const DispatchQueueFields = DatabaseSchema.Struct({
   attempts: DatabaseSchema.Field({
     select: Schema.Int,
     insert: Schema.optionalKey(Schema.Int),
     update: Schema.optionalKey(Schema.Int),
+  }),
+  available_at: DatabaseSchema.Field({
+    select: Schema.Date,
+    insert: Schema.Date,
+    update: Schema.optionalKey(Schema.Date),
   }),
   created_at: DatabaseSchema.Field({
     select: Schema.Date,
     insert: Schema.Date,
     update: Schema.optionalKey(Schema.Date),
   }),
-  element: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+  failure: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String)),
   }),
   id: DatabaseSchema.Field({
     select: Schema.String,
     insert: Schema.String,
     update: Schema.optionalKey(Schema.String),
   }),
-  last_failure: DatabaseSchema.Field({
-    select: Schema.NullOr(Schema.String),
-    insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
-    update: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  lease_id: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String.check(Schema.isUUID())),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String.check(Schema.isUUID()))),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String.check(Schema.isUUID()))),
   }),
-  queue_name: DatabaseSchema.Field({
+  leased_at: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.Date),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.Date)),
+    update: Schema.optionalKey(Schema.NullOr(Schema.Date)),
+  }),
+  payload: DatabaseSchema.Field({
+    select: Schema.String,
+    insert: Schema.String,
+    update: Schema.optionalKey(Schema.String),
+  }),
+  queue: DatabaseSchema.Field({
     select: Schema.String,
     insert: Schema.String,
     update: Schema.optionalKey(Schema.String),
   }),
   sequence: DatabaseSchema.Field({
-    select: EffectQueueId,
-    insert: Schema.optionalKey(EffectQueueId),
+    select: DispatchQueueId,
+    insert: Schema.optionalKey(DispatchQueueId),
   }),
   state: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: DispatchState,
+    insert: DispatchState,
+    update: Schema.optionalKey(DispatchState),
   }),
   updated_at: DatabaseSchema.Field({
     select: Schema.Date,
     insert: Schema.Date,
     update: Schema.optionalKey(Schema.Date),
   }),
-  visible_at: DatabaseSchema.Field({
-    select: Schema.Date,
-    insert: Schema.Date,
-    update: Schema.optionalKey(Schema.Date),
-  }),
 });
 
-export const EffectQueue = DatabaseSchema.extract(EffectQueueFields, 'select');
-export type EffectQueue = typeof EffectQueue.Type;
+export const DispatchQueue = DatabaseSchema.extract(DispatchQueueFields, 'select');
+export type DispatchQueue = typeof DispatchQueue.Type;
 
-export const EffectQueueInsert = DatabaseSchema.extract(EffectQueueFields, 'insert');
-export type EffectQueueInsert = typeof EffectQueueInsert.Type;
+export const DispatchQueueInsert = DatabaseSchema.extract(DispatchQueueFields, 'insert');
+export type DispatchQueueInsert = typeof DispatchQueueInsert.Type;
 
-export const EffectQueueUpdate = DatabaseSchema.extract(EffectQueueFields, 'update');
-export type EffectQueueUpdate = typeof EffectQueueUpdate.Type;
-
-const EffectQueueMigrationsFields = DatabaseSchema.Struct({
-  created_at: DatabaseSchema.Field({
-    select: Schema.Date,
-    insert: Schema.optionalKey(Schema.Date),
-    update: Schema.optionalKey(Schema.Date),
-  }),
-  migration_id: DatabaseSchema.Field({
-    select: EffectQueueMigrationsId,
-    insert: EffectQueueMigrationsId,
-  }),
-  name: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
-  }),
-});
-
-export const EffectQueueMigrations = DatabaseSchema.extract(EffectQueueMigrationsFields, 'select');
-export type EffectQueueMigrations = typeof EffectQueueMigrations.Type;
-
-export const EffectQueueMigrationsInsert = DatabaseSchema.extract(
-  EffectQueueMigrationsFields,
-  'insert'
-);
-export type EffectQueueMigrationsInsert = typeof EffectQueueMigrationsInsert.Type;
-
-export const EffectQueueMigrationsUpdate = DatabaseSchema.extract(
-  EffectQueueMigrationsFields,
-  'update'
-);
-export type EffectQueueMigrationsUpdate = typeof EffectQueueMigrationsUpdate.Type;
+export const DispatchQueueUpdate = DatabaseSchema.extract(DispatchQueueFields, 'update');
+export type DispatchQueueUpdate = typeof DispatchQueueUpdate.Type;
 
 const EvidenceFields = DatabaseSchema.Struct({
   data: DatabaseSchema.Field({
@@ -249,19 +215,27 @@ const EvidenceFields = DatabaseSchema.Struct({
     update: Schema.optionalKey(Schema.Number),
   }),
   principal: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.pipe(Schema.brand('PrincipalId')),
+    insert: Schema.String.pipe(Schema.brand('PrincipalId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('PrincipalId'))),
   }),
   sha: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/)).pipe(
+      Schema.brand('@samuelho/coordinator/Sha')
+    ),
+    insert: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/)).pipe(
+      Schema.brand('@samuelho/coordinator/Sha')
+    ),
+    update: Schema.optionalKey(
+      Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/)).pipe(
+        Schema.brand('@samuelho/coordinator/Sha')
+      )
+    ),
   }),
   task: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: TaskId,
+    insert: TaskId,
+    update: Schema.optionalKey(TaskId),
   }),
 });
 
@@ -274,65 +248,59 @@ export type EvidenceInsert = typeof EvidenceInsert.Type;
 export const EvidenceUpdate = DatabaseSchema.extract(EvidenceFields, 'update');
 export type EvidenceUpdate = typeof EvidenceUpdate.Type;
 
-const ParticipantConsentsFields = DatabaseSchema.Struct({
+const ParticipantConsentFields = DatabaseSchema.Struct({
   enabled: DatabaseSchema.Field({
     select: Schema.Int,
     insert: Schema.Int,
     update: Schema.optionalKey(Schema.Int),
   }),
   owner: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
+    select: Schema.String.pipe(Schema.brand('OwnerId')),
+    insert: Schema.String.pipe(Schema.brand('OwnerId')),
   }),
   participant: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
+    select: Schema.String.pipe(Schema.brand('PrincipalId')),
+    insert: Schema.String.pipe(Schema.brand('PrincipalId')),
   }),
   session: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
+    select: SessionId,
+    insert: SessionId,
   }),
 });
 
-export const ParticipantConsents = DatabaseSchema.extract(ParticipantConsentsFields, 'select');
-export type ParticipantConsents = typeof ParticipantConsents.Type;
+export const ParticipantConsent = DatabaseSchema.extract(ParticipantConsentFields, 'select');
+export type ParticipantConsent = typeof ParticipantConsent.Type;
 
-export const ParticipantConsentsInsert = DatabaseSchema.extract(
-  ParticipantConsentsFields,
-  'insert'
-);
-export type ParticipantConsentsInsert = typeof ParticipantConsentsInsert.Type;
+export const ParticipantConsentInsert = DatabaseSchema.extract(ParticipantConsentFields, 'insert');
+export type ParticipantConsentInsert = typeof ParticipantConsentInsert.Type;
 
-export const ParticipantConsentsUpdate = DatabaseSchema.extract(
-  ParticipantConsentsFields,
-  'update'
-);
-export type ParticipantConsentsUpdate = typeof ParticipantConsentsUpdate.Type;
+export const ParticipantConsentUpdate = DatabaseSchema.extract(ParticipantConsentFields, 'update');
+export type ParticipantConsentUpdate = typeof ParticipantConsentUpdate.Type;
 
-const PeersFields = DatabaseSchema.Struct({
+const PeerFields = DatabaseSchema.Struct({
   expires: DatabaseSchema.Field({
     select: Schema.Number,
     insert: Schema.Number,
     update: Schema.optionalKey(Schema.Number),
   }),
   fingerprint: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.pipe(Schema.brand('Hash')),
+    insert: Schema.String.pipe(Schema.brand('Hash')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('Hash'))),
   }),
   id: DatabaseSchema.Field({
-    select: PeersId,
-    insert: PeersId,
+    select: PeerId,
+    insert: PeerId,
   }),
   incarnation: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.pipe(Schema.brand('IncarnationId')),
+    insert: Schema.String.pipe(Schema.brand('IncarnationId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('IncarnationId'))),
   }),
   owner: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.pipe(Schema.brand('OwnerId')),
+    insert: Schema.String.pipe(Schema.brand('OwnerId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('OwnerId'))),
   }),
   payload: DatabaseSchema.Field({
     select: Schema.String,
@@ -340,25 +308,25 @@ const PeersFields = DatabaseSchema.Struct({
     update: Schema.optionalKey(Schema.String),
   }),
   sender: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: Schema.String.pipe(Schema.brand('PrincipalId')),
+    insert: Schema.String.pipe(Schema.brand('PrincipalId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('PrincipalId'))),
   }),
   session: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: SessionId,
+    insert: SessionId,
+    update: Schema.optionalKey(SessionId),
   }),
 });
 
-export const Peers = DatabaseSchema.extract(PeersFields, 'select');
-export type Peers = typeof Peers.Type;
+export const Peer = DatabaseSchema.extract(PeerFields, 'select');
+export type Peer = typeof Peer.Type;
 
-export const PeersInsert = DatabaseSchema.extract(PeersFields, 'insert');
-export type PeersInsert = typeof PeersInsert.Type;
+export const PeerInsert = DatabaseSchema.extract(PeerFields, 'insert');
+export type PeerInsert = typeof PeerInsert.Type;
 
-export const PeersUpdate = DatabaseSchema.extract(PeersFields, 'update');
-export type PeersUpdate = typeof PeersUpdate.Type;
+export const PeerUpdate = DatabaseSchema.extract(PeerFields, 'update');
+export type PeerUpdate = typeof PeerUpdate.Type;
 
 const RecoveryGateFields = DatabaseSchema.Struct({
   id: DatabaseSchema.Field({
@@ -381,37 +349,52 @@ export type RecoveryGateInsert = typeof RecoveryGateInsert.Type;
 export const RecoveryGateUpdate = DatabaseSchema.extract(RecoveryGateFields, 'update');
 export type RecoveryGateUpdate = typeof RecoveryGateUpdate.Type;
 
-const RunnerEventsFields = DatabaseSchema.Struct({
+const RunnerEventFields = DatabaseSchema.Struct({
   payload: DatabaseSchema.Field({
     select: Schema.String,
     insert: Schema.String,
     update: Schema.optionalKey(Schema.String),
   }),
   seq: DatabaseSchema.Field({
-    select: RunnerEventsId,
-    insert: Schema.optionalKey(RunnerEventsId),
+    select: RunnerEventId,
+    insert: Schema.optionalKey(RunnerEventId),
   }),
   taskId: DatabaseSchema.Field({
-    select: Schema.String.pipe(Schema.brand('TasksId')),
-    insert: Schema.String.pipe(Schema.brand('TasksId')),
-    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('TasksId'))),
+    select: TaskId,
+    insert: TaskId,
+    update: Schema.optionalKey(TaskId),
   }),
 });
 
-export const RunnerEvents = DatabaseSchema.extract(RunnerEventsFields, 'select');
-export type RunnerEvents = typeof RunnerEvents.Type;
+export const RunnerEvent = DatabaseSchema.extract(RunnerEventFields, 'select');
+export type RunnerEvent = typeof RunnerEvent.Type;
 
-export const RunnerEventsInsert = DatabaseSchema.extract(RunnerEventsFields, 'insert');
-export type RunnerEventsInsert = typeof RunnerEventsInsert.Type;
+export const RunnerEventInsert = DatabaseSchema.extract(RunnerEventFields, 'insert');
+export type RunnerEventInsert = typeof RunnerEventInsert.Type;
 
-export const RunnerEventsUpdate = DatabaseSchema.extract(RunnerEventsFields, 'update');
-export type RunnerEventsUpdate = typeof RunnerEventsUpdate.Type;
+export const RunnerEventUpdate = DatabaseSchema.extract(RunnerEventFields, 'update');
+export type RunnerEventUpdate = typeof RunnerEventUpdate.Type;
 
-const RunnerTasksFields = DatabaseSchema.Struct({
+const RunnerTaskFields = DatabaseSchema.Struct({
   address: DatabaseSchema.Field({
     select: Schema.NullOr(Schema.String),
     insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
     update: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  }),
+  agentBinding: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  }),
+  agentCursor: DatabaseSchema.Field({
+    select: Schema.Int.pipe(Schema.brand('AgentEventSequence')),
+    insert: Schema.optionalKey(Schema.Int.pipe(Schema.brand('AgentEventSequence'))),
+    update: Schema.optionalKey(Schema.Int.pipe(Schema.brand('AgentEventSequence'))),
+  }),
+  agentRunId: DatabaseSchema.Field({
+    select: Schema.NullOr(Schema.String.pipe(Schema.brand('AgentRunId'))),
+    insert: Schema.optionalKey(Schema.NullOr(Schema.String.pipe(Schema.brand('AgentRunId')))),
+    update: Schema.optionalKey(Schema.NullOr(Schema.String.pipe(Schema.brand('AgentRunId')))),
   }),
   detached: DatabaseSchema.Field({
     select: Schema.Int,
@@ -419,31 +402,14 @@ const RunnerTasksFields = DatabaseSchema.Struct({
     update: Schema.optionalKey(Schema.Int),
   }),
   fingerprint: DatabaseSchema.Field({
-    select: Schema.String.pipe(Schema.brand('@samuelho/coordinator/Hash')),
-    insert: Schema.String.pipe(Schema.brand('@samuelho/coordinator/Hash')),
-    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('@samuelho/coordinator/Hash'))),
+    select: Schema.String.pipe(Schema.brand('Hash')),
+    insert: Schema.String.pipe(Schema.brand('Hash')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('Hash'))),
   }),
   incarnation: DatabaseSchema.Field({
-    select: Schema.String.pipe(Schema.brand('@samuelho/coordinator/IncarnationId')),
-    insert: Schema.String.pipe(Schema.brand('@samuelho/coordinator/IncarnationId')),
-    update: Schema.optionalKey(
-      Schema.String.pipe(Schema.brand('@samuelho/coordinator/IncarnationId'))
-    ),
-  }),
-  nativeBinding: DatabaseSchema.Field({
-    select: Schema.NullOr(Schema.String),
-    insert: Schema.optionalKey(Schema.NullOr(Schema.String)),
-    update: Schema.optionalKey(Schema.NullOr(Schema.String)),
-  }),
-  nativeCursor: DatabaseSchema.Field({
-    select: Schema.Int.pipe(Schema.brand('NativeEventSequence')),
-    insert: Schema.optionalKey(Schema.Int.pipe(Schema.brand('NativeEventSequence'))),
-    update: Schema.optionalKey(Schema.Int.pipe(Schema.brand('NativeEventSequence'))),
-  }),
-  nativeRunId: DatabaseSchema.Field({
-    select: Schema.NullOr(Schema.String.pipe(Schema.brand('NativeRunId'))),
-    insert: Schema.optionalKey(Schema.NullOr(Schema.String.pipe(Schema.brand('NativeRunId')))),
-    update: Schema.optionalKey(Schema.NullOr(Schema.String.pipe(Schema.brand('NativeRunId')))),
+    select: Schema.String.pipe(Schema.brand('IncarnationId')),
+    insert: Schema.String.pipe(Schema.brand('IncarnationId')),
+    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('IncarnationId'))),
   }),
   occupied: DatabaseSchema.Field({
     select: Schema.Int,
@@ -456,12 +422,12 @@ const RunnerTasksFields = DatabaseSchema.Struct({
     update: Schema.optionalKey(Schema.NullOr(Schema.Int.pipe(Schema.brand('ProcessId')))),
   }),
   promptId: DatabaseSchema.Field({
-    select: Schema.NullOr(Schema.String.pipe(Schema.brand('NativeSubmissionId'))),
+    select: Schema.NullOr(Schema.String.pipe(Schema.brand('AgentSubmissionId'))),
     insert: Schema.optionalKey(
-      Schema.NullOr(Schema.String.pipe(Schema.brand('NativeSubmissionId')))
+      Schema.NullOr(Schema.String.pipe(Schema.brand('AgentSubmissionId')))
     ),
     update: Schema.optionalKey(
-      Schema.NullOr(Schema.String.pipe(Schema.brand('NativeSubmissionId')))
+      Schema.NullOr(Schema.String.pipe(Schema.brand('AgentSubmissionId')))
     ),
   }),
   reason: DatabaseSchema.Field({
@@ -475,18 +441,18 @@ const RunnerTasksFields = DatabaseSchema.Struct({
     update: Schema.optionalKey(Schema.NullOr(Schema.String)),
   }),
   sequence: DatabaseSchema.Field({
-    select: RunnerTasksId,
-    insert: Schema.optionalKey(RunnerTasksId),
+    select: RunnerTaskId,
+    insert: Schema.optionalKey(RunnerTaskId),
   }),
   state: DatabaseSchema.Field({
-    select: Schema.String,
-    insert: Schema.String,
-    update: Schema.optionalKey(Schema.String),
+    select: RunnerState,
+    insert: RunnerState,
+    update: Schema.optionalKey(RunnerState),
   }),
   taskId: DatabaseSchema.Field({
-    select: Schema.String.pipe(Schema.brand('TasksId')),
-    insert: Schema.String.pipe(Schema.brand('TasksId')),
-    update: Schema.optionalKey(Schema.String.pipe(Schema.brand('TasksId'))),
+    select: TaskId,
+    insert: TaskId,
+    update: Schema.optionalKey(TaskId),
   }),
   work: DatabaseSchema.Field({
     select: Schema.String,
@@ -500,56 +466,56 @@ const RunnerTasksFields = DatabaseSchema.Struct({
   }),
 });
 
-export const RunnerTasks = DatabaseSchema.extract(RunnerTasksFields, 'select');
-export type RunnerTasks = typeof RunnerTasks.Type;
+export const RunnerTask = DatabaseSchema.extract(RunnerTaskFields, 'select');
+export type RunnerTask = typeof RunnerTask.Type;
 
-export const RunnerTasksInsert = DatabaseSchema.extract(RunnerTasksFields, 'insert');
-export type RunnerTasksInsert = typeof RunnerTasksInsert.Type;
+export const RunnerTaskInsert = DatabaseSchema.extract(RunnerTaskFields, 'insert');
+export type RunnerTaskInsert = typeof RunnerTaskInsert.Type;
 
-export const RunnerTasksUpdate = DatabaseSchema.extract(RunnerTasksFields, 'update');
-export type RunnerTasksUpdate = typeof RunnerTasksUpdate.Type;
+export const RunnerTaskUpdate = DatabaseSchema.extract(RunnerTaskFields, 'update');
+export type RunnerTaskUpdate = typeof RunnerTaskUpdate.Type;
 
-const SessionsFields = DatabaseSchema.Struct({
+const SessionFields = DatabaseSchema.Struct({
   data: DatabaseSchema.Field({
     select: Schema.String,
     insert: Schema.String,
     update: Schema.optionalKey(Schema.String),
   }),
   id: DatabaseSchema.Field({
-    select: SessionsId,
-    insert: SessionsId,
+    select: SessionId,
+    insert: SessionId,
   }),
 });
 
-export const Sessions = DatabaseSchema.extract(SessionsFields, 'select');
-export type Sessions = typeof Sessions.Type;
+export const Session = DatabaseSchema.extract(SessionFields, 'select');
+export type Session = typeof Session.Type;
 
-export const SessionsInsert = DatabaseSchema.extract(SessionsFields, 'insert');
-export type SessionsInsert = typeof SessionsInsert.Type;
+export const SessionInsert = DatabaseSchema.extract(SessionFields, 'insert');
+export type SessionInsert = typeof SessionInsert.Type;
 
-export const SessionsUpdate = DatabaseSchema.extract(SessionsFields, 'update');
-export type SessionsUpdate = typeof SessionsUpdate.Type;
+export const SessionUpdate = DatabaseSchema.extract(SessionFields, 'update');
+export type SessionUpdate = typeof SessionUpdate.Type;
 
-const TasksFields = DatabaseSchema.Struct({
+const TaskFields = DatabaseSchema.Struct({
   data: DatabaseSchema.Field({
     select: Schema.String,
     insert: Schema.String,
     update: Schema.optionalKey(Schema.String),
   }),
   id: DatabaseSchema.Field({
-    select: TasksId,
-    insert: TasksId,
+    select: TaskId,
+    insert: TaskId,
   }),
 });
 
-export const Tasks = DatabaseSchema.extract(TasksFields, 'select');
-export type Tasks = typeof Tasks.Type;
+export const Task = DatabaseSchema.extract(TaskFields, 'select');
+export type Task = typeof Task.Type;
 
-export const TasksInsert = DatabaseSchema.extract(TasksFields, 'insert');
-export type TasksInsert = typeof TasksInsert.Type;
+export const TaskInsert = DatabaseSchema.extract(TaskFields, 'insert');
+export type TaskInsert = typeof TaskInsert.Type;
 
-export const TasksUpdate = DatabaseSchema.extract(TasksFields, 'update');
-export type TasksUpdate = typeof TasksUpdate.Type;
+export const TaskUpdate = DatabaseSchema.extract(TaskFields, 'update');
+export type TaskUpdate = typeof TaskUpdate.Type;
 
 export interface ArchiveTable {
   'created': ColumnType<
@@ -594,107 +560,85 @@ export interface ArchiveTable {
   >;
 }
 
-export interface ConsentsTable {
+export interface ConsentTable {
   'enabled': ColumnType<
-    (typeof Consents.Type)['enabled'],
-    (typeof ConsentsInsert.Type)['enabled'],
-    Exclude<(typeof ConsentsUpdate.Type)['enabled'], undefined>
+    (typeof Consent.Type)['enabled'],
+    (typeof ConsentInsert.Type)['enabled'],
+    Exclude<(typeof ConsentUpdate.Type)['enabled'], undefined>
   >;
-  'owner': ColumnType<
-    (typeof Consents.Type)['owner'],
-    (typeof ConsentsInsert.Type)['owner'],
-    never
-  >;
+  'owner': ColumnType<(typeof Consent.Type)['owner'], (typeof ConsentInsert.Type)['owner'], never>;
   'participants': ColumnType<
-    (typeof Consents.Type)['participants'],
-    (typeof ConsentsInsert.Type)['participants'],
-    Exclude<(typeof ConsentsUpdate.Type)['participants'], undefined>
+    (typeof Consent.Type)['participants'],
+    (typeof ConsentInsert.Type)['participants'],
+    Exclude<(typeof ConsentUpdate.Type)['participants'], undefined>
   >;
   'session': ColumnType<
-    (typeof Consents.Type)['session'],
-    (typeof ConsentsInsert.Type)['session'],
+    (typeof Consent.Type)['session'],
+    (typeof ConsentInsert.Type)['session'],
     never
   >;
 }
 
-export interface EffectQueueTable {
-  'acquired_at': ColumnType<
-    (typeof EffectQueue.Type)['acquired_at'],
-    (typeof EffectQueueInsert.Type)['acquired_at'],
-    Exclude<(typeof EffectQueueUpdate.Type)['acquired_at'], undefined>
-  >;
-  'acquired_by': ColumnType<
-    (typeof EffectQueue.Type)['acquired_by'],
-    (typeof EffectQueueInsert.Type)['acquired_by'],
-    Exclude<(typeof EffectQueueUpdate.Type)['acquired_by'], undefined>
-  >;
+export interface DispatchQueueTable {
   'attempts': ColumnType<
-    (typeof EffectQueue.Type)['attempts'],
-    (typeof EffectQueueInsert.Type)['attempts'],
-    Exclude<(typeof EffectQueueUpdate.Type)['attempts'], undefined>
+    (typeof DispatchQueue.Type)['attempts'],
+    (typeof DispatchQueueInsert.Type)['attempts'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['attempts'], undefined>
+  >;
+  'available_at': ColumnType<
+    (typeof DispatchQueue.Type)['available_at'],
+    (typeof DispatchQueueInsert.Type)['available_at'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['available_at'], undefined>
   >;
   'created_at': ColumnType<
-    (typeof EffectQueue.Type)['created_at'],
-    (typeof EffectQueueInsert.Type)['created_at'],
-    Exclude<(typeof EffectQueueUpdate.Type)['created_at'], undefined>
+    (typeof DispatchQueue.Type)['created_at'],
+    (typeof DispatchQueueInsert.Type)['created_at'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['created_at'], undefined>
   >;
-  'element': ColumnType<
-    (typeof EffectQueue.Type)['element'],
-    (typeof EffectQueueInsert.Type)['element'],
-    Exclude<(typeof EffectQueueUpdate.Type)['element'], undefined>
+  'failure': ColumnType<
+    (typeof DispatchQueue.Type)['failure'],
+    (typeof DispatchQueueInsert.Type)['failure'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['failure'], undefined>
   >;
   'id': ColumnType<
-    (typeof EffectQueue.Type)['id'],
-    (typeof EffectQueueInsert.Type)['id'],
-    Exclude<(typeof EffectQueueUpdate.Type)['id'], undefined>
+    (typeof DispatchQueue.Type)['id'],
+    (typeof DispatchQueueInsert.Type)['id'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['id'], undefined>
   >;
-  'last_failure': ColumnType<
-    (typeof EffectQueue.Type)['last_failure'],
-    (typeof EffectQueueInsert.Type)['last_failure'],
-    Exclude<(typeof EffectQueueUpdate.Type)['last_failure'], undefined>
+  'lease_id': ColumnType<
+    (typeof DispatchQueue.Type)['lease_id'],
+    (typeof DispatchQueueInsert.Type)['lease_id'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['lease_id'], undefined>
   >;
-  'queue_name': ColumnType<
-    (typeof EffectQueue.Type)['queue_name'],
-    (typeof EffectQueueInsert.Type)['queue_name'],
-    Exclude<(typeof EffectQueueUpdate.Type)['queue_name'], undefined>
+  'leased_at': ColumnType<
+    (typeof DispatchQueue.Type)['leased_at'],
+    (typeof DispatchQueueInsert.Type)['leased_at'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['leased_at'], undefined>
+  >;
+  'payload': ColumnType<
+    (typeof DispatchQueue.Type)['payload'],
+    (typeof DispatchQueueInsert.Type)['payload'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['payload'], undefined>
+  >;
+  'queue': ColumnType<
+    (typeof DispatchQueue.Type)['queue'],
+    (typeof DispatchQueueInsert.Type)['queue'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['queue'], undefined>
   >;
   'sequence': ColumnType<
-    (typeof EffectQueue.Type)['sequence'],
-    (typeof EffectQueueInsert.Type)['sequence'],
+    (typeof DispatchQueue.Type)['sequence'],
+    (typeof DispatchQueueInsert.Type)['sequence'],
     never
   >;
   'state': ColumnType<
-    (typeof EffectQueue.Type)['state'],
-    (typeof EffectQueueInsert.Type)['state'],
-    Exclude<(typeof EffectQueueUpdate.Type)['state'], undefined>
+    (typeof DispatchQueue.Type)['state'],
+    (typeof DispatchQueueInsert.Type)['state'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['state'], undefined>
   >;
   'updated_at': ColumnType<
-    (typeof EffectQueue.Type)['updated_at'],
-    (typeof EffectQueueInsert.Type)['updated_at'],
-    Exclude<(typeof EffectQueueUpdate.Type)['updated_at'], undefined>
-  >;
-  'visible_at': ColumnType<
-    (typeof EffectQueue.Type)['visible_at'],
-    (typeof EffectQueueInsert.Type)['visible_at'],
-    Exclude<(typeof EffectQueueUpdate.Type)['visible_at'], undefined>
-  >;
-}
-
-export interface EffectQueueMigrationsTable {
-  'created_at': ColumnType<
-    (typeof EffectQueueMigrations.Type)['created_at'],
-    (typeof EffectQueueMigrationsInsert.Type)['created_at'],
-    Exclude<(typeof EffectQueueMigrationsUpdate.Type)['created_at'], undefined>
-  >;
-  'migration_id': ColumnType<
-    (typeof EffectQueueMigrations.Type)['migration_id'],
-    (typeof EffectQueueMigrationsInsert.Type)['migration_id'],
-    never
-  >;
-  'name': ColumnType<
-    (typeof EffectQueueMigrations.Type)['name'],
-    (typeof EffectQueueMigrationsInsert.Type)['name'],
-    Exclude<(typeof EffectQueueMigrationsUpdate.Type)['name'], undefined>
+    (typeof DispatchQueue.Type)['updated_at'],
+    (typeof DispatchQueueInsert.Type)['updated_at'],
+    Exclude<(typeof DispatchQueueUpdate.Type)['updated_at'], undefined>
   >;
 }
 
@@ -732,65 +676,65 @@ export interface EvidenceTable {
   >;
 }
 
-export interface ParticipantConsentsTable {
+export interface ParticipantConsentTable {
   'enabled': ColumnType<
-    (typeof ParticipantConsents.Type)['enabled'],
-    (typeof ParticipantConsentsInsert.Type)['enabled'],
-    Exclude<(typeof ParticipantConsentsUpdate.Type)['enabled'], undefined>
+    (typeof ParticipantConsent.Type)['enabled'],
+    (typeof ParticipantConsentInsert.Type)['enabled'],
+    Exclude<(typeof ParticipantConsentUpdate.Type)['enabled'], undefined>
   >;
   'owner': ColumnType<
-    (typeof ParticipantConsents.Type)['owner'],
-    (typeof ParticipantConsentsInsert.Type)['owner'],
+    (typeof ParticipantConsent.Type)['owner'],
+    (typeof ParticipantConsentInsert.Type)['owner'],
     never
   >;
   'participant': ColumnType<
-    (typeof ParticipantConsents.Type)['participant'],
-    (typeof ParticipantConsentsInsert.Type)['participant'],
+    (typeof ParticipantConsent.Type)['participant'],
+    (typeof ParticipantConsentInsert.Type)['participant'],
     never
   >;
   'session': ColumnType<
-    (typeof ParticipantConsents.Type)['session'],
-    (typeof ParticipantConsentsInsert.Type)['session'],
+    (typeof ParticipantConsent.Type)['session'],
+    (typeof ParticipantConsentInsert.Type)['session'],
     never
   >;
 }
 
-export interface PeersTable {
+export interface PeerTable {
   'expires': ColumnType<
-    (typeof Peers.Type)['expires'],
-    (typeof PeersInsert.Type)['expires'],
-    Exclude<(typeof PeersUpdate.Type)['expires'], undefined>
+    (typeof Peer.Type)['expires'],
+    (typeof PeerInsert.Type)['expires'],
+    Exclude<(typeof PeerUpdate.Type)['expires'], undefined>
   >;
   'fingerprint': ColumnType<
-    (typeof Peers.Type)['fingerprint'],
-    (typeof PeersInsert.Type)['fingerprint'],
-    Exclude<(typeof PeersUpdate.Type)['fingerprint'], undefined>
+    (typeof Peer.Type)['fingerprint'],
+    (typeof PeerInsert.Type)['fingerprint'],
+    Exclude<(typeof PeerUpdate.Type)['fingerprint'], undefined>
   >;
-  'id': ColumnType<(typeof Peers.Type)['id'], (typeof PeersInsert.Type)['id'], never>;
+  'id': ColumnType<(typeof Peer.Type)['id'], (typeof PeerInsert.Type)['id'], never>;
   'incarnation': ColumnType<
-    (typeof Peers.Type)['incarnation'],
-    (typeof PeersInsert.Type)['incarnation'],
-    Exclude<(typeof PeersUpdate.Type)['incarnation'], undefined>
+    (typeof Peer.Type)['incarnation'],
+    (typeof PeerInsert.Type)['incarnation'],
+    Exclude<(typeof PeerUpdate.Type)['incarnation'], undefined>
   >;
   'owner': ColumnType<
-    (typeof Peers.Type)['owner'],
-    (typeof PeersInsert.Type)['owner'],
-    Exclude<(typeof PeersUpdate.Type)['owner'], undefined>
+    (typeof Peer.Type)['owner'],
+    (typeof PeerInsert.Type)['owner'],
+    Exclude<(typeof PeerUpdate.Type)['owner'], undefined>
   >;
   'payload': ColumnType<
-    (typeof Peers.Type)['payload'],
-    (typeof PeersInsert.Type)['payload'],
-    Exclude<(typeof PeersUpdate.Type)['payload'], undefined>
+    (typeof Peer.Type)['payload'],
+    (typeof PeerInsert.Type)['payload'],
+    Exclude<(typeof PeerUpdate.Type)['payload'], undefined>
   >;
   'sender': ColumnType<
-    (typeof Peers.Type)['sender'],
-    (typeof PeersInsert.Type)['sender'],
-    Exclude<(typeof PeersUpdate.Type)['sender'], undefined>
+    (typeof Peer.Type)['sender'],
+    (typeof PeerInsert.Type)['sender'],
+    Exclude<(typeof PeerUpdate.Type)['sender'], undefined>
   >;
   'session': ColumnType<
-    (typeof Peers.Type)['session'],
-    (typeof PeersInsert.Type)['session'],
-    Exclude<(typeof PeersUpdate.Type)['session'], undefined>
+    (typeof Peer.Type)['session'],
+    (typeof PeerInsert.Type)['session'],
+    Exclude<(typeof PeerUpdate.Type)['session'], undefined>
   >;
 }
 
@@ -803,142 +747,141 @@ export interface RecoveryGateTable {
   >;
 }
 
-export interface RunnerEventsTable {
+export interface RunnerEventTable {
   'payload': ColumnType<
-    (typeof RunnerEvents.Type)['payload'],
-    (typeof RunnerEventsInsert.Type)['payload'],
-    Exclude<(typeof RunnerEventsUpdate.Type)['payload'], undefined>
+    (typeof RunnerEvent.Type)['payload'],
+    (typeof RunnerEventInsert.Type)['payload'],
+    Exclude<(typeof RunnerEventUpdate.Type)['payload'], undefined>
   >;
   'seq': ColumnType<
-    (typeof RunnerEvents.Type)['seq'],
-    (typeof RunnerEventsInsert.Type)['seq'],
+    (typeof RunnerEvent.Type)['seq'],
+    (typeof RunnerEventInsert.Type)['seq'],
     never
   >;
   'taskId': ColumnType<
-    (typeof RunnerEvents.Type)['taskId'],
-    (typeof RunnerEventsInsert.Type)['taskId'],
-    Exclude<(typeof RunnerEventsUpdate.Type)['taskId'], undefined>
+    (typeof RunnerEvent.Type)['taskId'],
+    (typeof RunnerEventInsert.Type)['taskId'],
+    Exclude<(typeof RunnerEventUpdate.Type)['taskId'], undefined>
   >;
 }
 
-export interface RunnerTasksTable {
+export interface RunnerTaskTable {
   'address': ColumnType<
-    (typeof RunnerTasks.Type)['address'],
-    (typeof RunnerTasksInsert.Type)['address'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['address'], undefined>
+    (typeof RunnerTask.Type)['address'],
+    (typeof RunnerTaskInsert.Type)['address'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['address'], undefined>
+  >;
+  'agentBinding': ColumnType<
+    (typeof RunnerTask.Type)['agentBinding'],
+    (typeof RunnerTaskInsert.Type)['agentBinding'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['agentBinding'], undefined>
+  >;
+  'agentCursor': ColumnType<
+    (typeof RunnerTask.Type)['agentCursor'],
+    (typeof RunnerTaskInsert.Type)['agentCursor'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['agentCursor'], undefined>
+  >;
+  'agentRunId': ColumnType<
+    (typeof RunnerTask.Type)['agentRunId'],
+    (typeof RunnerTaskInsert.Type)['agentRunId'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['agentRunId'], undefined>
   >;
   'detached': ColumnType<
-    (typeof RunnerTasks.Type)['detached'],
-    (typeof RunnerTasksInsert.Type)['detached'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['detached'], undefined>
+    (typeof RunnerTask.Type)['detached'],
+    (typeof RunnerTaskInsert.Type)['detached'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['detached'], undefined>
   >;
   'fingerprint': ColumnType<
-    (typeof RunnerTasks.Type)['fingerprint'],
-    (typeof RunnerTasksInsert.Type)['fingerprint'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['fingerprint'], undefined>
+    (typeof RunnerTask.Type)['fingerprint'],
+    (typeof RunnerTaskInsert.Type)['fingerprint'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['fingerprint'], undefined>
   >;
   'incarnation': ColumnType<
-    (typeof RunnerTasks.Type)['incarnation'],
-    (typeof RunnerTasksInsert.Type)['incarnation'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['incarnation'], undefined>
-  >;
-  'nativeBinding': ColumnType<
-    (typeof RunnerTasks.Type)['nativeBinding'],
-    (typeof RunnerTasksInsert.Type)['nativeBinding'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['nativeBinding'], undefined>
-  >;
-  'nativeCursor': ColumnType<
-    (typeof RunnerTasks.Type)['nativeCursor'],
-    (typeof RunnerTasksInsert.Type)['nativeCursor'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['nativeCursor'], undefined>
-  >;
-  'nativeRunId': ColumnType<
-    (typeof RunnerTasks.Type)['nativeRunId'],
-    (typeof RunnerTasksInsert.Type)['nativeRunId'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['nativeRunId'], undefined>
+    (typeof RunnerTask.Type)['incarnation'],
+    (typeof RunnerTaskInsert.Type)['incarnation'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['incarnation'], undefined>
   >;
   'occupied': ColumnType<
-    (typeof RunnerTasks.Type)['occupied'],
-    (typeof RunnerTasksInsert.Type)['occupied'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['occupied'], undefined>
+    (typeof RunnerTask.Type)['occupied'],
+    (typeof RunnerTaskInsert.Type)['occupied'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['occupied'], undefined>
   >;
   'pid': ColumnType<
-    (typeof RunnerTasks.Type)['pid'],
-    (typeof RunnerTasksInsert.Type)['pid'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['pid'], undefined>
+    (typeof RunnerTask.Type)['pid'],
+    (typeof RunnerTaskInsert.Type)['pid'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['pid'], undefined>
   >;
   'promptId': ColumnType<
-    (typeof RunnerTasks.Type)['promptId'],
-    (typeof RunnerTasksInsert.Type)['promptId'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['promptId'], undefined>
+    (typeof RunnerTask.Type)['promptId'],
+    (typeof RunnerTaskInsert.Type)['promptId'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['promptId'], undefined>
   >;
   'reason': ColumnType<
-    (typeof RunnerTasks.Type)['reason'],
-    (typeof RunnerTasksInsert.Type)['reason'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['reason'], undefined>
+    (typeof RunnerTask.Type)['reason'],
+    (typeof RunnerTaskInsert.Type)['reason'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['reason'], undefined>
   >;
   'result': ColumnType<
-    (typeof RunnerTasks.Type)['result'],
-    (typeof RunnerTasksInsert.Type)['result'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['result'], undefined>
+    (typeof RunnerTask.Type)['result'],
+    (typeof RunnerTaskInsert.Type)['result'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['result'], undefined>
   >;
   'sequence': ColumnType<
-    (typeof RunnerTasks.Type)['sequence'],
-    (typeof RunnerTasksInsert.Type)['sequence'],
+    (typeof RunnerTask.Type)['sequence'],
+    (typeof RunnerTaskInsert.Type)['sequence'],
     never
   >;
   'state': ColumnType<
-    (typeof RunnerTasks.Type)['state'],
-    (typeof RunnerTasksInsert.Type)['state'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['state'], undefined>
+    (typeof RunnerTask.Type)['state'],
+    (typeof RunnerTaskInsert.Type)['state'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['state'], undefined>
   >;
   'taskId': ColumnType<
-    (typeof RunnerTasks.Type)['taskId'],
-    (typeof RunnerTasksInsert.Type)['taskId'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['taskId'], undefined>
+    (typeof RunnerTask.Type)['taskId'],
+    (typeof RunnerTaskInsert.Type)['taskId'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['taskId'], undefined>
   >;
   'work': ColumnType<
-    (typeof RunnerTasks.Type)['work'],
-    (typeof RunnerTasksInsert.Type)['work'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['work'], undefined>
+    (typeof RunnerTask.Type)['work'],
+    (typeof RunnerTaskInsert.Type)['work'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['work'], undefined>
   >;
   'worktree': ColumnType<
-    (typeof RunnerTasks.Type)['worktree'],
-    (typeof RunnerTasksInsert.Type)['worktree'],
-    Exclude<(typeof RunnerTasksUpdate.Type)['worktree'], undefined>
+    (typeof RunnerTask.Type)['worktree'],
+    (typeof RunnerTaskInsert.Type)['worktree'],
+    Exclude<(typeof RunnerTaskUpdate.Type)['worktree'], undefined>
   >;
 }
 
-export interface SessionsTable {
+export interface SessionTable {
   'data': ColumnType<
-    (typeof Sessions.Type)['data'],
-    (typeof SessionsInsert.Type)['data'],
-    Exclude<(typeof SessionsUpdate.Type)['data'], undefined>
+    (typeof Session.Type)['data'],
+    (typeof SessionInsert.Type)['data'],
+    Exclude<(typeof SessionUpdate.Type)['data'], undefined>
   >;
-  'id': ColumnType<(typeof Sessions.Type)['id'], (typeof SessionsInsert.Type)['id'], never>;
+  'id': ColumnType<(typeof Session.Type)['id'], (typeof SessionInsert.Type)['id'], never>;
 }
 
-export interface TasksTable {
+export interface TaskTable {
   'data': ColumnType<
-    (typeof Tasks.Type)['data'],
-    (typeof TasksInsert.Type)['data'],
-    Exclude<(typeof TasksUpdate.Type)['data'], undefined>
+    (typeof Task.Type)['data'],
+    (typeof TaskInsert.Type)['data'],
+    Exclude<(typeof TaskUpdate.Type)['data'], undefined>
   >;
-  'id': ColumnType<(typeof Tasks.Type)['id'], (typeof TasksInsert.Type)['id'], never>;
+  'id': ColumnType<(typeof Task.Type)['id'], (typeof TaskInsert.Type)['id'], never>;
 }
 
 // Kysely Database Interface
 export interface DB {
   'archive': ArchiveTable;
-  'consents': ConsentsTable;
-  'effect_queue': EffectQueueTable;
-  'effect_queue_migrations': EffectQueueMigrationsTable;
+  'consents': ConsentTable;
+  'dispatch_queue': DispatchQueueTable;
   'evidence': EvidenceTable;
-  'participant_consents': ParticipantConsentsTable;
-  'peers': PeersTable;
+  'participant_consents': ParticipantConsentTable;
+  'peers': PeerTable;
   'recovery_gate': RecoveryGateTable;
-  'runner_events': RunnerEventsTable;
-  'runner_tasks': RunnerTasksTable;
-  'sessions': SessionsTable;
-  'tasks': TasksTable;
+  'runner_events': RunnerEventTable;
+  'runner_tasks': RunnerTaskTable;
+  'sessions': SessionTable;
+  'tasks': TaskTable;
 }

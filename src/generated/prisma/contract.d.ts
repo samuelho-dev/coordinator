@@ -4,7 +4,6 @@
 import type {
   CodecTypes as PgTypes,
   TimestampString,
-  TimestamptzString,
   Varchar,
 } from '@prisma/orm-postgres/target/codec-types';
 import type { QueryOperationTypes as PgTargetQueryOps } from '@prisma/orm-postgres/target/operation-types';
@@ -23,7 +22,7 @@ import type {
 } from '@prisma/orm-postgres/contract/types';
 
 export type StorageHash =
-  StorageHashBase<'760c0ad54b65dc6f3098b00865c256f062047846de76dda5c9e3c53a65ba6825'>;
+  StorageHashBase<'8a45665e4f7f16574e423fa23578c2cd161a2a1c75d00e68dfd7f63bfdff3ef2'>;
 export type ExecutionHash = ExecutionHashBase<string>;
 export type ProfileHash =
   ProfileHashBase<'3916f444a8a17ad749191acf9e08dad97d1a327b88c2f1d45d12f240296aa8b2'>;
@@ -238,7 +237,7 @@ type DefaultLiteralValue<CodecId extends string, Encoded> = CodecId extends keyo
 
 export type FieldOutputTypes = {
   readonly public: {
-    readonly archive: {
+    readonly Archive: {
       readonly created: CodecTypes['pg/float8@1']['output'];
       readonly digest: CodecTypes['pg/text@1']['output'];
       readonly entry: CodecTypes['pg/text@1']['output'];
@@ -248,32 +247,27 @@ export type FieldOutputTypes = {
       readonly sequence: CodecTypes['pg/int8@1']['output'];
       readonly session: CodecTypes['pg/text@1']['output'];
     };
-    readonly consents: {
+    readonly Consent: {
       readonly enabled: CodecTypes['pg/int4@1']['output'];
       readonly owner: CodecTypes['pg/text@1']['output'];
       readonly participants: CodecTypes['pg/text@1']['output'];
       readonly session: CodecTypes['pg/text@1']['output'];
     };
-    readonly effect_queue: {
-      readonly acquired_at: TimestampString<6> | null;
-      readonly acquired_by: CodecTypes['pg/uuid@1']['output'] | null;
+    readonly DispatchQueue: {
       readonly attempts: CodecTypes['pg/int4@1']['output'];
+      readonly available_at: TimestampString<6>;
       readonly created_at: TimestampString<6>;
-      readonly element: CodecTypes['pg/text@1']['output'];
+      readonly failure: CodecTypes['pg/text@1']['output'] | null;
       readonly id: Varchar<255>;
-      readonly last_failure: CodecTypes['pg/text@1']['output'] | null;
-      readonly queue_name: Varchar<255>;
+      readonly lease_id: CodecTypes['pg/uuid@1']['output'] | null;
+      readonly leased_at: TimestampString<6> | null;
+      readonly payload: CodecTypes['pg/text@1']['output'];
+      readonly queue: Varchar<255>;
       readonly sequence: CodecTypes['pg/int8@1']['output'];
-      readonly state: Varchar<10>;
+      readonly state: 'pending' | 'failed' | 'completed';
       readonly updated_at: TimestampString<6>;
-      readonly visible_at: TimestampString<6>;
     };
-    readonly effect_queue_migrations: {
-      readonly created_at: TimestamptzString<6>;
-      readonly migration_id: CodecTypes['pg/int4@1']['output'];
-      readonly name: CodecTypes['pg/text@1']['output'];
-    };
-    readonly evidence: {
+    readonly Evidence: {
       readonly data: CodecTypes['pg/text@1']['output'];
       readonly id: CodecTypes['pg/int8@1']['output'];
       readonly kind: CodecTypes['pg/text@1']['output'];
@@ -282,13 +276,13 @@ export type FieldOutputTypes = {
       readonly sha: CodecTypes['pg/text@1']['output'];
       readonly task: CodecTypes['pg/text@1']['output'];
     };
-    readonly participant_consents: {
+    readonly ParticipantConsent: {
       readonly enabled: CodecTypes['pg/int4@1']['output'];
       readonly owner: CodecTypes['pg/text@1']['output'];
       readonly participant: CodecTypes['pg/text@1']['output'];
       readonly session: CodecTypes['pg/text@1']['output'];
     };
-    readonly peers: {
+    readonly Peer: {
       readonly expires: CodecTypes['pg/float8@1']['output'];
       readonly fingerprint: CodecTypes['pg/text@1']['output'];
       readonly id: CodecTypes['pg/text@1']['output'];
@@ -298,39 +292,47 @@ export type FieldOutputTypes = {
       readonly sender: CodecTypes['pg/text@1']['output'];
       readonly session: CodecTypes['pg/text@1']['output'];
     };
-    readonly recovery_gate: {
+    readonly RecoveryGate: {
       readonly id: CodecTypes['pg/int4@1']['output'];
       readonly ready: CodecTypes['pg/bool@1']['output'];
     };
-    readonly runner_events: {
+    readonly RunnerEvent: {
       readonly payload: CodecTypes['pg/text@1']['output'];
       readonly seq: CodecTypes['pg/int4@1']['output'];
       readonly taskId: CodecTypes['pg/text@1']['output'];
     };
-    readonly runner_tasks: {
+    readonly RunnerTask: {
       readonly address: CodecTypes['pg/text@1']['output'] | null;
+      readonly agentBinding: CodecTypes['pg/text@1']['output'] | null;
+      readonly agentCursor: CodecTypes['pg/int4@1']['output'];
+      readonly agentRunId: CodecTypes['pg/text@1']['output'] | null;
       readonly detached: CodecTypes['pg/int4@1']['output'];
       readonly fingerprint: CodecTypes['pg/text@1']['output'];
       readonly incarnation: CodecTypes['pg/text@1']['output'];
-      readonly nativeBinding: CodecTypes['pg/text@1']['output'] | null;
-      readonly nativeCursor: CodecTypes['pg/int4@1']['output'];
-      readonly nativeRunId: CodecTypes['pg/text@1']['output'] | null;
       readonly occupied: CodecTypes['pg/int4@1']['output'];
       readonly pid: CodecTypes['pg/int4@1']['output'] | null;
       readonly promptId: CodecTypes['pg/text@1']['output'] | null;
       readonly reason: CodecTypes['pg/text@1']['output'] | null;
       readonly result: CodecTypes['pg/text@1']['output'] | null;
       readonly sequence: CodecTypes['pg/int4@1']['output'];
-      readonly state: CodecTypes['pg/text@1']['output'];
+      readonly state:
+        | 'ACCEPTED'
+        | 'LAUNCHING'
+        | 'READY'
+        | 'PROMPT_INTENT'
+        | 'RUNNING'
+        | 'SUCCEEDED'
+        | 'FAILED'
+        | 'HELD';
       readonly taskId: CodecTypes['pg/text@1']['output'];
       readonly work: CodecTypes['pg/text@1']['output'];
       readonly worktree: CodecTypes['pg/text@1']['output'];
     };
-    readonly sessions: {
+    readonly Session: {
       readonly data: CodecTypes['pg/text@1']['output'];
       readonly id: CodecTypes['pg/text@1']['output'];
     };
-    readonly tasks: {
+    readonly Task: {
       readonly data: CodecTypes['pg/text@1']['output'];
       readonly id: CodecTypes['pg/text@1']['output'];
     };
@@ -338,7 +340,7 @@ export type FieldOutputTypes = {
 };
 export type FieldInputTypes = {
   readonly public: {
-    readonly archive: {
+    readonly Archive: {
       readonly created: CodecTypes['pg/float8@1']['input'];
       readonly digest: CodecTypes['pg/text@1']['input'];
       readonly entry: CodecTypes['pg/text@1']['input'];
@@ -348,32 +350,27 @@ export type FieldInputTypes = {
       readonly sequence: CodecTypes['pg/int8@1']['input'];
       readonly session: CodecTypes['pg/text@1']['input'];
     };
-    readonly consents: {
+    readonly Consent: {
       readonly enabled: CodecTypes['pg/int4@1']['input'];
       readonly owner: CodecTypes['pg/text@1']['input'];
       readonly participants: CodecTypes['pg/text@1']['input'];
       readonly session: CodecTypes['pg/text@1']['input'];
     };
-    readonly effect_queue: {
-      readonly acquired_at: CodecTypes['pg/timestamp-string@1']['input'] | null;
-      readonly acquired_by: CodecTypes['pg/uuid@1']['input'] | null;
+    readonly DispatchQueue: {
       readonly attempts: CodecTypes['pg/int4@1']['input'];
+      readonly available_at: CodecTypes['pg/timestamp-string@1']['input'];
       readonly created_at: CodecTypes['pg/timestamp-string@1']['input'];
-      readonly element: CodecTypes['pg/text@1']['input'];
+      readonly failure: CodecTypes['pg/text@1']['input'] | null;
       readonly id: CodecTypes['sql/varchar@1']['input'];
-      readonly last_failure: CodecTypes['pg/text@1']['input'] | null;
-      readonly queue_name: CodecTypes['sql/varchar@1']['input'];
+      readonly lease_id: CodecTypes['pg/uuid@1']['input'] | null;
+      readonly leased_at: CodecTypes['pg/timestamp-string@1']['input'] | null;
+      readonly payload: CodecTypes['pg/text@1']['input'];
+      readonly queue: CodecTypes['sql/varchar@1']['input'];
       readonly sequence: CodecTypes['pg/int8@1']['input'];
-      readonly state: CodecTypes['sql/varchar@1']['input'];
+      readonly state: 'pending' | 'failed' | 'completed';
       readonly updated_at: CodecTypes['pg/timestamp-string@1']['input'];
-      readonly visible_at: CodecTypes['pg/timestamp-string@1']['input'];
     };
-    readonly effect_queue_migrations: {
-      readonly created_at: CodecTypes['pg/timestamptz-string@1']['input'];
-      readonly migration_id: CodecTypes['pg/int4@1']['input'];
-      readonly name: CodecTypes['pg/text@1']['input'];
-    };
-    readonly evidence: {
+    readonly Evidence: {
       readonly data: CodecTypes['pg/text@1']['input'];
       readonly id: CodecTypes['pg/int8@1']['input'];
       readonly kind: CodecTypes['pg/text@1']['input'];
@@ -382,13 +379,13 @@ export type FieldInputTypes = {
       readonly sha: CodecTypes['pg/text@1']['input'];
       readonly task: CodecTypes['pg/text@1']['input'];
     };
-    readonly participant_consents: {
+    readonly ParticipantConsent: {
       readonly enabled: CodecTypes['pg/int4@1']['input'];
       readonly owner: CodecTypes['pg/text@1']['input'];
       readonly participant: CodecTypes['pg/text@1']['input'];
       readonly session: CodecTypes['pg/text@1']['input'];
     };
-    readonly peers: {
+    readonly Peer: {
       readonly expires: CodecTypes['pg/float8@1']['input'];
       readonly fingerprint: CodecTypes['pg/text@1']['input'];
       readonly id: CodecTypes['pg/text@1']['input'];
@@ -398,39 +395,47 @@ export type FieldInputTypes = {
       readonly sender: CodecTypes['pg/text@1']['input'];
       readonly session: CodecTypes['pg/text@1']['input'];
     };
-    readonly recovery_gate: {
+    readonly RecoveryGate: {
       readonly id: CodecTypes['pg/int4@1']['input'];
       readonly ready: CodecTypes['pg/bool@1']['input'];
     };
-    readonly runner_events: {
+    readonly RunnerEvent: {
       readonly payload: CodecTypes['pg/text@1']['input'];
       readonly seq: CodecTypes['pg/int4@1']['input'];
       readonly taskId: CodecTypes['pg/text@1']['input'];
     };
-    readonly runner_tasks: {
+    readonly RunnerTask: {
       readonly address: CodecTypes['pg/text@1']['input'] | null;
+      readonly agentBinding: CodecTypes['pg/text@1']['input'] | null;
+      readonly agentCursor: CodecTypes['pg/int4@1']['input'];
+      readonly agentRunId: CodecTypes['pg/text@1']['input'] | null;
       readonly detached: CodecTypes['pg/int4@1']['input'];
       readonly fingerprint: CodecTypes['pg/text@1']['input'];
       readonly incarnation: CodecTypes['pg/text@1']['input'];
-      readonly nativeBinding: CodecTypes['pg/text@1']['input'] | null;
-      readonly nativeCursor: CodecTypes['pg/int4@1']['input'];
-      readonly nativeRunId: CodecTypes['pg/text@1']['input'] | null;
       readonly occupied: CodecTypes['pg/int4@1']['input'];
       readonly pid: CodecTypes['pg/int4@1']['input'] | null;
       readonly promptId: CodecTypes['pg/text@1']['input'] | null;
       readonly reason: CodecTypes['pg/text@1']['input'] | null;
       readonly result: CodecTypes['pg/text@1']['input'] | null;
       readonly sequence: CodecTypes['pg/int4@1']['input'];
-      readonly state: CodecTypes['pg/text@1']['input'];
+      readonly state:
+        | 'ACCEPTED'
+        | 'LAUNCHING'
+        | 'READY'
+        | 'PROMPT_INTENT'
+        | 'RUNNING'
+        | 'SUCCEEDED'
+        | 'FAILED'
+        | 'HELD';
       readonly taskId: CodecTypes['pg/text@1']['input'];
       readonly work: CodecTypes['pg/text@1']['input'];
       readonly worktree: CodecTypes['pg/text@1']['input'];
     };
-    readonly sessions: {
+    readonly Session: {
       readonly data: CodecTypes['pg/text@1']['input'];
       readonly id: CodecTypes['pg/text@1']['input'];
     };
-    readonly tasks: {
+    readonly Task: {
       readonly data: CodecTypes['pg/text@1']['input'];
       readonly id: CodecTypes['pg/text@1']['input'];
     };
@@ -454,24 +459,19 @@ export type StorageColumnTypes = {
       readonly participants: CodecTypes['pg/text@1']['output'];
       readonly session: CodecTypes['pg/text@1']['output'];
     };
-    readonly effect_queue: {
-      readonly acquired_at: TimestampString<6> | null;
-      readonly acquired_by: CodecTypes['pg/uuid@1']['output'] | null;
+    readonly dispatch_queue: {
       readonly attempts: CodecTypes['pg/int4@1']['output'];
+      readonly available_at: TimestampString<6>;
       readonly created_at: TimestampString<6>;
-      readonly element: CodecTypes['pg/text@1']['output'];
+      readonly failure: CodecTypes['pg/text@1']['output'] | null;
       readonly id: Varchar<255>;
-      readonly last_failure: CodecTypes['pg/text@1']['output'] | null;
-      readonly queue_name: Varchar<255>;
+      readonly lease_id: CodecTypes['pg/uuid@1']['output'] | null;
+      readonly leased_at: TimestampString<6> | null;
+      readonly payload: CodecTypes['pg/text@1']['output'];
+      readonly queue: Varchar<255>;
       readonly sequence: CodecTypes['pg/int8@1']['output'];
-      readonly state: Varchar<10>;
+      readonly state: 'pending' | 'failed' | 'completed';
       readonly updated_at: TimestampString<6>;
-      readonly visible_at: TimestampString<6>;
-    };
-    readonly effect_queue_migrations: {
-      readonly created_at: TimestamptzString<6>;
-      readonly migration_id: CodecTypes['pg/int4@1']['output'];
-      readonly name: CodecTypes['pg/text@1']['output'];
     };
     readonly evidence: {
       readonly data: CodecTypes['pg/text@1']['output'];
@@ -509,19 +509,27 @@ export type StorageColumnTypes = {
     };
     readonly runner_tasks: {
       readonly address: CodecTypes['pg/text@1']['output'] | null;
+      readonly agentBinding: CodecTypes['pg/text@1']['output'] | null;
+      readonly agentCursor: CodecTypes['pg/int4@1']['output'];
+      readonly agentRunId: CodecTypes['pg/text@1']['output'] | null;
       readonly detached: CodecTypes['pg/int4@1']['output'];
       readonly fingerprint: CodecTypes['pg/text@1']['output'];
       readonly incarnation: CodecTypes['pg/text@1']['output'];
-      readonly nativeBinding: CodecTypes['pg/text@1']['output'] | null;
-      readonly nativeCursor: CodecTypes['pg/int4@1']['output'];
-      readonly nativeRunId: CodecTypes['pg/text@1']['output'] | null;
       readonly occupied: CodecTypes['pg/int4@1']['output'];
       readonly pid: CodecTypes['pg/int4@1']['output'] | null;
       readonly promptId: CodecTypes['pg/text@1']['output'] | null;
       readonly reason: CodecTypes['pg/text@1']['output'] | null;
       readonly result: CodecTypes['pg/text@1']['output'] | null;
       readonly sequence: CodecTypes['pg/int4@1']['output'];
-      readonly state: CodecTypes['pg/text@1']['output'];
+      readonly state:
+        | 'ACCEPTED'
+        | 'LAUNCHING'
+        | 'READY'
+        | 'PROMPT_INTENT'
+        | 'RUNNING'
+        | 'SUCCEEDED'
+        | 'FAILED'
+        | 'HELD';
       readonly taskId: CodecTypes['pg/text@1']['output'];
       readonly work: CodecTypes['pg/text@1']['output'];
       readonly worktree: CodecTypes['pg/text@1']['output'];
@@ -554,24 +562,19 @@ export type StorageColumnInputTypes = {
       readonly participants: CodecTypes['pg/text@1']['input'];
       readonly session: CodecTypes['pg/text@1']['input'];
     };
-    readonly effect_queue: {
-      readonly acquired_at: CodecTypes['pg/timestamp-string@1']['input'] | null;
-      readonly acquired_by: CodecTypes['pg/uuid@1']['input'] | null;
+    readonly dispatch_queue: {
       readonly attempts: CodecTypes['pg/int4@1']['input'];
+      readonly available_at: CodecTypes['pg/timestamp-string@1']['input'];
       readonly created_at: CodecTypes['pg/timestamp-string@1']['input'];
-      readonly element: CodecTypes['pg/text@1']['input'];
+      readonly failure: CodecTypes['pg/text@1']['input'] | null;
       readonly id: CodecTypes['sql/varchar@1']['input'];
-      readonly last_failure: CodecTypes['pg/text@1']['input'] | null;
-      readonly queue_name: CodecTypes['sql/varchar@1']['input'];
+      readonly lease_id: CodecTypes['pg/uuid@1']['input'] | null;
+      readonly leased_at: CodecTypes['pg/timestamp-string@1']['input'] | null;
+      readonly payload: CodecTypes['pg/text@1']['input'];
+      readonly queue: CodecTypes['sql/varchar@1']['input'];
       readonly sequence: CodecTypes['pg/int8@1']['input'];
-      readonly state: CodecTypes['sql/varchar@1']['input'];
+      readonly state: 'pending' | 'failed' | 'completed';
       readonly updated_at: CodecTypes['pg/timestamp-string@1']['input'];
-      readonly visible_at: CodecTypes['pg/timestamp-string@1']['input'];
-    };
-    readonly effect_queue_migrations: {
-      readonly created_at: CodecTypes['pg/timestamptz-string@1']['input'];
-      readonly migration_id: CodecTypes['pg/int4@1']['input'];
-      readonly name: CodecTypes['pg/text@1']['input'];
     };
     readonly evidence: {
       readonly data: CodecTypes['pg/text@1']['input'];
@@ -609,19 +612,27 @@ export type StorageColumnInputTypes = {
     };
     readonly runner_tasks: {
       readonly address: CodecTypes['pg/text@1']['input'] | null;
+      readonly agentBinding: CodecTypes['pg/text@1']['input'] | null;
+      readonly agentCursor: CodecTypes['pg/int4@1']['input'];
+      readonly agentRunId: CodecTypes['pg/text@1']['input'] | null;
       readonly detached: CodecTypes['pg/int4@1']['input'];
       readonly fingerprint: CodecTypes['pg/text@1']['input'];
       readonly incarnation: CodecTypes['pg/text@1']['input'];
-      readonly nativeBinding: CodecTypes['pg/text@1']['input'] | null;
-      readonly nativeCursor: CodecTypes['pg/int4@1']['input'];
-      readonly nativeRunId: CodecTypes['pg/text@1']['input'] | null;
       readonly occupied: CodecTypes['pg/int4@1']['input'];
       readonly pid: CodecTypes['pg/int4@1']['input'] | null;
       readonly promptId: CodecTypes['pg/text@1']['input'] | null;
       readonly reason: CodecTypes['pg/text@1']['input'] | null;
       readonly result: CodecTypes['pg/text@1']['input'] | null;
       readonly sequence: CodecTypes['pg/int4@1']['input'];
-      readonly state: CodecTypes['pg/text@1']['input'];
+      readonly state:
+        | 'ACCEPTED'
+        | 'LAUNCHING'
+        | 'READY'
+        | 'PROMPT_INTENT'
+        | 'RUNNING'
+        | 'SUCCEEDED'
+        | 'FAILED'
+        | 'HELD';
       readonly taskId: CodecTypes['pg/text@1']['input'];
       readonly work: CodecTypes['pg/text@1']['input'];
       readonly worktree: CodecTypes['pg/text@1']['input'];
@@ -638,7 +649,7 @@ export type StorageColumnInputTypes = {
 };
 
 export namespace Models {
-  export type public_archive = {
+  export type public_Archive = {
     created: CodecTypes['pg/float8@1']['output'];
     digest: CodecTypes['pg/text@1']['output'];
     entry: CodecTypes['pg/text@1']['output'];
@@ -649,35 +660,29 @@ export namespace Models {
     session: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_consents = {
+  export type public_Consent = {
     enabled: CodecTypes['pg/int4@1']['output'];
     owner: CodecTypes['pg/text@1']['output'];
     participants: CodecTypes['pg/text@1']['output'];
     session: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_effect_queue = {
-    acquired_at: TimestampString<6> | null;
-    acquired_by: CodecTypes['pg/uuid@1']['output'] | null;
+  export type public_DispatchQueue = {
     attempts: CodecTypes['pg/int4@1']['output'];
+    available_at: TimestampString<6>;
     created_at: TimestampString<6>;
-    element: CodecTypes['pg/text@1']['output'];
+    failure: CodecTypes['pg/text@1']['output'] | null;
     id: Varchar<255>;
-    last_failure: CodecTypes['pg/text@1']['output'] | null;
-    queue_name: Varchar<255>;
+    lease_id: CodecTypes['pg/uuid@1']['output'] | null;
+    leased_at: TimestampString<6> | null;
+    payload: CodecTypes['pg/text@1']['output'];
+    queue: Varchar<255>;
     sequence: CodecTypes['pg/int8@1']['output'];
-    state: Varchar<10>;
+    state: 'pending' | 'failed' | 'completed';
     updated_at: TimestampString<6>;
-    visible_at: TimestampString<6>;
     readonly [RelationKeys]?: never;
   };
-  export type public_effect_queue_migrations = {
-    created_at: TimestamptzString<6>;
-    migration_id: CodecTypes['pg/int4@1']['output'];
-    name: CodecTypes['pg/text@1']['output'];
-    readonly [RelationKeys]?: never;
-  };
-  export type public_evidence = {
+  export type public_Evidence = {
     data: CodecTypes['pg/text@1']['output'];
     id: CodecTypes['pg/int8@1']['output'];
     kind: CodecTypes['pg/text@1']['output'];
@@ -687,14 +692,14 @@ export namespace Models {
     task: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_participant_consents = {
+  export type public_ParticipantConsent = {
     enabled: CodecTypes['pg/int4@1']['output'];
     owner: CodecTypes['pg/text@1']['output'];
     participant: CodecTypes['pg/text@1']['output'];
     session: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_peers = {
+  export type public_Peer = {
     expires: CodecTypes['pg/float8@1']['output'];
     fingerprint: CodecTypes['pg/text@1']['output'];
     id: CodecTypes['pg/text@1']['output'];
@@ -705,43 +710,51 @@ export namespace Models {
     session: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_recovery_gate = {
+  export type public_RecoveryGate = {
     id: CodecTypes['pg/int4@1']['output'];
     ready: CodecTypes['pg/bool@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_runner_events = {
+  export type public_RunnerEvent = {
     payload: CodecTypes['pg/text@1']['output'];
     seq: CodecTypes['pg/int4@1']['output'];
     taskId: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_runner_tasks = {
+  export type public_RunnerTask = {
     address: CodecTypes['pg/text@1']['output'] | null;
+    agentBinding: CodecTypes['pg/text@1']['output'] | null;
+    agentCursor: CodecTypes['pg/int4@1']['output'];
+    agentRunId: CodecTypes['pg/text@1']['output'] | null;
     detached: CodecTypes['pg/int4@1']['output'];
     fingerprint: CodecTypes['pg/text@1']['output'];
     incarnation: CodecTypes['pg/text@1']['output'];
-    nativeBinding: CodecTypes['pg/text@1']['output'] | null;
-    nativeCursor: CodecTypes['pg/int4@1']['output'];
-    nativeRunId: CodecTypes['pg/text@1']['output'] | null;
     occupied: CodecTypes['pg/int4@1']['output'];
     pid: CodecTypes['pg/int4@1']['output'] | null;
     promptId: CodecTypes['pg/text@1']['output'] | null;
     reason: CodecTypes['pg/text@1']['output'] | null;
     result: CodecTypes['pg/text@1']['output'] | null;
     sequence: CodecTypes['pg/int4@1']['output'];
-    state: CodecTypes['pg/text@1']['output'];
+    state:
+      | 'ACCEPTED'
+      | 'LAUNCHING'
+      | 'READY'
+      | 'PROMPT_INTENT'
+      | 'RUNNING'
+      | 'SUCCEEDED'
+      | 'FAILED'
+      | 'HELD';
     taskId: CodecTypes['pg/text@1']['output'];
     work: CodecTypes['pg/text@1']['output'];
     worktree: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_sessions = {
+  export type public_Session = {
     data: CodecTypes['pg/text@1']['output'];
     id: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
   };
-  export type public_tasks = {
+  export type public_Task = {
     data: CodecTypes['pg/text@1']['output'];
     id: CodecTypes['pg/text@1']['output'];
     readonly [RelationKeys]?: never;
@@ -750,18 +763,17 @@ export namespace Models {
 
 export declare const models: {
   public: {
-    archive: Models.public_archive;
-    consents: Models.public_consents;
-    effect_queue: Models.public_effect_queue;
-    effect_queue_migrations: Models.public_effect_queue_migrations;
-    evidence: Models.public_evidence;
-    participant_consents: Models.public_participant_consents;
-    peers: Models.public_peers;
-    recovery_gate: Models.public_recovery_gate;
-    runner_events: Models.public_runner_events;
-    runner_tasks: Models.public_runner_tasks;
-    sessions: Models.public_sessions;
-    tasks: Models.public_tasks;
+    Archive: Models.public_Archive;
+    Consent: Models.public_Consent;
+    DispatchQueue: Models.public_DispatchQueue;
+    Evidence: Models.public_Evidence;
+    ParticipantConsent: Models.public_ParticipantConsent;
+    Peer: Models.public_Peer;
+    RecoveryGate: Models.public_RecoveryGate;
+    RunnerEvent: Models.public_RunnerEvent;
+    RunnerTask: Models.public_RunnerTask;
+    Session: Models.public_Session;
+    Task: Models.public_Task;
   };
 };
 
@@ -877,21 +889,8 @@ type ContractBase = Omit<
               indexes: readonly [];
               foreignKeys: readonly [];
             };
-            readonly effect_queue: {
+            readonly dispatch_queue: {
               columns: {
-                readonly acquired_at: {
-                  readonly dataType: 'pg/timestamp';
-                  readonly codecId: 'pg/timestamp-string@1';
-                  readonly nullable: true;
-                  readonly typeParams: { readonly precision: 6 };
-                  readonly many: false;
-                };
-                readonly acquired_by: {
-                  readonly dataType: 'pg/uuid';
-                  readonly codecId: 'pg/uuid@1';
-                  readonly nullable: true;
-                  readonly many: false;
-                };
                 readonly attempts: {
                   readonly dataType: 'pg/int4';
                   readonly codecId: 'pg/int4@1';
@@ -902,6 +901,13 @@ type ContractBase = Omit<
                   };
                   readonly many: false;
                 };
+                readonly available_at: {
+                  readonly dataType: 'pg/timestamp';
+                  readonly codecId: 'pg/timestamp-string@1';
+                  readonly nullable: false;
+                  readonly typeParams: { readonly precision: 6 };
+                  readonly many: false;
+                };
                 readonly created_at: {
                   readonly dataType: 'pg/timestamp';
                   readonly codecId: 'pg/timestamp-string@1';
@@ -909,10 +915,10 @@ type ContractBase = Omit<
                   readonly typeParams: { readonly precision: 6 };
                   readonly many: false;
                 };
-                readonly element: {
+                readonly failure: {
                   readonly dataType: 'pg/text';
                   readonly codecId: 'pg/text@1';
-                  readonly nullable: false;
+                  readonly nullable: true;
                   readonly many: false;
                 };
                 readonly id: {
@@ -922,13 +928,26 @@ type ContractBase = Omit<
                   readonly typeParams: { readonly length: 255 };
                   readonly many: false;
                 };
-                readonly last_failure: {
-                  readonly dataType: 'pg/text';
-                  readonly codecId: 'pg/text@1';
+                readonly lease_id: {
+                  readonly dataType: 'pg/uuid';
+                  readonly codecId: 'pg/uuid@1';
                   readonly nullable: true;
                   readonly many: false;
                 };
-                readonly queue_name: {
+                readonly leased_at: {
+                  readonly dataType: 'pg/timestamp';
+                  readonly codecId: 'pg/timestamp-string@1';
+                  readonly nullable: true;
+                  readonly typeParams: { readonly precision: 6 };
+                  readonly many: false;
+                };
+                readonly payload: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: false;
+                  readonly many: false;
+                };
+                readonly queue: {
                   readonly dataType: 'pg/varchar';
                   readonly codecId: 'sql/varchar@1';
                   readonly nullable: false;
@@ -946,20 +965,12 @@ type ContractBase = Omit<
                   readonly many: false;
                 };
                 readonly state: {
-                  readonly dataType: 'pg/varchar';
-                  readonly codecId: 'sql/varchar@1';
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
                   readonly nullable: false;
-                  readonly typeParams: { readonly length: 10 };
                   readonly many: false;
                 };
                 readonly updated_at: {
-                  readonly dataType: 'pg/timestamp';
-                  readonly codecId: 'pg/timestamp-string@1';
-                  readonly nullable: false;
-                  readonly typeParams: { readonly precision: 6 };
-                  readonly many: false;
-                };
-                readonly visible_at: {
                   readonly dataType: 'pg/timestamp';
                   readonly codecId: 'pg/timestamp-string@1';
                   readonly nullable: false;
@@ -970,52 +981,24 @@ type ContractBase = Omit<
               primaryKey: { readonly columns: readonly ['sequence'] };
               uniques: readonly [
                 {
-                  readonly columns: readonly ['id', 'queue_name'];
-                  readonly name: 'idx_effect_queue_id';
+                  readonly columns: readonly ['id', 'queue'];
+                  readonly name: 'idx_dispatch_queue_id';
                 },
               ];
               indexes: readonly [
                 {
-                  readonly name: 'idx_effect_queue_take_3179164e';
-                  readonly prefix: 'idx_effect_queue_take';
-                  readonly columns: readonly ['queue_name', 'visible_at'];
+                  readonly name: 'idx_dispatch_queue_take_d4c7b4d1';
+                  readonly prefix: 'idx_dispatch_queue_take';
+                  readonly columns: readonly ['queue', 'available_at'];
                   readonly where: "state = 'pending'";
                   readonly unique: false;
                 },
                 {
-                  readonly name: 'idx_effect_queue_update';
-                  readonly columns: readonly ['sequence', 'acquired_by'];
+                  readonly name: 'idx_dispatch_queue_update';
+                  readonly columns: readonly ['sequence', 'lease_id'];
                   readonly unique: false;
                 },
               ];
-              foreignKeys: readonly [];
-            };
-            readonly effect_queue_migrations: {
-              columns: {
-                readonly created_at: {
-                  readonly dataType: 'pg/timestamptz';
-                  readonly codecId: 'pg/timestamptz-string@1';
-                  readonly nullable: false;
-                  readonly default: { readonly kind: 'function'; readonly expression: 'now()' };
-                  readonly typeParams: { readonly precision: 6 };
-                  readonly many: false;
-                };
-                readonly migration_id: {
-                  readonly dataType: 'pg/int4';
-                  readonly codecId: 'pg/int4@1';
-                  readonly nullable: false;
-                  readonly many: false;
-                };
-                readonly name: {
-                  readonly dataType: 'pg/text';
-                  readonly codecId: 'pg/text@1';
-                  readonly nullable: false;
-                  readonly many: false;
-                };
-              };
-              primaryKey: { readonly columns: readonly ['migration_id'] };
-              uniques: readonly [];
-              indexes: readonly [];
               foreignKeys: readonly [];
             };
             readonly evidence: {
@@ -1225,6 +1208,28 @@ type ContractBase = Omit<
                   readonly nullable: true;
                   readonly many: false;
                 };
+                readonly agentBinding: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
+                readonly agentCursor: {
+                  readonly dataType: 'pg/int4';
+                  readonly codecId: 'pg/int4@1';
+                  readonly nullable: false;
+                  readonly default: {
+                    readonly kind: 'literal';
+                    readonly value: DefaultLiteralValue<'pg/int4@1', 0>;
+                  };
+                  readonly many: false;
+                };
+                readonly agentRunId: {
+                  readonly dataType: 'pg/text';
+                  readonly codecId: 'pg/text@1';
+                  readonly nullable: true;
+                  readonly many: false;
+                };
                 readonly detached: {
                   readonly dataType: 'pg/int4';
                   readonly codecId: 'pg/int4@1';
@@ -1245,28 +1250,6 @@ type ContractBase = Omit<
                   readonly dataType: 'pg/text';
                   readonly codecId: 'pg/text@1';
                   readonly nullable: false;
-                  readonly many: false;
-                };
-                readonly nativeBinding: {
-                  readonly dataType: 'pg/text';
-                  readonly codecId: 'pg/text@1';
-                  readonly nullable: true;
-                  readonly many: false;
-                };
-                readonly nativeCursor: {
-                  readonly dataType: 'pg/int4';
-                  readonly codecId: 'pg/int4@1';
-                  readonly nullable: false;
-                  readonly default: {
-                    readonly kind: 'literal';
-                    readonly value: DefaultLiteralValue<'pg/int4@1', 0>;
-                  };
-                  readonly many: false;
-                };
-                readonly nativeRunId: {
-                  readonly dataType: 'pg/text';
-                  readonly codecId: 'pg/text@1';
-                  readonly nullable: true;
                   readonly many: false;
                 };
                 readonly occupied: {
@@ -1380,6 +1363,37 @@ type ContractBase = Omit<
               foreignKeys: readonly [];
             };
           };
+          readonly valueSet: {
+            readonly DispatchState: {
+              readonly kind: 'valueSet';
+              readonly values: readonly ['pending', 'failed', 'completed'];
+            };
+            readonly RunnerState: {
+              readonly kind: 'valueSet';
+              readonly values: readonly [
+                'ACCEPTED',
+                'LAUNCHING',
+                'READY',
+                'PROMPT_INTENT',
+                'RUNNING',
+                'SUCCEEDED',
+                'FAILED',
+                'HELD',
+              ];
+            };
+            readonly TaskState: {
+              readonly kind: 'valueSet';
+              readonly values: readonly [
+                'QUEUED',
+                'ASSIGNING',
+                'ACCEPTED',
+                'RUNNING',
+                'SUCCEEDED',
+                'FAILED',
+                'HELD',
+              ];
+            };
+          };
         };
       };
     };
@@ -1390,42 +1404,38 @@ type ContractBase = Omit<
   readonly target: 'postgres';
   readonly targetFamily: 'sql';
   readonly roots: {
-    readonly archive: { readonly namespace: 'public' & NamespaceId; readonly model: 'archive' };
-    readonly consents: { readonly namespace: 'public' & NamespaceId; readonly model: 'consents' };
-    readonly effect_queue: {
+    readonly archive: { readonly namespace: 'public' & NamespaceId; readonly model: 'Archive' };
+    readonly consents: { readonly namespace: 'public' & NamespaceId; readonly model: 'Consent' };
+    readonly dispatch_queue: {
       readonly namespace: 'public' & NamespaceId;
-      readonly model: 'effect_queue';
+      readonly model: 'DispatchQueue';
     };
-    readonly effect_queue_migrations: {
-      readonly namespace: 'public' & NamespaceId;
-      readonly model: 'effect_queue_migrations';
-    };
-    readonly evidence: { readonly namespace: 'public' & NamespaceId; readonly model: 'evidence' };
+    readonly evidence: { readonly namespace: 'public' & NamespaceId; readonly model: 'Evidence' };
     readonly participant_consents: {
       readonly namespace: 'public' & NamespaceId;
-      readonly model: 'participant_consents';
+      readonly model: 'ParticipantConsent';
     };
-    readonly peers: { readonly namespace: 'public' & NamespaceId; readonly model: 'peers' };
+    readonly peers: { readonly namespace: 'public' & NamespaceId; readonly model: 'Peer' };
     readonly recovery_gate: {
       readonly namespace: 'public' & NamespaceId;
-      readonly model: 'recovery_gate';
+      readonly model: 'RecoveryGate';
     };
     readonly runner_events: {
       readonly namespace: 'public' & NamespaceId;
-      readonly model: 'runner_events';
+      readonly model: 'RunnerEvent';
     };
     readonly runner_tasks: {
       readonly namespace: 'public' & NamespaceId;
-      readonly model: 'runner_tasks';
+      readonly model: 'RunnerTask';
     };
-    readonly sessions: { readonly namespace: 'public' & NamespaceId; readonly model: 'sessions' };
-    readonly tasks: { readonly namespace: 'public' & NamespaceId; readonly model: 'tasks' };
+    readonly sessions: { readonly namespace: 'public' & NamespaceId; readonly model: 'Session' };
+    readonly tasks: { readonly namespace: 'public' & NamespaceId; readonly model: 'Task' };
   };
   readonly domain: {
     readonly namespaces: {
       readonly public: {
         readonly models: {
-          readonly archive: {
+          readonly Archive: {
             readonly fields: {
               readonly created: {
                 readonly nullable: false;
@@ -1476,7 +1486,7 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly consents: {
+          readonly Consent: {
             readonly fields: {
               readonly enabled: {
                 readonly nullable: false;
@@ -1507,23 +1517,19 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly effect_queue: {
+          readonly DispatchQueue: {
             readonly fields: {
-              readonly acquired_at: {
-                readonly nullable: true;
+              readonly attempts: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
+              };
+              readonly available_at: {
+                readonly nullable: false;
                 readonly type: {
                   readonly kind: 'scalar';
                   readonly codecId: 'pg/timestamp-string@1';
                   readonly typeParams: { readonly precision: 6 };
                 };
-              };
-              readonly acquired_by: {
-                readonly nullable: true;
-                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/uuid@1' };
-              };
-              readonly attempts: {
-                readonly nullable: false;
-                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
               };
               readonly created_at: {
                 readonly nullable: false;
@@ -1533,8 +1539,8 @@ type ContractBase = Omit<
                   readonly typeParams: { readonly precision: 6 };
                 };
               };
-              readonly element: {
-                readonly nullable: false;
+              readonly failure: {
+                readonly nullable: true;
                 readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
               };
               readonly id: {
@@ -1545,11 +1551,23 @@ type ContractBase = Omit<
                   readonly typeParams: { readonly length: 255 };
                 };
               };
-              readonly last_failure: {
+              readonly lease_id: {
                 readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/uuid@1' };
+              };
+              readonly leased_at: {
+                readonly nullable: true;
+                readonly type: {
+                  readonly kind: 'scalar';
+                  readonly codecId: 'pg/timestamp-string@1';
+                  readonly typeParams: { readonly precision: 6 };
+                };
+              };
+              readonly payload: {
+                readonly nullable: false;
                 readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
               };
-              readonly queue_name: {
+              readonly queue: {
                 readonly nullable: false;
                 readonly type: {
                   readonly kind: 'scalar';
@@ -1563,11 +1581,7 @@ type ContractBase = Omit<
               };
               readonly state: {
                 readonly nullable: false;
-                readonly type: {
-                  readonly kind: 'scalar';
-                  readonly codecId: 'sql/varchar@1';
-                  readonly typeParams: { readonly length: 10 };
-                };
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
               };
               readonly updated_at: {
                 readonly nullable: false;
@@ -1577,66 +1591,28 @@ type ContractBase = Omit<
                   readonly typeParams: { readonly precision: 6 };
                 };
               };
-              readonly visible_at: {
-                readonly nullable: false;
-                readonly type: {
-                  readonly kind: 'scalar';
-                  readonly codecId: 'pg/timestamp-string@1';
-                  readonly typeParams: { readonly precision: 6 };
-                };
-              };
             };
             readonly relations: Record<string, never>;
             readonly storage: {
-              readonly table: 'effect_queue';
+              readonly table: 'dispatch_queue';
               readonly namespaceId: 'public';
               readonly fields: {
-                readonly acquired_at: { readonly column: 'acquired_at' };
-                readonly acquired_by: { readonly column: 'acquired_by' };
                 readonly attempts: { readonly column: 'attempts' };
+                readonly available_at: { readonly column: 'available_at' };
                 readonly created_at: { readonly column: 'created_at' };
-                readonly element: { readonly column: 'element' };
+                readonly failure: { readonly column: 'failure' };
                 readonly id: { readonly column: 'id' };
-                readonly last_failure: { readonly column: 'last_failure' };
-                readonly queue_name: { readonly column: 'queue_name' };
+                readonly lease_id: { readonly column: 'lease_id' };
+                readonly leased_at: { readonly column: 'leased_at' };
+                readonly payload: { readonly column: 'payload' };
+                readonly queue: { readonly column: 'queue' };
                 readonly sequence: { readonly column: 'sequence' };
                 readonly state: { readonly column: 'state' };
                 readonly updated_at: { readonly column: 'updated_at' };
-                readonly visible_at: { readonly column: 'visible_at' };
               };
             };
           };
-          readonly effect_queue_migrations: {
-            readonly fields: {
-              readonly created_at: {
-                readonly nullable: false;
-                readonly type: {
-                  readonly kind: 'scalar';
-                  readonly codecId: 'pg/timestamptz-string@1';
-                  readonly typeParams: { readonly precision: 6 };
-                };
-              };
-              readonly migration_id: {
-                readonly nullable: false;
-                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
-              };
-              readonly name: {
-                readonly nullable: false;
-                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
-              };
-            };
-            readonly relations: Record<string, never>;
-            readonly storage: {
-              readonly table: 'effect_queue_migrations';
-              readonly namespaceId: 'public';
-              readonly fields: {
-                readonly created_at: { readonly column: 'created_at' };
-                readonly migration_id: { readonly column: 'migration_id' };
-                readonly name: { readonly column: 'name' };
-              };
-            };
-          };
-          readonly evidence: {
+          readonly Evidence: {
             readonly fields: {
               readonly data: {
                 readonly nullable: false;
@@ -1682,7 +1658,7 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly participant_consents: {
+          readonly ParticipantConsent: {
             readonly fields: {
               readonly enabled: {
                 readonly nullable: false;
@@ -1713,7 +1689,7 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly peers: {
+          readonly Peer: {
             readonly fields: {
               readonly expires: {
                 readonly nullable: false;
@@ -1764,7 +1740,7 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly recovery_gate: {
+          readonly RecoveryGate: {
             readonly fields: {
               readonly id: {
                 readonly nullable: false;
@@ -1785,7 +1761,7 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly runner_events: {
+          readonly RunnerEvent: {
             readonly fields: {
               readonly payload: {
                 readonly nullable: false;
@@ -1811,9 +1787,21 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly runner_tasks: {
+          readonly RunnerTask: {
             readonly fields: {
               readonly address: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly agentBinding: {
+                readonly nullable: true;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
+              };
+              readonly agentCursor: {
+                readonly nullable: false;
+                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
+              };
+              readonly agentRunId: {
                 readonly nullable: true;
                 readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
               };
@@ -1827,18 +1815,6 @@ type ContractBase = Omit<
               };
               readonly incarnation: {
                 readonly nullable: false;
-                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
-              };
-              readonly nativeBinding: {
-                readonly nullable: true;
-                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
-              };
-              readonly nativeCursor: {
-                readonly nullable: false;
-                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
-              };
-              readonly nativeRunId: {
-                readonly nullable: true;
                 readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
               };
               readonly occupied: {
@@ -1888,12 +1864,12 @@ type ContractBase = Omit<
               readonly namespaceId: 'public';
               readonly fields: {
                 readonly address: { readonly column: 'address' };
+                readonly agentBinding: { readonly column: 'agentBinding' };
+                readonly agentCursor: { readonly column: 'agentCursor' };
+                readonly agentRunId: { readonly column: 'agentRunId' };
                 readonly detached: { readonly column: 'detached' };
                 readonly fingerprint: { readonly column: 'fingerprint' };
                 readonly incarnation: { readonly column: 'incarnation' };
-                readonly nativeBinding: { readonly column: 'nativeBinding' };
-                readonly nativeCursor: { readonly column: 'nativeCursor' };
-                readonly nativeRunId: { readonly column: 'nativeRunId' };
                 readonly occupied: { readonly column: 'occupied' };
                 readonly pid: { readonly column: 'pid' };
                 readonly promptId: { readonly column: 'promptId' };
@@ -1907,7 +1883,7 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly sessions: {
+          readonly Session: {
             readonly fields: {
               readonly data: {
                 readonly nullable: false;
@@ -1928,7 +1904,7 @@ type ContractBase = Omit<
               };
             };
           };
-          readonly tasks: {
+          readonly Task: {
             readonly fields: {
               readonly data: {
                 readonly nullable: false;
@@ -1949,6 +1925,67 @@ type ContractBase = Omit<
               };
             };
           };
+        };
+        readonly enum: {
+          readonly DispatchState: {
+            readonly codecId: 'pg/text@1';
+            readonly members: readonly [
+              { readonly name: 'pending'; readonly value: 'pending' },
+              { readonly name: 'failed'; readonly value: 'failed' },
+              { readonly name: 'completed'; readonly value: 'completed' },
+            ];
+          };
+          readonly RunnerState: {
+            readonly codecId: 'pg/text@1';
+            readonly members: readonly [
+              { readonly name: 'ACCEPTED'; readonly value: 'ACCEPTED' },
+              { readonly name: 'LAUNCHING'; readonly value: 'LAUNCHING' },
+              { readonly name: 'READY'; readonly value: 'READY' },
+              { readonly name: 'PROMPT_INTENT'; readonly value: 'PROMPT_INTENT' },
+              { readonly name: 'RUNNING'; readonly value: 'RUNNING' },
+              { readonly name: 'SUCCEEDED'; readonly value: 'SUCCEEDED' },
+              { readonly name: 'FAILED'; readonly value: 'FAILED' },
+              { readonly name: 'HELD'; readonly value: 'HELD' },
+            ];
+          };
+          readonly TaskState: {
+            readonly codecId: 'pg/text@1';
+            readonly members: readonly [
+              { readonly name: 'QUEUED'; readonly value: 'QUEUED' },
+              { readonly name: 'ASSIGNING'; readonly value: 'ASSIGNING' },
+              { readonly name: 'ACCEPTED'; readonly value: 'ACCEPTED' },
+              { readonly name: 'RUNNING'; readonly value: 'RUNNING' },
+              { readonly name: 'SUCCEEDED'; readonly value: 'SUCCEEDED' },
+              { readonly name: 'FAILED'; readonly value: 'FAILED' },
+              { readonly name: 'HELD'; readonly value: 'HELD' },
+            ];
+          };
+        };
+        readonly enumMemberTypes?: {
+          readonly DispatchState: readonly [
+            { readonly name: 'pending'; readonly value: 'pending' },
+            { readonly name: 'failed'; readonly value: 'failed' },
+            { readonly name: 'completed'; readonly value: 'completed' },
+          ];
+          readonly RunnerState: readonly [
+            { readonly name: 'ACCEPTED'; readonly value: 'ACCEPTED' },
+            { readonly name: 'LAUNCHING'; readonly value: 'LAUNCHING' },
+            { readonly name: 'READY'; readonly value: 'READY' },
+            { readonly name: 'PROMPT_INTENT'; readonly value: 'PROMPT_INTENT' },
+            { readonly name: 'RUNNING'; readonly value: 'RUNNING' },
+            { readonly name: 'SUCCEEDED'; readonly value: 'SUCCEEDED' },
+            { readonly name: 'FAILED'; readonly value: 'FAILED' },
+            { readonly name: 'HELD'; readonly value: 'HELD' },
+          ];
+          readonly TaskState: readonly [
+            { readonly name: 'QUEUED'; readonly value: 'QUEUED' },
+            { readonly name: 'ASSIGNING'; readonly value: 'ASSIGNING' },
+            { readonly name: 'ACCEPTED'; readonly value: 'ACCEPTED' },
+            { readonly name: 'RUNNING'; readonly value: 'RUNNING' },
+            { readonly name: 'SUCCEEDED'; readonly value: 'SUCCEEDED' },
+            { readonly name: 'FAILED'; readonly value: 'FAILED' },
+            { readonly name: 'HELD'; readonly value: 'HELD' },
+          ];
         };
       };
     };

@@ -1,12 +1,13 @@
 import { parseArgs } from "node:util";
 import { Effect, Layer, Schema } from "effect";
 import { NodeRuntime } from "@effect/platform-node";
-import { BrokerConfig, RunnerConfig, BackupError, Sha } from "../src/contracts.ts";
+import { BrokerConfig, RunnerConfig, BackupError } from "../src/contracts.ts";
+import { Evidence } from "../src/generated/database/types.ts";
 import { privateRecoveryPath, recover } from "../src/backup.ts";
 import { Platform } from "../src/platform.ts";
 
 // Offline only: this command never pauses services, dispatches work, or deletes existing state.
-const usage = "Usage: tsx scripts/recover.ts backup|restore --broker-config /private/broker.json [--runner-config /private/runner.json] --artifact /private/new-artifact --source-sha <40-lowercase-hex> --offline-maintenance [--hold-accepted-work (restore only)]. Stop broker/runner/native children offline. Restore into separate fresh empty exactly-migrated PostgreSQL databases via each config's private databaseUrlFile; mount fresh runner roots at identical absolute paths/UID layout. Recovery version 3 uses PostgreSQL 18 custom data-only broker.pgdump and runner.pgdump. Independently reconstruct excluded credentials/model seed; encrypt private artifacts outside Git. Failed partial targets remain fenced; no replay or native reattachment.";
+const usage = "Usage: tsx scripts/recover.ts backup|restore --broker-config /private/broker.json [--runner-config /private/runner.json] --artifact /private/new-artifact --source-sha <40-lowercase-hex> --offline-maintenance [--hold-accepted-work (restore only)]. Provide broker COORDINATOR_DATABASE_URL and, with --runner-config, separate COORDINATOR_RUNNER_DATABASE_URL through the environment; never command arguments or config files. Stop broker/runner/agent children offline. Restore into separate fresh empty PostgreSQL databases initialized with the committed initial schema; mount fresh runner roots at identical absolute paths/UID layout. Recovery version 3 uses PostgreSQL 18 custom data-only broker.pgdump and runner.pgdump. Independently reconstruct excluded credentials/model seed; encrypt private artifacts outside Git. Failed partial targets remain fenced; no replay or agent reattachment.";
 process.umask(0o077);
 NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
   const args = yield* Effect.try({ try: () => parseArgs({ allowPositionals: true, options: {
@@ -17,14 +18,14 @@ NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
   const operation = args.positionals[0];
   const configPath = args.values["broker-config"], artifact = args.values.artifact, sha = args.values["source-sha"];
   if (args.positionals.length !== 1 || (operation !== "backup" && operation !== "restore") || !configPath || !artifact || !sha || !args.values["offline-maintenance"] || (operation === "backup" && args.values["hold-accepted-work"])) return yield* new BackupError({ message: usage });
-  const sourceSha = yield* Schema.decodeUnknownEffect(Sha)(sha);
+  const sourceSha = yield* Schema.decodeUnknownEffect(Evidence.fields.sha)(sha);
   const platform = yield* Platform;
   yield* privateRecoveryPath(configPath, "file");
-  const broker = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(yield* platform.privateFile(configPath));
+  const broker = yield* Schema.decodeEffect(Schema.fromJsonString(BrokerConfig), { onExcessProperty: "error" })(yield* platform.privateFile(configPath));
   let runner: RunnerConfig | undefined;
   if (args.values["runner-config"]) {
     yield* privateRecoveryPath(args.values["runner-config"], "file");
-    runner = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(yield* platform.privateFile(args.values["runner-config"]));
+    runner = yield* Schema.decodeEffect(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(yield* platform.privateFile(args.values["runner-config"]));
   }
   if (runner && [runner.childDirectory, ...Object.values(runner.repositories)].some((root) =>
     [configPath, args.values["runner-config"]].some((file) => file && (file === root || file.startsWith(`${root}/`))))) return yield* new BackupError({ message: "Operator config files must remain outside archived runner roots" });

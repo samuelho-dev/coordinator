@@ -1,6 +1,8 @@
-# Coordinator chart 0.2.0-beta.3
+# Coordinator chart 0.2.0-beta.5 (unpublished candidate)
 
 **Private beta, not public production certification.** External PostgreSQL18 is required; no database server/provider CRD/common-chart/ingress/namespace/HPA/public endpoint is installed. No publication, visibility change or deployment is implied. Broker-only is supported with runner disabled and no runner principals. Effect4.0.3 is stable; Prisma8.0.0-rc.22 and transitive orm-postgres8.0.0-rc.17 are RC dependencies.
+
+Beta.5 has not been published or deployed. Historical results for earlier sources do not certify this service-owned database configuration cutover; all current-source and operator gates remain required.
 
 ## Release and storage inputs
 
@@ -35,11 +37,13 @@ Both role Secrets require:
 | --- | --- |
 | `config.json` | Complete existing `BrokerConfig` or `RunnerConfig` JSON, decoded with excess-property rejection. No alternate enrollment schema. |
 | `health.token` | 64 lowercase hexadecimal characters, with optional trailing whitespace. Broker: matches an enrolled principal's tokenHash. Runner: equals runner.token. |
+| `database.url` | The role's independent PostgreSQL URL; runtime and migration init receive it as `COORDINATOR_DATABASE_URL` via native secretKeyRef. No application URL file or JSON field. |
+
+Database URLs require nonempty decoded user/password/database and a host. Remote requires `?sslmode=verify-full`; only sslmode is accepted as a query setting. No fragments/control bytes or extra path components. `DatabaseService.connection()` validates redacted service configuration once; never put the DSN in config JSON/values/argv/logs. The native Secret key `database.url` remains unchanged, but init does not stage it into `/config`.
 
 Broker-only additional keys:
-* **Required `database.url`**: external PostgreSQL URL with nonempty user/password/database. Remote requires `?sslmode=verify-full`; only sslmode is accepted as a query setting. No fragments/control bytes. Staged `/config/database.url` is UID1000/0600 within private0700 config; never put the DSN in JSON/values/argv/logs.
 
-* For each principal with role `runner`, `control.<base64url(principal.id)>`: raw 64-hex control token matching its `controlTokenHash`. Base64url encodes UTF-8 without padding (for example `node -p 'Buffer.from(process.argv[1]).toString("base64url")' "$RUNNER_ID"`). Config principals require explicit private HTTPS `runnerUrl`. The staged path is `/config/tokens/<principal.id>`.
+* For each principal with role `runner`, `control.<base64url(principal.id)>`: raw 64-hex control token matching its `controlTokenHash`. Base64url encodes UTF-8 without padding (for example `node -p 'Buffer.from(process.argv[1]).toString("base64url")' "$RUNNER_ID"`). Config principals require explicit private HTTPS `runnerUrl`. The staged path is `/config/tokens/<lowercase SHA256 of UTF-8 principal.id>` with no extension; the Secret key remains base64url-encoded.
 * When `objectBackup` is configured, `backup.access-key` and `backup.secret-key`: exact provider values. Their config destinations must be descendants of `/config`. Object backup is optional; neither Garage nor any other provider is required.
 
 Runner-only additional keys:
@@ -55,20 +59,13 @@ Runner-only additional keys:
 
 Seed only model settings/auth/definitions, never sessions/history/prompts/plugin enrollment or unrelated HOME. Init validates JSON, not provider semantics; require a real admission/model-turn gate. Stock image contains checksum-pinned `/usr/local/bin/omp` and real production Pi at `/app/node_modules/.bin/pi`. Derivative images need their own source/signature/SDK evidence. Nothing is installed from a shell URL during pod startup.
 
-Generate tokens with a cryptographically secure generator, hash their **trimmed exact raw bytes** with SHA-256 into the existing config's tokenHash/controlTokenHash fields, and scope principals/repositoryIds/roles using normal enrollment policy. Keep source files private (umask 077); never put Secret contents in chart values, shell arguments, release metadata, Git, or CI logs. A file-based Secret creation pattern is:
+Generate tokens with a cryptographically secure generator, hash their **trimmed exact raw bytes** with SHA-256 into the existing config's tokenHash/controlTokenHash fields, and scope principals/repositoryIds/roles using normal enrollment policy. Keep token/config files private (umask 077); never put Secret contents in chart values, shell arguments, release metadata, Git, or CI logs. Have your secret manager/reconciler populate each role's `database.url` directly. The [operator guide](../../../docs/self-hosting.md#4-provision-namespace-secrets-storage-and-tls) also provides stdin-only Kubernetes Secret creation from a secret-manager-injected environment without URL files or credential arguments.
 
-```sh
-kubectl -n "$NAMESPACE" create secret generic "$BROKER_SECRET" \
-  --from-file=config.json="$BROKER_CONFIG_FILE" \
-  --from-file=database.url="$DATABASE_URL_FILE" \
-  --from-file=health.token="$BROKER_HEALTH_TOKEN_FILE"
-```
-
-For a broker with runners or object backup, add the exact additional `--from-file=KEY=PRIVATE_FILE` entries above. Build the runner Secret analogously, including repositories.json, runner.token, health.token and the real selected model seed. Those commands mutate the target namespace: execute only as an explicit operator deployment step, not during private preparation.
+For a broker with runners or object backup, add the exact additional Secret keys above. Build the runner Secret with its own database/login, repositories.json, runner.token, health.token and the real selected model seed. Secret creation mutates the target namespace: execute only as an explicit operator deployment step, not during private preparation.
 
 ## Config paths and repository preparation
 
-Broker config must use host0.0.0.0, **databaseUrlFile `/config/database.url` exactly**, and backupDirectory at/below `/backups`. Retention/principals/repository IDs/optional HTTPS backup remain BrokerConfig. No broker SQLite compatibility field/flag exists. Remote PostgreSQL requires verified TLS and an operator-owned database role with rights to apply the committed package and serve the broker, never a shared superuser role.
+Broker config must use host0.0.0.0 and backupDirectory at/below `/backups`. Retention/principals/repository IDs/optional HTTPS backup remain BrokerConfig; database connection configuration belongs to DatabaseService, not either role's JSON. Initialization requires separate fresh PostgreSQL databases/logins for broker and runner. Remote PostgreSQL requires verified TLS and operator-owned database roles with rights to apply the committed package and serve their own role, never a shared superuser role.
 
 Runner config must use host `0.0.0.0`, an HTTPS brokerUrl whose certificate is valid for that hostname, and tokenFile under `/config` (normally `/config/runner.token`). Set stateDirectory, modelDirectory, childDirectory, and all repository paths to **distinct, nonoverlapping canonical descendants of `/work`**. Conventional values are `/work/runner`, `/work/home`, `/work/children`, and `/work/repos/<operator-name>`. Slots, childUidBase (at least 1000000), controlTokenHash, identity, allowlisted repositories, and installed executable launchers come directly from RunnerConfig. The child root is separate from every private directory.
 
@@ -85,10 +82,10 @@ node --import tsx scripts/deploy-init.ts broker --input /input --config /config
 node --import tsx scripts/deploy-init.ts runner --input /input --config /config
 ```
 
-Broker then has a **fixed second init**, same repository@digest:
+Each role then has a **fixed second init**, same repository@digest, with its own `COORDINATOR_DATABASE_URL` injected from that role's `existingSecret` key `database.url`:
 
 ```sh
-COORDINATOR_DATABASE_URL_FILE=/config/database.url node --import tsx scripts/migrate.ts
+node --import tsx scripts/migrate.ts
 ```
 
 It runs UID1000/cap0 with config/CA read-only and writable tmp. Actual native Prisma migration failure prevents serving; no optional skip flag. Recreate stops the old broker before migration acquires the same advisory owner. **No PreSync migration hook:** Argo must reconcile the Recreate Deployment and await its ordinary init gate, not wait on a migration while the old owner is live.
@@ -99,6 +96,8 @@ Staging walks mount ancestors, rejects symlink/non-directory ancestors, and assi
 
 The broker runs directly as1000 with all capabilities dropped. Runner startup uses root setpriv to become1000 with exactly CHOWN, DAC_OVERRIDE, KILL, SETUID, SETGID, SETPCAP; the supervisor retains its existing distinct child-UID/capability/no-new-privileges isolation. Init has only CHOWN, FOWNER, DAC_OVERRIDE. The cluster policy must permit these intentional capabilities on the runner; do not weaken child isolation to satisfy a restricted policy.
 
+The runner service owns only its own database connection and filesystem lifecycle. Distinct-UID native agent/model/provider children, Git and irrelevant subprocesses must not inherit database environment secrets. Paired offline recovery separately receives broker `COORDINATOR_DATABASE_URL` and optional runner `COORDINATOR_RUNNER_DATABASE_URL`; fixture tooling uses independent `COORDINATOR_TEST_POSTGRES_URL`. Native pg_dump/pg_restore authentication uses scoped private0600 pgpass from the owning service's connection, not an application URL file.
+
 ## TLS and network-policy integration ownership
 
 Both Services are internal ClusterIP HTTP services; no host is required for broker-only startup. They are not public HTTPS endpoints. The operator owns TLS termination/proxying, valid private certificates/trust, DNS, any gateway/provider resources, and NetworkPolicies. Before enabling runners, provide real private HTTPS routes to broker and runner control endpoints, matching brokerUrl and principal.runnerUrl, with TLS verification intact. Never disable verification.
@@ -107,7 +106,7 @@ Both Services are internal ClusterIP HTTP services; no host is required for brok
 
 The added CA extends Node runtime trust; certificate chain, hostname and SNI verification remain enabled, including with `connectHosts` DNS overrides. It does not configure the root initializer's Git fetch, curl, or arbitrary SDK/child TLS stacks: provision trust separately for those when required. Node reads the CA file at process startup, so Kubernetes Secret projection updates alone do not reload trust; the operator must arrange a controlled pod restart/rollout after rotation (for example through the role annotations and an independently installed Secret-reload controller). Role config Secrets are likewise staged only by init. Private CA, config Secret and image rotation remain operator-owned lifecycle decisions; do not interrupt accepted work or replay it as a reload procedure.
 
-Use app.kubernetes.io name/instance/component labels for default deny and explicit DNS/probes/private gateways, **broker init/runtime→PostgreSQL**, broker↔runner, optional backup/GitHub, init repository fetch and selected SDK provider/auth flows. Database trust/availability, gateway/network policy and connectHosts routing belong to operators. Do not expose native control or broker credentials to children; chart presumes no provider/maintainer hosts.
+Use app.kubernetes.io name/instance/component labels for default deny and explicit DNS/probes/private gateways, **broker init/runtime→PostgreSQL**, broker↔runner, optional backup/GitHub, init repository fetch and selected SDK provider/auth flows. Database trust/availability, gateway/network policy and connectHosts routing belong to operators. Do not expose agent control or broker credentials to children; chart presumes no provider/maintainer hosts.
 
 Broker startup/liveness use cheap unauthenticated `/livez`; broker readiness uses curl with `@/config/health.header` against authenticated `/readyz`, never a token in argv. Broker readiness includes the authenticated SELECT1 gate and returns non-2xx on failure; successful readiness includes `x-coordinator-source-sha`. Runner startup, liveness, and readiness instead use authenticated curl exec probes against its existing `/healthz`, with the same mounted header file; the runner does not implement `/livez` or `/readyz`. Runner journal-ownership loss still fails health. Neither role's `/healthz` is exposed publicly or made unauthenticated; MCP health remains unchanged.
 
@@ -132,10 +131,10 @@ helm template "$RELEASE" deploy/helm/coordinator -f "$OPERATOR_VALUES" > "$RENDE
 helm template "$RELEASE" deploy/helm/coordinator -f "$OPERATOR_VALUES" --set runner.enabled=true --set runner.existingSecret="$RUNNER_SECRET"
 ```
 
-Negative rendering checks must reject absent/malformed digest/SHA, missing broker Secret name, and enabled runner without its Secret name. Inspect rendered broker-only and broker+runner workloads with only ordinary Kubernetes APIs. Main should run the repository type/lint/native-isolation gates and actual init tests with independently generated schema-valid broker/runner inputs. Operator acceptance additionally requires valid credential readiness, raw-ledger ownership fencing, durable restart/no-replay evidence, clean public/private repository preparation, real selected SDK/provider model turn, private verified TLS, and policy-enforced child isolation. No build, rendering, lint, test, cluster action or publication was performed by this chart task.
+Negative rendering checks must reject absent/malformed digest/SHA, missing broker Secret name, and enabled runner without its Secret name. Inspect rendered broker-only and broker+runner workloads with only ordinary Kubernetes APIs. Main should run the repository type/lint/agent-isolation gates and actual init tests with independently generated schema-valid broker/runner inputs. Operator acceptance additionally requires valid credential readiness, raw-ledger ownership fencing, durable restart/no-replay evidence, clean public/private repository preparation, real selected SDK/provider model turn, private verified TLS, and policy-enforced child isolation. No build, rendering, lint, test, cluster action or publication was performed by this chart task.
 
 ## Concrete installation and recovery process
 
-Follow the [operator guide](../../../docs/self-hosting.md) for independently generated identities, private URL-file/CA provisioning, local Docker staging→migration→broker, Kubernetes Secret creation→Recreate/init→private acceptance, and operator-owned GitOps ordering. It includes exact-source generation, offline backup/restore and legacy SQLite import commands. Prisma owns the broker schema; Effect's queue schema/version seeds are part of the committed initial package, not a second runtime schema owner.
+Follow the [operator guide](../../../docs/self-hosting.md) for independently generated identities, service-owned secret environment/CA provisioning, local Docker staging→migration→broker, native Kubernetes Secret creation→Recreate/init→private acceptance, and operator-owned GitOps ordering. It includes exact-source generation and offline backup/restore into fresh PostgreSQL databases. Prisma owns the single initial schema for broker, runner and dispatch storage; no library migration tracker or historical import workflow is supported. Every client and agent configuration must be reloaded together for the canonical `agent.*` protocol and `COORDINATOR_AGENT_CONFIG` environment.
 
 Primary platform contracts: [Kubernetes init ordering](https://kubernetes.io/docs/concepts/workloads/pods/init-containers/), [Recreate Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#recreate-deployment), [official signed PGDG/client packages](https://www.postgresql.org/download/linux/debian/), [PostgreSQL TLS verification](https://www.postgresql.org/docs/18/libpq-ssl.html), [Node startup CA trust](https://nodejs.org/docs/latest-v24.x/api/cli.html#node_extra_ca_certsfile).

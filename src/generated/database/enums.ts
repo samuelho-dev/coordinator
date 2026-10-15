@@ -4,3 +4,39 @@
  */
 
 import { Schema } from 'effect';
+
+export enum DispatchStateEnum {
+  pending = 'pending',
+  failed = 'failed',
+  completed = 'completed',
+}
+
+export const DispatchState = Schema.Enum(DispatchStateEnum);
+export type DispatchState = typeof DispatchState.Type;
+
+export enum RunnerStateEnum {
+  ACCEPTED = 'ACCEPTED',
+  LAUNCHING = 'LAUNCHING',
+  READY = 'READY',
+  PROMPT_INTENT = 'PROMPT_INTENT',
+  RUNNING = 'RUNNING',
+  SUCCEEDED = 'SUCCEEDED',
+  FAILED = 'FAILED',
+  HELD = 'HELD',
+}
+
+export const RunnerState = Schema.Enum(RunnerStateEnum);
+export type RunnerState = typeof RunnerState.Type;
+
+export enum TaskStateEnum {
+  QUEUED = 'QUEUED',
+  ASSIGNING = 'ASSIGNING',
+  ACCEPTED = 'ACCEPTED',
+  RUNNING = 'RUNNING',
+  SUCCEEDED = 'SUCCEEDED',
+  FAILED = 'FAILED',
+  HELD = 'HELD',
+}
+
+export const TaskState = Schema.Enum(TaskStateEnum);
+export type TaskState = typeof TaskState.Type;
