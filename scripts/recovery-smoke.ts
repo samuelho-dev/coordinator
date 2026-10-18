@@ -1,7 +1,7 @@
 import { OfferDecisionEnum } from "../src/contracts.ts";
 import { TaskStateEnum, RunnerStateEnum } from "../src/generated/database/enums.ts";
 import assert from "node:assert/strict";
-import { Effect, Context, Layer, Option, Schema } from "effect";
+import { Console, Effect, Context, Formatter, Layer, Option, Schema } from "effect";
 import { ChildProcess } from "effect/process";
 import { NodeRuntime } from "@effect/platform-node";
 
@@ -13,8 +13,8 @@ import { recover } from "../src/backup.ts";
 import { BrokerConfig, GitHubRepositoryId, RunnerConfig, RunnerId, Task, Work, Repo, UserId, WorkerId } from "../src/contracts.ts";
 import { TaskId, Archive, Evidence, ParticipantConsent, Peer, RunnerTask, SessionId } from "../src/generated/database/types.ts";
 import { provisionPostgres, postgresAdmin, postgresConfig, dropPostgres } from "../test/postgres-fixture.ts";
-import { DatabaseService } from "../src/database-service.ts";
-import { AgentHostEnum, AgentSubmissionId } from "../src/agent/contracts.ts";
+import { DatabaseService } from "../src/database.ts";
+import { AgentHostEnum, AgentSubmissionId } from "../src/agent/protocol.ts";
 
 // Requires real Linux flock/setpriv + runner supervisor capabilities. No provider, enrollment, or task dispatch.
 process.umask(0o077);
@@ -88,7 +88,7 @@ NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
     const acceptedFingerprint = yield* platform.fingerprint(accepted);
     const acceptedDirectory = yield* platform.digest(accepted.taskId);
     yield* db.query((client) => client.insertInto("runner_tasks").values({ taskId: accepted.taskId, fingerprint: acceptedFingerprint, work: Schema.encodeSync(Schema.fromJsonString(Work))(accepted), worktree: join(children, acceptedDirectory, "repo"), state: RunnerStateEnum.ACCEPTED, occupied: 1, incarnation: RunnerTask.fields.incarnation.make("accepted-incarnation") }));
-    yield* db.query((client) => client.insertInto("runner_events").values({ taskId: work.taskId, payload: JSON.stringify({ type: "runner_state", state: RunnerStateEnum.PROMPT_INTENT }) }));
+    yield* db.query((client) => client.insertInto("runner_events").values({ taskId: work.taskId, payload: Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ type: "runner_state", state: RunnerStateEnum.PROMPT_INTENT }) }));
   }).pipe(Effect.provide(DatabaseService.layer(runnerUrl))));
   const artifact = join(privateRoot, "artifact"), sourceSha = Evidence.fields.sha.make("a".repeat(40));
   yield* Effect.scoped(Effect.gen(function*() {
@@ -191,8 +191,8 @@ NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
   }));
   const overwrite = yield* Effect.exit(recover("restore", restoredBroker, artifact, sourceSha, restoredRunner, true));
   assert.equal(overwrite._tag, "Failure", "restore cannot overwrite existing ledger");
-  console.log(JSON.stringify({ scenario: "private-offline-recovery", fixtureOnly: true, actualBrokerReopened: true, actualRunnerReopened: true, workspaceAndAgentSessionRetained: true,
-    modelCredentialExcluded: true, brokerLockFenced: true, acceptedRecoveryExplicitlyHeld: true, uncertainPromptAndOccupiedSlotRetained: true, launcherInvocations: 0, productionBackupClaim: false }));
+  yield* Console.log(Formatter.formatJson({ scenario: "private-offline-recovery", fixtureOnly: true, actualBrokerReopened: true, actualRunnerReopened: true, workspaceAndAgentSessionRetained: true,
+    modelCredentialExcluded: true, brokerLockFenced: true, acceptedRecoveryExplicitlyHeld: true, uncertainPromptAndOccupiedSlotRetained: true, launcherInvocations: 0, productionBackupClaim: false }, { space: 2 }));
   }).pipe(Effect.provide(postgresConfig(targetUrl, targetRunnerUrl)));
   }).pipe(Effect.provide(postgresConfig(sourceUrl, runnerUrl)));
 })).pipe(Effect.provide(Layer.mergeAll(Platform.layer, Mcp.layer))));

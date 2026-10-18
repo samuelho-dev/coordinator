@@ -1,5 +1,5 @@
 import { CiVerdictEnum } from "../src/contracts.ts";
-import { AgentHostEnum } from "../src/agent/contracts.ts";
+import { AgentHostEnum } from "../src/agent/protocol.ts";
 import { it } from "@effect/vitest"
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
@@ -7,7 +7,7 @@ import { NodeHttpClient } from "@effect/platform-node";
 import { Clock, Effect, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { TestClock } from "effect/testing";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
-import { pollCi } from "../src/evidence.ts";
+import { pollCi } from "../src/broker.ts";
 import { JsonValue, Work } from "../src/contracts.ts";
 import { Evidence } from "../src/generated/database/types.ts";
 

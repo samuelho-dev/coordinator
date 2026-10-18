@@ -2,26 +2,30 @@ import { RoleEnum, DispositionEnum, OfferDecisionEnum, ReviewDecisionEnum } from
 import { TaskStateEnum, RunnerStateEnum } from "../src/generated/database/enums.ts";
 // Node assert has no Effect equivalent; assertions intentionally remain synchronous.
 import assert from "node:assert/strict";
-import { Cause, Clock, Config, Context, Effect, Exit, Layer, Redacted, Schema, Scope, Stdio, Stream } from "effect";
+import { Cause, Clock, Config, Context, Effect, Exit, Formatter, Layer, Redacted, Schema, Scope, Stdio, Stream } from "effect";
 import { Hex } from "effect/encoding";
-import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
+import { HttpClient, HttpClientRequest, HttpServer, HttpServerResponse } from "effect/http";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { NodeRuntime, NodeStdio } from "@effect/platform-node";
-import { DatabaseService, type DatabaseClient } from "../src/database-service.ts";
+import { DatabaseService, type DatabaseClient } from "../src/database.ts";
 
 import { dropPostgres, postgresAdmin, postgresConfig, provisionPostgres } from "../test/postgres-fixture.ts";
 import { restoreBrokerDatabase } from "../src/backup.ts";
-import { BrokerConfig, RunnerConfig, RunnerRequest, RunnerControlEnum, RunnerEvent, ModelProfile, MachineId, WorkerId, RunnerId, GitHubRepositoryId, UserId, Repo, Json, JsonValue, HttpError, Commands, CommandError, type CommandInput, type Work, type Address, type SessionKey } from "../src/contracts.ts";
+import { BrokerConfig, RunnerConfig, RunnerRequest, RunnerControlEnum, RunnerEvent, ModelProfile, MachineId, WorkerId, RunnerId, GitHubRepositoryId, UserId, Repo, Json, JsonValue, HttpError, Commands, command, CommandError, type CommandInput, type Work, type Address, type SessionKey } from "../src/contracts.ts";
 import { TaskId, PeerId, SessionId, Archive, Evidence, Peer, RunnerTask } from "../src/generated/database/types.ts";
 import { Platform } from "../src/platform.ts";
-import { inspectGithubRepository } from "../src/evidence.ts";
+import { inspectGithubRepository } from "../src/broker.ts";
 import { Mcp, serverLayer } from "../src/mcp.ts";
 import { CHILD_UID_BASE, requireIsolation, isolationArgs, childEnvironment, ownChildDirectory } from "../src/runner.ts";
 import { connectAgentClient } from "../src/agent/client.ts";
-import { AgentTools, AgentHostEnum, AgentConfig } from "../src/agent/contracts.ts";
+import { AgentTools, AgentHostEnum, AgentConfig } from "../src/agent/protocol.ts";
+import { Tool } from "effect/ai";
+
+const smokeCommand = command("program.smoke", "program", "runSmoke", "Run the integration smoke with configured real host and GitHub read credential.", Schema.Struct({ "--runner-isolation-only": Schema.optional(Schema.Boolean).annotate({ description: "Run only the real Linux agent-child isolation proof." }) }), Schema.Void, { exposure: "private" });
+const isolationSmokeCommand = command("program.smoke:isolation", "program", "runIsolationSmoke", "Run only the real Linux setpriv and agent-child isolation proof.", Tool.EmptyParams, Schema.Void, { exposure: "private" });
 
 // Effect has no executable-path, runtime-version or own-PID service; process is used only for these boundary facts.
-const runSmoke = (flags: CommandInput<typeof Commands.runSmoke>) => Effect.gen(function*() {
+const runSmoke = (flags: CommandInput<typeof smokeCommand>) => Effect.gen(function*() {
   const platform = yield* Platform;
   const { fs: fileSystem, path: { join, resolve }, crypto, spawner, digest, fingerprint, exec } = platform;
   const { call: rpc, serve } = yield* Mcp;
@@ -71,11 +75,19 @@ const runSmoke = (flags: CommandInput<typeof Commands.runSmoke>) => Effect.gen(f
     const ownRoot = join(children, "own"), sibling = join(children, "sibling");
     const own = join(ownRoot, "repo"), sessions = join(ownRoot, "sessions"), home = join(ownRoot, "home");
     for (const path of [credentials, children, model, ownRoot, own, sessions, home, sibling]) yield* fileSystem.makeDirectory(path, { mode: 0o700 });
+    // ponytail: isolated controls need a selectable local model, never external provider credentials.
+    const provider = Context.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
+    let providerRequests = 0;
+    yield* provider.serve(Effect.sync(() => { providerRequests++; return HttpServerResponse.empty({ status: 500 }); }));
+    const models = { providers: { "coordinator-isolation": { api: "openai-completions", baseUrl: `${HttpServer.formatAddress(provider.address)}/v1`, apiKey: "local-isolation",
+      models: [{ id: "scripted", name: "Isolation fixture", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 512,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } };
     const token = join(credentials, "runner.token"), controlPath = join(credentials, "control.token"), ledger = join(directory, "private.key");
     for (const path of [token, controlPath, ledger, join(sibling, "private")]) yield* fileSystem.writeFileString(path, "ISOLATION_SECRET", { mode: 0o600 });
     yield* fileSystem.makeDirectory(join(home, ".omp/agent"), { recursive: true, mode: 0o700 });
-    yield* fileSystem.writeFileString(join(home, ".omp/agent/config.yml"), Schema.encodeSync(Schema.fromJsonString(ModelProfile), { onExcessProperty: "error" })({ modelRoles: { default: yield* setting("COORDINATOR_MODEL", "openai-codex/gpt-6.1-sol:xhigh") } }), { mode: 0o600 });
+    yield* fileSystem.writeFileString(join(home, ".omp/agent/config.yml"), Schema.encodeSync(Schema.fromJsonString(ModelProfile), { onExcessProperty: "error" })({ modelRoles: { default: "coordinator-isolation/scripted" } }), { mode: 0o600 });
     yield* fileSystem.writeFileString(join(home, ".omp/agent/auth.json"), "{}", { mode: 0o600 });
+    yield* fileSystem.writeFileString(join(home, ".omp/agent/models.yml"), Schema.encodeSync(Schema.fromJsonString(Schema.Json))(models), { mode: 0o600 });
     yield* fileSystem.makeDirectory(join(model, ".omp/agent"), { recursive: true, mode: 0o700 });
     const parentProfile = join(model, ".omp/agent/auth.json");
     yield* fileSystem.writeFileString(parentProfile, "ISOLATION_SECRET", { mode: 0o600 });
@@ -94,7 +106,7 @@ const runSmoke = (flags: CommandInput<typeof Commands.runSmoke>) => Effect.gen(f
     // Stock RPC stdio remains private; the extension owns its separate MCP endpoint.
     const agent = yield* connectAgentClient({
       host: AgentHostEnum.omp, command: "/usr/bin/env",
-      args: [`--chdir=${own}`, "/usr/bin/setpriv", ...isolationArgs(ownUid), launcher, "--mode", "rpc", "--session-dir", sessions, "--no-extensions", "-e", resolve(import.meta.dirname, "../dist/plugins/runner-plugin.js")],
+      args: [`--chdir=${own}`, "/usr/bin/setpriv", ...isolationArgs(ownUid), launcher, "--mode", "rpc", "--session-dir", sessions, "--no-extensions", "-e", resolve(import.meta.dirname, "../dist/plugins/agent-session.js")],
       cwd: directory, env: { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", HOME: home, COORDINATOR_AGENT_CONFIG: agentConfig }, connectTimeoutMs: 60000,
       plugin: { endpointFile, token: agentToken },
     }).pipe(Effect.provideService(Scope.Scope, agentScope));
@@ -117,9 +129,10 @@ const runSmoke = (flags: CommandInput<typeof Commands.runSmoke>) => Effect.gen(f
     assert.ok(response.output.includes("ISOLATION_OK"));
     yield* Scope.close(agentScope, Exit.void);
     yield* agent.observedProcessClosed.pipe(Effect.timeout(10000));
-    yield* print(Schema.encodeSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })({ scenario: "real-agent-os-isolation", childUid: CHILD_UID_BASE + 1, forbiddenPathsDenied: denied.length,
+    assert.equal(providerRequests, 0, "Isolation controls must not contact a model provider");
+    yield* print(Formatter.formatJson({ scenario: "real-agent-os-isolation", childUid: CHILD_UID_BASE + 1, forbiddenPathsDenied: denied.length,
       ownWorkspaceAndSessionWritable: true, modelProfileReadable: true, privateAuthProfileReadable: true, privateHomeMode: "0700", parentProfileDenied: true, parentEnvironDenied: true, siblingUidDistinct: true,
-      capabilitiesZero: true, supplementalGroupsEmpty: true, noNewPrivileges: true, agentStateAndMessagesUsable: true, forbiddenEnvironmentAbsent: true, sdkPid: agent.pid, physicalScopedCloseProved: true }));
+      capabilitiesZero: true, supplementalGroupsEmpty: true, noNewPrivileges: true, agentStateAndMessagesUsable: true, forbiddenEnvironmentAbsent: true, sdkPid: agent.pid, physicalScopedCloseProved: true, modelProviderRequests: providerRequests }, { space: 2 }));
     return;
   }
 const root = resolve(import.meta.dirname, "..");
@@ -167,7 +180,7 @@ yield* (fileSystem.writeFileString(brokerPath, Schema.encodeSync(Schema.fromJson
 const alternateConfig: RunnerConfig = { ...runnerConfig, id: RunnerId.make("alternate-runner"), port: alternatePort, tokenFile: alternateEnrollmentPath, stateDirectory: join(state, "alternate-runner"), childDirectory: join(state, "alternate-children"), childUidBase: UserId.make(2000000), controlTokenHash: (yield* digest(alternateControl)) };
 const alternatePath = join(state, "alternate.json"); yield* (fileSystem.writeFileString(alternatePath, Schema.encodeSync(Schema.fromJsonString(RunnerConfig), { onExcessProperty: "error" })(alternateConfig), { mode: 0o600 }));
 const transcript: JsonValue[] = [];
-const evidence = Effect.fnUntraced(function*(scenario: string, observed: JsonValue) { const entry: JsonValue = { scenario, observed, time: new Date(yield* Clock.currentTimeMillis).toISOString() }; transcript.push(entry); yield* print(Schema.encodeSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(entry)); });
+const evidence = Effect.fnUntraced(function*(scenario: string, observed: JsonValue) { const entry: JsonValue = { scenario, observed, time: new Date(yield* Clock.currentTimeMillis).toISOString() }; transcript.push(entry); yield* print(Formatter.formatJson(entry, { space: 2 })); });
 const processFor = Effect.fnUntraced(function*(mode: "broker" | "runner", config: string, databaseUrl: Redacted.Redacted<string>) {
   const env = { ...(yield* childEnvironment(yield* setting("HOME", "/tmp"))), COORDINATOR_CONFIG: config, COORDINATOR_RUNNER_TOKEN_DIRECTORY: tokenDirectory, COORDINATOR_DATABASE_URL: Redacted.value(databaseUrl) };
   const readToken = yield* setting("GITHUB_READ_TOKEN", "");
@@ -356,7 +369,7 @@ yield* Effect.addFinalizer(() => Effect.gen(function*() {
   assert.equal(Schema.encodeSync(Schema.fromJsonString(Schema.Json), { onExcessProperty: "error" })(historyMessages).includes(worker.prompt), false);
   yield* rpc(brokerUrl, coordinator, Commands.confirmTask, { taskId: worker.taskId, revision: 2 });
   const finished = yield* until(() => rpc(brokerUrl, coordinator, Commands.getTask, { taskId: worker.taskId }), (task) => [TaskStateEnum.SUCCEEDED, TaskStateEnum.FAILED, TaskStateEnum.HELD].includes(task.state), 180000);
-  assert.equal(finished.state, TaskStateEnum.SUCCEEDED, `Real host final state ${finished.state}: ${Schema.encodeSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })(finished.result ?? null)}`);
+  assert.equal(finished.state, TaskStateEnum.SUCCEEDED, `Real host final state ${finished.state}: ${Formatter.formatJson(finished.result ?? null, { space: 2 })}`);
   const one = yield* postgresRead(runnerDatabaseUrl, (db) => db.query((client) => client.selectFrom("runner_tasks").select("taskId").where("taskId", "=", worker.taskId)));
   const settledEvents = yield* runnerEvents(runnerDatabaseUrl, worker.taskId);
   assert.equal(one.length, 1); assert.equal(settledEvents.filter((event) => event.state === RunnerStateEnum.LAUNCHING).length, 1);
@@ -399,9 +412,9 @@ const runIsolationSmoke = () => runSmoke({ "--runner-isolation-only": true });
 const program = Effect.gen(function*() {
   const args = [...(yield* (yield* Stdio.Stdio).args)];
   if (args.length === 1 && args[0] === "--runner-isolation-only") {
-    return yield* Commands.runIsolationSmoke.executeDecoded({ runIsolationSmoke }, {});
+    return yield* isolationSmokeCommand.executeDecoded({ runIsolationSmoke }, {});
   }
-  return yield* Commands.runSmoke.execute({ runSmoke }, Object.fromEntries(args.map(flag => [flag, true])));
+  return yield* smokeCommand.execute({ runSmoke }, Object.fromEntries(args.map(flag => [flag, true])));
 });
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.provide(Layer.mergeAll(Platform.layer, Mcp.layer, NodeStdio.layer))));
 function sessionKey(session: SessionKey): SessionKey { return { sessionId: session.sessionId, incarnation: session.incarnation }; }

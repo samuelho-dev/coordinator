@@ -1,5 +1,5 @@
 import { Commands, RoleEnum } from "../src/contracts.ts";
-import { AgentHostEnum } from "../src/agent/contracts.ts";
+import { AgentHostEnum } from "../src/agent/protocol.ts";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { pipeline } from "node:stream/promises";
@@ -9,16 +9,15 @@ import { TestClock } from "effect/testing";
 import { ChildProcess } from "effect/process";
 import { HttpServer } from "effect/http";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { AgentEndpoint } from "../src/agent/contracts.ts";
-import { CommandError, Delivery, MachineId, PluginConfig, Principal } from "../src/contracts.ts";
-import type { Context } from "../src/contracts.ts";
+import { AgentEndpoint } from "../src/agent/protocol.ts";
+import { CommandError, Delivery, MachineId, PluginConfig, Principal, SessionKey } from "../src/contracts.ts";
 import { Mcp, serverLayer } from "../src/mcp.ts";
 import { Platform } from "../src/platform.ts";
-import { Plugin } from "../src/plugin.ts";
+import { Plugin, makeJournal, type Context } from "../src/plugin.ts";
 
 
 // Agent startup mutates Pi's documented agent directory; keep these tests sequential.
-const fixture = Effect.fn(function*() {
+const fixture = Effect.fn(function*(approve = false, beforeResume: Effect.Effect<void> = Effect.void) {
   const platform = yield* Platform, mcp = yield* Mcp;
   const baseClock = yield* TestClock.make({ warningDelay: "1 minute" });
   const idleScheduled = yield* Deferred.make<void>(), idlePolled = yield* Deferred.make<void>();
@@ -59,7 +58,7 @@ const fixture = Effect.fn(function*() {
   let parentSession = "first-host-session";
   const ctx: Context = { cwd: directory, mode: "tui", hasUI: true,
     sessionManager: { getSessionId: () => parentSession },
-    ui: { notify: (text, level) => { notifications.push({ text, level }); }, confirm: async () => false,
+    ui: { notify: (text, level) => { notifications.push({ text, level }); }, confirm: async () => approve,
       setStatus: (key, value) => { if (value === undefined) statuses.delete(key); else statuses.set(key, value); },
       onTerminalInput: (handler) => { input = handler; return () => { input = undefined; }; } } };
   const traffic: { method: string; at: number; sessionId?: string; incarnation?: string }[] = [];
@@ -78,6 +77,8 @@ const fixture = Effect.fn(function*() {
       }
       if (request.method === Commands.acknowledgePeer.name) return { handled: true };
       if (request.method === Commands.stopSession.name) return { stopped: true };
+      if (request.method === Commands.consentArchive.name) return { enabled: request.params.enabled };
+      if (request.method === Commands.deleteArchive.name) return { revoked: true, deleted: true, backupPolicy: "journal rows and enrollment are omitted from every broker snapshot" };
       return yield* new CommandError({ message: "Unexpected fixture command" });
     }),
   });
@@ -176,8 +177,11 @@ const fixture = Effect.fn(function*() {
   assert.ok(address && typeof address === "object");
   const config = platform.path.join(directory, "config.json");
   yield* platform.fs.writeFileString(config, Schema.encodeSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${address.port}`, tokenFile, stateDirectory, machineId: MachineId.make("machine"), host: AgentHostEnum.pi }), { mode: 0o600 });
-  const plugin = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
-    Layer.provide(Layer.succeed(Platform, platform)),
+  const pluginLayer = Plugin.layer.pipe(
+    Layer.provide(Layer.succeed(Platform, { ...platform, fs: { ...platform.fs,
+      remove: (path, options) => path === platform.path.join(stateDirectory, "off.json")
+        ? beforeResume.pipe(Effect.andThen(platform.fs.remove(path, options))) : platform.fs.remove(path, options),
+    } })),
     Layer.provide(Layer.succeed(Clock.Clock, clock)),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
     Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(true), stdout: () => Sink.forEach((chunk: string | Uint8Array) => Effect.sync(() => {
@@ -185,7 +189,8 @@ const fixture = Effect.fn(function*() {
       frames.push(chunk);
       if (chunk.includes("7501;?")) queueMicrotask(() => input?.("\x1b]7501;?\x1b\\"));
     })) })),
-  )), Plugin);
+  );
+  const plugin = EffectContext.get(yield* Layer.build(pluginLayer), Plugin);
   assert.ok(plugin);
   // Never move virtual deadlines while a real response or the owner's durable work is unfinished.
   const waitFor = (ready: () => boolean, message: string) => Effect.promise(async () => {
@@ -216,7 +221,7 @@ const fixture = Effect.fn(function*() {
     assert.notEqual(result.isError, true, "Paused broker traffic must not dispose the owned native endpoint");
     return (yield* Schema.decodeUnknownEffect(Schema.Struct({ result: Schema.Struct({ messageCount: Schema.Number, isStreaming: Schema.Boolean }) }))(result.structuredContent)).result;
   });
-  return { plugin, ctx, traffic, notifications, statuses, frames, advance, settle, waitFor, agentState, clock,
+  return { plugin, pluginLayer, ctx, traffic, notifications, statuses, frames, advance, settle, waitFor, agentState, clock,
     idleScheduled: Deferred.await(idleScheduled), idlePolled: Deferred.await(idlePolled),
     eligible: () => clock.currentTimeMillisUnsafe() < liveUntil && clock.currentTimeMillisUnsafe() - polledAt < 10000,
     fail: (value: typeof failure) => { failure = value; }, hang: (value: boolean) => { hanging = value; }, cancelled: () => cancelled,
@@ -436,3 +441,62 @@ it.live("a permanent command fault prevents a queued conflict restart", () => Ef
   yield* f.plugin.stop();
   }).pipe(Effect.provideService(Clock.Clock, f.clock));
 })).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 30000 });
+
+it.live("off persists participation opt-out, retries explicit archive cleanup and preserves the private owner until retirement", () => Effect.scoped(Effect.gen(function*() {
+  const platform = yield* Platform;
+  const f = yield* fixture(true);
+  yield* Effect.gen(function*() {
+    yield* f.plugin.start(f.ctx);
+    yield* f.plugin.command('consent {"participants":["fixture"]}', f.ctx);
+    const offFile = platform.path.join(f.plugin.config.stateDirectory, "off.json");
+    f.fail({ status: 503, method: Commands.deleteArchive.name });
+    assert.equal((yield* Effect.exit(f.plugin.command("off", f.ctx)))._tag, "Failure");
+    const pending = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.NullOr(SessionKey)))(yield* platform.privateFile(offFile));
+    assert.ok(pending, "Offline remote cleanup retains its exact owner binding for explicit retry");
+    const journal = yield* makeJournal(f.plugin.config.stateDirectory, pending.sessionId);
+    assert.equal(journal.state.consent, false);
+    assert.deepEqual(journal.state.spool, []);
+    const quiet = f.traffic.length;
+    yield* f.advance(60000);
+    assert.equal(f.traffic.length, quiet, "Off cannot heartbeat, poll, upload or automatically retry cleanup");
+    assert.equal((yield* Effect.exit(f.plugin.command("identity", f.ctx)))._tag, "Failure");
+    assert.equal((yield* Effect.exit(f.plugin.command("on", f.ctx)))._tag, "Failure", "Unconfirmed sharing revocation cannot silently re-enable participation");
+    assert.equal((yield* f.agentState()).isStreaming, false, "Off does not dispose the private owner");
+    f.fail(undefined);
+    yield* f.plugin.command("off", f.ctx);
+    assert.equal(yield* Schema.decodeEffect(Schema.fromJsonString(Schema.NullOr(SessionKey)))(yield* platform.privateFile(offFile)), null);
+    const cleaned = f.traffic.length;
+    yield* f.plugin.command("off", f.ctx);
+    assert.equal(f.traffic.length, cleaned, "Repeated off must not revive already-completed remote cleanup");
+    yield* f.plugin.stop();
+    const reopened = EffectContext.get(yield* Layer.build(f.pluginLayer), Plugin);
+    assert.ok(reopened);
+    const beforeRestart = f.traffic.length;
+    yield* reopened.start(f.ctx);
+    assert.equal(f.traffic.length, beforeRestart, "A reopened host remains opted out");
+    yield* reopened.command("on", f.ctx);
+    assert.equal(yield* platform.fs.exists(offFile), false);
+    assert.ok(f.traffic.slice(beforeRestart).some(call => call.method === Commands.heartbeatSession.name));
+    assert.equal((yield* makeJournal(f.plugin.config.stateDirectory, pending.sessionId)).state.consent, false, "On does not grant archive consent");
+  }).pipe(Effect.provideService(Clock.Clock, f.clock));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 60000 });
+
+it.live("a later off wins when on is suspended while changing the durable preference", () => Effect.scoped(Effect.gen(function*() {
+  const removing = yield* Deferred.make<void>(), resume = yield* Deferred.make<void>();
+  const f = yield* fixture(false, Deferred.succeed(removing, undefined).pipe(Effect.andThen(Deferred.await(resume))));
+  yield* Effect.gen(function*() {
+    yield* f.plugin.start(f.ctx);
+    yield* f.plugin.command("off", f.ctx);
+    const enabling = yield* Effect.forkChild(f.plugin.command("on", f.ctx));
+    yield* Deferred.await(removing);
+    const disabling = yield* Effect.forkChild(f.plugin.command("off", f.ctx));
+    yield* Effect.yieldNow;
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(enabling);
+    yield* Fiber.join(disabling);
+    const quiet = f.traffic.length;
+    yield* f.advance(30000);
+    assert.equal(f.traffic.length, quiet, "A completed later off fences resumed heartbeat and poll");
+    assert.equal((yield* Effect.exit(f.plugin.command("identity", f.ctx)))._tag, "Failure");
+  }).pipe(Effect.provideService(Clock.Clock, f.clock));
+})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))), { timeout: 60000 });

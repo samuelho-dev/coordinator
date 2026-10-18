@@ -3,7 +3,7 @@ import { it } from "@effect/vitest";
 import assert from "node:assert/strict";
 import { Cause, ConfigProvider, Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Redacted, Schema, Scope } from "effect";
 import { PersistedQueueStore } from "effect/persistence/PersistedQueue";
-import { layerDispatchStore } from "../src/dispatch-store.ts";
+import { layerDispatchStore } from "../src/broker.ts";
 import type { ContractMarkerRow } from "@prisma/orm-postgres/family/verify";
 import type { LedgerEntryRecord } from "@prisma/orm-postgres/contract/types";
 import { assertBrokerSchema, assertRunnerSchema, brokerSchemaIdentity, brokerStorageHash } from "../src/database.ts";
@@ -11,7 +11,7 @@ import { Platform } from "../src/platform.ts";
 
 import { dropPostgres, postgresAdmin, provisionPostgres } from "./postgres-fixture.ts";
 import { migrateBrokerPostgres } from "../scripts/migrate.ts";
-import { DatabaseService } from "../src/database-service.ts";
+import { DatabaseService } from "../src/database.ts";
 import {
   Archive,
   type ArchiveInsert,

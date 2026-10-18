@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { mkdtemp, realpath, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { makeAgentSessionServer } from "../src/runner-plugin.ts";
+import { makeAgentSessionServer } from "../src/agent-session.ts";
 import { Platform } from "../src/platform.ts";
 import { Client, ProtocolError, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -15,10 +15,8 @@ import { NodeCrypto, NodeHttpServer, NodeRuntime, NodeServices, NodeStdio } from
 import { Effect, Exit, Layer, ManagedRuntime, Schema, Scope } from "effect";
 import { HttpRouter, HttpServer } from "effect/http";
 import { connectAgentClient } from "../src/agent/client.ts";
-import { AgentHostEnum, AgentBinding, AgentError, AgentMcpProtocolVersion, AgentMcpResultBytes, AgentMcpWireBytes, AgentTools, AgentHost } from "../src/agent/contracts.ts";
-import { AgentLifecycleJournal } from "../src/agent/lifecycle.ts";
-import { AgentMcpLifetime, agentHttpLayer, agentStdioLayer, agentTool } from "../src/agent/server.ts";
-import { createAgentPresentation } from "../src/agent/interaction.ts";
+import { AgentHostEnum, AgentBinding, AgentError, AgentMcpProtocolVersion, AgentMcpResultBytes, AgentMcpWireBytes, AgentTools, AgentHost, AgentLifecycleJournal } from "../src/agent/protocol.ts";
+import { AgentMcpLifetime, agentHttpLayer, agentStdioLayer, agentTool, createAgentPresentation } from "../src/agent/server.ts";
 
 type RawServer = {
   readonly child: ChildProcessWithoutNullStreams;
@@ -37,7 +35,9 @@ if (host !== undefined) {
     .filter(name => name.hosts.some(value => value === host))
     .map(name => name.name === AgentTools.getState.name
       ? agentTool(AgentTools.getState, () => Effect.succeed({ binding, cwd, model: null, currentRunId: null, isStreaming: false, isCompacting: false, pendingMessageCount: 0, pendingAsyncWorkCount: 0, messageCount: 0, queuedMessages: { steering: [], followUp: [] }, steeringMode: "all", followUpMode: "all", interruptMode: "immediate", autoCompactionEnabled: true, fastModeEnabled: false, fastModeActive: false, slowModeSupported: false, slowModeEnabled: false, tokensPerSecond: null, goal: null, systemPrompt: host === AgentHostEnum.pi ? "😀".repeat(20000) : ["😀".repeat(20000)] }))
-      : agentTool(name, () => Effect.fail(new AgentError({ code: "unsupported_operation", message: "Boundary regression only reads canonical metadata and state" }))));
+      : name.name === AgentTools.getSessionStats.name
+        ? agentTool(AgentTools.getSessionStats, () => Effect.succeed({ escaped: '"\\😀'.repeat(4000) }))
+        : agentTool(name, () => Effect.fail(new AgentError({ code: "unsupported_operation", message: "Boundary regression only reads canonical metadata and state" }))));
   const cleanup = Layer.effectDiscard(Effect.addFinalizer(() => Effect.sync(() => process.stderr.write("agent-byte-cleanup\n"))));
   if (process.env.AGENT_BYTE_LIMIT_HTTP === "1") {
     NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
@@ -157,12 +157,25 @@ if (host !== undefined) {
           assert.equal(invalid.isError, true);
           const failure = Schema.decodeUnknownSync(Schema.toCodecJson(Schema.Struct({ error: AgentError })), { onExcessProperty: "error" })(invalid.structuredContent);
           assert.equal(failure.error.code, "invalid_input");
+          const failureText = invalid.content.find(content => content.type === "text");
+          assert.ok(failureText?.type === "text");
+          assert.deepEqual(JSON.parse(failureText.text), invalid.structuredContent);
+          assert.equal(failureText.text.includes("valid JSON, invalid native DTO"), false);
+          const state = await client.callTool({ name: AgentTools.getState.name, arguments: {} });
+          const stateText = state.content.find(content => content.type === "text");
+          assert.ok(stateText?.type === "text");
+          assert.deepEqual(JSON.parse(stateText.text), state.structuredContent);
+          const reference = Schema.decodeUnknownSync(Schema.Struct({ resultResource: Schema.Struct({ uri: Schema.String }) }))(state.structuredContent);
+          assert.ok(reference.resultResource.uri.includes("/results/"));
+          assert.equal(stateText.text.includes("😀"), false, "Private snapshot contents must not leak into the reference text");
         } finally { await client.close(); }
       });
       yield* Effect.scoped(Effect.gen(function*() {
         const agent = yield* connectAgentClient({ host: profile, command: process.execPath, args, cwd, env: { ...process.env, AGENT_BYTE_LIMIT_SERVER: profile }, maxBufferSize: AgentMcpWireBytes, connectTimeoutMs: 10000 });
         const state = yield* agent.call(AgentTools.getState, {}, { timeoutMs: 10000 });
         assert.deepEqual(state.systemPrompt, profile === AgentHostEnum.pi ? "😀".repeat(20000) : ["😀".repeat(20000)]);
+        const stats = yield* agent.call(AgentTools.getSessionStats, { binding: state.binding }, { timeoutMs: 10000 });
+        assert.deepEqual(stats, { escaped: '"\\😀'.repeat(4000) }, "An output that fit the old inline bound must use private resources when duplicated text exceeds the wire bound");
       }));
     }), { timeout: 20000 });
   }

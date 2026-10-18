@@ -8,8 +8,11 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { Cause, Effect, Schema, Scope } from "effect";
 import type { Exit } from "effect";
-import { AgentPresentationPage, agentPresentationUri, type AgentPresentationCursor, type AgentPresentationValue } from "./interaction.ts";
 import {
+  AgentPresentationPage,
+  agentPresentationUri,
+  type AgentPresentationCursor,
+  type AgentPresentationValue,
   AgentError,
   AgentEndpoint,
   AgentEventPage,
@@ -33,7 +36,9 @@ import {
   type AgentPromptResult as AgentPromptResultType,
   type AgentToolDescriptor,
   type AgentToolName,
-} from "./contracts.ts";
+} from "./protocol.ts";
+
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 export type AgentClientLaunch = Readonly<{
   host: AgentHostType;
@@ -623,7 +628,7 @@ export const connectAgentTransport = <ProcessID extends number | null>(
             if (response.contents.length !== 1) throw fail("resource_gap", "Agent presentation page is unavailable");
             const content = response.contents[0];
             if (!content || content.uri !== uri || content.mimeType !== "application/json" || !("text" in content)) throw fail("binding_mismatch", "Agent presentation page identity does not match");
-            if (new TextEncoder().encode(JSON.stringify({ result: response })).byteLength > AgentMcpResultBytes) throw fail("resource_gap", "Agent presentation page exceeds its wire bound");
+            if (new TextEncoder().encode(encodeJson({ result: response })).byteLength > AgentMcpResultBytes) throw fail("resource_gap", "Agent presentation page exceeds its wire bound");
             const page = Schema.decodeSync(Schema.fromJsonString(AgentPresentationPage), { onExcessProperty: "error" })(content.text);
             assertBinding(cursor.binding, page.binding);
             if (page.gap !== null) throw fail("resource_gap", "Agent presentation retention gap prevents complete delivery");

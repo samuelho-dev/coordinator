@@ -1,11 +1,11 @@
-import { AgentRunOutcomeEnum } from "../src/agent/contracts.ts";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { it } from "@effect/vitest";
 import { Effect, Fiber } from "effect";
-import { AgentHostEnum, AgentError, AgentSubmissionId } from "../src/agent/contracts.ts";
+import { AgentRunOutcomeEnum, AgentHostEnum, AgentError, AgentSubmissionId } from "../src/agent/protocol.ts";
 import { makeAgentSession } from "../src/agent-session.ts";
 import { Platform } from "../src/platform.ts";
+
 
 it.live("automatic retirement refuses accepted agent work and fences new admission once idle", () => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;

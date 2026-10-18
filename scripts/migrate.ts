@@ -1,9 +1,9 @@
-import { Effect, Redacted } from "effect";
+import { Console, Effect, Redacted } from "effect";
 import { ChildProcess } from "effect/process";
 import { assertBrokerSchema, assertRunnerSchema, brokerStorageHash } from "../src/database.ts";
 import { HttpError } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
-import { awaitDatabaseLoss, DatabaseService } from "../src/database-service.ts";
+import { awaitDatabaseLoss, DatabaseService } from "../src/database.ts";
 
 export const migrateBrokerPostgres = (url: Redacted.Redacted<string>) => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
@@ -30,8 +30,7 @@ if (import.meta.main) {
   const program = Effect.gen(function*() {
     yield* migrateBrokerPostgres(yield* DatabaseService.connection());
   }).pipe(Effect.provide(Platform.layer));
-  await Effect.runPromise(program.pipe(Effect.catch(() => Effect.sync(() => {
-    console.error("Broker migration failed; database credentials and native diagnostics withheld");
-    process.exitCode = 1;
-  }))));
+  await Effect.runPromise(program.pipe(Effect.catch(() => Console.error("Broker migration failed; database credentials and native diagnostics withheld").pipe(
+    Effect.andThen(Effect.sync(() => { process.exitCode = 1; })),
+  ))));
 }

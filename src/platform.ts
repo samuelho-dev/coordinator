@@ -53,15 +53,14 @@ export class Platform extends Context.Service<Platform>()("@samuelho/coordinator
     const digest = Effect.fnUntraced(function*(value: string) {
       return RunnerTask.fields.fingerprint.make(Hex.encode(yield* crypto.digest("SHA-256", utf8.encode(value))));
     });
+    const encodeFingerprint = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown, {
+      replacer: (_key, item: unknown) => {
+        if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
+        return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)));
+      },
+    }));
     const fingerprint = <A>(value: A) => Effect.gen(function*() {
-      const text = yield* Effect.try({
-        try: () => JSON.stringify(value, (_key, item: unknown) => {
-          if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
-          return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)));
-        }),
-        catch: () => new CommandError({ message: "Fingerprint input is not JSON serializable" }),
-      });
-      if (text === undefined) return yield* new CommandError({ message: "Fingerprint input is not JSON serializable" });
+      const text = yield* encodeFingerprint(value).pipe(Effect.mapError(() => new CommandError({ message: "Fingerprint input is not JSON serializable" })));
       return yield* digest(text);
     });
     // Effect has no HMAC API; signing uses standard WebCrypto.

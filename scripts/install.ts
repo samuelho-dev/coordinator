@@ -1,21 +1,56 @@
-import { InstallModeEnum } from "../src/contracts.ts";
-import { AgentHostEnum } from "../src/agent/contracts.ts";
-import { Config, Console, Effect, Layer, Option, PlatformError, Redacted, Schema, Stdio } from "effect";
+import { AgentHost, AgentHostEnum } from "../src/agent/protocol.ts";
+import { Config, Console, Effect, Formatter, Layer, Option, PlatformError, Redacted, Schema, Stdio } from "effect";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
 import { X509Certificate } from "node:crypto";
-import { PluginConfig, RunnerConfig, InstallPlan, JsonValue, Commands, CommandError, HttpError, UserId, type CommandInput, type InstallCommand } from "../src/contracts.ts";
+import { PluginConfig, RunnerConfig, JsonValue, Text, command, CommandError, HttpError, UserId, type CommandInput } from "../src/contracts.ts";
 import { Platform } from "../src/platform.ts";
-import { DatabaseService } from "../src/database-service.ts";
+import { DatabaseService } from "../src/database.ts";
+const InstallCommand = Schema.Struct({ binary: Schema.String, args: Schema.mutable(Schema.Array(Schema.String)) });
+type InstallCommand = typeof InstallCommand.Type;
+enum InstallModeEnum {
+  pluginOnly = "plugin-only",
+  runnerOnly = "runner-only",
+}
+const InstallMode = Schema.Enum(InstallModeEnum);
+type InstallMode = typeof InstallMode.Type;
+const InstallPlan = Schema.Struct({
+  dryRun: Schema.Boolean, mode: InstallMode,
+  service: Schema.optional(Schema.String), pluginConfig: Schema.optional(Schema.String),
+  program: Schema.mutable(Schema.Array(Text)), operations: Schema.mutable(Schema.Array(InstallCommand)),
+  host: Schema.optional(AgentHost), package: Schema.String,
+});
+type InstallPlan = typeof InstallPlan.Type;
 
-const command = Commands.installHost;
-const installHost = Effect.fnUntraced(function*(flags: CommandInput<typeof Commands.installHost>) {
+const absolutePath = Schema.String.check(Schema.isPattern(/^\/[^\r\n\u0000]*$/));
+const installCommand = command("program.install:host", "program", "installHost", "Install one agent plugin or privileged runner; help returns usage, dry-run still validates isolation.", Schema.Struct({
+  "--help": Schema.optional(Schema.Boolean).annotate({ description: "Print usage without installation." }),
+  "--runtime": Schema.optional(absolutePath).annotate({ description: "Absolute executable runtime path; required unless help." }),
+  "--host-binary": Schema.optional(absolutePath).annotate({ description: "Absolute executable omp or pi path; required unless help." }),
+  "--plugin-only": Schema.optional(Schema.Boolean).annotate({ description: "Install plugin as a nonroot agent user; exactly one install mode." }),
+  "--runner-only": Schema.optional(Schema.Boolean).annotate({ description: "Install runner as Linux root; exactly one install mode." }),
+  "--host": Schema.optional(AgentHost).annotate({ description: "Agent host; required for plugin-only." }),
+  "--plugin-config": Schema.optional(absolutePath).annotate({ description: "Absolute mode-0600 plugin configuration; required for plugin-only." }),
+  "--runner-config": Schema.optional(absolutePath).annotate({ description: "Absolute mode-0600 runner configuration owned by the dedicated service account; required for runner-only." }),
+  "--dry-run": Schema.optional(Schema.Boolean).annotate({ description: "Suppress installation writes but still validate and probe isolation." }),
+  "--remote": Schema.optional(Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_.@][a-zA-Z0-9_.@-]*$/))).annotate({ description: "SSH destination for remote installation; requires remote-root." }),
+  "--remote-root": Schema.optional(absolutePath).annotate({ description: "Absolute preinstalled remote repository path." }),
+}).check(Schema.makeFilter((flags) => {
+  if (flags["--help"]) return undefined;
+  if (!flags["--runtime"] || !flags["--host-binary"]) return "Executable --runtime and --host-binary are required";
+  if (Boolean(flags["--plugin-only"]) === Boolean(flags["--runner-only"])) return "Select exactly one of --plugin-only or --runner-only";
+  if (flags["--plugin-only"] && (!flags["--host"] || !flags["--plugin-config"])) return "Plugin mode requires --host and --plugin-config";
+  if (flags["--runner-only"] && !flags["--runner-config"]) return "Runner mode requires --runner-config";
+  if (flags["--remote"] && !flags["--remote-root"]) return "Remote installation requires --remote-root";
+  return undefined;
+})), Schema.Union([InstallPlan, Schema.Void]), { exposure: "private" });
+const installHost = Effect.fnUntraced(function*(flags: CommandInput<typeof installCommand>) {
   const platform = yield* Platform;
   const fs = platform.fs;
   const { dirname, isAbsolute, join, resolve } = platform.path;
   if (flags["--help"]) {
-    yield* Console.log(command.description);
-    for (const [name, field] of Object.entries(command.input.fields)) {
+    yield* Console.log(installCommand.description);
+    for (const [name, field] of Object.entries(installCommand.input.fields)) {
       yield* Console.log(`${name}${Schema.is(field)(true) ? "" : " VALUE"}: ${Schema.resolveAnnotations(field)?.description ?? ""}`);
     }
     return;
@@ -48,7 +83,7 @@ const installHost = Effect.fnUntraced(function*(flags: CommandInput<typeof Comma
       Effect.mapError(() => new CommandError({ message: "Remote coordinator install unavailable; repository, dependencies and private configs must already exist at remote absolute paths. No local installation applied." })),
     );
     const plan = Schema.decodeSync(Schema.fromJsonString(InstallPlan), { onExcessProperty: "error" })(output);
-    yield* Console.log(Schema.encodeSync(Schema.fromJsonString(InstallPlan, { space: 2 }), { onExcessProperty: "error" })(plan));
+    yield* Console.log(Formatter.formatJson(Schema.encodeSync(InstallPlan, { onExcessProperty: "error" })(plan), { space: 2 }));
     return plan;
   }
   // Effect has no OS platform or current effective UID API; these enforce the agent-account privilege boundary.
@@ -62,12 +97,12 @@ const installHost = Effect.fnUntraced(function*(flags: CommandInput<typeof Comma
   // Registration and service launches require the root build's compiled agent modules.
   // Never substitute workspace TypeScript when a deployed release omitted its runtime files.
   const agentDirectory = join(root, "dist/agent");
-  for (const entry of ["contracts", "lifecycle", "client", "server", "interaction", "mcp-protocol"]) {
+  for (const entry of ["protocol", "client", "server"]) {
     yield* fs.readFileString(join(agentDirectory, `${entry}.js`)).pipe(
       Effect.mapError(() => new CommandError({ message: `Installed compiled agent runtime missing: dist/agent/${entry}.js; build the release before registration` })),
     );
   }
-  for (const entry of ["plugin", "runner-plugin"]) {
+  for (const entry of ["plugin", "agent-session"]) {
     yield* fs.readFileString(join(root, "dist/plugins", `${entry}.js`)).pipe(
       Effect.mapError(() => new CommandError({ message: `Bundled public extension missing: dist/plugins/${entry}.js; build the release before registration` })),
     );
@@ -201,13 +236,13 @@ await E.runPromise(E.gen(function*() {
   }
   // Print only paths and operation plans, never config contents, tokens, or host subprocess output.
   const plan: InstallPlan = { dryRun: dry, mode: pluginOnly ? InstallModeEnum.pluginOnly : InstallModeEnum.runnerOnly, service, pluginConfig: installedConfig, program, operations: commands, host, package: root };
-  yield* Console.log(Schema.encodeSync(Schema.fromJsonString(InstallPlan, { space: 2 }), { onExcessProperty: "error" })(plan));
+  yield* Console.log(Formatter.formatJson(Schema.encodeSync(InstallPlan, { onExcessProperty: "error" })(plan), { space: 2 }));
   return plan;
 });
 
 NodeRuntime.runMain(Effect.gen(function*() {
   const args = yield* (yield* Stdio.Stdio).args;
-  const fields = new Map(Object.entries(command.input.fields));
+  const fields = new Map(Object.entries(installCommand.input.fields));
   const flags = new Map<string, string | boolean>();
   for (let index = 0; index < args.length; index++) {
     const name = args[index]!;
@@ -221,5 +256,5 @@ NodeRuntime.runMain(Effect.gen(function*() {
       flags.set(name, value);
     }
   }
-  return yield* command.execute({ installHost }, Object.fromEntries(flags));
+  return yield* installCommand.execute({ installHost }, Object.fromEntries(flags));
 }).pipe(Effect.provide(Layer.merge(Platform.layer, NodeServices.layer))));

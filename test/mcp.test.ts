@@ -3,12 +3,12 @@ import { it } from "@effect/vitest"
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest, type IncomingMessage } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
-import { Context, Deferred, Effect, Layer, ManagedRuntime } from "effect";
+import { Context, Deferred, Effect, Formatter, Layer, ManagedRuntime } from "effect";
 import { HttpServer } from "effect/http";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { Commands, Acceptance, CommandError, HttpError, type CommandInput } from "../src/contracts.ts";
 import { TaskId } from "../src/generated/database/types.ts";
-import { LIMIT, Mcp, serverLayer } from "../src/mcp.ts";
+import { LIMIT, MCP_RESPONSE_LIMIT, Mcp, serverLayer } from "../src/mcp.ts";
 
 it("Mcp.call closes its oversized real HTTP 401 body before releasing the body or disposing its layer", async () => {
   const releaseBody = await Effect.runPromise(Deferred.make<void>());
@@ -213,6 +213,14 @@ it("stateless MCP calls authorize every HTTP request and close without retaining
       assert.equal(malformed.status, 400);
     }
     assert.equal(handled, beforeMalformed);
+    const oversized = await fetch(`${url}/mcp`, {
+      method: "POST",
+      headers: { authorization: "Bearer caller-a", "content-type": "application/json" },
+      body: JSON.stringify({ padding: "x".repeat(LIMIT) }),
+    });
+    assert.equal(oversized.status, 413);
+    await oversized.text();
+    assert.equal(handled, beforeMalformed);
   } finally {
     releaseSlow.resolve();
     await runtime.dispose();
@@ -271,6 +279,7 @@ it("native MCP proxy disposes after its downstream runner closes during a tool c
 
 it("cancelled native MCP subscription releases its response and application scope", async () => {
   const nativeServer = createServer({ requestTimeout: 15000 });
+  const largeTaskId = TaskId.make("😀\"\\\n".repeat(3000));
   class Endpoint extends Context.Service<Endpoint>()("test/McpSubscriptionShutdown", {
     make: Effect.gen(function*() {
       const mcp = yield* Mcp;
@@ -279,7 +288,7 @@ it("cancelled native MCP subscription releases its response and application scop
         target: "runner",
         authorize: () => Effect.succeed("caller"),
         handle: (_caller, request) => request.method === Commands.journalTask.name
-          ? Effect.succeed(Acceptance.make({ taskId: request.params.taskId, accepted: false, state: RunnerRejectionStateEnum.notAccepted }))
+          ? Effect.succeed(Acceptance.make({ taskId: request.params.taskId === "large-result" ? largeTaskId : request.params.taskId === "oversized-result" ? TaskId.make("x".repeat(LIMIT)) : request.params.taskId, accepted: false, state: RunnerRejectionStateEnum.notAccepted }))
           : Effect.fail(new HttpError({ status: 400, message: "Unexpected test command" })),
       });
       return { server, mcp };
@@ -298,6 +307,33 @@ it("cancelled native MCP subscription releases its response and application scop
     await client.connect(new StreamableHTTPClientTransport(new URL(`${url}/mcp`), {
       requestInit: { headers: { authorization: "Bearer caller" }, redirect: "error" },
     }));
+    const readable = await client.callTool({ name: Commands.journalTask.name, arguments: { taskId: "readable-😀-\"\\\n" } });
+    const readableText = readable.content.find(content => content.type === "text");
+    assert.ok(readableText?.type === "text");
+    assert.deepEqual(JSON.parse(readableText.text), readable.structuredContent);
+    const large = await client.callTool({ name: Commands.journalTask.name, arguments: { taskId: "large-result" } });
+    assert.notEqual(large.isError, true);
+    assert.ok(Buffer.byteLength(JSON.stringify(large.structuredContent)) < LIMIT - 1024);
+    assert.ok(Buffer.byteLength(JSON.stringify(large)) > LIMIT);
+    assert.ok(Buffer.byteLength(JSON.stringify(large)) < MCP_RESPONSE_LIMIT);
+    const largeText = large.content.find(content => content.type === "text");
+    assert.ok(largeText?.type === "text");
+    assert.deepEqual(JSON.parse(largeText.text), large.structuredContent);
+    const received = await runtime.runPromise(mcp.call(url, "caller", Commands.journalTask, { taskId: TaskId.make("large-result") }));
+    assert.equal(received.taskId, largeTaskId);
+    await runtime.runPromise(mcp.call(url, "caller", Commands.journalTask, { taskId: TaskId.make("oversized-result") }).pipe(Effect.match({
+      onSuccess: () => assert.fail("Oversized structured result must fail"),
+      onFailure: (error) => {
+        assert.ok(error instanceof HttpError);
+        assert.equal(error.status, 413);
+      },
+    })));
+    const rejected = await client.callTool({ name: Commands.journalTask.name, arguments: { taskId: "private-input", unexpected: "private-secret" } });
+    assert.equal(rejected.isError, true);
+    const rejectedText = rejected.content.find(content => content.type === "text");
+    assert.ok(rejectedText?.type === "text");
+    assert.deepEqual(JSON.parse(rejectedText.text), rejected.structuredContent);
+    assert.equal(rejectedText.text.includes("private-secret"), false);
     // The official SDK resolves listen only after parsing the acknowledged SSE event.
     // This must happen while the long-lived response is still open, not at EOF.
     const subscription = await client.listen({ toolsListChanged: true }, { timeout: 3000 });
@@ -417,7 +453,7 @@ for (const status of [400, 401, 403, 404, 429, 503]) {
   }, 5000);
 }
 
-for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-json", "unknown-sse", "interrupted", "valid-json", "valid-sse"]) {
+for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-json", "unknown-sse", "interrupted", "valid-json", "valid-sse", "oversized-json", "oversized-sse"]) {
   it(`Mcp.call preserves ${variant} tool response semantics`, async () => {
     let tools = 0;
     const nativeServer = createServer(async (request, response) => {
@@ -437,7 +473,7 @@ for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-jso
       }
       assert.equal(rpc.method, "tools/call");
       tools++;
-      response.writeHead(200, { "content-type": variant === "sse" || variant === "unknown-sse" || variant === "valid-sse" || variant === "interrupted" ? "text/event-stream" : "application/json" });
+      response.writeHead(200, { "content-type": variant === "sse" || variant === "unknown-sse" || variant === "valid-sse" || variant === "oversized-sse" || variant === "interrupted" ? "text/event-stream" : "application/json" });
       if (variant === "interrupted") {
         response.write(": connected\n\n");
         setImmediate(() => response.destroy());
@@ -448,9 +484,14 @@ for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-jso
         const envelope = JSON.stringify({ jsonrpc: "invalid", id: rpc.id, result: {} });
         response.end(variant === "unknown-sse" ? `data: ${envelope}\n\n` : envelope);
       }
-      else if (variant === "valid-json" || variant === "valid-sse") {
-        const result = JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { resultType: "complete", content: [], structuredContent: { result: { taskId: "response-failure", accepted: false, state: RunnerRejectionStateEnum.notAccepted } } } });
-        response.end(variant === "valid-sse" ? `data: ${result}\n\n` : result);
+      else if (variant === "valid-json" || variant === "valid-sse" || variant === "oversized-json" || variant === "oversized-sse") {
+        const structuredContent = { result: { taskId: "😀\"\\\n".repeat(3000), accepted: false, state: RunnerRejectionStateEnum.notAccepted } };
+        const text = variant === "oversized-json" || variant === "oversized-sse" ? "x".repeat(MCP_RESPONSE_LIMIT) : Formatter.formatJson(structuredContent, { space: 2 });
+        const result = JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { resultType: "complete", content: [{ type: "text", text }], structuredContent } });
+        assert.ok(Buffer.byteLength(JSON.stringify(structuredContent)) < LIMIT - 1024);
+        assert.ok(Buffer.byteLength(result) > LIMIT);
+        assert.equal(Buffer.byteLength(result) < MCP_RESPONSE_LIMIT, variant === "valid-json" || variant === "valid-sse");
+        response.end(variant === "valid-sse" || variant === "oversized-sse" ? `data: ${result}\n\n` : result);
       } else response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, error: { code: -32602, message: "Invalid input" } }));
     });
     const runtime = ManagedRuntime.make(Mcp.layer);
@@ -462,7 +503,7 @@ for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-jso
       await runtime.runPromise(mcp.call(`http://127.0.0.1:${address.port}`, "caller", Commands.journalTask, { taskId: TaskId.make("response-failure") }, 1500).pipe(Effect.match({
         onSuccess: (result) => {
           assert.ok(variant === "valid-json" || variant === "valid-sse", "Invalid or interrupted RPC must fail");
-          assert.equal(result.taskId, "response-failure");
+          assert.equal(result.taskId, "😀\"\\\n".repeat(3000));
           assert.equal(result.accepted, false);
         },
         onFailure: (error) => {
@@ -471,6 +512,9 @@ for (const variant of ["json", "sse", "protocol", "invalid-result", "unknown-jso
             assert.ok(error instanceof HttpError);
             assert.equal(error.status, 200);
             assert.equal(error.protocolCode, -32602);
+          } else if (variant === "oversized-json" || variant === "oversized-sse") {
+            assert.ok(error instanceof HttpError);
+            assert.equal(error.status, 413);
           } else {
             assert.ok(error instanceof CommandError);
             assert.equal(error.reason, variant === "interrupted" ? "transport" : variant === "unknown-json" || variant === "unknown-sse" ? undefined : "protocol");

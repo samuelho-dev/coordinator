@@ -1,6 +1,6 @@
 import { ConfigProvider, Effect, Redacted } from "effect";
 import { sql } from "kysely";
-import { DatabaseService } from "../src/database-service.ts";
+import { DatabaseService } from "../src/database.ts";
 import { Platform } from "../src/platform.ts";
 import { migrateBrokerPostgres } from "../scripts/migrate.ts";
 

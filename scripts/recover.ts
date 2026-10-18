@@ -1,9 +1,9 @@
 import { parseArgs } from "node:util";
-import { Effect, Layer, Schema } from "effect";
+import { Console, Effect, Formatter, Layer, Schema } from "effect";
 import { NodeRuntime } from "@effect/platform-node";
-import { BrokerConfig, RunnerConfig, BackupError } from "../src/contracts.ts";
+import { BrokerConfig, RunnerConfig } from "../src/contracts.ts";
 import { Evidence } from "../src/generated/database/types.ts";
-import { privateRecoveryPath, recover } from "../src/backup.ts";
+import { BackupError, privateRecoveryPath, recover } from "../src/backup.ts";
 import { Platform } from "../src/platform.ts";
 
 // Offline only: this command never pauses services, dispatches work, or deletes existing state.
@@ -14,7 +14,7 @@ NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
     "broker-config": { type: "string" }, "runner-config": { type: "string" }, artifact: { type: "string" },
     "source-sha": { type: "string" }, "offline-maintenance": { type: "boolean" }, "hold-accepted-work": { type: "boolean" }, help: { type: "boolean" },
   } }), catch: () => new BackupError({ message: "Invalid recovery arguments" }) });
-  if (args.values.help) { console.log(usage); return; }
+  if (args.values.help) { yield* Console.log(usage); return; }
   const operation = args.positionals[0];
   const configPath = args.values["broker-config"], artifact = args.values.artifact, sha = args.values["source-sha"];
   if (args.positionals.length !== 1 || (operation !== "backup" && operation !== "restore") || !configPath || !artifact || !sha || !args.values["offline-maintenance"] || (operation === "backup" && args.values["hold-accepted-work"])) return yield* new BackupError({ message: usage });
@@ -30,8 +30,8 @@ NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
   if (runner && [runner.childDirectory, ...Object.values(runner.repositories)].some((root) =>
     [configPath, args.values["runner-config"]].some((file) => file && (file === root || file.startsWith(`${root}/`))))) return yield* new BackupError({ message: "Operator config files must remain outside archived runner roots" });
   const metadata = yield* recover(operation, broker, artifact, sourceSha, runner, args.values["hold-accepted-work"] === true);
-  console.log(JSON.stringify({ operation, artifact, kind: metadata.kind, sourceSha: metadata.sourceSha, brokerRows: metadata.broker.rows, runnerRows: metadata.runner?.rows ?? null, runnerEvents: metadata.runner?.eventRows ?? null,
+  yield* Console.log(Formatter.formatJson({ operation, artifact, kind: metadata.kind, sourceSha: metadata.sourceSha, brokerRows: metadata.broker.rows, runnerRows: metadata.runner?.rows ?? null, runnerEvents: metadata.runner?.eventRows ?? null,
     acceptedRowsFencedHeld: operation === "restore" ? metadata.broker.pendingAccepted + (metadata.runner?.pendingAccepted ?? 0) : 0,
     brokerRowsFencedHeld: operation === "restore" ? metadata.broker.pendingAccepted : 0, runnerRowsFencedHeld: operation === "restore" ? metadata.runner?.pendingAccepted ?? 0 : 0, excluded: metadata.excluded,
-    maintenance: "Keep all services stopped until successful complete restore. On failure quarantine partial fresh volumes; do not start them. Reconstruct excluded credentials and model seed independently. Start broker, then runner with the same source/absolute paths/UID layout; reconcile HELD outcomes manually without replay. Unknown external side effects are not recoverable." }));
+    maintenance: "Keep all services stopped until successful complete restore. On failure quarantine partial fresh volumes; do not start them. Reconstruct excluded credentials and model seed independently. Start broker, then runner with the same source/absolute paths/UID layout; reconcile HELD outcomes manually without replay. Unknown external side effects are not recoverable." }, { space: 2 }));
 })).pipe(Effect.provide(Layer.mergeAll(Platform.layer))));

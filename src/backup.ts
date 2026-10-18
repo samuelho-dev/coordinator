@@ -1,14 +1,15 @@
-import { Clock, Context, Effect, FileSystem, Layer, Option, PlatformError, Redacted, Schema, Stream } from "effect";
+import { Clock, Context, Effect, Equivalence, FileSystem, Layer, Option, PlatformError, Redacted, Schema, Stream } from "effect";
 import { Hex } from "effect/encoding";
 import { HttpClient, HttpClientRequest, type HttpClientResponse } from "effect/http";
-import { awaitDatabaseLoss, DatabaseError, DatabaseService } from "./database-service.ts";
-import { BackupError, BrokerConfig, ObjectBackupConfig, RunnerConfig, SnapshotKey, Task, Work } from "./contracts.ts";
+import { awaitDatabaseLoss, DatabaseError, DatabaseService } from "./database.ts";
+import { BrokerConfig, ObjectBackupConfig, RunnerConfig, SnapshotKey, Task, Work } from "./contracts.ts";
 import { Platform } from "./platform.ts";
 import { ChildProcess, type ChildProcessSpawner } from "effect/process";
 import { brokerSchemaIdentity, assertRunnerSchema } from "./database.ts";
 import { Evidence, RecoveryGateId, RunnerTaskId, type DB, type Task as StoredTask, type TaskId } from "./generated/database/types.ts";
 import { RunnerStateEnum, TaskStateEnum } from "./generated/database/enums.ts";
 
+export class BackupError extends Schema.TaggedError<BackupError>()("BackupError", { message: Schema.String }) {}
 const utf8 = new TextEncoder();
 const encode = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 const failure = () => new BackupError({ message: "Snapshot object storage operation failed" });
@@ -99,7 +100,7 @@ const contentLength = (response: HttpClientResponse.HttpClientResponse) => check
   return BigInt(value);
 });
 
-const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig) {
+export const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig) {
   const platform = yield* Platform;
   const client = HttpClient.withScope(yield* HttpClient.HttpClient);
   const config = input;
@@ -227,10 +228,6 @@ const makeSnapshotStore = Effect.fnUntraced(function*(input: ObjectBackupConfig)
   return { put, restore, expire };
 });
 
-export class SnapshotStore extends Context.Service<SnapshotStore>()("coordinator/SnapshotStore", { make: makeSnapshotStore }) {
-  static layer(config: ObjectBackupConfig) { return Layer.effect(this, this.make(config)); }
-}
-
 // Private recovery is deliberately separate from sanitized support snapshots.
 const RecoveryFile = Schema.Struct({ sha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)), schema: Schema.String, rows: Schema.Number, pendingAccepted: Schema.Number });
 const RecoveryEntry = Schema.Struct({
@@ -252,9 +249,9 @@ export const RecoveryMetadata = Schema.Struct({
   excluded: Schema.Array(Schema.String),
 });
 export type RecoveryMetadata = typeof RecoveryMetadata.Type;
-export const recoveryError = (message: string) => new BackupError({ message });
+const recoveryError = (message: string) => new BackupError({ message });
 // Report only typed categories and native operation names, never paths, SQL, causes or subprocess output.
-export const io = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.mapError((error) => {
+const io = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.mapError((error) => {
   if (error instanceof BackupError) return error;
   const reason = PlatformError.isPlatformError(error)
     ? `platform/${error.reason._tag}/${/^[A-Za-z]+$/.test(error.reason.method) ? error.reason.method : "operation"}`
@@ -295,7 +292,7 @@ const checkedRecoveryPath = (file: string, type: "file" | "directory", absent = 
 export const privateRecoveryPath = (file: string, type: "file" | "directory", absent = false) =>
   checkedRecoveryPath(file, type, absent);
 // ponytail: Effect Crypto has no incremental digest; its scoped process service keeps hashing bounded.
-export const hashFile = (file: string) => Effect.gen(function*() {
+const hashFile = (file: string) => Effect.gen(function*() {
   const platform = yield* Platform;
   const output = yield* platform.exec(ChildProcess.make("/usr/bin/sha256sum", [], { stdin: platform.fs.stream(file), env: {}, extendEnv: false }), Infinity);
   if (!/^[a-f0-9]{64}  -\n$/.test(output)) return yield* recoveryError("Invalid incremental recovery digest");
@@ -394,7 +391,7 @@ const validateBrokerRunnerPair = (runner: RunnerConfig, owner: typeof DatabaseSe
     }
   }
 });
-export const emptyBrokerDatabase = Effect.gen(function*() {
+const emptyBrokerDatabase = Effect.gen(function*() {
   const db = yield* DatabaseService;
   yield* brokerSchemaIdentity(db);
   for (const table of brokerTables) {
@@ -403,11 +400,11 @@ export const emptyBrokerDatabase = Effect.gen(function*() {
   const gate = yield* db.query((client) => client.selectFrom("recovery_gate").selectAll().where("id", "=", RecoveryGateId.make(1)));
   if (gate.length) return yield* recoveryError("Recovery target has already been used or fenced; provision a fresh database");
 });
-export const fenceBroker = Effect.gen(function*() {
+const fenceBroker = Effect.gen(function*() {
   const db = yield* DatabaseService;
   yield* db.query((client) => client.insertInto("recovery_gate").values({ id: RecoveryGateId.make(1), ready: false }));
 });
-export const holdBrokerAccepted = Effect.gen(function*() {
+const holdBrokerAccepted = Effect.gen(function*() {
   const db = yield* DatabaseService;
   let after: TaskId | null = null;
   for (;;) {
@@ -427,7 +424,7 @@ export const holdBrokerAccepted = Effect.gen(function*() {
     }
   }
 });
-export const openBrokerGate = Effect.gen(function*() {
+const openBrokerGate = Effect.gen(function*() {
   const db = yield* DatabaseService;
   const changed = yield* db.query((client) => client.updateTable("recovery_gate").set({ ready: true }).where("id", "=", RecoveryGateId.make(1)).where("ready", "=", false).returningAll());
   if (changed.length !== 1) return yield* recoveryError("Recovery fence missing; refuse opening target");
@@ -462,7 +459,7 @@ const durableCopy = (source: string, destination: string) => Effect.gen(function
   yield* syncPath(destination);
   yield* syncPath(path.dirname(destination));
 }).pipe(io);
-export const inspectRunnerDatabase = (runner: RunnerConfig, owner: typeof DatabaseService.Service) => Effect.gen(function*() {
+const inspectRunnerDatabase = (runner: RunnerConfig, owner: typeof DatabaseService.Service) => Effect.gen(function*() {
   const platform = yield* Platform;
   const schema = yield* brokerSchemaIdentity(owner);
   let after = 0, rows = 0, pendingAccepted = 0;
@@ -509,10 +506,10 @@ const emptyRunnerDatabase = (owner: typeof DatabaseService.Service) => Effect.sc
   yield* emptyBrokerDatabase;
   for (const table of runnerTables) if ((yield* db.query((client) => client.selectFrom(table).selectAll().limit(1))).length) return yield* recoveryError("Fresh empty runner PostgreSQL target required");
 }).pipe(Effect.provideService(DatabaseService, owner)));
-export const holdRunnerAccepted = (owner: typeof DatabaseService.Service) =>
+const holdRunnerAccepted = (owner: typeof DatabaseService.Service) =>
   owner.query((client) => client.updateTable("runner_tasks").set({ state: RunnerStateEnum.HELD, reason: "private recovery: accepted launch fenced; operator reconciliation required; no replay" }).where("state", "=", RunnerStateEnum.ACCEPTED).where("occupied", "=", 1).where("detached", "=", 0)).pipe(Effect.asVoid);
 
-export const recoverOwned = (operation: "backup" | "restore", config: BrokerConfig, artifact: string, sourceSha: typeof Evidence.fields.sha.Type, runner?: RunnerConfig, holdAcceptedWork = false) => Effect.scoped(Effect.gen(function*() {
+const recoverOwned = (operation: "backup" | "restore", config: BrokerConfig, artifact: string, sourceSha: typeof Evidence.fields.sha.Type, runner?: RunnerConfig, holdAcceptedWork = false) => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
   const { fs, path: paths } = platform;
   const runnerOwner = runner ? Context.get(yield* Layer.build(DatabaseService.layer(yield* DatabaseService.connection("COORDINATOR_RUNNER_DATABASE_URL"))), DatabaseService) : undefined;
@@ -533,7 +530,7 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
   }
   const work = Effect.gen(function*() {
     const roots = runner ? [runner.childDirectory, ...Object.values(runner.repositories)].sort() : [];
-    const layout = runner ? JSON.stringify({ stateDirectory: runner.stateDirectory, childDirectory: runner.childDirectory, repositories: runner.repositories, childUidBase: runner.childUidBase }) : "";
+    const layout = runner ? yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({ stateDirectory: runner.stateDirectory, childDirectory: runner.childDirectory, repositories: runner.repositories, childUidBase: runner.childUidBase }) : "";
     if (roots.some((root, index) => root === "/" || !paths.isAbsolute(root) || paths.resolve(root) !== root ||
       roots.some((other, otherIndex) => index !== otherIndex && (root === other || root.startsWith(`${other}/`))) ||
       [artifact, config.backupDirectory, config.objectBackup?.accessKeyFile, config.objectBackup?.secretKeyFile, runner?.stateDirectory, runner?.modelDirectory, runner?.tokenFile].some((privatePath) => privatePath && (privatePath === root || privatePath.startsWith(`${root}/`))))) return yield* recoveryError("Canonical disjoint runner recovery roots required");
@@ -609,7 +606,7 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
     if (metadata.broker.pendingAccepted + (metadata.runner?.pendingAccepted ?? 0) > 0 && !holdAcceptedWork) return yield* recoveryError("Restore requires --hold-accepted-work: accepted/running work must be fenced HELD without replay");
     if (metadata.sourceSha !== sourceSha || !!metadata.runner !== !!runner || (metadata.runner && (metadata.runner.id !== runner?.id || metadata.runner.layout !== layout))) return yield* recoveryError("Recovery source revision or runner absolute-path/UID pairing mismatch");
     const expected = ["broker.pgdump", "recovery.json", ...(metadata.runner ? ["runner.pgdump", "blobs"] : [])].sort();
-    if (JSON.stringify((yield* platform.fs.readDirectory(artifact)).sort()) !== JSON.stringify(expected)) return yield* recoveryError("Unexpected recovery artifact contents");
+    if (!Equivalence.Array(Equivalence.String)((yield* platform.fs.readDirectory(artifact)).sort(), expected)) return yield* recoveryError("Unexpected recovery artifact contents");
     const brokerDump = paths.join(artifact, "broker.pgdump");
     yield* privateRecoveryPath(brokerDump, "file");
     if ((yield* hashFile(brokerDump)) !== metadata.broker.sha256 || (yield* brokerSchemaIdentity(database)) !== metadata.broker.schema) return yield* recoveryError("Broker recovery digest/schema mismatch");
@@ -641,7 +638,7 @@ export const recoverOwned = (operation: "backup" | "restore", config: BrokerConf
           if ((yield* hashFile(blob)) !== entry.sha256) return yield* recoveryError("Runner blob digest mismatch");
         }
       }
-      if (JSON.stringify((yield* io(fs.readDirectory(paths.join(artifact, "blobs")))).sort()) !== JSON.stringify([...blobs].sort())) return yield* recoveryError("Unexpected runner recovery blobs");
+      if (!Equivalence.Array(Equivalence.String)((yield* io(fs.readDirectory(paths.join(artifact, "blobs")))).sort(), [...blobs].sort())) return yield* recoveryError("Unexpected runner recovery blobs");
       for (const root of roots) {
         if (!directories.has(root) || (yield* io(fs.readDirectory(root))).length) return yield* recoveryError("Fresh empty runner child/repository roots required");
       }

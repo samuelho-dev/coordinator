@@ -1,25 +1,228 @@
-import { Cause, Clock, Config, Context, Deferred, Effect, Exit, Layer, Option, Schedule, Schema, Scope, Semaphore } from "effect";
+import { Cause, Clock, Config, Context, Deferred, Duration, Effect, Exit, Layer, Option, Schedule, Schema, Scope, Semaphore } from "effect";
 import * as PersistedQueue from "effect/persistence/PersistedQueue";
-import { layerDispatchStore } from "./dispatch-store.ts";
+import { PersistedQueueError, PersistedQueueStore } from "effect/persistence/PersistedQueue";
+import type { ExpressionBuilder } from "kysely";
 import { HttpClient, HttpServer } from "effect/http";
-import { Commands, Address, Work, RunnerId, WorkerId, Repo, BrokerConfig, Task, LiveSession, ArchivePayload, ArchiveEntry, ArchiveRow, JournalState, Json, JsonValue, Poll, Delivery, EvidenceObservation, HttpError, RunnerRejectionStateEnum, RoleEnum, DispositionEnum, OfferDecisionEnum, SessionLivenessEnum, BrokerRequest, type Command, type CommandInput, type CommandOutput, type Principal, type Role, type SessionKey, type LiveRunner } from "./contracts.ts";
+import { Commands, Address, Work, RunnerId, WorkerId, Repo, BrokerConfig, Task, Session, Text, GitHubRepositoryId, GitHubRunId, GitHubWorkflowId, GitHubPullRequestNumber, CiVerdictEnum, Job, type CiEvidence, ArchivePayload, ArchiveEntry, ArchiveRow, ArchiveParticipants, Json, JsonValue, Poll, Delivery, EvidenceObservation, HttpError, RunnerRejectionStateEnum, RoleEnum, DispositionEnum, OfferDecisionEnum, SessionLivenessEnum, BrokerRequest, type Command, type CommandInput, type CommandOutput, type Principal, type Role, type SessionKey } from "./contracts.ts";
 import { Platform, redactedCause } from "./platform.ts";
-import { Mcp, serverLayer, MCP_RESULT_LIMIT } from "./mcp.ts";
-import { pollCi } from "./evidence.ts";
-import { SnapshotStore, dumpBrokerDatabase } from "./backup.ts";
-import { assertBrokerSchema } from "./database.ts";
-import { ArchiveId, TaskId, type SessionId, type Evidence as StoredEvidence } from "./generated/database/types.ts";
-import { TaskStateEnum, RunnerStateEnum } from "./generated/database/enums.ts";
-import { awaitDatabaseLoss, DatabaseService, type DatabaseError } from "./database-service.ts";
+import { Mcp, serverLayer, LIMIT, MCP_RESULT_LIMIT, mcpResultText } from "./mcp.ts";
+import { makeSnapshotStore, dumpBrokerDatabase } from "./backup.ts";
+import { assertBrokerSchema, awaitDatabaseLoss, DatabaseService, type DatabaseError } from "./database.ts";
+import { ArchiveId, TaskId, Peer, Evidence, type DB, type DispatchQueueId, type SessionId, type Evidence as StoredEvidence } from "./generated/database/types.ts";
+import { TaskStateEnum, RunnerStateEnum, DispatchStateEnum } from "./generated/database/enums.ts";
 
-const BrokerConfiguration = Context.Service<BrokerConfig>("coordinator/BrokerConfiguration");
-const pollResultText = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(Commands.pollSession.structuredOutput)), { onExcessProperty: "error" });
-const sessionResultText = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(Commands.listSessions.structuredOutput)), { onExcessProperty: "error" });
-const taskResultText = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(Commands.getTask.structuredOutput)), { onExcessProperty: "error" });
-const archiveResultText = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(Commands.listArchive.structuredOutput)), { onExcessProperty: "error" });
+export const LiveSession = Schema.Struct({ ...Session.fields, owner: Peer.fields.owner, principal: Peer.fields.sender, verified: Schema.mutableKey(Schema.Boolean), liveUntil: Schema.mutableKey(Schema.Finite), polledAt: Schema.mutableKey(Schema.Finite) });
+export type LiveSession = typeof LiveSession.Type;
+const LiveRunner = Schema.Struct({ runnerId: RunnerId, owner: Peer.fields.owner, slots: Schema.Int, load: Schema.mutableKey(Schema.Int), liveUntil: Schema.Finite });
+type LiveRunner = typeof LiveRunner.Type;
+const RepoIdentity = Schema.Struct({ id: GitHubRepositoryId, full_name: Text, private: Schema.Boolean });
+const Run = Schema.Struct({ id: GitHubRunId, workflow_id: GitHubWorkflowId, name: Schema.NullOr(Text), head_sha: Evidence.fields.sha, head_branch: Schema.NullOr(Text), pull_requests: Schema.optional(Schema.Array(Schema.Struct({ number: GitHubPullRequestNumber }))), run_attempt: Schema.Int, status: Text, conclusion: Schema.NullOr(Text), html_url: Text, created_at: Text });
+type Run = typeof Run.Type;
+const MergeRef = Schema.Struct({ ref: Text, object: Schema.Struct({ type: Schema.Literal("commit"), sha: Evidence.fields.sha }) });
+const CiSeen = Schema.Struct({ lane: Text, run: Run, jobs: Schema.mutable(Schema.Array(Job)), green: Schema.Boolean });
+type CiSeen = typeof CiSeen.Type;
+const github = <S extends Schema.ConstraintCodec<unknown, unknown>>(path: string, schema: S, token?: string) =>
+  Effect.scoped(Effect.gen(function*() {
+    const client = HttpClient.withScope(yield* HttpClient.HttpClient);
+    const response = yield* client.get(`https://api.github.com${path}`, {
+      headers: { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    });
+    if (response.status < 200 || response.status >= 300) return yield* new HttpError({ status: 502, message: `GitHub unavailable (${response.status})` });
+    // GitHub owns its additive fields; project only the canonical DTO at this HTTP boundary.
+    return yield* response.json.pipe(Effect.flatMap(Schema.decodeUnknownEffect(schema, { onExcessProperty: "ignore" })));
+  })).pipe(Effect.timeout("15 seconds"));
+export const inspectGithubRepository = Effect.fn("GitHub.inspectRepository")(function*(repo: typeof Repo.Type, token?: string) {
+  const parts = repo.split("/");
+  if (parts[0] !== "github.com" || parts.length !== 3) return yield* new HttpError({ status: 502, message: "GitHub evidence requires a GitHub repository" });
+  return yield* github(`/repos/${parts[1]}/${parts[2]}`, RepoIdentity, token);
+});
+export const pollCi = Effect.fn("GitHub.pollCi")(function*(work: Work, token?: string) {
+  const evidence: CiEvidence = { sha: work.sha, repositoryId: work.githubRepoId, ref: work.ref,
+    observedAt: new Date(yield* Clock.currentTimeMillis).toISOString(), provenance: "GitHub Actions REST exact-SHA run-attempt/jobs", verdict: CiVerdictEnum.unknown, lanes: [] };
+  return yield* Effect.gen(function*() {
+    const pull = /^refs\/pull\/([1-9]\d*)\/merge$/.exec(work.ref);
+    if (pull && !token) return yield* new HttpError({ status: 502, message: "PR merge-ref evidence requires authenticated GitHub metadata" });
+    const pullNumber = pull ? yield* Schema.decodeEffect(GitHubPullRequestNumber)(Number(pull[1])) : undefined;
+    const identity = yield* inspectGithubRepository(work.repo, token);
+    if (identity.id !== work.githubRepoId) return yield* new HttpError({ status: 502, message: "Repository identity mismatch" });
+    const base = `/repos/${identity.full_name}`;
+    const mergeRefPath = pullNumber !== undefined ? `${base}/git/ref/pull/${pullNumber}/merge` : undefined;
+    const checkMergeRef = Effect.fnUntraced(function*() {
+      if (!mergeRefPath) return;
+      const current = yield* github(mergeRefPath, MergeRef, token);
+      if (current.ref !== work.ref || current.object.sha !== work.sha) return yield* new HttpError({ status: 502, message: "Current PR merge-ref SHA mismatch" });
+    });
+    yield* checkMergeRef();
+    const matchesRef = (run: Run): boolean => pullNumber !== undefined
+      ? run.pull_requests?.some((pr) => pr.number === pullNumber) === true
+      : run.head_branch === work.ref.replace(/^refs\/heads\//, "") || run.head_branch === work.ref;
+    const collection: Run[] = [];
+    let truncated = false;
+    for (let page = 1; page <= 10; page++) {
+      const { workflow_runs: entries } = yield* github(`${base}/actions/runs?head_sha=${work.sha}&per_page=100&page=${page}`, Schema.Struct({ workflow_runs: Schema.Array(Run) }), token);
+      collection.push(...entries);
+      if (entries.length < 100) break;
+      if (page === 10) truncated = true;
+    }
+    if (truncated) return yield* new HttpError({ status: 502, message: "Run history truncated; cannot prove latest relevant run" });
+    if (collection.some((run) => run.head_sha !== work.sha)) return yield* new HttpError({ status: 502, message: "GitHub exact-SHA query mismatch" });
+    const relevant = collection.filter((run) => run.head_sha === work.sha && matchesRef(run));
+    const latest = new Map<GitHubWorkflowId, Run>();
+    for (const run of relevant) {
+      const prior = latest.get(run.workflow_id);
+      if (!prior || run.id > prior.id || (run.id === prior.id && run.run_attempt > prior.run_attempt)) latest.set(run.workflow_id, run);
+    }
+    if (work.requiredLanes.length === 0) return yield* new HttpError({ status: 502, message: "No explicit required CI lanes" });
+    const seen: CiSeen[] = [];
+    for (const run of latest.values()) {
+      const attempt = yield* github(`${base}/actions/runs/${run.id}/attempts/${run.run_attempt}`, Run, token);
+      if (attempt.id !== run.id || attempt.workflow_id !== run.workflow_id || attempt.head_sha !== work.sha || attempt.run_attempt !== run.run_attempt || !matchesRef(attempt)) return yield* new HttpError({ status: 502, message: "Attempt identity/SHA/ref/number mismatch" });
+      const jobs: Job[] = [];
+      for (let page = 1; page <= 10; page++) {
+        const { jobs: entries } = yield* github(`${base}/actions/runs/${run.id}/attempts/${run.run_attempt}/jobs?per_page=100&page=${page}`, Schema.Struct({ jobs: Schema.Array(Job) }), token);
+        jobs.push(...entries);
+        if (entries.length < 100) break;
+        if (page === 10) return yield* new HttpError({ status: 502, message: "Jobs truncated" });
+      }
+      for (const job of jobs) seen.push({ lane: `${run.name}/${job.name}`, run: attempt, jobs: [job], green: attempt.status === "completed" && attempt.conclusion === "success" && job.status === "completed" && job.conclusion === "success" });
+    }
+    let verdict: CiEvidence["verdict"] = CiVerdictEnum.green;
+    for (const lane of work.requiredLanes) {
+      const matches = seen.filter((entry) => entry.lane === lane);
+      if (matches.length !== 1) { evidence.lanes.push({ lane }); verdict = CiVerdictEnum.unknown; continue; }
+      const entry = matches[0]!;
+      evidence.lanes.push({ lane, runId: entry.run.id, attempt: entry.run.run_attempt, status: entry.run.status, conclusion: entry.run.conclusion, jobs: entry.jobs });
+      if (!entry.green && verdict !== CiVerdictEnum.unknown) verdict = entry.run.status !== "completed" ? CiVerdictEnum.pending : CiVerdictEnum.failed;
+    }
+    // Re-read each run after jobs: a rerun queued during polling invalidates old success.
+    for (const run of latest.values()) {
+      const current = yield* github(`${base}/actions/runs/${run.id}`, Run, token);
+      if (current.run_attempt !== run.run_attempt || current.head_sha !== work.sha || current.status !== run.status || (pull && !matchesRef(current))) verdict = CiVerdictEnum.pending;
+    }
+    // PR synchronization during polling invalidates the previously tested merge commit.
+    yield* checkMergeRef();
+    evidence.verdict = verdict;
+    return evidence;
+  }).pipe(Effect.catch((error) => Effect.sync(() => {
+    evidence.verdict = CiVerdictEnum.unknown;
+    evidence.reason = `${error._tag}: ${error.message}`;
+    return evidence;
+  })));
+});
+const timestamp = (eb: ExpressionBuilder<DB, "dispatch_queue">, seconds = 0) => eb.fn<Date>("to_timestamp", [
+  eb(eb.fn<number>("date_part", [eb.val("epoch"), eb.fn<Date>("clock_timestamp", [])]), "+", seconds),
+]);
+const ackSchedule = Schedule.min([Schedule.exponential(200, 1.5), Schedule.spaced(5000)]).pipe(Schedule.upTo({ duration: "5 seconds" }));
+
+export const layerDispatchStore = <S extends Schema.Constraint>(schema: S) => Layer.effect(PersistedQueueStore, Effect.gen(function*() {
+  const database = yield* DatabaseService;
+  const decode = Schema.decodeEffect(Schema.fromJsonString(Schema.toEncoded(schema)));
+  const active = new Map<DispatchQueueId, string>();
+  const wrap = <A, R>(effect: Effect.Effect<A, DatabaseError, R>) => effect.pipe(Effect.mapError((cause) => new PersistedQueueError({ message: "Persisted queue database operation failed", cause })));
+  const acknowledge = <A, E, R>(sequence: DispatchQueueId, token: string, operation: Effect.Effect<A, E, R>) => operation.pipe(
+    Effect.retry(ackSchedule), Effect.orDie, Effect.asVoid,
+    Effect.ensuring(Effect.sync(() => { if (active.get(sequence) === token) active.delete(sequence); })),
+  );
+  // A per-claim token also fences a stale finalizer after lease reclamation.
+  yield* Effect.suspend(() => Effect.forEach(active, ([sequence, token]) => database.query((db) => db.updateTable("dispatch_queue")
+    .set((eb) => ({ leased_at: timestamp(eb) })).where("sequence", "=", sequence).where("lease_id", "=", token)), { discard: true })).pipe(
+    Effect.tapError((error) => Effect.logWarning(`dispatch lease refresh failed: ${redactedCause(Cause.fail(error))}`)),
+    Effect.retry(Schedule.spaced(500)), Effect.repeat(Schedule.fixed("1 second")), Effect.forkScoped,
+  );
+
+  return PersistedQueueStore.of({
+    offer: ({ name, id, element, delay }) => Effect.gen(function*() {
+      const payload = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(element).pipe(
+        Effect.mapError((cause) => new PersistedQueueError({ message: "Persisted queue serialization failed", cause })),
+      );
+      yield* wrap(database.query((db) => db.insertInto("dispatch_queue").values((eb) => ({
+        id, queue: name, payload, state: DispatchStateEnum.pending, attempts: 0,
+        available_at: timestamp(eb, delay === undefined ? 0 : Math.ceil(Duration.toSeconds(delay))),
+        created_at: timestamp(eb), updated_at: timestamp(eb),
+      })).onConflict((oc) => oc.columns(["id", "queue"]).doNothing()))).pipe(Effect.asVoid);
+    }),
+    take: (options) => Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+      while (true) {
+        yield* wrap(database.query((db) => db.updateTable("dispatch_queue")
+          .set((eb) => ({ state: DispatchStateEnum.failed, leased_at: null, lease_id: null, updated_at: timestamp(eb) }))
+          .where("queue", "=", options.name).where("state", "=", DispatchStateEnum.pending)
+          .where((eb) => eb("attempts", ">=", eb.cast<number>(eb.val(options.maxAttempts), "bigint")))
+          .where((eb) => eb.or([eb("leased_at", "is", null), eb("leased_at", "<", timestamp(eb, -5))]))));
+        const token = crypto.randomUUID();
+        const rows = yield* wrap(database.query((db) => db.updateTable("dispatch_queue")
+          .set((eb) => ({ leased_at: timestamp(eb), lease_id: token, attempts: eb("attempts", "+", 1) }))
+          .where("sequence", "in", (eb) => eb.selectFrom("dispatch_queue").select("sequence")
+            .where("queue", "=", options.name).where("state", "=", DispatchStateEnum.pending).where((eb) => eb("attempts", "<", eb.cast<number>(eb.val(options.maxAttempts), "bigint")))
+            .where((eb) => eb("available_at", "<=", timestamp(eb)))
+            .where((eb) => eb.or([eb("leased_at", "is", null), eb("leased_at", "<", timestamp(eb, -5))]))
+            .orderBy("available_at").orderBy("sequence").forUpdate().skipLocked().limit(1))
+          .returning(["sequence", "id", "payload", "attempts"])));
+        const row = rows[0];
+        if (!row) { yield* restore(Effect.sleep("200 millis")); continue; }
+        active.set(row.sequence, token);
+        const parsed = yield* Effect.result(decode(row.payload));
+        if (parsed._tag === "Failure") {
+          yield* acknowledge(row.sequence, token, database.query((db) => db.updateTable("dispatch_queue").where("sequence", "=", row.sequence).where("lease_id", "=", token).set((eb) => ({ leased_at: null, lease_id: null, state: DispatchStateEnum.failed, updated_at: timestamp(eb), failure: "Invalid persisted queue payload" }))));
+          continue;
+        }
+        yield* Effect.addFinalizer((exit) => Effect.gen(function*() {
+          if (exit._tag === "Success") {
+            yield* acknowledge(row.sequence, token, database.query((db) => db.updateTable("dispatch_queue").where("sequence", "=", row.sequence).where("lease_id", "=", token).set((eb) => ({ leased_at: null, lease_id: null, state: DispatchStateEnum.completed, updated_at: timestamp(eb) }))));
+            return;
+          }
+          if (Cause.hasInterruptsOnly(exit.cause)) {
+            yield* acknowledge(row.sequence, token, database.query((db) => db.updateTable("dispatch_queue").where("sequence", "=", row.sequence).where("lease_id", "=", token).set((eb) => ({ leased_at: null, lease_id: null, attempts: eb("attempts", "-", 1) }))));
+            return;
+          }
+          if (row.attempts >= options.maxAttempts) {
+            yield* acknowledge(row.sequence, token, database.query((db) => db.updateTable("dispatch_queue").where("sequence", "=", row.sequence).where("lease_id", "=", token).set((eb) => ({ leased_at: null, lease_id: null, state: DispatchStateEnum.failed, updated_at: timestamp(eb), failure: redactedCause(exit.cause) }))));
+            return;
+          }
+          const delay = yield* options.retryDelay(row.attempts);
+          yield* acknowledge(row.sequence, token, database.query((db) => db.updateTable("dispatch_queue").where("sequence", "=", row.sequence).where("lease_id", "=", token).set((eb) => ({ leased_at: null, lease_id: null, updated_at: timestamp(eb), available_at: timestamp(eb, Math.max(Math.ceil(Duration.toSeconds(delay)), 0)), failure: redactedCause(exit.cause) }))));
+        }));
+        return { id: row.id, attempts: row.attempts, element: parsed.success };
+      }
+    })),
+    cleanup: ({ timeToLive, failedTimeToLive }) => wrap(Effect.gen(function*() {
+      for (const [state, ttl] of new Map([[DispatchStateEnum.completed, timeToLive], [DispatchStateEnum.failed, failedTimeToLive]])) {
+        if (ttl === undefined) continue;
+        while (true) {
+          const rows = yield* database.query((db) => db.deleteFrom("dispatch_queue")
+            .where("sequence", "in", (eb) => eb.selectFrom("dispatch_queue").select("sequence").where("state", "=", state)
+              .where((eb) => eb("updated_at", "<=", timestamp(eb, -Math.max(Math.ceil(Duration.toSeconds(ttl)), 0)))).limit(1000))
+            .returning("sequence"));
+          if (rows.length < 1000) break;
+          yield* Effect.sleep("10 millis");
+        }
+      }
+    })),
+  });
+}));
+const encodePollResult = Schema.encodeSync(Schema.toCodecJson(Commands.pollSession.structuredOutput), { onExcessProperty: "error" });
+const encodeSessionResult = Schema.encodeSync(Schema.toCodecJson(Commands.listSessions.structuredOutput), { onExcessProperty: "error" });
+const encodeTaskResult = Schema.encodeSync(Schema.toCodecJson(Commands.getTask.structuredOutput), { onExcessProperty: "error" });
+const encodeArchiveResult = Schema.encodeSync(Schema.toCodecJson(Commands.listArchive.structuredOutput), { onExcessProperty: "error" });
+const encodeRawResult = Schema.encodeSync(Schema.fromJsonString(Schema.Json), { onExcessProperty: "error" });
+const resultEncoder = new TextEncoder();
+const pollResultFits = (value: typeof Commands.pollSession.structuredOutput.Type) => {
+  const encoded = encodePollResult(value);
+  return resultEncoder.encode(encodeRawResult(encoded)).byteLength < 60000 && resultEncoder.encode(mcpResultText(encoded)).byteLength <= MCP_RESULT_LIMIT;
+};
+const sessionResultFits = (value: typeof Commands.listSessions.structuredOutput.Type) => {
+  const encoded = encodeSessionResult(value);
+  return resultEncoder.encode(encodeRawResult(encoded)).byteLength <= LIMIT - 1024 && resultEncoder.encode(mcpResultText(encoded)).byteLength <= MCP_RESULT_LIMIT;
+};
+const taskResultFits = (value: typeof Commands.getTask.structuredOutput.Type, rawLimit = LIMIT - 1024) => {
+  const encoded = encodeTaskResult(value);
+  return resultEncoder.encode(encodeRawResult(encoded)).byteLength <= rawLimit && resultEncoder.encode(mcpResultText(encoded)).byteLength <= MCP_RESULT_LIMIT;
+};
+const archiveResultFits = (value: typeof Commands.listArchive.structuredOutput.Type) => {
+  const encoded = encodeArchiveResult(value);
+  return resultEncoder.encode(encodeRawResult(encoded)).byteLength <= LIMIT - 1024 && resultEncoder.encode(mcpResultText(encoded)).byteLength <= MCP_RESULT_LIMIT;
+};
 export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
-  make: Effect.gen(function*() {
-    const config = yield* BrokerConfiguration;
+  make: (config: BrokerConfig) => Effect.gen(function*() {
     const platform = yield* Platform;
     const mcp = yield* Mcp;
     const client = yield* HttpClient.HttpClient;
@@ -98,7 +301,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       );
     }));
 
-    const objectBackup = config.objectBackup ? Context.get(yield* Layer.build(SnapshotStore.layer(config.objectBackup)), SnapshotStore) : undefined;
+    const objectBackup = config.objectBackup ? yield* makeSnapshotStore(config.objectBackup) : undefined;
     if (!objectBackup) yield* Effect.logWarning("Durable object backup is unconfigured: dedicated bucket and narrow credentials required");
     const snapshotLock = yield* Semaphore.make(1);
     const snapshot = Effect.fn("Broker.snapshot")(function*() {
@@ -156,6 +359,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
     });
     const save = Effect.fn("Broker.save")(function*(task: Task) {
       task.updatedAt = yield* Clock.currentTimeMillis;
+      if (!taskResultFits({ result: task })) return yield* new HttpError({ status: 413, message: "Task exceeds delivery budget" });
       const data = Schema.encodeSync(Schema.fromJsonString(Task), { onExcessProperty: "error" })(task);
       const previous = versions.get(task);
       const changed = previous === undefined
@@ -165,7 +369,6 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
       versions.set(task, data);
     });
     const saveReturnedTask = Effect.fn("Broker.saveReturnedTask")(function*(task: Task) {
-      if (new TextEncoder().encode(taskResultText({ result: task })).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Task exceeds delivery budget" });
       yield* save(task);
       return task;
     });
@@ -277,7 +480,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           const { sessionId, incarnation, machineId, host, repo, workerId, liveUntil } = session;
           page.sessions.push({ sessionId, incarnation, machineId, host, repo, workerId, liveUntil,
             status: session.verified && liveUntil > now && session.polledAt >= now - 10000 ? SessionLivenessEnum.live : SessionLivenessEnum.stale });
-          if (new TextEncoder().encode(sessionResultText({ result: { ...page, nextCursor: sessionId } })).byteLength > MCP_RESULT_LIMIT) {
+          if (!sessionResultFits({ result: { ...page, nextCursor: sessionId } })) {
             page.sessions.pop();
             const last = page.sessions.at(-1);
             if (!last) return yield* new HttpError({ status: 413, message: "Session metadata exceeds delivery budget" });
@@ -301,11 +504,11 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         }));
         const bound = (yield* tasks()).filter((task) => task.owner === principal.owner && task.peerSession === input.sessionId && task.peerIncarnation === input.incarnation);
         const result: Poll = { messages: [], offers: [], releases: [], archiveEnabled: Boolean((yield* database.query((db) => db.selectFrom("consents").selectAll().where("owner", "=", principal.owner).where("session", "=", input.sessionId)))[0]?.enabled) };
-        for (const message of messages) { const next = { ...result, messages: [...result.messages, message] }; if (new TextEncoder().encode(pollResultText({ result: next })).byteLength < 60000) result.messages.push(message); }
+        for (const message of messages) { const next = { ...result, messages: [...result.messages, message] }; if (pollResultFits({ result: next })) result.messages.push(message); }
         for (const task of bound) {
           const key = task.runnerId === undefined && task.offerDecision === OfferDecisionEnum.pending && (task.offerExpires ?? 0) > now ? "offers"
             : task.runnerId === undefined && task.offerDecision === OfferDecisionEnum.accepted && task.address && session.workerId === task.address.workerId && session.repo === task.address.repo && task.address.deadline > now && task.confirmedRevision === task.address.revision && task.disposition === DispositionEnum.ready && task.state === TaskStateEnum.ACCEPTED ? "releases" : undefined;
-          if (key && new TextEncoder().encode(pollResultText({ result: { ...result, [key]: [...result[key], task] } })).byteLength < 60000) result[key].push(task);
+          if (key && pollResultFits({ result: { ...result, [key]: [...result[key], task] } })) result[key].push(task);
         }
         return result; }),
         stopSession: Effect.fn("Broker.stopSession")(function*(params: CommandInput<typeof Commands.stopSession>) { (yield* role(principal, RoleEnum.session)); const input = params; const session = (yield* boundSession(principal, input, false)); session.verified = false; session.liveUntil = 0;
@@ -342,7 +545,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
           return { kind: row.kind, sha: row.sha, principal: row.principal, data, observedAt: row.observed, stale: row.sha !== target.sha || (row.kind === "ci" && data.policy !== policy) };
         }));
         const evidence: EvidenceObservation[] = [];
-        for (const observation of observations) if (new TextEncoder().encode(taskResultText({ result: { ...task, evidence: [...evidence, observation] } })).byteLength < 60000) evidence.push(observation);
+        for (const observation of observations) if (taskResultFits({ result: { ...task, evidence: [...evidence, observation] } }, 59999)) evidence.push(observation);
         return { ...task, evidence }; }),
         attachTask: Effect.fn("Broker.attachTask")(function*(params: CommandInput<typeof Commands.attachTask>) { const task = yield* readableTask(params.taskId);
         if (task.runnerId === undefined) return yield* new HttpError({ status: 409, message: "Only runner-owned children are attachable" });
@@ -364,7 +567,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         (yield* recipient(principal, input.address));
         task.instruction = { prompt: input.prompt, address: input.address }; task.address = input.address;
         delete task.readback; delete task.confirmedRevision; task.disposition = DispositionEnum.hold; task.reason = "Later instruction awaits new readback"; task.state = TaskStateEnum.ACCEPTED;
-        if (new TextEncoder().encode(taskResultText({ result: task })).byteLength > 50000) return yield* new HttpError({ status: 413, message: "Addressed task exceeds delivery budget" });
+        if (!taskResultFits({ result: task }, 50000)) return yield* new HttpError({ status: 413, message: "Addressed task exceeds delivery budget" });
         return yield* saveReturnedTask(task); }),
         addressTask: Effect.fn("Broker.addressTask")(function*(params: CommandInput<typeof Commands.addressTask>) { (yield* role(principal, RoleEnum.coordinator)); const input = params; const task = (yield* loadTask(principal, input.taskId)); const approved = task.instruction?.address ?? task.request;
         if (task.runnerId === undefined) {
@@ -380,7 +583,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         if (task.runnerId === undefined && task.peerSession !== undefined && (input.address.sessionId !== task.peerSession || input.address.incarnation !== task.peerIncarnation)) return yield* new HttpError({ status: 409, message: "Peer address mismatch" });
         task.address = input.address; delete task.readback; delete task.confirmedRevision; task.disposition = DispositionEnum.hold; task.reason = "Awaiting matching readback";
         if (task.instruction) task.instruction.address = input.address;
-        if (new TextEncoder().encode(taskResultText({ result: task.runnerId !== undefined ? { ...task, readback: input.address, disposition: DispositionEnum.ready, reason: undefined } : task })).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Task exceeds delivery budget" });
+        if (!taskResultFits({ result: task.runnerId !== undefined ? { ...task, readback: input.address, disposition: DispositionEnum.ready, reason: undefined } : task })) return yield* new HttpError({ status: 413, message: "Task exceeds delivery budget" });
         if (task.runnerId !== undefined) {
           yield* save(task);
           const runner = runnerPrincipal(task);
@@ -480,7 +683,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         (yield* repo(principal, session.repo));
         if (!input.enabled && principal.owner !== input.owner) {
           const consent = (yield* database.query((db) => db.selectFrom("consents").selectAll().where("owner", "=", input.owner).where("session", "=", input.sessionId)))[0];
-          if (!consent || !(yield* Schema.decodeEffect(Schema.fromJsonString(JournalState.fields.participants), { onExcessProperty: "error" })(consent.participants)).includes(principal.id)) return yield* new HttpError({ status: 403, message: "Not an enrolled archive participant" });
+          if (!consent || !(yield* Schema.decodeEffect(Schema.fromJsonString(ArchiveParticipants), { onExcessProperty: "error" })(consent.participants)).includes(principal.id)) return yield* new HttpError({ status: 403, message: "Not an enrolled archive participant" });
         }
         
           (yield* database.query((db) => db.insertInto("participant_consents").values({ owner: input.owner, session: input.sessionId, participant: principal.id, enabled: input.enabled ? 1 : 0 }).onConflict((oc) => oc.columns(["owner", "session", "participant"]).doUpdateSet((eb) => ({ enabled: eb.ref("excluded.enabled") })))));
@@ -496,7 +699,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         for (const participant of input.participants) {
           if (participant !== principal.id && input.enabled && !(yield* database.query((db) => db.selectFrom("participant_consents").selectAll().where("owner", "=", principal.owner).where("session", "=", input.sessionId).where("participant", "=", participant)))[0]?.enabled) return yield* new HttpError({ status: 403, message: "Each participant must explicitly consent using their own enrolled credential" });
         }
-        (yield* database.query((db) => db.insertInto("consents").values({ owner: principal.owner, session: input.sessionId, enabled: input.enabled ? 1 : 0, participants: Schema.encodeSync(Schema.fromJsonString(JournalState.fields.participants), { onExcessProperty: "error" })(input.participants) }).onConflict((oc) => oc.columns(["owner", "session"]).doUpdateSet((eb) => ({ enabled: eb.ref("excluded.enabled"), participants: eb.ref("excluded.participants") }))))); return { enabled: input.enabled }; }),
+        (yield* database.query((db) => db.insertInto("consents").values({ owner: principal.owner, session: input.sessionId, enabled: input.enabled ? 1 : 0, participants: Schema.encodeSync(Schema.fromJsonString(ArchiveParticipants), { onExcessProperty: "error" })(input.participants) }).onConflict((oc) => oc.columns(["owner", "session"]).doUpdateSet((eb) => ({ enabled: eb.ref("excluded.enabled"), participants: eb.ref("excluded.participants") }))))); return { enabled: input.enabled }; }),
         appendArchive: Effect.fn("Broker.appendArchive")(function*(params: CommandInput<typeof Commands.appendArchive>) { (yield* role(principal, RoleEnum.session, RoleEnum.archiveWriter)); const input = params;
         const consent = (yield* database.query((db) => db.selectFrom("consents").selectAll().where("owner", "=", principal.owner).where("session", "=", input.sessionId)))[0]; if (!consent?.enabled) return yield* new HttpError({ status: 403, message: "Archive enrollment revoked or absent" });
         if (principal.roles.includes(RoleEnum.session)) { const session = sessions.get(input.sessionId); if (session?.principal !== principal.id || session.owner !== principal.owner) return yield* new HttpError({ status: 403, message: "Archive session mismatch" }); }
@@ -515,7 +718,7 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
         }
         const page: ArchiveRow[] = [];
         for (const row of rows) {
-          if (new TextEncoder().encode(archiveResultText({ result: [...page, row] })).byteLength > MCP_RESULT_LIMIT) {
+          if (!archiveResultFits({ result: [...page, row] })) {
             if (!page.length) return yield* new HttpError({ status: 413, message: "Archive row exceeds delivery budget" });
             break;
           }
@@ -593,6 +796,6 @@ export class Broker extends Context.Service<Broker>()("coordinator/Broker", {
   }),
 }) {
   static layer(config: BrokerConfig) {
-    return Layer.effect(this, this.make).pipe(Layer.provide(Layer.succeed(BrokerConfiguration, config)));
+    return Layer.effect(this, this.make(config));
   }
 }

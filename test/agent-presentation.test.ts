@@ -6,8 +6,8 @@ import { HttpRouter, HttpServer } from "effect/http";
 import { NodeCrypto, NodeHttpServer } from "@effect/platform-node";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { McpProtocol, McpSchema, McpServer, Tool } from "effect/ai";
-import { AgentHostEnum, AgentBinding, AgentMcpProtocolVersion } from "../src/agent/contracts.ts";
-import { createAgentPresentation, AgentPresentationPage, agentPresentationUri, withAgentMcpRequest } from "../src/agent/interaction.ts";
+import { AgentHostEnum, AgentBinding, AgentMcpProtocolVersion, AgentPresentationPage, agentPresentationUri } from "../src/agent/protocol.ts";
+import { createAgentPresentation, withAgentMcpRequest } from "../src/agent/server.ts";
 
 const WriteInput = Schema.Struct({ values: Schema.Array(Schema.String), rotate: Schema.optional(Schema.Boolean) });
 

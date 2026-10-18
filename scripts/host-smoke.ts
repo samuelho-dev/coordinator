@@ -1,25 +1,28 @@
-import { AgentRunPhaseEnum } from "../src/agent/contracts.ts";
+import { AgentRunPhaseEnum } from "../src/agent/protocol.ts";
 import { RoleEnum, DispositionEnum, OfferDecisionEnum } from "../src/contracts.ts";
-import { AgentRunOutcomeEnum, AgentAdmissionDispositionEnum } from "../src/agent/contracts.ts";
+import { AgentRunOutcomeEnum, AgentAdmissionDispositionEnum } from "../src/agent/protocol.ts";
 import { TaskStateEnum } from "../src/generated/database/enums.ts";
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest } from "node:http";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
-import { Clock, Config, Context, Effect, Exit, Fiber, Layer, Schema, Scope } from "effect";
+import { Clock, Config, Console, Context, Effect, Exit, Fiber, Formatter, Layer, Schema, Scope } from "effect";
 import { Hex } from "effect/encoding";
 import { ChildProcess } from "effect/process";
 import { NodeRuntime } from "@effect/platform-node";
 import { connectAgentClient } from "../src/agent/client.ts";
-import { AgentTools, AgentHostEnum, AgentEventSequence, AgentGeneration, AgentHost, AgentConfig, AgentSubmissionId } from "../src/agent/contracts.ts";
-import type { AgentBinding, AgentLifecycleEvent } from "../src/agent/contracts.ts";
-import { BrokerConfig, CommandError, Commands, GitHubRepositoryId, JournalHandledKey, JournalState, LiveSession, MachineId, PluginConfig } from "../src/contracts.ts";
+import { AgentTools, AgentHostEnum, AgentEventSequence, AgentGeneration, AgentHost, AgentConfig, AgentSubmissionId } from "../src/agent/protocol.ts";
+import type { AgentBinding, AgentLifecycleEvent } from "../src/agent/protocol.ts";
+import { BrokerConfig, CommandError, Commands, command, GitHubRepositoryId, MachineId, PluginConfig } from "../src/contracts.ts";
+import { JournalHandledKey, JournalState } from "../src/plugin.ts";
 import { Platform } from "../src/platform.ts";
-import { Broker } from "../src/broker.ts";
+import { Tool } from "effect/ai";
+import { Broker, LiveSession } from "../src/broker.ts";
 import { Mcp } from "../src/mcp.ts";
 import { dropPostgres, postgresConfig, provisionPostgres } from "../test/postgres-fixture.ts";
 import { TaskId, SessionId, PeerId, Evidence } from "../src/generated/database/types.ts";
 
+const hostSmokeCommand = command("program.smoke:hosts", "program", "runHostSmoke", "Exercise installed Pi/OMP public-plugin control and report the whole-run admission/final-outcome blocker without a model turn.", Tool.EmptyParams, Schema.Void, { exposure: "private" });
 // Installed CLIs, unmodified public SDKs and real provider parsing against a local SSE fixture.
 // No external provider, global profile, SDK UI consent or terminal rendering is inferred.
 const runHostSmoke = () => Effect.gen(function*() {
@@ -53,7 +56,7 @@ const runHostSmoke = () => Effect.gen(function*() {
       try {
         const wire = Schema.decodeSync(Schema.fromJsonString(requestBody))(Buffer.concat(chunks).toString("utf8"));
         fixtureCalls++;
-        const user = JSON.stringify(wire.messages.findLast((message) => message.role === "user")?.content ?? "");
+        const user = Schema.encodeSync(Schema.fromJsonString(Schema.Json))(wire.messages.findLast((message) => message.role === "user")?.content ?? "");
         const primary = wire.tools?.some((tool) => tool.function.name === "bash") === true;
         const retry = user.includes("SDK_RETRY_pi") ? AgentHostEnum.pi : user.includes("SDK_RETRY_omp") ? AgentHostEnum.omp : undefined;
         if (primary && retry !== undefined) {
@@ -61,17 +64,17 @@ const runHostSmoke = () => Effect.gen(function*() {
           retryAttempts.set(retry, attempt);
           // OMP does six HTTP attempts plus one provider replay before session-level retry.
           if (attempt <= (retry === AgentHostEnum.omp ? 12 : 1)) {
-            response.writeHead(503, { "content-type": "application/json" }); response.end(JSON.stringify({ error: { message: "Scripted temporary provider overload", type: "server_error" } })); return;
+            response.writeHead(503, { "content-type": "application/json" }); response.end(Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ error: { message: "Scripted temporary provider overload", type: "server_error" } })); return;
           }
         }
         const compact = user.includes("SDK_COMPACT_pi") ? AgentHostEnum.pi : user.includes("SDK_COMPACT_omp") ? AgentHostEnum.omp : undefined;
-        if (primary && compact !== undefined && !compacted.has(compact)) { compacted.add(compact); response.writeHead(400, { "content-type": "application/json" }); response.end(JSON.stringify({ error: { message: "maximum context length exceeded", code: "context_length_exceeded", type: "invalid_request_error" } })); return; }
-        if (primary && user.includes("SDK_ERROR")) { response.writeHead(400, { "content-type": "application/json" }); response.end(JSON.stringify({ error: { message: "Scripted non-retryable provider rejection", type: "invalid_request_error" } })); return; }
+        if (primary && compact !== undefined && !compacted.has(compact)) { compacted.add(compact); response.writeHead(400, { "content-type": "application/json" }); response.end(Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ error: { message: "maximum context length exceeded", code: "context_length_exceeded", type: "invalid_request_error" } })); return; }
+        if (primary && user.includes("SDK_ERROR")) { response.writeHead(400, { "content-type": "application/json" }); response.end(Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ error: { message: "Scripted non-retryable provider rejection", type: "invalid_request_error" } })); return; }
         response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
-        const chunk = (delta: Schema.JsonObject, finish: string | null = null) => response.write(`data: ${JSON.stringify({ id: "local-fixture", object: "chat.completion.chunk", created: 1, model: "scripted", choices: [{ index: 0, delta, finish_reason: finish }], ...(finish === null ? {} : { usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }) })}\n\n`);
+        const chunk = (delta: Schema.JsonObject, finish: string | null = null) => response.write(`data: ${Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ id: "local-fixture", object: "chat.completion.chunk", created: 1, model: "scripted", choices: [{ index: 0, delta, finish_reason: finish }], ...(finish === null ? {} : { usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }) })}\n\n`);
         const finish = () => { chunk({}, "stop"); response.end("data: [DONE]\n\n"); };
-        if (primary && user.includes("SDK_TOOL") && !wire.messages.some((message) => message.role === "tool" && JSON.stringify(message.content).includes("SDK_TOOL_OK"))) {
-          chunk({ role: "assistant", tool_calls: [{ index: 0, id: "fixture-bash", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "printf SDK_TOOL_OK" }) } }] });
+        if (primary && user.includes("SDK_TOOL") && !wire.messages.some((message) => message.role === "tool" && Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(message.content).includes("SDK_TOOL_OK"))) {
+          chunk({ role: "assistant", tool_calls: [{ index: 0, id: "fixture-bash", type: "function", function: { name: "bash", arguments: Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ command: "printf SDK_TOOL_OK" }) } }] });
           chunk({}, "tool_calls"); response.end("data: [DONE]\n\n"); return;
         }
         const job = primary && user.includes("SDK_ASYNC_CANCEL") && !asyncIssued.has("cancel") ? "cancel" :
@@ -81,7 +84,7 @@ const runHostSmoke = () => Effect.gen(function*() {
           asyncIssued.add(job);
           const output = job === "cancel" ? "SDK_ASYNC_CANCELLED" : job === "one" ? "SDK_ASYNC_ONE" : "SDK_ASYNC_TWO";
           const command = `sleep ${job === "cancel" ? "30" : "1"}; printf ${output} > '${asyncDirectory}/${job}'; printf ${output}`;
-          chunk({ role: "assistant", tool_calls: [{ index: 0, id: `fixture-async-${job}`, type: "function", function: { name: "bash", arguments: JSON.stringify({ command, async: true }) } }] });
+          chunk({ role: "assistant", tool_calls: [{ index: 0, id: `fixture-async-${job}`, type: "function", function: { name: "bash", arguments: Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ command, async: true }) } }] });
           chunk({}, "tool_calls"); response.end("data: [DONE]\n\n"); return;
         }
         chunk({ role: "assistant", content: "SDK_FIXTURE_OK" });
@@ -89,7 +92,7 @@ const runHostSmoke = () => Effect.gen(function*() {
         const pause = primary && user.includes("SDK_PAUSE_pi") ? AgentHostEnum.pi : primary && user.includes("SDK_PAUSE_omp") ? AgentHostEnum.omp : undefined;
         if (pause !== undefined) { pauseRequests.set(pause, (pauseRequests.get(pause) ?? 0) + 1); paused.set(pause, finish); response.once("close", () => paused.delete(pause)); }
         else finish();
-      } catch (error) { console.error("Local scripted provider request failed", error); response.destroy(); }
+      } catch (error) { Effect.runSync(Console.error("Local scripted provider request failed", error)); response.destroy(); }
     });
   });
   yield* Effect.acquireRelease(
@@ -140,9 +143,9 @@ const runHostSmoke = () => Effect.gen(function*() {
     const binary = yield* fs.realPath(host === AgentHostEnum.pi ? pi : omp);
     const home = join(directory, host), agent = join(home, "agent"), sessions = join(home, "sessions");
     for (const folder of [home, agent, sessions]) yield* fs.makeDirectory(folder, { mode: 0o700 });
-    yield* fs.writeFileString(join(agent, host === AgentHostEnum.pi ? "models.json" : "models.yml"), JSON.stringify(models), { flag: "wx", mode: 0o600 });
+    yield* fs.writeFileString(join(agent, host === AgentHostEnum.pi ? "models.json" : "models.yml"), Schema.encodeSync(Schema.fromJsonString(Schema.Json))(models), { flag: "wx", mode: 0o600 });
     asyncDirectory = home;
-    yield* fs.writeFileString(join(agent, host === AgentHostEnum.pi ? "settings.json" : "config.yml"), JSON.stringify({
+    yield* fs.writeFileString(join(agent, host === AgentHostEnum.pi ? "settings.json" : "config.yml"), Schema.encodeSync(Schema.fromJsonString(Schema.Json))({
       compaction: { keepRecentTokens: 1, reserveTokens: 512 }, ...(host === AgentHostEnum.omp ? { async: { enabled: true } } : {}),
     }), { flag: "wx", mode: 0o600 });
     const env = { HOME: home, PATH: path, LANG: "C.UTF-8", TERM: "dumb", PI_CODING_AGENT_DIR: agent,
@@ -182,7 +185,7 @@ const runHostSmoke = () => Effect.gen(function*() {
             entry.status = fault === "poll" ? 503 : 403;
             if (fault === "poll") fault = "none";
             response.writeHead(entry.status, { "content-type": "application/json" });
-            response.end(JSON.stringify({ error: "Private control fault fixture" }));
+            response.end(Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ error: "Private control fault fixture" }));
             entry.completed = true;
             return;
           }
@@ -196,7 +199,7 @@ const runHostSmoke = () => Effect.gen(function*() {
           upstream.once("error", () => response.destroy());
           response.once("close", () => upstream.destroy());
           upstream.end(body);
-        } catch (error) { console.error("Private control proxy failed", error); response.destroy(); }
+        } catch (error) { Effect.runSync(Console.error("Private control proxy failed", error)); response.destroy(); }
       });
     });
     yield* Effect.acquireRelease(
@@ -285,7 +288,7 @@ const runHostSmoke = () => Effect.gen(function*() {
       if (complete.disposition !== "settled") return yield* new CommandError({ message: "Expected SDK run" });
       assert.equal(complete.final.outcome, AgentRunOutcomeEnum.completed);
       const privateMessages = yield* client.call(AgentTools.getMessages, { binding: client.binding }, { timeoutMs: 10000 });
-      assert.match(JSON.stringify(privateMessages.messages), /SDK_TOOL_OK/, "The actual agent tool continuation must be persisted in this owned transcript");
+      assert.match(Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(privateMessages.messages), /SDK_TOOL_OK/, "The actual agent tool continuation must be persisted in this owned transcript");
       const pausedRun = yield* Effect.forkIn(submit(`SDK_PAUSE_${host}`), scope);
       yield* until(() => Effect.sync(() => paused.has(host)), Boolean);
       let queuedAdmission = false;
@@ -320,9 +323,9 @@ const runHostSmoke = () => Effect.gen(function*() {
       assert.equal(independent.final.outcome, AgentRunOutcomeEnum.completed);
       assert.notEqual(independent.final.runId, continued.final.runId);
       const continuationMessages = yield* client.call(AgentTools.getMessages, { binding: client.binding }, { timeoutMs: 10000 });
-      assert.match(JSON.stringify(continuationMessages.messages), /SDK_QUEUED_INPUT/);
-      assert.match(JSON.stringify(continuationMessages.messages), /SDK_CONTINUATION/);
-      assert.match(JSON.stringify(continuationMessages.messages), /SDK_STEERING/);
+      assert.match(Formatter.formatJson(continuationMessages.messages), /SDK_QUEUED_INPUT/);
+      assert.match(Formatter.formatJson(continuationMessages.messages), /SDK_CONTINUATION/);
+      assert.match(Formatter.formatJson(continuationMessages.messages), /SDK_STEERING/);
       const retryResult = yield* submit(`SDK_RETRY_${host}`);
       if (retryResult.disposition !== "settled") return yield* new CommandError({ message: "Expected retried SDK run" });
       assert.equal(retryResult.final.outcome, AgentRunOutcomeEnum.completed);
@@ -330,8 +333,8 @@ const runHostSmoke = () => Effect.gen(function*() {
       if (compactResult.disposition !== "settled") return yield* new CommandError({ message: "Expected compacted SDK run" });
       assert.equal(compactResult.final.outcome, AgentRunOutcomeEnum.completed);
       yield* watch.drain;
-      assert.ok(events.some((event) => event.kind === "run_phase" && event.runId === retryResult.final.runId && event.phase === AgentRunPhaseEnum.retry), `${host}: SDK retry must remain inside ${retryResult.final.runId}; observed ${JSON.stringify(events.filter((event) => event.kind === "run_phase"))}`);
-      assert.ok(events.some((event) => event.kind === "run_phase" && event.runId === compactResult.final.runId && event.phase === AgentRunPhaseEnum.compaction), `${host}: SDK compaction must remain inside ${compactResult.final.runId}; observed ${JSON.stringify(events.filter((event) => event.kind === "run_phase"))}`);
+      assert.ok(events.some((event) => event.kind === "run_phase" && event.runId === retryResult.final.runId && event.phase === AgentRunPhaseEnum.retry), `${host}: SDK retry must remain inside ${retryResult.final.runId}; observed ${Formatter.formatJson(events.filter((event) => event.kind === "run_phase"))}`);
+      assert.ok(events.some((event) => event.kind === "run_phase" && event.runId === compactResult.final.runId && event.phase === AgentRunPhaseEnum.compaction), `${host}: SDK compaction must remain inside ${compactResult.final.runId}; observed ${Formatter.formatJson(events.filter((event) => event.kind === "run_phase"))}`);
       const failed = yield* submit("SDK_ERROR");
       assert.equal(failed.disposition, "settled");
       if (failed.disposition !== "settled") return yield* new CommandError({ message: "Expected error SDK run" });
@@ -488,7 +491,7 @@ const runHostSmoke = () => Effect.gen(function*() {
   }
   yield* Scope.close(brokerScope, Exit.void);
   yield* dropPostgres(brokerDatabaseUrl);
-  yield* fs.writeFileString(transcript, JSON.stringify({ accepted: true, observations, controlChecks,
+  yield* fs.writeFileString(transcript, Schema.encodeSync(Schema.fromJsonString(Schema.Json))({ accepted: true, observations, controlChecks,
     controlsAcceptance: "accepted", exercisedControls: exercisedControls.map(descriptor => descriptor.name),
     guardedNegativeControls: { controls: guardedNegativeControls.map(descriptor => descriptor.name), result: "binding_mismatch before delivery" },
     sendDeliveryAcceptance: "accepted: actual SDK tool, steering, queued follow-up and independent FIFO admission",
@@ -497,9 +500,9 @@ const runHostSmoke = () => Effect.gen(function*() {
     terminalAcceptance: "not-exercised",
     consentedCaptureAcceptance: "not-exercised: real participant consent requires SDK UI; broker regression remains in the separate unfiltered agent suite",
     fixtureModelCalls: fixtureCalls, externalModelCalls: 0 }), { flag: "wx", mode: 0o600 });
-  console.log(JSON.stringify({ accepted: true, transcript, privateHome: directory, controlChecks, controlsAcceptance: "accepted", exercisedControls: exercisedControls.map(descriptor => descriptor.name), guardedNegativeControls: guardedNegativeControls.map(descriptor => descriptor.name),
-    brokerPluginAcceptance: "accepted", wholeRunAcceptance: "accepted", terminalAcceptance: "not-exercised", consentedCaptureAcceptance: "not-exercised", fixtureModelCalls: fixtureCalls, externalModelCalls: 0 }));
+  yield* Console.log(Formatter.formatJson({ accepted: true, transcript, privateHome: directory, controlChecks, controlsAcceptance: "accepted", exercisedControls: exercisedControls.map(descriptor => descriptor.name), guardedNegativeControls: guardedNegativeControls.map(descriptor => descriptor.name),
+    brokerPluginAcceptance: "accepted", wholeRunAcceptance: "accepted", terminalAcceptance: "not-exercised", consentedCaptureAcceptance: "not-exercised", fixtureModelCalls: fixtureCalls, externalModelCalls: 0 }, { space: 2 }));
 });
-NodeRuntime.runMain(Commands.runHostSmoke.executeDecoded({ runHostSmoke }, {}).pipe(
+NodeRuntime.runMain(hostSmokeCommand.executeDecoded({ runHostSmoke }, {}).pipe(
   Effect.scoped, Effect.provide(Platform.layer),
 ));

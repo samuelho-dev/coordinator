@@ -1,9 +1,8 @@
-import { AgentInputKindEnum } from "../src/agent/contracts.ts";
+import { AgentInputKindEnum } from "../src/agent/protocol.ts";
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import { Deferred, Effect, Exit, Scope, Sink, Stdio, Stream } from "effect";
-import { makeProgramStatus, ProgramState, ProgramNetworkState } from "../src/plugin-status.ts";
-import type { Context } from "../src/contracts.ts";
+import { makeProgramStatus, ProgramState, ProgramNetworkState, type Context } from "../src/plugin.ts";
 
 const query = "\x1b]7501;?\x1b\\";
 type Handler = (data: string) => { consume?: boolean; data?: string } | undefined;

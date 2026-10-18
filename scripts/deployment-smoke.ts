@@ -1,5 +1,5 @@
 import { parseArgs } from "node:util";
-import { ByteSize, ConfigProvider, Context, Effect, Layer, Schema, Stdio, Stream } from "effect";
+import { ByteSize, ConfigProvider, Context, Effect, Formatter, Layer, Schema, Stdio, Stream } from "effect";
 import { HttpClient, HttpClientRequest, HttpIncomingMessage } from "effect/http";
 import { NodeRuntime, NodeStdio } from "@effect/platform-node";
 import { Commands, CommandError, ConnectHosts, HttpError, PluginConfig, Repo } from "../src/contracts.ts";
@@ -131,11 +131,11 @@ const program = Effect.gen(function*() {
     }).pipe(Effect.timeout(60000));
   }));
   if (!stopped) return yield* fail("Session cleanup not proven");
-  yield* emit(`${JSON.stringify({ scenario: "deployment-acceptance", status: "ok", sourceSha: expectedSha, cycles, authRejected: true, readiness: true, mcpHealth: true, databasePoll: true, noDispatch: true, emptyDeliveries: true, sessionStopped: true, probe: { elapsedMs: probeElapsedMs, concurrencyLimit: concurrency, peakInFlight, completedWhileConcurrent, latencies } })}\n`);
+  yield* emit(`${Formatter.formatJson({ scenario: "deployment-acceptance", status: "ok", sourceSha: expectedSha, cycles, authRejected: true, readiness: true, mcpHealth: true, databasePoll: true, noDispatch: true, emptyDeliveries: true, sessionStopped: true, probe: { elapsedMs: probeElapsedMs, concurrencyLimit: concurrency, peakInFlight, completedWhileConcurrent, latencies } }, { space: 2 })}\n`);
 });
 
 NodeRuntime.runMain(program.pipe(
   Effect.scoped,
-  Effect.catchCause((cause) => emit(`${JSON.stringify({ scenario: "deployment-acceptance", status: "failed", error: redactedCause(cause).slice(0, 512) })}\n`).pipe(Effect.andThen(Effect.sync(() => { process.exitCode = 1; })))),
+  Effect.catchCause((cause) => emit(`${Formatter.formatJson({ scenario: "deployment-acceptance", status: "failed", error: redactedCause(cause).slice(0, 512) }, { space: 2 })}\n`).pipe(Effect.andThen(Effect.sync(() => { process.exitCode = 1; })))),
   Effect.provide(Layer.mergeAll(Platform.layer, NodeStdio.layer)),
 ));

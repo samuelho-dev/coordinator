@@ -8,7 +8,7 @@
   },
   "packageManager": "pnpm@11.9.0",
   "scripts": {
-    "build": "effect-tsgo patch --typescript && tsc -p tsconfig.build.json && esbuild src/plugin.ts src/runner-plugin.ts --bundle --external:@earendil-works/pi-coding-agent --external:@oh-my-pi/pi-coding-agent --external:@modelcontextprotocol/client --external:kysely --external:pg --external:undici --external:ws --external:redis --platform=node --format=esm --target=node22 --outdir=dist/plugins",
+    "build": "node --input-type=module -e 'import { rmSync } from \"node:fs\"; for (const path of [\"dist/agent\", \"dist/plugins\"]) rmSync(path, { recursive: true, force: true });' && effect-tsgo patch --typescript && tsc -p tsconfig.build.json && esbuild src/plugin.ts src/agent-session.ts --bundle --external:@earendil-works/pi-coding-agent --external:@oh-my-pi/pi-coding-agent --external:@modelcontextprotocol/client --external:kysely --external:pg --external:undici --external:ws --external:redis --platform=node --format=esm --target=node22 --outdir=dist/plugins",
     "check": "pnpm run build && pnpm db:generate && tsx src/generated/database/index.ts && tsc --noEmit",
     "test": ": \"${COORDINATOR_TEST_POSTGRES_URL:?COORDINATOR_TEST_POSTGRES_URL is required: private admin DSN for disposable PostgreSQL 18}\" && pnpm run build && vitest run --configLoader native",
     "broker": "pnpm run build && tsx src/main.ts broker",

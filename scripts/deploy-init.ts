@@ -1,11 +1,15 @@
-import { AgentHostEnum } from "../src/agent/contracts.ts";
+import { AgentHostEnum } from "../src/agent/protocol.ts";
 import { Console, Effect, Layer, PlatformError, Schema, Stdio } from "effect";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { ChildProcess } from "effect/process";
-import { RoleEnum, BrokerConfig, RunnerConfig, Commands, CommandError, ModelProfile, UserId } from "../src/contracts.ts";
+import { RoleEnum, BrokerConfig, RunnerConfig, command, CommandError, ModelProfile, UserId } from "../src/contracts.ts";
 import { Evidence } from "../src/generated/database/types.ts";
 import { Platform } from "../src/platform.ts";
 import { ownChildDirectory } from "../src/runner.ts";
+import { Tool } from "effect/ai";
+
+const brokerDeploymentCommand = command("program.deploy-init.broker", "program", "initializeBrokerDeployment", "Stage schema-valid operator broker configuration and private credentials.", Tool.EmptyParams, Schema.Void, { exposure: "private" });
+const runnerDeploymentCommand = command("program.deploy-init.runner", "program", "initializeRunnerDeployment", "Stage operator runner configuration, pinned repositories and model seed.", Tool.EmptyParams, Schema.Void, { exposure: "private" });
 
 NodeRuntime.runMain(Effect.gen(function*() {
   const platform = yield* Platform;
@@ -138,7 +142,7 @@ NodeRuntime.runMain(Effect.gen(function*() {
     yield* checkSeed(config.modelDirectory);
     yield* file(platform.path.join(output, "runner.json"), Schema.encodeSync(Schema.fromJsonString(RunnerConfig))(config));
   });
-  yield* (mode === "broker" ? Commands.initializeBrokerDeployment : Commands.initializeRunnerDeployment).executeDecoded({ initializeBrokerDeployment, initializeRunnerDeployment }, {});
+  yield* (mode === "broker" ? brokerDeploymentCommand : runnerDeploymentCommand).executeDecoded({ initializeBrokerDeployment, initializeRunnerDeployment }, {});
   yield* file(platform.path.join(output, "health.header"), `authorization: Bearer ${health}`);
   yield* Console.log(`coordinator ${mode} deployment initialized`);
 }).pipe(Effect.provide(Layer.merge(Platform.layer, NodeServices.layer))));

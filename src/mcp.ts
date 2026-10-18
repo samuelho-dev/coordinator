@@ -1,4 +1,4 @@
-import { ByteSize, Cause, Config, Context, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect";
+import { ByteSize, Cause, Config, Context, Effect, Exit, Formatter, Layer, Option, Schema, Scope, Stream } from "effect";
 import { HttpBody, HttpClient, HttpClientError, HttpClientRequest, HttpIncomingMessage, HttpRouter, HttpServer, HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { NodeHttpClient, NodeHttpServer } from "@effect/platform-node";
 import { createServer } from "node:http";
@@ -9,8 +9,15 @@ import { Client, ProtocolError, SdkError, SdkErrorCode, StreamableHTTPClientTran
 import { BrokerRequest, RunnerRequest, ConnectHosts, HttpError, CommandError, BoundaryError, Json, Commands, McpResult, type CommandDescriptor, type CommandOutput, type McpEndpoint } from "./contracts.ts";
 
 export const LIMIT = 64 * 1024;
-export const MCP_RESULT_LIMIT = LIMIT - 1024;
+export const MCP_RESPONSE_LIMIT = 3 * LIMIT;
+export const MCP_RESULT_LIMIT = MCP_RESPONSE_LIMIT - 1024;
 const commandProtocol = McpProtocol.v2026_07_28;
+
+const encodeToolResult = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(McpSchema.CallToolResult)));
+const encodeStructuredResult = Schema.encodeSync(Schema.fromJsonString(Schema.Json), { onExcessProperty: "error" });
+const toolResult = (structuredContent: Schema.Json, isError = false) =>
+  new McpSchema.CallToolResult({ isError, content: [McpSchema.TextContent.make({ type: "text", text: Formatter.formatJson(structuredContent, { space: 2 }) })], structuredContent });
+export const mcpResultText = (structuredContent: Schema.Json) => encodeToolResult(toolResult(structuredContent));
 
 const clientLayer = Layer.unwrap(Effect.gen(function*() {
   const configuredHosts = yield* Config.String("COORDINATOR_CONNECT_HOSTS_JSON").pipe(Config.withDefault("{}"));
@@ -77,7 +84,7 @@ const boundedResponse = Effect.fnUntraced(function*(response: HttpServerResponse
 });
 
 // fromWeb uses Raw for Web streams; NodeHttpClient needs an Effect byte stream.
-export function fromWebRequest(request: Request): HttpClientRequest.HttpClientRequest {
+function fromWebRequest(request: Request): HttpClientRequest.HttpClientRequest {
   const outbound = HttpClientRequest.fromWeb(request);
   if (request.body === null || outbound.body._tag !== "Raw") return outbound;
   const body = outbound.body;
@@ -167,11 +174,11 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
             return httpFailure ?? commandFailure ?? error;
           }));
           body += decoder.decode();
-          // Discovery contains the full catalog; command responses keep the existing 64 KiB bound.
+          // Discovery contains the full catalog; command responses include structured JSON and readable text.
           const method = body ? (yield* Schema.decodeEffect(Schema.fromJsonString(Json), { onExcessProperty: "error" })(body)).method : undefined;
           const discovery = method === "server/discover" || method === "tools/list";
           const rejected = response.status < 200 || response.status >= 300;
-          const limit = !rejected && discovery ? 512 * 1024 : LIMIT;
+          const limit = rejected ? LIMIT : discovery ? 512 * 1024 : MCP_RESPONSE_LIMIT;
           responseMetadata = {
             status: response.status,
             ...(response.headers["retry-after"] === undefined ? {} : { retryAfter: response.headers["retry-after"].slice(0, 512) }),
@@ -204,7 +211,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
                 if (next.done) {
                   if (rejectedDecoder) {
                     rejectedBody += rejectedDecoder.decode();
-                    const decoded = Effect.runSync(Effect.try(() => parseJSONRPCMessage(JSON.parse(rejectedBody))).pipe(Effect.option));
+                    const decoded = Effect.runSync(Schema.decodeEffect(Schema.fromJsonString(Schema.Json))(rejectedBody).pipe(Effect.flatMap((value) => Effect.try(() => parseJSONRPCMessage(value))), Effect.option));
                     if (Option.isSome(decoded) && isJSONRPCErrorResponse(decoded.value)) responseMetadata = { ...responseMetadata!, protocolCode: decoded.value.error.code };
                   }
                   controller.close();
@@ -343,13 +350,14 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
             const result = yield* handle(descriptor.name, payload ?? {});
             // MCP results require JSON values before serialization, including optional undefined fields.
             const encoded = yield* Schema.encodeEffect(Schema.toCodecJson(McpResult), { onExcessProperty: "error" })({ result });
-            if (new TextEncoder().encode(JSON.stringify(encoded)).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Result too large; use cursor pagination" });
-            return new McpSchema.CallToolResult({ isError: false, content: [], structuredContent: encoded });
-          }).pipe(Effect.catchCause((cause) => Effect.sync(() => new McpSchema.CallToolResult({
-            isError: true,
-            content: [],
-            structuredContent: Schema.encodeSync(ToolFailure, { onExcessProperty: "error" })({ error: boundaryFailure(cause) }),
-          })))),
+            if (new TextEncoder().encode(encodeStructuredResult(encoded)).byteLength > LIMIT - 1024) return yield* new HttpError({ status: 413, message: "Result too large; use cursor pagination" });
+            const response = toolResult(encoded);
+            if (new TextEncoder().encode(encodeToolResult(response)).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Result too large; use cursor pagination" });
+            return response;
+          }).pipe(Effect.catchCause((cause) => Effect.sync(() => {
+            const structuredContent = Schema.encodeSync(Schema.toCodecJson(ToolFailure), { onExcessProperty: "error" })({ error: boundaryFailure(cause) });
+            return toolResult(structuredContent, true);
+          }))),
         });
         }))];
       });
@@ -375,7 +383,8 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
         const body = request.method === "POST" ? yield* request.json.pipe(Effect.interruptible, Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT))) : undefined;
         const method = body && typeof body === "object" && !Array.isArray(body) && "method" in body ? body.method : undefined;
         const response = yield* app.pipe(Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT)));
-        return yield* boundedResponse(response, method === "server/discover" || method === "tools/list" ? 512 * 1024 : LIMIT);
+        const rejected = response.status < 200 || response.status >= 300;
+        return yield* boundedResponse(response, rejected ? LIMIT : method === "server/discover" || method === "tools/list" ? 512 * 1024 : MCP_RESPONSE_LIMIT);
       }).pipe(Effect.catchCause((cause) => {
         if (Cause.squash(cause) instanceof HttpServerError.HttpServerError) {
           return HttpServerError.causeResponse(cause).pipe(Effect.map(([response]) => HttpServerResponse.setHeader(response, "cache-control", "no-store")));

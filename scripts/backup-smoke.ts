@@ -1,19 +1,22 @@
 import { RoleEnum, OfferDecisionEnum } from "../src/contracts.ts";
 import { TaskStateEnum } from "../src/generated/database/enums.ts";
-import { AgentHostEnum } from "../src/agent/contracts.ts";
+import { AgentHostEnum } from "../src/agent/protocol.ts";
 // Node assert has no Effect equivalent; assertions intentionally remain synchronous.
 import assert from "node:assert/strict";
-import { Clock, Config, Context, Effect, Layer, Schema, Stdio, Stream } from "effect";
+import { Clock, Config, Context, Effect, Formatter, Layer, Schema, Stdio, Stream } from "effect";
 import { NodeRuntime, NodeStdio } from "@effect/platform-node";
 
-import { SnapshotStore, restoreBrokerDatabase } from "../src/backup.ts";
-import { Broker } from "../src/broker.ts";
-import { BackupError, BrokerConfig, Commands, GitHubRepositoryId, JsonValue, JournalState, LiveSession, ObjectBackupConfig, Principal, Repo, SnapshotKey, Task } from "../src/contracts.ts";
+import { BackupError, makeSnapshotStore, restoreBrokerDatabase } from "../src/backup.ts";
+import { Broker, LiveSession } from "../src/broker.ts";
+import { BrokerConfig, Commands, command, GitHubRepositoryId, ArchiveParticipants, ObjectBackupConfig, Principal, Repo, SnapshotKey, Task } from "../src/contracts.ts";
 import { Mcp } from "../src/mcp.ts";
 import { Platform } from "../src/platform.ts";
 import { provisionPostgres, postgresAdmin, postgresConfig, dropPostgres } from "../test/postgres-fixture.ts";
-import { DatabaseService } from "../src/database-service.ts";
+import { DatabaseService } from "../src/database.ts";
 import { Archive, type ArchiveInsert, type ConsentInsert, type ParticipantConsentInsert, type SessionInsert, type TaskInsert } from "../src/generated/database/types.ts";
+import { Tool } from "effect/ai";
+
+const backupSmokeCommand = command("program.smoke:backup", "program", "runBackupSmoke", "Exercise real object backup using private proof config restricted to loopback and the proof bucket.", Tool.EmptyParams, Schema.Void, { exposure: "private" });
 
 const runBackupSmoke = () => Effect.gen(function*() {
   const platform = yield* Platform;
@@ -40,8 +43,7 @@ const runBackupSmoke = () => Effect.gen(function*() {
   };
   const brokerContext = yield* Layer.build(Broker.layer(config).pipe(Layer.provide(postgresConfig(sourceUrl))));
   const broker = Context.get(brokerContext, Broker);
-  const storeContext = yield* Layer.build(SnapshotStore.layer(objectBackup));
-  const store = Context.get(storeContext, SnapshotStore);
+  const store = yield* makeSnapshotStore(objectBackup);
   const initialDeadline = (yield* Clock.currentTimeMillis) + 30_000;
   while (!(yield* platform.fs.readDirectory(config.backupDirectory)).some((file) => file.endsWith(".pgdump"))) {
     if ((yield* Clock.currentTimeMillis) >= initialDeadline) return yield* Effect.fail(new BackupError({ message: "Initial broker snapshot deadline expired" }));
@@ -65,7 +67,7 @@ const runBackupSmoke = () => Effect.gen(function*() {
   const sessionInsert: SessionInsert = { id: session.sessionId, data: Schema.encodeSync(Schema.fromJsonString(LiveSession), { onExcessProperty: "error" })(session) };
   yield* db.query((client) => client.insertInto("sessions").values(sessionInsert));
   broker.sessions.set(session.sessionId, session);
-  const consentInsert: ConsentInsert = { owner: principal.owner, session: session.sessionId, enabled: 1, participants: Schema.encodeSync(Schema.fromJsonString(JournalState.fields.participants), { onExcessProperty: "error" })([principal.id]) };
+  const consentInsert: ConsentInsert = { owner: principal.owner, session: session.sessionId, enabled: 1, participants: Schema.encodeSync(Schema.fromJsonString(ArchiveParticipants), { onExcessProperty: "error" })([principal.id]) };
   yield* db.query((client) => client.insertInto("consents").values(consentInsert));
   const participantInsert: ParticipantConsentInsert = { owner: principal.owner, session: session.sessionId, participant: principal.id, enabled: 1 };
   yield* db.query((client) => client.insertInto("participant_consents").values(participantInsert));
@@ -123,13 +125,13 @@ const runBackupSmoke = () => Effect.gen(function*() {
   yield* store.restore(secondKey, currentAgain);
   assert.deepEqual(yield* platform.fs.readFile(currentAgain), yield* platform.fs.readFile(secondRestored));
 
-  yield* Stream.make(`${Schema.encodeSync(Schema.fromJsonString(JsonValue), { onExcessProperty: "error" })({ scenario: "application-object-backup", fixtureOnly: true,
+  yield* Stream.make(`${Formatter.formatJson({ scenario: "application-object-backup", fixtureOnly: true,
     uploadedBytesRestored: true, restoredPostgresOpened: true, taskMetadataSurvived: true,
     privacy: { archive: 0, consents: 0, participantConsents: 0, rawTranscriptAbsent: true, enrollmentPlaintextAbsent: true },
     optOutSnapshotSafe: true, existingRestoreTargetPreserved: true, expiredOldObject: true, currentObjectRetained: true,
-    productionBackupClaim: false })}\n`).pipe(Stream.run(stdio.stdout()));
+    productionBackupClaim: false }, { space: 2 })}\n`).pipe(Stream.run(stdio.stdout()));
 });
 
-NodeRuntime.runMain(Commands.runBackupSmoke.executeDecoded({ runBackupSmoke }, {}).pipe(
+NodeRuntime.runMain(backupSmokeCommand.executeDecoded({ runBackupSmoke }, {}).pipe(
   Effect.scoped, Effect.provide(Layer.mergeAll(Platform.layer, Mcp.layer, NodeStdio.layer)),
 ));

@@ -4,15 +4,21 @@ import { fileURLToPath } from "node:url";
 import { ChildProcess } from "effect/process";
 import { HttpServer } from "effect/http";
 import type { Kysely } from "kysely";
-import { Address, Work, RunnerConfig, type RunnerRow, RunnerEvent, RunnerResult, RunnerAgentState, WorkerId, UserId, Acceptance, HttpError, CommandError, Commands, RunnerCommand, RunnerControlEnum, RunnerRejectionStateEnum, RunnerReportStates, DispositionEnum, type CommandInput, type CommandOutput, type RunnerRelease, type RunnerReleased, RunnerRequest, type RunnerAdmission } from "./contracts.ts";
+import { Address, Work, RunnerConfig, RunnerEvent, RunnerResult, RunnerAgentState, WorkerId, UserId, Acceptance, HttpError, CommandError, Commands, RunnerCommand, RunnerControlEnum, RunnerRejectionStateEnum, RunnerReportStates, DispositionEnum, type CommandInput, type CommandOutput, type RunnerRelease, type RunnerReleased, RunnerRequest } from "./contracts.ts";
 import { Platform, redactedCause } from "./platform.ts";
-import { Mcp, serverLayer, LIMIT, MCP_RESULT_LIMIT } from "./mcp.ts";
+import { Mcp, serverLayer, LIMIT, MCP_RESULT_LIMIT, mcpResultText } from "./mcp.ts";
 import { assertRunnerSchema } from "./database.ts";
-import { awaitDatabaseLoss, DatabaseService, type DatabaseError } from "./database-service.ts";
+import { awaitDatabaseLoss, DatabaseService, type DatabaseError } from "./database.ts";
 import { RunnerEventId, PeerId, SessionId, RunnerTask, type TaskId, type DB } from "./generated/database/types.ts";
 import { RunnerStateEnum, TaskStateEnum } from "./generated/database/enums.ts";
 import { connectAgentClient, type AgentClient } from "./agent/client.ts";
-import { AgentTools, AgentRunOutcomeEnum, AgentBinding, AgentConfig, AgentSubmissionId, AgentEventSequence, AgentState, type AgentLifecycleEvent, type AgentPromptAdmission, type AgentPromptResult } from "./agent/contracts.ts";
+import { AgentTools, AgentRunOutcomeEnum, AgentBinding, AgentConfig, AgentSubmissionId, AgentEventSequence, AgentState, type AgentLifecycleEvent, type AgentPromptAdmission, type AgentPromptResult } from "./agent/protocol.ts";
+
+export type RunnerRow = RunnerTask & { readonly childUid: UserId };
+type RunnerAdmission<E> = {
+  readonly fingerprint: typeof RunnerTask.fields.fingerprint.Type;
+  readonly response: Deferred.Deferred<Acceptance, E>;
+};
 
 type OwnedAgentChild = { client: AgentClient; scope: Scope.Closeable; lost: boolean };
 const bindingText = Schema.encodeSync(Schema.fromJsonString(AgentBinding), { onExcessProperty: "error" });
@@ -85,10 +91,17 @@ export const requireIsolation = Effect.fn("Runner.requireIsolation")(function*(c
 });
 
 const byteLength = (value: string) => new TextEncoder().encode(value).byteLength;
-const inspectionText = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(Commands.inspectTask.structuredOutput)), { onExcessProperty: "error" });
-const agentResponseText = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(Commands.commandTask.structuredOutput)), { onExcessProperty: "error" });
-
-class RunnerConfiguration extends Context.Service<RunnerConfiguration, RunnerConfig>()("coordinator/RunnerConfiguration") {}
+const encodeInspection = Schema.encodeSync(Schema.toCodecJson(Commands.inspectTask.structuredOutput), { onExcessProperty: "error" });
+const encodeAgentResponse = Schema.encodeSync(Schema.toCodecJson(Commands.commandTask.structuredOutput), { onExcessProperty: "error" });
+const encodeRawResult = Schema.encodeSync(Schema.fromJsonString(Schema.Json), { onExcessProperty: "error" });
+const inspectionFits = (value: typeof Commands.inspectTask.structuredOutput.Type) => {
+  const encoded = encodeInspection(value);
+  return byteLength(encodeRawResult(encoded)) <= LIMIT - 1024 && byteLength(mcpResultText(encoded)) <= MCP_RESULT_LIMIT;
+};
+const agentResponseFits = (value: typeof Commands.commandTask.structuredOutput.Type) => {
+  const encoded = encodeAgentResponse(value);
+  return byteLength(encodeRawResult(encoded)) <= LIMIT - 1024 && byteLength(mcpResultText(encoded)) <= MCP_RESULT_LIMIT;
+};
 
 const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
   const platform = yield* Platform, rpc = yield* Mcp;
@@ -200,7 +213,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
         for (const event of rows) {
           const value = yield* Schema.decodeEffect(Schema.fromJsonString(RunnerEvent), { onExcessProperty: "error" })(event.payload);
           events.push(value); nextCursor = Number(event.seq);
-          if (new TextEncoder().encode(inspectionText({ result: { ...accepted, events, nextCursor } })).byteLength > MCP_RESULT_LIMIT) {
+          if (!inspectionFits({ result: { ...accepted, events, nextCursor } })) {
             events.pop(); events.push({ type: "gap", reason: "event exceeds remaining response bound", seq: Number(event.seq) }); break;
           }
         }
@@ -221,7 +234,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
           return yield* new CommandError({ message: "Agent control response binding mismatch" });
         }
         if (type === RunnerControlEnum.abort) yield* hold(taskId, "operator requested abort; await host outcome");
-        const bounded: CommandOutput<typeof Commands.commandTask> = byteLength(agentResponseText({ result: response })) <= MCP_RESULT_LIMIT ? response : { type: "gap", reason: "agent response exceeds endpoint bound" };
+        const bounded: CommandOutput<typeof Commands.commandTask> = agentResponseFits({ result: response }) ? response : { type: "gap", reason: "agent response exceeds endpoint bound" };
         return bounded;
       }),
       prepareTask: Effect.fnUntraced(function*(input: CommandInput<typeof Commands.prepareTask>) {
@@ -428,9 +441,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     heartbeatBusy = true;
     yield* Effect.gen(function*() {
       const rows = yield* database.query((db) => taskRows(db).where("detached", "=", 0).orderBy("taskId"));
-      const journal: Acceptance[] = []; let size = 1024;
-      for (const row of rows) { const item = yield* acceptance(row); const bytes = byteLength(Schema.encodeSync(Schema.fromJsonString(Acceptance), { onExcessProperty: "error" })(item)); if (size + bytes > LIMIT - 1024) break; journal.push(item); size += bytes; }
-      yield* rpc.call(config.brokerUrl, token, Commands.heartbeatRunner, { runnerId: config.id, slots: config.slots, load: yield* load(), journal }, 4000);
+      yield* rpc.call(config.brokerUrl, token, Commands.heartbeatRunner, { runnerId: config.id, slots: config.slots, load: yield* load() }, 4000);
       if (!reportsBusy) yield* fork(reports(rows).pipe(Effect.flatMap((outcomes) => Effect.forEach(outcomes, Effect.fromResult, { discard: true }))));
     }).pipe(Effect.ensuring(Effect.sync(() => { heartbeatBusy = false; })));
     // Broker outages never interrupt agent work or replay uncertain prompt sends.
@@ -519,7 +530,7 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
       yield* fileSystem.chown(agentConfig, row.childUid, row.childUid);
       const client = yield* connectAgentClient({
         host: work.launcher, command: "/usr/bin/env",
-        args: [`--chdir=${row.worktree}`, "/usr/bin/setpriv", ...isolationArgs(row.childUid), config.launchers[work.launcher]!, "--mode", "rpc", "--session-dir", sessions, "--no-extensions", "-e", fileURLToPath(new URL("../dist/plugins/runner-plugin.js", import.meta.url))],
+        args: [`--chdir=${row.worktree}`, "/usr/bin/setpriv", ...isolationArgs(row.childUid), config.launchers[work.launcher]!, "--mode", "rpc", "--session-dir", sessions, "--no-extensions", "-e", fileURLToPath(new URL("../dist/plugins/agent-session.js", import.meta.url))],
         env, cwd: config.stateDirectory, connectTimeoutMs: 60000, plugin: { endpointFile, token: agentToken },
       }).pipe(Effect.provideService(Scope.Scope, childScope), Effect.withSpan("Runner.launch.connect"));
       const childPid = RunnerTask.fields.pid.members[0].make(client.pid, { disableChecks: true });
@@ -651,11 +662,11 @@ const makeRunner = Effect.fn("Runner.make")(function*(input: RunnerConfig) {
     )));
   }));
   if (ownershipLost) return yield* Deferred.await(fatal);
-  return { config, database, server, failure: Deferred.await(fatal), authorize, handle, row: getRow, state, event, reports, heartbeat, launch };
+  return { config, database, server, failure: Deferred.await(fatal), authorize, handle, row: getRow, reports };
 });
 
 export class Runner extends Context.Service<Runner>()("coordinator/Runner", {
-  make: Effect.gen(function*() { return yield* makeRunner(yield* RunnerConfiguration); })
+  make: makeRunner
 }) {
-  static layer(config: RunnerConfig) { return Layer.effect(Runner, Runner.make).pipe(Layer.provide(Layer.merge(Layer.succeed(RunnerConfiguration, config), DatabaseService.layer()))); }
+  static layer(config: RunnerConfig) { return Layer.effect(Runner, Runner.make(config)).pipe(Layer.provide(DatabaseService.layer())); }
 }

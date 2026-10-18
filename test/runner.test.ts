@@ -1,22 +1,19 @@
 import { RoleEnum, DispositionEnum, RunnerRejectionStateEnum, RunnerControlEnum } from "../src/contracts.ts";
-import { AgentRunOutcomeEnum, AgentAdmissionDispositionEnum } from "../src/agent/contracts.ts";
 import { TaskStateEnum, RunnerStateEnum } from "../src/generated/database/enums.ts";
-import { AgentHostEnum } from "../src/agent/contracts.ts";
 import { it, onTestFinished } from "@effect/vitest";
 import assert from "node:assert/strict";
 import { existsSync, watch } from "node:fs";
-import { Clock, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime, PlatformError, Schema } from "effect";
+import { Clock, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { ChildProcess } from "effect/process";
 import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
 import { Runner, childEnvironment } from "../src/runner.ts";
 import { Broker } from "../src/broker.ts";
-import { DatabaseConnectionError, DatabaseError, DatabaseService } from "../src/database-service.ts";
+import { DatabaseService } from "../src/database.ts";
 import { Mcp, serverLayer } from "../src/mcp.ts";
 import { Platform } from "../src/platform.ts";
 import { Commands, type Command, type CommandDescriptor, Address, BrokerRequest, CommandError, HttpError, Json, JsonValue, RunnerEvent, RunnerResult, RunnerAgentState, RunnerRequest, Task, RunnerId, Repo, GitHubRepositoryId, Principal, RunnerConfig, UserId, Work } from "../src/contracts.ts";
 import { RunnerTask, TaskId } from "../src/generated/database/types.ts";
-import { AgentBinding, AgentEventSequence, AgentGeneration, AgentIncarnationId, AgentSessionId, AgentSubmissionId, AgentMessagesPage } from "../src/agent/contracts.ts";
-import { AgentLifecycleJournal } from "../src/agent/lifecycle.ts";
+import { AgentRunOutcomeEnum, AgentAdmissionDispositionEnum, AgentHostEnum, AgentBinding, AgentEventSequence, AgentGeneration, AgentIncarnationId, AgentSessionId, AgentSubmissionId, AgentMessagesPage, AgentLifecycleJournal } from "../src/agent/protocol.ts";
 import { provisionPostgres, dropPostgres, postgresAdmin, postgresConfig } from "./postgres-fixture.ts";
 
 
@@ -98,10 +95,8 @@ import * as HttpRouter from ${await moduleUrl("node_modules/effect/dist/http/Htt
 import * as HttpServerRequest from ${await moduleUrl("node_modules/effect/dist/http/HttpServerRequest.js")};
 import * as HttpServerResponse from ${await moduleUrl("node_modules/effect/dist/http/HttpServerResponse.js")};
 import * as NodeRuntime from ${await moduleUrl("node_modules/@effect/platform-node/dist/NodeRuntime.js")};
-import { AgentHostEnum, AgentRunOutcomeEnum, AgentAdmissionDispositionEnum, AgentBinding, AgentError, AgentConfig, AgentTools, AgentPromptResult, agentEventsUri } from ${await moduleUrl("dist/agent/contracts.js")};
-import { AgentLifecycleJournal } from ${await moduleUrl("dist/agent/lifecycle.js")};
-import { agentHttpLayer, agentTool } from ${await moduleUrl("dist/agent/server.js")};
-import { createAgentPresentation } from ${await moduleUrl("dist/agent/interaction.js")};
+import { AgentHostEnum, AgentRunOutcomeEnum, AgentAdmissionDispositionEnum, AgentBinding, AgentError, AgentConfig, AgentTools, AgentPromptResult, agentEventsUri, AgentLifecycleJournal } from ${await moduleUrl("dist/agent/protocol.js")};
+import { agentHttpLayer, agentTool, createAgentPresentation } from ${await moduleUrl("dist/agent/server.js")};
 import { realpathSync, writeFileSync, readFileSync, renameSync, statSync, existsSync, watch } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -209,7 +204,8 @@ if (process.argv.includes("--version")) {
     await run(broker.database.query(db => db.insertInto("tasks").values({ id: task.taskId, data }).onConflict((conflict) => conflict.column("id").doUpdateSet({ data })))); return task;
   }
   await save(work);
-  const runtimes = new Set<ManagedRuntime.ManagedRuntime<Runner, Effect.Error<typeof Runner.make> | DatabaseError | DatabaseConnectionError | PlatformError.PlatformError | Layer.Error<typeof common>>>();
+  const runnerLayer = Runner.layer(config);
+  const runtimes = new Set<ManagedRuntime.ManagedRuntime<Runner, Layer.Error<typeof runnerLayer> | Layer.Error<typeof common>>>();
   async function open(input = config, servicesLayer = common, url = runnerDatabaseUrl) {
     const runtime = ManagedRuntime.make(Runner.layer(input).pipe(Layer.provide(postgresConfig(url)), Layer.provide(servicesLayer))); runtimes.add(runtime);
     const service = await runtime.runPromise(Runner);

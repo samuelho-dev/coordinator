@@ -8,8 +8,10 @@ export const AgentMcpWireBytes = 64 * 1024;
 export const AgentMcpResultBytes = AgentMcpWireBytes - 1024;
 export const AgentPrivateResultBytes = 64 * 1024 * 1024;
 const utf8 = new TextEncoder();
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const encodePrettyJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown, { space: 2 }));
 export const resultByteLimit = Schema.makeFilter<unknown>((value) =>
-  utf8.encode(JSON.stringify(value)).byteLength <= AgentMcpResultBytes ? undefined : "Agent result exceeds encoded byte budget",
+  utf8.encode(encodeJson({ content: [{ type: "text", text: encodePrettyJson(value) }], structuredContent: value })).byteLength <= AgentMcpResultBytes ? undefined : "Agent result exceeds encoded byte budget",
   // The wire union has only object branches; preserve its root type for standard MCP discovery.
   { toJsonSchema: () => [{ type: "object" }, true] });
 
@@ -96,9 +98,9 @@ export const AgentEventPage = Schema.Struct({
   entries: Schema.Array(AgentLifecycleEvent).check(Schema.isMaxLength(256)), nextAfter: AgentEventSequence, more: Schema.Boolean,
   gap: Schema.NullOr(Schema.Struct({ from: AgentEventSequence, through: AgentEventSequence })),
 }).check(Schema.makeFilter((page) =>
-  utf8.encode(JSON.stringify({ result: { contents: [{
+  utf8.encode(encodeJson({ result: { contents: [{
     uri: agentEventsUri(page.binding), mimeType: "application/json",
-    text: JSON.stringify(page),
+    text: encodeJson(page),
   }] } })).byteLength <= AgentMcpResultBytes ? undefined : "Agent resource page exceeds encoded byte budget"));
 export type AgentEventPage = typeof AgentEventPage.Type;
 export function agentEventsUri(binding: AgentBinding): string {
@@ -346,3 +348,136 @@ export type AgentToolHandlers<H extends AgentHost, R = never> = {
 export const agentToolDescriptors = Object.values(AgentTools);
 export const agentToolDiscovery = new Map<string, AgentTool>(agentToolDescriptors.map((descriptor) => [descriptor.name, descriptor]));
 export const AgentToolName = Schema.Literals(agentToolDescriptors.map((descriptor) => descriptor.name));
+export const AgentPresentationMetadataKey = "io.coordinator.agent/presentation";
+export const AgentHostResultReference = Schema.Struct({
+  uri: Schema.String, mimeType: Schema.Literal("application/json"),
+  byteLength: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 67108864 })),
+});
+
+const presentationSequence = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
+const presentationKey = Schema.String.check(Schema.isMaxLength(4096));
+export const AgentPresentationCursor = Schema.Struct({ binding: AgentBinding, after: presentationSequence });
+export type AgentPresentationCursor = typeof AgentPresentationCursor.Type;
+export const AgentPresentationPage = Schema.Struct({
+  binding: AgentBinding, after: presentationSequence, highWater: presentationSequence,
+  nextAfter: presentationSequence, more: Schema.Boolean,
+  gap: Schema.NullOr(Schema.Struct({ from: presentationSequence, through: presentationSequence })),
+  entries: Schema.Array(Schema.Struct({
+    binding: AgentBinding, seq: presentationSequence.check(Schema.isGreaterThan(0)), key: presentationKey,
+    snapshot: AgentHostResultReference,
+  })).check(Schema.isMaxLength(256)),
+});
+export type AgentPresentationPage = typeof AgentPresentationPage.Type;
+export const AgentPresentationValue = Schema.Struct({
+  binding: AgentBinding, seq: presentationSequence.check(Schema.isGreaterThan(0)), key: presentationKey, value: Schema.Json,
+});
+export type AgentPresentationValue = typeof AgentPresentationValue.Type;
+export const agentPresentationUri = (binding: AgentBinding) => agentEventsUri(binding).replace(/\/events$/, "/presentation");
+
+const eventText = Schema.encodeSync(Schema.fromJsonString(AgentLifecycleEvent), { onExcessProperty: "error" });
+const escapedText = Schema.encodeSync(Schema.fromJsonString(Schema.String));
+
+export class AgentLifecycleJournal {
+  readonly #retention: number;
+  readonly #maxPageSize: number;
+  readonly #entries: AgentLifecycleEvent[] = [];
+  readonly #listeners = new Set<(event: AgentLifecycleEvent) => void>();
+  #highWater = AgentEventSequence.make(0);
+  #evictedThrough = AgentEventSequence.make(0);
+  #fanoutThrough = AgentEventSequence.make(0);
+  #fanoutScheduled = false;
+  readonly #flushFanout = (): void => {
+    const through = this.#highWater;
+    // Snapshot retained rows only. Reentrant appends cannot reorder this batch or grow a pending queue.
+    const retained = this.#entries.filter((event) => event.seq > this.#fanoutThrough && event.seq <= through);
+    const listeners = Array.from(this.#listeners);
+    for (const event of retained) {
+      for (const listener of listeners) {
+        if (!this.#listeners.has(listener)) continue;
+        try { listener(event); } catch { /* Subscriber failures cannot roll back committed metadata. */ }
+      }
+    }
+    this.#fanoutThrough = through;
+    this.#fanoutScheduled = false;
+    if (this.#highWater > through) {
+      this.#fanoutScheduled = true;
+      queueMicrotask(this.#flushFanout);
+    }
+  };
+
+  constructor(options: { readonly retention?: number; readonly maxPageSize?: number } = {}) {
+    this.#retention = options.retention ?? 1024;
+    this.#maxPageSize = options.maxPageSize ?? 256;
+    if (!Number.isSafeInteger(this.#retention) || this.#retention < 1 || this.#retention > 65536 ||
+        !Number.isSafeInteger(this.#maxPageSize) || this.#maxPageSize < 1 || this.#maxPageSize > 256) {
+      throw new AgentError({ code: "invalid_input", message: "Invalid lifecycle journal bounds" });
+    }
+  }
+
+  get highWater(): AgentEventSequence { return this.#highWater; }
+
+  // SDK adapters derive this typed metadata; unknown SDK/network values are decoded before reaching the journal.
+  append(emission: AgentLifecycleEmission): AgentLifecycleEvent {
+    if (this.#highWater === Number.MAX_SAFE_INTEGER) {
+      throw new AgentError({ code: "sequence_exhausted", message: "Agent lifecycle sequence exhausted" });
+    }
+    const event: AgentLifecycleEvent = { ...emission, binding: { ...emission.binding },
+      ...(emission.kind === "session_retired" && emission.replacement ? { replacement: { ...emission.replacement } } : {}),
+      seq: AgentEventSequence.make(this.#highWater + 1) };
+    Object.freeze(event.binding);
+    if (event.kind === "session_retired" && event.replacement) Object.freeze(event.replacement);
+    Object.freeze(event);
+    this.#entries.push(event);
+    this.#highWater = event.seq;
+    if (this.#entries.length > this.#retention) {
+      const evicted = this.#entries.shift();
+      if (evicted) this.#evictedThrough = evicted.seq;
+    }
+    // Agent physical fences unwind before any subscriber runs. Fanout is a retained-event hint, not delivery.
+    if (!this.#fanoutScheduled) {
+      this.#fanoutScheduled = true;
+      queueMicrotask(this.#flushFanout);
+    }
+    return event;
+  }
+
+  // Resource handlers decode wire bindings/cursors; the journal enforces retained-history and paging bounds.
+  read(binding: AgentBinding, after: AgentEventSequence, limit = this.#maxPageSize): AgentEventPage {
+    const identity = { ...binding };
+    const cursor = after;
+    if (cursor > this.#highWater || !Number.isSafeInteger(limit) || limit < 1 || limit > this.#maxPageSize) {
+      throw new AgentError({ code: "invalid_input", message: "Invalid lifecycle resource cursor or page limit" });
+    }
+    const gap = cursor < this.#evictedThrough ? Object.freeze({ from: AgentEventSequence.make(cursor + 1), through: this.#evictedThrough }) : null;
+    const entries: AgentLifecycleEvent[] = [];
+    const pageBase = { binding: identity, after: cursor, oldestAvailable: this.#entries[0]?.seq ?? this.#highWater, highWater: this.#highWater, gap };
+    const baseBytes = utf8.encode(encodeJson({
+      result: { contents: [{ uri: agentEventsUri(identity), mimeType: "application/json",
+        text: encodeJson({ ...pageBase, entries: [], nextAfter: this.#highWater, more: false }),
+      }] },
+    })).byteLength;
+    let encodedEntriesBytes = 0;
+    let more = false;
+    const available = this.#entries.filter((event) => event.seq > cursor && event.binding.host === identity.host &&
+      event.binding.sessionId === identity.sessionId && event.binding.incarnation === identity.incarnation && event.binding.generation === identity.generation);
+    for (const event of available) {
+      if (entries.length === limit) { more = true; break; }
+      const entryBytes = utf8.encode(escapedText(eventText(event))).byteLength - 2 + (entries.length === 0 ? 0 : 1);
+      const candidateMore = entries.length + 1 < available.length;
+      // JSON's true is one byte shorter; the cursor contains only unescaped decimal digits.
+      const metadataBytes = candidateMore ? -1 + String(event.seq).length - String(this.#highWater).length : 0;
+      if (baseBytes + encodedEntriesBytes + entryBytes + metadataBytes > AgentMcpResultBytes) { more = true; break; }
+      encodedEntriesBytes += entryBytes;
+      entries.push(event);
+    }
+    const last = entries.at(-1);
+    const nextAfter = more && last ? last.seq : this.#highWater;
+    return Object.freeze({ ...pageBase, binding: Object.freeze(identity),
+      entries: Object.freeze(entries), nextAfter, more });
+  }
+
+  subscribe(listener: (event: AgentLifecycleEvent) => void): () => void {
+    this.#listeners.add(listener);
+    return () => { this.#listeners.delete(listener); };
+  }
+}

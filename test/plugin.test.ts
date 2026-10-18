@@ -1,22 +1,19 @@
-import { JournalReleaseStateEnum } from "../src/contracts.ts";
 import { Commands, type CommandOutput, RoleEnum, DispositionEnum } from "../src/contracts.ts";
-import { AgentRunOutcomeEnum, AgentRunPhaseEnum, AgentPhaseTransitionEnum } from "../src/agent/contracts.ts";
 import { TaskStateEnum } from "../src/generated/database/enums.ts";
-import { AgentHostEnum } from "../src/agent/contracts.ts";
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import { Cause, Clock, ConfigProvider, Context as EffectContext, Deferred, Duration, Effect, Layer, Schema, Sink, Stdio } from "effect";
 import { ChildProcess } from "effect/process";
 import { TestClock } from "effect/testing";
 import { HttpServer } from "effect/http";
-import { AgentBinding, AgentEventSequence, AgentRunId } from "../src/agent/contracts.ts";
+import { AgentRunOutcomeEnum, AgentRunPhaseEnum, AgentPhaseTransitionEnum, AgentHostEnum, AgentBinding, AgentEventSequence, AgentRunId } from "../src/agent/protocol.ts";
 import { Mcp, serverLayer } from "../src/mcp.ts";
 import { Platform, redactedCause } from "../src/platform.ts";
-import { Journal } from "../src/journal.ts";
-import { CommandError, Delivery, HttpError, MachineId, Task, Principal, PluginConfig, JournalReleaseKey } from "../src/contracts.ts";
+import { CommandError, Delivery, HttpError, MachineId, Task, Principal, PluginConfig } from "../src/contracts.ts";
 import { SessionId } from "../src/generated/database/types.ts";
-import type { Context, BrokerRequest } from "../src/contracts.ts";
-import { Plugin } from "../src/plugin.ts";
+import type { BrokerRequest } from "../src/contracts.ts";
+import { Plugin, makeJournal, JournalReleaseStateEnum, JournalReleaseKey, type Context } from "../src/plugin.ts";
+
 
 it.live("ordinary host startup discovers private plugin config and fences owned SDK delivery", () => Effect.scoped(Effect.gen(function*() {
   const platform = yield* Platform;
@@ -80,7 +77,7 @@ it.live("ordinary host startup discovers private plugin config and fences owned 
       if (request.method === Commands.acknowledgePeer.name) { const output: CommandOutput<typeof Commands.acknowledgePeer> = { handled: true }; return output; }
       if (request.method === Commands.stopSession.name) { const output: CommandOutput<typeof Commands.stopSession> = { stopped: true }; return output; }
       if (request.method === Commands.reportTask.name && task !== undefined) {
-        const persisted = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, request.params.sessionId)), Journal);
+        const persisted = yield* makeJournal(stateDirectory, request.params.sessionId);
         assert.equal(persisted.state.releases[JournalReleaseKey.make("task:1")], JournalReleaseStateEnum.sent, "SDK admission must follow durable intent before reporting");
         if (request.params.state === TaskStateEnum.RUNNING) {
           attempts++;
@@ -130,7 +127,7 @@ it.live("ordinary host startup discovers private plugin config and fences owned 
   assert.match(terminalOutput.at(-1) ?? "", /state=done/);
   yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
   assert.equal(attempts, 1, "A lost admission report cannot replay an already admitted native prompt during recovery");
-  const retained = EffectContext.get(yield* Layer.build(Journal.layer(stateDirectory, SessionId.make(identity.sessionId))), Journal);
+  const retained = yield* makeJournal(stateDirectory, SessionId.make(identity.sessionId));
   assert.equal(retained.state.releases[JournalReleaseKey.make("task:1")], JournalReleaseStateEnum.sent, "Journal pause cannot clear admitted release uncertainty");
   for (const frame of terminalOutput.filter(frame => !frame.includes("7501;?"))) {
     assert.match(frame, /id=coordinator/);

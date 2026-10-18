@@ -1,4 +1,4 @@
-import { AgentRunOutcomeEnum } from "../src/agent/contracts.ts";
+import { AgentRunOutcomeEnum, AgentHostEnum, AgentError, AgentEventSequence, AgentGeneration, AgentSubmissionId, AgentTools } from "../src/agent/protocol.ts";
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import { fileURLToPath } from "node:url";
@@ -6,7 +6,6 @@ import type { Transport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { Cause, Effect, Schema, Scope } from "effect";
 import { connectAgentTransport, type AgentClient } from "../src/agent/client.ts";
-import { AgentHostEnum, AgentError, AgentEventSequence, AgentGeneration, AgentSubmissionId, AgentTools } from "../src/agent/contracts.ts";
 
 // Reuse the real SDK server/resource fixture, not an echo transport or copied schemas.
 const source = fileURLToPath(new URL("agent-client-proof.test.ts", import.meta.url));

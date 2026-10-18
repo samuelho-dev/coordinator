@@ -1,6 +1,6 @@
-import { Deferred, Effect, Option, Schema, SchemaGetter, Struct } from "effect";
+import { Effect, Schema, Struct } from "effect";
 import { Tool } from "effect/ai";
-import { AgentBinding, AgentRunId, AgentSubmissionId, AgentEventSequence, AgentState, AgentGetMessagesInput, AgentMessagesPage, AgentAbortResult, AgentHost, AgentRunOutcome, AgentLifecycleEmission } from "./agent/contracts.ts";
+import { AgentBinding, AgentRunId, AgentSubmissionId, AgentEventSequence, AgentState, AgentGetMessagesInput, AgentMessagesPage, AgentAbortResult, AgentHost, AgentRunOutcome, AgentLifecycleEmission } from "./agent/protocol.ts";
 import { TaskId, PeerId, SessionId, RunnerTask, Archive, Evidence, Peer } from "./generated/database/types.ts";
 import { TaskState, TaskStateEnum, RunnerState, RunnerStateEnum } from "./generated/database/enums.ts";
 
@@ -10,10 +10,6 @@ export const WorkerId = Schema.String.pipe(Schema.brand("WorkerId"));
 export type WorkerId = typeof WorkerId.Type;
 export const RunnerId = Schema.String.pipe(Schema.brand("RunnerId"));
 export type RunnerId = typeof RunnerId.Type;
-export const JournalHandledKey = Schema.String.pipe(Schema.brand("JournalHandledKey"));
-export type JournalHandledKey = typeof JournalHandledKey.Type;
-export const JournalReleaseKey = Schema.String.pipe(Schema.brand("JournalReleaseKey"));
-export type JournalReleaseKey = typeof JournalReleaseKey.Type;
 export const GitHubRepositoryId = Schema.Int.pipe(Schema.brand("GitHubRepositoryId"));
 export type GitHubRepositoryId = typeof GitHubRepositoryId.Type;
 export const GitHubRunId = Schema.Int.pipe(Schema.brand("GitHubRunId"));
@@ -34,7 +30,7 @@ export const Json = Schema.Record(Schema.String, Schema.mutableKey(JsonValue));
 export type Json = typeof Json.Type;
 const strings = Schema.mutable(Schema.Array(Text));
 const boundedStrings = strings.check(Schema.isMaxLength(32));
-const participants = Schema.mutable(Schema.Array(Peer.fields.sender));
+export const ArchiveParticipants = Schema.mutable(Schema.Array(Peer.fields.sender));
 const port = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 65535 }));
 const hash = RunnerTask.fields.fingerprint.check(Schema.isPattern(/^[a-f0-9]{64}$/));
 
@@ -128,7 +124,7 @@ export const BrokerConfig = Schema.Struct({ host: Text, port, principals: Schema
 export type BrokerConfig = typeof BrokerConfig.Type;
 export const RunnerConfig = Schema.Struct({
   id: RunnerId, brokerUrl: Schema.String, tokenFile: Schema.String, host: Schema.String, port, controlTokenHash: hash,
-  stateDirectory: Schema.String, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 128 })),
+  stateDirectory: Schema.String, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 64 })),
   repositories: Schema.Record(Schema.String.pipe(Schema.brand("@samuelho/coordinator/Repo")), Schema.String), launchers: Schema.Record(Schema.String, Schema.String),
   modelDirectory: Schema.String, childDirectory: Schema.String,
   childUidBase: UserId.check(Schema.isBetween({ minimum: 1000000, maximum: 0xffffffff - 1000000 })),
@@ -144,10 +140,6 @@ export const SessionKey = Session.mapFields(Struct.pick(["sessionId", "incarnati
 export type SessionKey = typeof SessionKey.Type;
 export const TaskKey = Work.mapFields(Struct.pick(["taskId"]));
 export type TaskKey = typeof TaskKey.Type;
-export const LiveSession = Schema.Struct({ ...Session.fields, owner: Peer.fields.owner, principal: Peer.fields.sender, verified: Schema.mutableKey(Schema.Boolean), liveUntil: Schema.mutableKey(Schema.Finite), polledAt: Schema.mutableKey(Schema.Finite) });
-export type LiveSession = typeof LiveSession.Type;
-export const LiveRunner = Schema.Struct({ runnerId: RunnerId, owner: Peer.fields.owner, slots: Schema.Int, load: Schema.mutableKey(Schema.Int), liveUntil: Schema.Finite });
-export type LiveRunner = typeof LiveRunner.Type;
 export const Delivery = Schema.Struct({ messageId: PeerId, incarnation: RunnerTask.fields.incarnation, payload: JsonValue, expiresAt: Schema.Finite });
 export type Delivery = typeof Delivery.Type;
 export const Poll = Schema.Struct({ messages: Schema.mutable(Schema.Array(Delivery)), offers: Schema.mutable(Schema.Array(Task)), releases: Schema.mutable(Schema.Array(Task)), archiveEnabled: Schema.optional(Schema.Boolean) });
@@ -166,43 +158,8 @@ export type ArchiveRow = typeof ArchiveRow.Type;
 export const InboxEntry = Schema.Struct({ payload: JsonValue, digest: hash, receivedAt: Schema.Finite });
 export type InboxEntry = typeof InboxEntry.Type;
 export const Inbox = Schema.Record(PeerId, Schema.mutableKey(InboxEntry));
-export enum JournalReleaseStateEnum {
-  intent = "intent",
-  sent = "sent",
-}
-export const JournalReleaseState = Schema.Enum(JournalReleaseStateEnum);
-export type JournalReleaseState = typeof JournalReleaseState.Type;
-export const JournalState = Schema.Struct({
-  handled: Schema.Record(JournalHandledKey, Schema.mutableKey(Schema.Literal(true))),
-  releases: Schema.Record(JournalReleaseKey, Schema.mutableKey(JournalReleaseState)),
-  consent: Schema.mutableKey(Schema.Boolean), participants: Schema.mutableKey(participants), seen: Schema.mutableKey(Schema.Record(hash, Schema.mutableKey(hash))),
-  fileDigest: Schema.mutableKey(Schema.optional(hash)), spool: Schema.mutableKey(Schema.mutable(Schema.Array(ArchiveEntry))), gaps: Schema.mutableKey(strings),
-  inbox: Schema.mutableKey(Inbox.pipe(Schema.withDecodingDefaultKey(Effect.sync(() => ({}))))),
-});
-export type JournalState = typeof JournalState.Type;
-// One-way host journal boundary: unknown fields and message content never survive.
-export const HostJournalEntry = Schema.Struct({
-  id: Archive.fields.entry,
-  parentId: Schema.optional(ArchivePayload.members[0].fields.parentId).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(null)))),
-  type: Schema.optional(ArchivePayload.members[0].fields.type).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(undefined)))),
-  message: Schema.optional(Schema.Struct({
-    role: ArchivePayload.members[0].fields.role.pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(undefined)))),
-  })).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(undefined)))),
-}).pipe(Schema.decodeTo(ArchivePayload.members[0], {
-  decode: SchemaGetter.transform(entry => ({
-    id: entry.id, parentId: entry.parentId ?? null, type: entry.type ?? "omitted",
-    ...(entry.message?.role === undefined ? {} : { role: entry.message.role }), contentOmitted: true,
-  })),
-  encode: SchemaGetter.forbiddenEncoding,
-}));
-export type HostJournalEntry = typeof HostJournalEntry.Type;
-export const ObservedFile = Schema.Struct({ path: Schema.String, size: Schema.Finite, mtimeMs: Schema.Finite });
-export type ObservedFile = typeof ObservedFile.Type;
 
-export const RepoIdentity = Schema.Struct({ id: GitHubRepositoryId, full_name: Text, private: Schema.Boolean });
 export const Job = Schema.Struct({ id: GitHubJobId, name: Text, status: Text, conclusion: Schema.NullOr(Text), started_at: Schema.NullOr(Text), completed_at: Schema.NullOr(Text) });
-export const Run = Schema.Struct({ id: GitHubRunId, workflow_id: GitHubWorkflowId, name: Schema.NullOr(Text), head_sha: Evidence.fields.sha, head_branch: Schema.NullOr(Text), pull_requests: Schema.optional(Schema.Array(Schema.Struct({ number: GitHubPullRequestNumber }))), run_attempt: Schema.Int, status: Text, conclusion: Schema.NullOr(Text), html_url: Text, created_at: Text });
-export const MergeRef = Schema.Struct({ ref: Text, object: Schema.Struct({ type: Schema.Literal("commit"), sha: Evidence.fields.sha }) });
 export const CiLane = Schema.Struct({ lane: Text, runId: Schema.optional(GitHubRunId), attempt: Schema.optional(Schema.Int), status: Schema.optional(Text), conclusion: Schema.optional(Schema.NullOr(Text)), jobs: Schema.optional(Schema.mutable(Schema.Array(Job))) });
 export enum CiVerdictEnum {
   green = "green",
@@ -214,8 +171,6 @@ export const CiVerdict = Schema.Enum(CiVerdictEnum);
 export type CiVerdict = typeof CiVerdict.Type;
 export const CiEvidence = Schema.Struct({ sha: Evidence.fields.sha, repositoryId: GitHubRepositoryId, ref: Text, observedAt: Text, provenance: Text, verdict: Schema.mutableKey(CiVerdict), reason: Schema.mutableKey(Schema.optional(Text)), lanes: Schema.mutable(Schema.Array(CiLane)) });
 export type CiEvidence = typeof CiEvidence.Type;
-export const CiSeen = Schema.Struct({ lane: Text, run: Run, jobs: Schema.mutable(Schema.Array(Job)), green: Schema.Boolean });
-export type CiSeen = typeof CiSeen.Type;
 export const LocalEvidence = Schema.Struct({ taskId: TaskId, sha: Evidence.fields.sha, commands: strings, passed: Schema.Boolean });
 export type LocalEvidence = typeof LocalEvidence.Type;
 export const DeploymentEvidence = Schema.Struct({ taskId: TaskId, sha: Evidence.fields.sha, environment: Text, url: Text, observedState: Text, provenance: Text });
@@ -229,13 +184,8 @@ export type ReviewDecision = typeof ReviewDecision.Type;
 export const ReviewEvidence = Schema.Struct({ taskId: TaskId, sha: Evidence.fields.sha, decision: ReviewDecision, note: Text });
 export type ReviewEvidence = typeof ReviewEvidence.Type;
 
-export type RunnerRow = RunnerTask & { readonly childUid: UserId };
 export const AgentIdentity = Session.mapFields(Struct.omit(["host", "workerId"])).pipe(Schema.fieldsAssign({ ref: Work.fields.ref, sha: Work.fields.sha, workerId: Work.fields.workerId, workerIdentitySource: Schema.Literal("agent-session") }));
 export type AgentIdentity = typeof AgentIdentity.Type;
-export type RunnerAdmission<E> = {
-  readonly fingerprint: typeof RunnerTask.fields.fingerprint.Type;
-  readonly response: Deferred.Deferred<Acceptance, E>;
-};
 export const RunnerInspect = Schema.Struct({ ...TaskKey.fields, cursor: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))) });
 export type RunnerInspect = typeof RunnerInspect.Type;
 export enum RunnerControlEnum {
@@ -270,43 +220,6 @@ export type RunnerInspection = typeof RunnerInspection.Type;
 export const RunnerAgentState = AgentState.mapFields(Struct.pick(["sessionFile", "cwd", "currentRunId", "isStreaming", "isCompacting", "pendingMessageCount", "pendingAsyncWorkCount", "messageCount"])).pipe(Schema.fieldsAssign({ binding: AgentBinding }));
 export const AgentResponse = Schema.Union([RunnerAgentState, AgentMessagesPage, AgentAbortResult, Schema.Struct({ type: Schema.Literal("gap"), reason: Text })]);
 
-// Pi and omp expose this minimal structural subset; no runtime host dependency.
-export type Context = {
-  readonly cwd: string;
-  readonly hasUI: boolean;
-  readonly model?: { readonly provider: string; readonly id: string } | undefined;
-  readonly mode: "tui" | "rpc" | "json" | "print";
-  readonly agent?: { readonly kind: "main" | "sub" } | undefined;
-  readonly sessionManager: { readonly getSessionId: () => string };
-  readonly ui: {
-    readonly notify: (text: string, level?: "info" | "warning" | "error") => void;
-    readonly confirm: (title: string, text: string) => Promise<boolean>;
-    readonly setStatus?: ((key: string, text: string | undefined) => void) | undefined;
-    readonly onTerminalInput?: ((handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void) | undefined;
-  };
-};
-export type AgentEventName = "session_start" | "session_shutdown" | "session_switch";
-export type Host = {
-  readonly on: (event: AgentEventName, handler: (event: unknown, ctx: Context) => Promise<void>) => unknown;
-  readonly registerCommand: (name: string, options: { description: string; handler: (args: string, ctx: Context) => Promise<void> }) => void;
-};
-export const Observation = Schema.Struct({ operation: Schema.String, observed: JsonValue });
-export type Observation = typeof Observation.Type;
-export const InstallCommand = Schema.Struct({ binary: Schema.String, args: Schema.mutable(Schema.Array(Schema.String)) });
-export type InstallCommand = typeof InstallCommand.Type;
-export enum InstallModeEnum {
-  pluginOnly = "plugin-only",
-  runnerOnly = "runner-only",
-}
-export const InstallMode = Schema.Enum(InstallModeEnum);
-export type InstallMode = typeof InstallMode.Type;
-export const InstallPlan = Schema.Struct({
-  dryRun: Schema.Boolean, mode: InstallMode,
-  service: Schema.optional(Schema.String), pluginConfig: Schema.optional(Schema.String),
-  program: strings, operations: Schema.mutable(Schema.Array(InstallCommand)),
-  host: Schema.optional(AgentHost), package: Schema.String,
-});
-export type InstallPlan = typeof InstallPlan.Type;
 export const ModelProfile = Schema.Struct({ modelRoles: Schema.Struct({ default: Schema.String }) });
 export type ModelProfile = typeof ModelProfile.Type;
 
@@ -318,18 +231,17 @@ export type CommandTarget = "broker" | "runner" | "shared" | "plugin" | "program
 export type CommandExposure = "tool" | "internal" | "local" | "private";
 type CommandPolicy = {
   readonly exposure: CommandExposure;
-  readonly method?: string;
   readonly transaction?: "transaction" | "remote";
   readonly offer?: true;
   readonly approval?: "exact-work" | "exact-instruction" | "release" | "handoff" | "participant-consent" | "archive-consent" | "control";
 };
 // Capabilities capture the authenticated principal or active host context at composition time.
 // Executors never import a service, cast a callback, or discard its error/environment channels.
-function command<const N extends string, const T extends CommandTarget, const K extends string, I extends Schema.ConstraintCodec<unknown, unknown>, O extends Schema.ConstraintCodec<unknown, unknown>, const P extends CommandPolicy>(
+export function command<const N extends string, const T extends CommandTarget, const K extends string, I extends Schema.ConstraintCodec<unknown, unknown>, O extends Schema.ConstraintCodec<unknown, unknown>, const P extends CommandPolicy>(
   name: N, target: T, capability: K, description: string, input: I, output: O, policy: P,
 ) {
   return {
-    name, target, capability, description, input, output, method: policy.method,
+    name, target, capability, description, input, output,
     request: Schema.Struct({ method: Schema.Literal(name), params: input }),
     transaction: policy.transaction, offer: policy.offer ?? false, approval: policy.approval,
     ...policy,
@@ -358,7 +270,6 @@ export type SessionLiveness = typeof SessionLiveness.Type;
 const sessionList = Schema.mutable(Schema.Array(Schema.Struct({ ...Session.fields, status: SessionLiveness, liveUntil: Schema.Finite })));
 const sessionPage = Schema.Struct({ sessions: sessionList, nextCursor: Schema.optional(SessionId) });
 const pluginReadback = Schema.Struct({ ...RunnerPrepare.fields, reason: Schema.optional(Text), nextCheck: Schema.optional(Schema.Finite) });
-const absolutePath = Schema.String.check(Schema.isPattern(/^\/[^\r\n\u0000]*$/));
 export const Commands = {
   health: command("health", "shared", "health", "Read authenticated service health.", empty, Health, { exposure: "internal" }),
   listSessions: command("session.list", "broker", "listSessions", "List authenticated same-owner sessions across repositories with current liveness in bounded pages.", Schema.Struct({ cursor: Schema.optional(SessionId) }), sessionPage, { exposure: "tool", transaction: "transaction" }),
@@ -370,7 +281,7 @@ export const Commands = {
   replyPeer: command("peer.reply", "broker", "replyPeer", "Accept or decline an unexpired peer offer for the bound agent session.", Schema.Struct({ ...SessionKey.fields, ...TaskKey.fields, decision: Schema.Literals([OfferDecisionEnum.accepted, OfferDecisionEnum.declined]) }), Task, { exposure: "internal", transaction: "transaction", offer: true }),
   submitTask: command("task.submit", "broker", "submitTask", "Record exact human-approved bounded work, preserving idempotent task identity.", Work, Task, { exposure: "tool", transaction: "transaction", offer: true, approval: "exact-work" }),
   getTask: command("task.get", "broker", "getTask", "Read an authorized task and current evidence observations, including staleness.", TaskKey, Task, { exposure: "tool", transaction: "transaction" }),
-  attachTask: command("task.attach", "broker", "attachTask", "Read projected runner journal events as the task coordinator.", Schema.Struct({ ...TaskKey.fields, cursor: Schema.optional(Schema.Int) }), RunnerInspection, { exposure: "tool", transaction: "remote" }),
+  attachTask: command("task.attach", "broker", "attachTask", "Read projected runner journal events as the task coordinator.", RunnerInspect, RunnerInspection, { exposure: "tool", transaction: "remote" }),
   controlTask: command("task.control", "broker", "controlTask", "Control the assigned child: get_messages is sensitive and abort requires approval.", RunnerCommand, AgentResponse, { exposure: "tool", transaction: "remote", approval: "control" }),
   instructTask: command("task.instruction", "broker", "instructTask", "Set an exact human-approved later instruction for an accepted agent peer.", Schema.Struct({ ...RunnerPrepare.fields, prompt: Text, approved: Schema.Literal(true) }), Task, { exposure: "tool", transaction: "transaction", approval: "exact-instruction" }),
   addressTask: command("task.address", "broker", "addressTask", "Bind an increased address revision while preserving approved work and reconciling runner readback.", RunnerPrepare, Task, { exposure: "tool", transaction: "remote" }),
@@ -378,7 +289,7 @@ export const Commands = {
   confirmTask: command("task.confirm", "broker", "confirmTask", "Explicitly confirm matching ready readback and release the approved instruction before its deadline.", Schema.Struct({ ...TaskKey.fields, revision: Schema.Int }), Task, { exposure: "tool", transaction: "remote", approval: "release" }),
   handoffTask: command("task.handoff", "broker", "handoffTask", "Rebind to a verified agent recipient only after old ownership has safely reconciled.", Schema.Struct({ ...TaskKey.fields, oldSessionId: SessionId, oldIncarnation: RunnerTask.fields.incarnation, newSessionId: SessionId, newIncarnation: RunnerTask.fields.incarnation, revision: Schema.Int }), Task, { exposure: "tool", transaction: "remote", approval: "handoff" }),
   reportTask: command("task.report", "broker", "reportTask", "Record a confirmed addressed agent peer's state and result without terminal regression.", Schema.Struct({ ...SessionKey.fields, ...TaskKey.fields, state: ReportState, result: JsonValue }), Task, { exposure: "internal", transaction: "transaction" }),
-  heartbeatRunner: command("runner.heartbeat", "broker", "heartbeatRunner", "Renew the enrolled runner capacity lease and reconcile its durable journal.", Schema.Struct({ runnerId: RunnerId, slots: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 64 })), load: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100000 })), journal: Schema.Array(Acceptance).check(Schema.isMaxLength(256)) }), ok, { exposure: "internal", transaction: "transaction" }),
+  heartbeatRunner: command("runner.heartbeat", "broker", "heartbeatRunner", "Renew the enrolled runner capacity lease; durable outcomes are reported separately.", Schema.Struct({ runnerId: RunnerId, slots: RunnerConfig.fields.slots, load: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 100000 })) }), ok, { exposure: "internal", transaction: "transaction" }),
   readbackRunner: command("runner.readback", "broker", "readbackRunner", "Persist assigned runner readback bound to the actual child session.", Schema.Struct({ runnerId: RunnerId, ...RunnerPrepare.fields }), ok, { exposure: "internal", transaction: "transaction" }),
   reportRunner: command("runner.report", "broker", "reportRunner", "Persist assigned runner state and result without terminal regression.", Schema.Struct({ runnerId: RunnerId, ...TaskKey.fields, state: ReportState, result: JsonValue }), ok, { exposure: "internal", transaction: "transaction" }),
   targetEvidence: command("evidence.target", "broker", "targetEvidence", "Set the SHA/ref/CI observation target; this does not authorize execution.", Schema.Struct({ ...TaskKey.fields, sha: Evidence.fields.sha, ref: Text, requiredLanes: strings.check(Schema.isBetweenLength(1, 32)) }), Schema.Struct({ target: EvidenceTarget, executionAuthorized: Schema.Literal(false) }), { exposure: "tool", transaction: "transaction" }),
@@ -387,7 +298,7 @@ export const Commands = {
   recordDeploymentEvidence: command("evidence.deployment", "broker", "recordDeploymentEvidence", "Record a caller-supplied deployment observation; this operation does not deploy.", DeploymentEvidence, recorded, { exposure: "tool", transaction: "transaction" }),
   recordReviewEvidence: command("evidence.review", "broker", "recordReviewEvidence", "Record an enrolled reviewer's decision with trusted reviewer identity.", ReviewEvidence, recorded, { exposure: "tool", transaction: "transaction" }),
   consentParticipant: command("archive.participantConsent", "broker", "consentParticipant", "Enroll or revoke the authenticated participant's consent after explicit human consent.", Schema.Struct({ owner: Peer.fields.owner, sessionId: SessionId, enabled: Schema.Boolean }), Schema.Struct({ participant: Peer.fields.sender, enabled: Schema.Boolean }), { exposure: "internal", transaction: "transaction", approval: "participant-consent" }),
-  consentArchive: command("archive.consent", "broker", "consentArchive", "Set bound session archive enrollment with separately consenting participants.", Schema.Struct({ sessionId: SessionId, participants: participants.check(Schema.isMaxLength(32)), enabled: Schema.Boolean }), Schema.Struct({ enabled: Schema.Boolean }), { exposure: "internal", transaction: "transaction", approval: "archive-consent" }),
+  consentArchive: command("archive.consent", "broker", "consentArchive", "Set bound session archive enrollment with separately consenting participants.", Schema.Struct({ sessionId: SessionId, participants: ArchiveParticipants.check(Schema.isMaxLength(32)), enabled: Schema.Boolean }), Schema.Struct({ enabled: Schema.Boolean }), { exposure: "internal", transaction: "transaction", approval: "archive-consent" }),
   appendArchive: command("archive.append", "broker", "appendArchive", "Append only privacy-projected journal metadata under active consent.", Schema.Struct({ sessionId: SessionId, ...ArchiveEntry.fields, gaps: boundedStrings }), Schema.Struct({ appended: Schema.Literal(true), digest: hash }), { exposure: "internal", transaction: "transaction" }),
   listArchive: command("archive.list", "broker", "listArchive", "Read authorized sanitized archive metadata in bounded pages.", Schema.Struct({ sessionId: SessionId, cursor: Schema.optional(Schema.Int) }), Schema.mutable(Schema.Array(ArchiveRow)), { exposure: "tool", transaction: "transaction" }),
   deleteArchive: command("archive.delete", "broker", "deleteArchive", "Revoke archive enrollment and delete server rows; local optout additionally erases the journal.", Schema.Struct({ sessionId: SessionId }), Schema.Struct({ revoked: Schema.Literal(true), deleted: Schema.Literal(true), backupPolicy: Schema.Literal("journal rows and enrollment are omitted from every broker snapshot") }), { exposure: "internal", transaction: "transaction" }),
@@ -398,8 +309,10 @@ export const Commands = {
   prepareTask: command("prepare", "runner", "prepareTask", "Correct an unprompted child's address after reading actual agent state.", RunnerPrepare, Address, { exposure: "internal" }),
   releaseTask: command("release", "runner", "releaseTask", "Durably record prompt intent then deliver exact confirmed work; never replay uncertain sends.", RunnerRelease, RunnerReleased, { exposure: "internal" }),
   pluginParticipantConsent: command("plugin.participant-consent", "plugin", "pluginParticipantConsent", "Ask agent UI consent before enrolling or revoking this participant.", Schema.Struct({ owner: Peer.fields.owner, sessionId: SessionId, enabled: Schema.Boolean }), Schema.Struct({ participant: Peer.fields.sender, enabled: Schema.Boolean }), { exposure: "local", approval: "participant-consent" }),
-  pluginConsent: command("plugin.consent", "plugin", "pluginConsent", "Ask human consent, enroll the active session remotely and persist local journal consent.", Schema.Struct({ participants: participants.check(Schema.isBetweenLength(1, 32)) }), Schema.Struct({ enabled: Schema.Literal(true) }), { exposure: "local", approval: "archive-consent" }),
+  pluginConsent: command("plugin.consent", "plugin", "pluginConsent", "Ask human consent, enroll the active session remotely and persist local journal consent.", Schema.Struct({ participants: ArchiveParticipants.check(Schema.isBetweenLength(1, 32)) }), Schema.Struct({ enabled: Schema.Literal(true) }), { exposure: "local", approval: "archive-consent" }),
   pluginOptout: command("plugin.optout", "plugin", "pluginOptout", "Revoke remote consent before erasing the local journal and deleting server archive rows.", empty, Schema.Struct({ enabled: Schema.Literal(false) }), { exposure: "local" }),
+  pluginOff: command("plugin.off", "plugin", "pluginOff", "Persistently stop coordination and archive sharing without aborting accepted agent work; retry off explicitly if remote cleanup fails.", empty, Schema.Struct({ enabled: Schema.Literal(false), sharing: Schema.Literal(false) }), { exposure: "local" }),
+  pluginOn: command("plugin.on", "plugin", "pluginOn", "Explicitly resume coordination after completed opt-out cleanup; archive sharing still requires separate consent.", empty, Schema.Struct({ enabled: Schema.Literal(true) }), { exposure: "local" }),
   pluginAccept: command("plugin.accept", "plugin", "pluginAccept", "Accept an unexpired offer using the active agent session identity.", TaskKey, Task, { exposure: "local" }),
   pluginDecline: command("plugin.decline", "plugin", "pluginDecline", "Decline an unexpired offer using the active agent session identity.", TaskKey, Task, { exposure: "local" }),
   pluginSubmit: command("plugin.submit", "plugin", "pluginSubmit", "Ask UI approval of exact work before submitting it to the broker.", Work, Task, { exposure: "local", approval: "exact-work" }),
@@ -418,52 +331,27 @@ export const Commands = {
   pluginEvidenceReview: command("plugin.evidence-review", "plugin", "pluginEvidenceReview", "Record a decision using the enrolled reviewer identity.", ReviewEvidence, recorded, { exposure: "local" }),
   pluginEvidenceDeployment: command("plugin.evidence-deployment", "plugin", "pluginEvidenceDeployment", "Record a caller-supplied deployment observation.", DeploymentEvidence, recorded, { exposure: "local" }),
   pluginStatus: command("plugin.status", "plugin", "pluginStatus", "Read an authorized task and latest evidence.", TaskKey, Task, { exposure: "local" }),
-  pluginAttach: command("plugin.attach", "plugin", "pluginAttach", "Read authorized projected runner events.", Schema.Struct({ ...TaskKey.fields, cursor: Schema.optional(Schema.Int) }), RunnerInspection, { exposure: "local" }),
+  pluginAttach: command("plugin.attach", "plugin", "pluginAttach", "Read authorized projected runner events.", RunnerInspect, RunnerInspection, { exposure: "local" }),
   pluginControl: command("plugin.control", "plugin", "pluginControl", "Request child control; get_messages is sensitive and abort needs human approval.", RunnerCommand, AgentResponse, { exposure: "local", approval: "control" }),
   pluginArchive: command("plugin.archive", "plugin", "pluginArchive", "Read sanitized archive rows with the active session injected.", Schema.Struct({ cursor: Schema.optional(Schema.Int) }), Schema.mutable(Schema.Array(ArchiveRow)), { exposure: "local" }),
   pluginInbox: command("plugin.inbox", "plugin", "pluginInbox", "Read or explicitly clear the active session's durable local inbox.", Schema.Struct({ clear: Schema.optional(Schema.Boolean) }), Schema.Union([Inbox, Schema.Struct({ cleared: Schema.Literal(true) })]), { exposure: "local" }),
   pluginSessions: command("plugin.sessions", "plugin", "pluginSessions", "List all authorized Coordinator sessions across machines, including stale participants.", empty, sessionList, { exposure: "local" }),
   pluginIdentity: command("plugin.identity", "plugin", "pluginIdentity", "Read actual agent session, worker and local repository identity.", empty, AgentIdentity, { exposure: "local" }),
-  runBroker: command("program.broker", "program", "runBroker", "Start the broker using COORDINATOR_CONFIG private file and remain serving.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" }),
-  runRunner: command("program.runner", "program", "runRunner", "Start the isolated runner using COORDINATOR_CONFIG private file and await failure.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" }),
-  installHost: command("program.install:host", "program", "installHost", "Install one agent plugin or privileged runner; help returns usage, dry-run still validates isolation.", Schema.Struct({
-    "--help": Schema.optional(Schema.Boolean).annotate({ description: "Print usage without installation." }),
-    "--runtime": Schema.optional(absolutePath).annotate({ description: "Absolute executable runtime path; required unless help." }),
-    "--host-binary": Schema.optional(absolutePath).annotate({ description: "Absolute executable omp or pi path; required unless help." }),
-    "--plugin-only": Schema.optional(Schema.Boolean).annotate({ description: "Install plugin as a nonroot agent user; exactly one install mode." }),
-    "--runner-only": Schema.optional(Schema.Boolean).annotate({ description: "Install runner as Linux root; exactly one install mode." }),
-    "--host": Schema.optional(AgentHost).annotate({ description: "Agent host; required for plugin-only." }),
-    "--plugin-config": Schema.optional(absolutePath).annotate({ description: "Absolute mode-0600 plugin configuration; required for plugin-only." }),
-    "--runner-config": Schema.optional(absolutePath).annotate({ description: "Absolute mode-0600 runner configuration owned by the dedicated service account; required for runner-only." }),
-    "--dry-run": Schema.optional(Schema.Boolean).annotate({ description: "Suppress installation writes but still validate and probe isolation." }),
-    "--remote": Schema.optional(Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_.@][a-zA-Z0-9_.@-]*$/))).annotate({ description: "SSH destination for remote installation; requires remote-root." }),
-    "--remote-root": Schema.optional(absolutePath).annotate({ description: "Absolute preinstalled remote repository path." }),
-  }).check(Schema.makeFilter((flags) => {
-    if (flags["--help"]) return undefined;
-    if (!flags["--runtime"] || !flags["--host-binary"]) return "Executable --runtime and --host-binary are required";
-    if (Boolean(flags["--plugin-only"]) === Boolean(flags["--runner-only"])) return "Select exactly one of --plugin-only or --runner-only";
-    if (flags["--plugin-only"] && (!flags["--host"] || !flags["--plugin-config"])) return "Plugin mode requires --host and --plugin-config";
-    if (flags["--runner-only"] && !flags["--runner-config"]) return "Runner mode requires --runner-config";
-    if (flags["--remote"] && !flags["--remote-root"]) return "Remote installation requires --remote-root";
-    return undefined;
-  })), Schema.Union([InstallPlan, Schema.Void]), { exposure: "private" }),
-  initializeBrokerDeployment: command("program.deploy-init.broker", "program", "initializeBrokerDeployment", "Stage schema-valid operator broker configuration and private credentials.", empty, Schema.Void, { exposure: "private" }),
-  initializeRunnerDeployment: command("program.deploy-init.runner", "program", "initializeRunnerDeployment", "Stage operator runner configuration, pinned repositories and model seed.", empty, Schema.Void, { exposure: "private" }),
-  runSmoke: command("program.smoke", "program", "runSmoke", "Run the integration smoke with configured real host and GitHub read credential.", Schema.Struct({ "--runner-isolation-only": Schema.optional(Schema.Boolean).annotate({ description: "Run only the real Linux agent-child isolation proof." }) }), Schema.Void, { exposure: "private" }),
-  runIsolationSmoke: command("program.smoke:isolation", "program", "runIsolationSmoke", "Run only the real Linux setpriv and agent-child isolation proof.", empty, Schema.Void, { exposure: "private" }),
-  runHostSmoke: command("program.smoke:hosts", "program", "runHostSmoke", "Exercise installed Pi/OMP public-plugin control and report the whole-run admission/final-outcome blocker without a model turn.", empty, Schema.Void, { exposure: "private" }),
-  runBackupSmoke: command("program.smoke:backup", "program", "runBackupSmoke", "Exercise real object backup using private proof config restricted to loopback and the proof bucket.", empty, Schema.Void, { exposure: "private" }),
 };
 export type Command = typeof Commands[keyof typeof Commands];
 export type CommandName = Command["name"];
 export type CommandDescriptor<I extends Schema.ConstraintCodec<unknown, unknown>, O extends Schema.ConstraintCodec<unknown, unknown>> =
-  Pick<Command, "name" | "target" | "capability" | "exposure"> & {
+  {
+    readonly name: string;
+    readonly target: CommandTarget;
+    readonly capability: string;
+    readonly exposure: CommandExposure;
     readonly input: I;
     readonly output: O;
     readonly structuredOutput: Schema.Struct<{ readonly result: O }>;
   };
-export type CommandInput<D extends Command> = D["input"]["Type"];
-export type CommandOutput<D extends Command> = D["output"]["Type"];
+export type CommandInput<D extends { readonly input: Schema.ConstraintCodec<unknown, unknown> }> = D["input"]["Type"];
+export type CommandOutput<D extends { readonly output: Schema.ConstraintCodec<unknown, unknown> }> = D["output"]["Type"];
 export type CommandCapabilities<T extends CommandTarget, E, R = never> = {
   [D in Extract<Command, { readonly target: T }> as D["capability"]]: (params: CommandInput<D>) => Effect.Effect<CommandOutput<D>, E, R>
 };
@@ -495,10 +383,7 @@ export type ReconciledRunner = typeof ReconciledRunner.Type;
 export type Role = typeof Role.Type;
 export type ConnectHosts = typeof ConnectHosts.Type;
 export type Inbox = typeof Inbox.Type;
-export type RepoIdentity = typeof RepoIdentity.Type;
 export type Job = typeof Job.Type;
-export type Run = typeof Run.Type;
-export type MergeRef = typeof MergeRef.Type;
 export type CiLane = typeof CiLane.Type;
 export type AgentResponse = typeof AgentResponse.Type;
 
@@ -519,5 +404,3 @@ export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", {
   protocolCode: Schema.optional(Schema.Int),
 }) {}
 export class CommandError extends Schema.TaggedError<CommandError>()("CommandError", { message: Schema.String, reason: Schema.optional(Schema.Literals(["transport", "protocol"])) }) {}
-export class BackupError extends Schema.TaggedError<BackupError>()("BackupError", { message: Schema.String }) {}
-export class PluginDeclined extends Schema.TaggedError<PluginDeclined>()("PluginDeclined", { message: Schema.String }) {}

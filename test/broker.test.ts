@@ -1,6 +1,5 @@
 import { RoleEnum, DispositionEnum, OfferDecisionEnum, ReviewDecisionEnum, SessionLivenessEnum } from "../src/contracts.ts";
 import { TaskStateEnum, RunnerStateEnum } from "../src/generated/database/enums.ts";
-import { AgentHostEnum } from "../src/agent/contracts.ts";
 import { it } from "@effect/vitest"
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -8,16 +7,17 @@ import type { ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { Clock, ConfigProvider, Context, Deferred, Effect, Fiber, Layer, ManagedRuntime, Redacted, Schema } from "effect";
 import { HttpClient, HttpClientResponse, HttpServer } from "effect/http";
+import { AgentHostEnum } from "../src/agent/protocol.ts";
 
 import { provisionPostgres, postgresAdmin, postgresConfig, dropPostgres } from "./postgres-fixture.ts";
 import { Broker } from "../src/broker.ts";
 import { Acceptance, Commands, HttpError, JsonValue, Task, Address, BrokerConfig, Work, Repo, RunnerId, MachineId, WorkerId, ReportState, type BrokerConfig as BrokerConfigType, type ArchiveEntry, type ArchiveRow, type CommandInput, type CommandOutput } from "../src/contracts.ts";
 import { Archive, Evidence, Peer, PeerId, RunnerTask, SessionId, TaskId } from "../src/generated/database/types.ts";
 import { Platform } from "../src/platform.ts";
-import { Journal } from "../src/journal.ts";
+import { makeJournal } from "../src/plugin.ts";
 import { Mcp, serverLayer } from "../src/mcp.ts";
 import { restoreBrokerDatabase } from "../src/backup.ts";
-import { DatabaseService } from "../src/database-service.ts";
+import { DatabaseService } from "../src/database.ts";
 
 const repo = Repo.make("github.com/test/broker"), sha = Evidence.fields.sha.make("1".repeat(40));
 const coordinator = "coordinator-regression-only-credential", peer = "native-peer-regression-only-credential", reviewer = "reviewer-regression-only-credential";
@@ -60,19 +60,23 @@ it("agent release fences and independent evidence survive stale peers and CI pol
     let session: CommandInput<typeof Commands.heartbeatSession> = { sessionId: SessionId.make("owner-session"), incarnation: RunnerTask.fields.incarnation.make("native-incarnation"), machineId: MachineId.make("machine"), host: AgentHostEnum.omp, repo, workerId: WorkerId.make("wrong-worker") };
     const key = { sessionId: session.sessionId, incarnation: session.incarnation };
     await setup.runPromise(mcp.call(url, peer, Commands.heartbeatSession, session)); await setup.runPromise(mcp.call(url, peer, Commands.pollSession, key));
-    const receiver = await setup.runPromise(Journal.make(platform.path.join(root, "receiver"), session.sessionId));
+    const receiver = await setup.runPromise(makeJournal(platform.path.join(root, "receiver"), session.sessionId));
     const messageIds = Array.from({ length: 5 }, (_, index) => PeerId.make(`large-peer-${index}`));
     const largePayload = "x".repeat(7900);
     for (const messageId of messageIds) await setup.runPromise(mcp.call(url, coordinator, Commands.sendPeer, { ...key, messageId, payload: largePayload, ttlMs: 60000 }));
-    const delivered = (await setup.runPromise(mcp.call(url, peer, Commands.pollSession, key))).messages;
+    const delivered: CommandOutput<typeof Commands.pollSession>["messages"] = [];
+    for (let page = 0; page < messageIds.length && delivered.length < messageIds.length; page++) {
+      const messages = (await setup.runPromise(mcp.call(url, peer, Commands.pollSession, key))).messages;
+      for (const message of messages) {
+        await setup.runPromise(receiver.receive(message.messageId, message.payload));
+        await setup.runPromise(mcp.call(url, peer, Commands.acknowledgePeer, { ...key, messageId: message.messageId }));
+      }
+      delivered.push(...messages);
+    }
     assert.deepEqual(delivered.map((message) => message.messageId).sort(), messageIds);
     assert.deepEqual(delivered.map((message) => message.payload), messageIds.map(() => largePayload));
-    for (const message of delivered) {
-      await setup.runPromise(receiver.receive(message.messageId, message.payload));
-      await setup.runPromise(mcp.call(url, peer, Commands.acknowledgePeer, { ...key, messageId: message.messageId }));
-    }
     assert.deepEqual((await setup.runPromise(mcp.call(url, peer, Commands.pollSession, key))).messages, []);
-    const reopenedReceiver = await setup.runPromise(Journal.make(platform.path.join(root, "receiver"), session.sessionId));
+    const reopenedReceiver = await setup.runPromise(makeJournal(platform.path.join(root, "receiver"), session.sessionId));
     assert.deepEqual(Object.keys(reopenedReceiver.state.inbox).sort(), messageIds);
     const work = Schema.decodeUnknownSync(Work, { onExcessProperty: "error" })({ taskId: "wrong-worker-offer", repo, ref: "refs/heads/main", sha, launcher: AgentHostEnum.omp, prompt: "approved bounded work", scope: "s".repeat(16000), restrictions: "no deployment", expectedEvidence: ["CI/verify"], deadline: now + 60000,
       workerId: "native-worker", githubRepoId: 42, requiredLanes: ["CI/verify"], bypassPeer: false, approved: true });
@@ -302,7 +306,7 @@ it.each([RunnerId.make("../private.key"), RunnerId.make("")])("opaque task dispa
     assert.equal(submitted.taskId, work.taskId);
     assert.equal(submitted.offerDecision, OfferDecisionEnum.bypass);
     await setup.runPromise(mcp.call(url, coordinator, Commands.submitTask, work));
-    assert.deepEqual(await setup.runPromise(mcp.call(url, enrollment, Commands.heartbeatRunner, { runnerId, slots: 1, load: 0, journal: [] })), { ok: true });
+    assert.deepEqual(await setup.runPromise(mcp.call(url, enrollment, Commands.heartbeatRunner, { runnerId, slots: 1, load: 0 })), { ok: true });
     const delivered = await setup.runPromise(Effect.gen(function*() {
       for (;;) {
         const task = yield* mcp.call(url, coordinator, Commands.getTask, { taskId: work.taskId });
@@ -355,7 +359,7 @@ it("broker restart preserves RPC delivery, release fences and consented JSONL me
   const platform = await setup.runPromise(Platform);
   const root = await setup.runPromise(platform.fs.makeTempDirectory({ prefix: "coordinator-durable-" }));
   const databaseUrl = await setup.runPromise(provisionPostgres());
-  let runtime: ManagedRuntime.ManagedRuntime<Broker, Effect.Error<typeof Broker.make> | Layer.Error<typeof base>> | undefined;
+  let disposeRuntime: (() => Promise<void>) | undefined;
   try {
     await setup.runPromise(platform.fs.chmod(root, 0o700));
     const clock = await setup.runPromise(Clock.Clock);
@@ -377,8 +381,11 @@ it("broker restart preserves RPC delivery, release fences and consented JSONL me
         { id: "participant", owner: "participant-owner", roles: [RoleEnum.session], repos: [repo], tokenHash: await setup.runPromise(platform.digest(participantToken)) },
       ],
     });
+    const brokerLayer = Broker.layer(config).pipe(Layer.provide(postgresConfig(databaseUrl)), Layer.provide(services));
+    let runtime: ManagedRuntime.ManagedRuntime<Broker, Layer.Error<typeof brokerLayer>> | undefined;
     const open = async () => {
-      runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(postgresConfig(databaseUrl)), Layer.provide(services)));
+      runtime = ManagedRuntime.make(brokerLayer);
+      disposeRuntime = () => runtime ? runtime.dispose() : Promise.resolve();
       const broker = await runtime.runPromise(Broker);
       const bound = broker.server.address;
       if (bound._tag !== "InetAddressV4") throw new Error("Expected IPv4 TCP server");
@@ -417,7 +424,7 @@ it("broker restart preserves RPC delivery, release fences and consented JSONL me
     assert.deepEqual(before.releases.map((task) => task.taskId), [work.taskId]);
     assert.equal(before.messages.length, 1);
 
-    const journal = await setup.runPromise(Journal.make(platform.path.join(root, "journal"), session.sessionId));
+    const journal = await setup.runPromise(makeJournal(platform.path.join(root, "journal"), session.sessionId));
     const file = platform.path.join(root, "host.jsonl");
     const lines = [
       { id: "root", parentId: null, type: "message", message: { role: "user", content: "TOKEN=private-capture-secret" } },
@@ -514,7 +521,7 @@ it("broker restart preserves RPC delivery, release fences and consented JSONL me
     const deleted = await setup.runPromise(mcp.call(url, peer, Commands.deleteArchive, { sessionId: session.sessionId }));
     assert.equal(deleted.revoked, true); assert.equal(deleted.deleted, true);
     await setup.runPromise(journal.erase());
-    const optedOut = await setup.runPromise(Journal.make(platform.path.join(root, "journal"), session.sessionId));
+    const optedOut = await setup.runPromise(makeJournal(platform.path.join(root, "journal"), session.sessionId));
     await setup.runPromise(optedOut.scan(file));
     await setup.runPromise(optedOut.upload(append));
     assert.equal(optedOut.state.consent, false);
@@ -535,7 +542,7 @@ it("broker restart preserves RPC delivery, release fences and consented JSONL me
     await reject(403, mcp.call(url, peer, Commands.reportTask, { ...replacementKey, taskId: work.taskId, state: TaskStateEnum.SUCCEEDED, result: { completed: true } }));
     assert.deepEqual(await setup.runPromise(mcp.call(url, coordinator, Commands.getTask, { taskId: work.taskId })), beforeRestartTask);
   } finally {
-    try { await runtime?.dispose(); }
+    try { await disposeRuntime?.(); }
     finally {
       try {
         await setup.runPromise(dropPostgres(databaseUrl));
@@ -705,11 +712,12 @@ it("PostgreSQL ownership excludes duplicate serving, releases on shutdown, and f
     backupDirectory: platform.path.join(root, "snapshots"), archiveRetentionMs: 60000, backupRetentionMs: 60000,
     repositoryIds: {}, principals: [],
   });
-  const runtimes: Array<ManagedRuntime.ManagedRuntime<Broker, Effect.Error<typeof Broker.make> | Layer.Error<typeof Mcp.layer> | Layer.Error<typeof Platform.layer>>> = [];
+  const brokerLayer = Broker.layer(config);
+  const runtimes: Array<ManagedRuntime.ManagedRuntime<Broker, Layer.Error<typeof brokerLayer> | Layer.Error<typeof Mcp.layer> | Layer.Error<typeof Platform.layer>>> = [];
   const admin = ManagedRuntime.make(postgresAdmin(databaseUrl).pipe(Layer.provide(Platform.layer)));
   const services = Layer.merge(Mcp.layer, Platform.layer);
   const open = () => {
-    const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(postgresConfig(databaseUrl)), Layer.provide(services)));
+    const runtime = ManagedRuntime.make(brokerLayer.pipe(Layer.provide(postgresConfig(databaseUrl)), Layer.provide(services)));
     runtimes.push(runtime);
     return runtime;
   };
@@ -864,7 +872,7 @@ it("broker health stays responsive while PostgreSQL waits for a table lock", asy
     const locker = start(`
       import { Effect, Layer, ManagedRuntime } from "effect";
       import { sql } from "kysely";
-      import { DatabaseService } from ${JSON.stringify(new URL("../src/database-service.ts", import.meta.url).href)};
+      import { DatabaseService } from ${JSON.stringify(new URL("../src/database.ts", import.meta.url).href)};
       import { postgresAdmin } from ${JSON.stringify(new URL("./postgres-fixture.ts", import.meta.url).href)};
       import { Platform } from ${JSON.stringify(new URL("../src/platform.ts", import.meta.url).href)};
       const runtime = ManagedRuntime.make(postgresAdmin().pipe(Layer.provide(Platform.layer)));

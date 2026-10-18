@@ -1,5 +1,3 @@
-import { AgentAdmissionDispositionEnum } from "../src/agent/contracts.ts";
-import { AgentRunOutcomeEnum } from "../src/agent/contracts.ts";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -11,12 +9,11 @@ import { Config, Effect, FileSystem, Layer, Schema } from "effect";
 import { HttpRouter } from "effect/http";
 import { NodeCrypto, NodeHttpServer, NodeRuntime, NodeServices, NodeStdio } from "@effect/platform-node";
 import { connectAgentClient } from "../src/agent/client.ts";
-import { AgentHostEnum, AgentBinding, AgentError, AgentEventSequence, AgentMcpWireBytes, AgentPromptResult, AgentRunId, AgentState, AgentSubmissionId, AgentTools, agentEventsUri, type AgentTool, type AgentLifecycleEmission } from "../src/agent/contracts.ts";
-import { AgentLifecycleJournal } from "../src/agent/lifecycle.ts";
-import { AgentMcpLifetime, agentHttpLayer, agentStdioLayer, agentTool } from "../src/agent/server.ts";
-import { createAgentPresentation, withAgentMcpRequest } from "../src/agent/interaction.ts";
+import { AgentAdmissionDispositionEnum, AgentRunOutcomeEnum, AgentHostEnum, AgentBinding, AgentError, AgentEventSequence, AgentMcpWireBytes, AgentPromptResult, AgentRunId, AgentState, AgentSubmissionId, AgentTools, agentEventsUri, AgentLifecycleJournal, type AgentTool, type AgentLifecycleEmission } from "../src/agent/protocol.ts";
+import { AgentMcpLifetime, agentHttpLayer, agentStdioLayer, agentTool, createAgentPresentation, withAgentMcpRequest } from "../src/agent/server.ts";
 
 const binding = Schema.decodeUnknownSync(AgentBinding)({ host: AgentHostEnum.pi, sessionId: "proof-test", incarnation: "retained", generation: 0 });
+
 const privateSystemPrompt = "private-system-prompt-" + "λ".repeat(40000);
 const privateTools = [{ name: "proof-tool", description: "private-tool-description", parameters: { type: "object", properties: { token: { type: "string" } }, required: ["token"], additionalProperties: false } }];
 

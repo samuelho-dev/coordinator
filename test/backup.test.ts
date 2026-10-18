@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import { it } from "@effect/vitest"
-import { Context, Effect, Layer, ManagedRuntime, Redacted, Schema } from "effect";
+import { Effect, Layer, ManagedRuntime, Redacted, Schema } from "effect";
 import { createServer } from "node:http";
 import { NodeHttpClient } from "@effect/platform-node";
 import { BrokerConfig, ObjectBackupConfig, type BrokerConfig as BrokerConfigType } from "../src/contracts.ts";
-import { decodeSnapshotList, dumpBrokerDatabase, privateRecoveryPath, recover, RecoveryMetadata, restoreBrokerDatabase, SnapshotStore } from "../src/backup.ts";
+import { decodeSnapshotList, dumpBrokerDatabase, makeSnapshotStore, privateRecoveryPath, recover, RecoveryMetadata, restoreBrokerDatabase } from "../src/backup.ts";
 import { Platform } from "../src/platform.ts";
 
 
 import { assertBrokerSchema } from "../src/database.ts";
 import { provisionPostgres, postgresAdmin, postgresConfig, dropPostgres } from "./postgres-fixture.ts";
-import { DatabaseService } from "../src/database-service.ts";
+import { DatabaseService } from "../src/database.ts";
 import { Archive, Consent, Evidence, SessionId, TaskId } from "../src/generated/database/types.ts";
 
 it("private recovery contract accepts PostgreSQL pair metadata and rejects unsupported versions", () => {
@@ -97,7 +97,7 @@ it("snapshot expiry carries opaque pagination through real HTTP and never delete
     await runtime.runPromise(platform.fs.writeFileString(accessKeyFile, "fixtureaccess", { mode: 0o600 }));
     await runtime.runPromise(platform.fs.writeFileString(secretKeyFile, "fixturesecret", { mode: 0o600 }));
     await runtime.runPromise(Effect.scoped(Effect.gen(function*() {
-      const store = Context.get(yield* Layer.build(SnapshotStore.layer({ endpoint: `http://127.0.0.1:${address.port}`, region: "garage", bucket: "snapshot-regression", accessKeyFile, secretKeyFile })), SnapshotStore);
+      const store = yield* makeSnapshotStore({ endpoint: `http://127.0.0.1:${address.port}`, region: "garage", bucket: "snapshot-regression", accessKeyFile, secretKeyFile });
       const tokens: ReadonlyArray<readonly [string, string]> = [[`${"a".repeat(40)}]`, `${"a".repeat(40)}]`], [" ]&amp;&lt;&gt;&quot;&apos;&#93;&#x1F642;+/=%? ", ` ]&<>"']🙂+/=%? `]];
       for (const [encoded, token] of tokens) {
         firstPage = lastPage.replace("<IsTruncated>false</IsTruncated>", "<IsTruncated>true</IsTruncated>").replace("</ListBucketResult>", `<NextContinuationToken>${encoded}</NextContinuationToken></ListBucketResult>`);
