@@ -32,27 +32,24 @@ const program = Effect.gen(function*() {
   const token = yield* readConnectorToken(config);
   const mcp = yield* Mcp;
   const invalidToken = `invalid-${randomUUID()}`;
-  const readiness = (credential?: string) => Effect.tryPromise({
+  const probe = (path: string, credential?: string) => Effect.tryPromise({
     try: async (signal) => {
-      const response = await fetch(new URL("/readyz", endpoint), { redirect: "error", signal,
-        headers: credential === undefined ? {} : { authorization: `Bearer ${credential}` } });
+      const response = await fetch(new URL(path, endpoint), { redirect: "error", signal,
+        method: path === "/mcp" ? "POST" : "GET",
+        headers: { "content-type": "application/json", ...(credential === undefined ? {} : { authorization: `Bearer ${credential}` }) },
+        ...(path === "/mcp" ? { body: "{}" } : {}) });
       await response.body?.cancel();
       return { status: response.status, sourceSha: response.headers.get("x-coordinator-source-sha") };
     },
-    catch: () => new HttpError({ status: 502, message: "Verified TLS readiness request failed" }),
+    catch: () => new HttpError({ status: 502, message: "Verified TLS HTTP probe failed" }),
   }).pipe(Effect.timeout("10 seconds"));
   for (const credential of [undefined, invalidToken]) {
-    const response = yield* readiness(credential);
-    if (response.status !== 401 && response.status !== 403) return yield* fail("Readiness authentication rejection not proven");
-    yield* mcp.call(config.inspectorUrl, credential ?? "", InspectionTools.list, { limit: 1 }).pipe(Effect.matchEffect({
-      onSuccess: () => fail("MCP authentication rejection not proven"),
-      onFailure: (error) => Effect.gen(function*() {
-        if (error._tag !== "HttpError") return yield* Effect.fail(error);
-        if (error.status !== 401 && error.status !== 403) return yield* fail("Unexpected MCP rejection");
-      }),
-    }));
+    for (const path of ["/readyz", "/mcp"]) {
+      const response = yield* probe(path, credential);
+      if (response.status !== 401 && response.status !== 403) return yield* fail("HTTP authentication rejection not proven");
+    }
   }
-  const ready = yield* readiness(token);
+  const ready = yield* probe("/readyz", token);
   if (ready.status !== 200 || ready.sourceSha !== sourceSha) return yield* fail("Readiness source identity mismatch");
   let targetInspected = false;
   const targetFile = flags.values["safe-target"];

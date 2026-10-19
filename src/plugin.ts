@@ -1,11 +1,12 @@
 import { NodeServices } from "@effect/platform-node";
 import { hostname, release } from "node:os";
-import { Effect, Fiber, Layer, ManagedRuntime } from "effect";
+import { Effect, Fiber, Layer, ManagedRuntime, Schema } from "effect";
 import { createInspection, HttpError, InspectionTools, metric, sessionRefKey, unavailableMetric } from "./inspection.ts";
 import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, SessionInspection, SessionListOutput, SessionPresence } from "./inspection.ts";
 import { Mcp } from "./mcp.ts";
 import { connectNative, loadConnectorConfig, NativeError, readConnectorToken, withProcessResources } from "./native.ts";
 import { identifyProcess } from "./resources.ts";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 declare const COORDINATOR_HARNESS: "pi" | "omp";
 
@@ -37,6 +38,7 @@ export type Host = {
     (name: "input", handler: (event: Input, ctx: Context) => Promise<InputResult>): unknown;
     (name: "session_start" | "session_switch" | "session_shutdown" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_end" | "tool_execution_start" | "tool_execution_end", handler: (event: NativeEvent, ctx: Context) => Promise<void>): unknown;
   };
+  readonly registerTool: (tool: ToolDefinition<ToolDefinition["parameters"], unknown, unknown>) => void;
 };
 
 const provenance = (source: string, scope: MetricProvenance["scope"], scopeDescription: string, observedAt: number | null, nativeUpdatedAt: number | null = null): MetricProvenance => ({
@@ -202,6 +204,29 @@ export default function plugin(host: Host): void {
   let connector: Fiber.Fiber<void> | undefined;
   let starting: Promise<void> | undefined;
   let stopped = false;
+  if (harness === "pi") {
+    const register = <I extends Schema.Top & Schema.ConstraintCodec<unknown, Schema.JsonObject>, O extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>>(
+      descriptor: { readonly name: string; readonly description: string; readonly input: I; readonly output: O },
+    ) => {
+      const document = Schema.toJsonSchemaDocument(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" });
+      host.registerTool({
+        name: `coordinator_${descriptor.name.replaceAll(".", "_")}`, label: `Coordinator ${descriptor.name}`,
+        description: descriptor.description,
+        parameters: { ...document.schema, type: "object", $defs: document.definitions },
+        execute: (_id, params, signal) => runtime.runPromise(Effect.gen(function*() {
+          const activeConfig = config;
+          if (!activeConfig) return yield* new NativeError({ operation: "Connector configuration required" });
+          const input = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(params);
+          const token = yield* readConnectorToken(activeConfig);
+          const mcp = yield* Mcp;
+          const result = yield* mcp.call(activeConfig.inspectorUrl, token, descriptor, input);
+          return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+        }), { signal }),
+      });
+    };
+    register(InspectionTools.list);
+    register(InspectionTools.inspect);
+  }
   const report = (ctx: Context) => (error: { readonly _tag: string }) => Effect.sync(() => {
     if (ctx.hasUI) ctx.ui.notify(`Native inspector unavailable (${error._tag})`, "warning");
     else process.stderr.write(`Native inspector unavailable (${error._tag})\n`);

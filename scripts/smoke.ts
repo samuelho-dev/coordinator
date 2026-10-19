@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
-import { Context, Effect, Fiber, FileSystem, Layer, Stream } from "effect";
+import { Context, Effect, Fiber, FileSystem, Layer, Schema, Stream } from "effect";
 import { HttpServer } from "effect/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
@@ -242,9 +242,38 @@ const program = Effect.gen(function*() {
     }));
     const inspected = yield* mcp.call(inspectorUrl, token, InspectionTools.inspect, { ref: native.ref });
     assert.equal(inspected.presence.ref.harness, harness);
+    if (harness === "pi") yield* Effect.promise(async () => {
+      // Host-only SDK: the production inspector image deliberately omits native CLI/SDK packages.
+      const { createAgentSession, DefaultResourceLoader, SessionManager } = await import("@earendil-works/pi-coding-agent");
+      const previousConfig = process.env.COORDINATOR_CONNECTOR_CONFIG;
+      process.env.COORDINATOR_CONNECTOR_CONFIG = configFile;
+      try {
+        const loader = new DefaultResourceLoader({ cwd: home, agentDir: home, additionalExtensionPaths: [existsSync(extension) ? extension : sourceExtension], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
+        await loader.reload();
+        const { session } = await createAgentSession({ cwd: home, agentDir: home, resourceLoader: loader, sessionManager: SessionManager.inMemory(home), tools: ["coordinator_session_list", "coordinator_session_inspect"] });
+        try {
+          await session.bindExtensions({});
+          const list = session.agent.state.tools.find((tool) => tool.name === "coordinator_session_list");
+          const inspect = session.agent.state.tools.find((tool) => tool.name === "coordinator_session_inspect");
+          assert.ok(list, "Native Pi must expose its authenticated session reader");
+          assert.ok(inspect, "Native Pi must expose its authenticated detail reader");
+          const listing = Schema.decodeUnknownSync(InspectionTools.list.output)((await list.execute("native-smoke-list", { machineId, harness, limit: 100 })).details);
+          assert.ok(listing.sessions.some((entry) => entry.ref.nativeSessionId === native.ref.nativeSessionId), "Native reader must discover the real CLI session");
+          const detail = Schema.decodeUnknownSync(InspectionTools.inspect.output)((await inspect.execute("native-smoke-inspect", { ref: native.ref })).details);
+          assert.deepEqual(detail.presence.ref, native.ref);
+          assert.equal(detail.resources.ownedRssBytes.status, "available");
+        } finally {
+          await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+          session.dispose();
+        }
+      } finally {
+        if (previousConfig === undefined) delete process.env.COORDINATOR_CONNECTOR_CONFIG;
+        else process.env.COORDINATOR_CONNECTOR_CONFIG = previousConfig;
+      }
+    });
     yield* child.kill();
     yield* child.exitCode;
-    nativeResults.push({ harness, status: "actual disposable CLI extension inspected; no prompt sent" });
+    nativeResults.push({ harness, status: harness === "pi" ? "actual disposable CLI inspected through native SDK reader tools; no model prompt sent" : "actual disposable CLI extension inspected; no prompt sent" });
   }
   console.log(JSON.stringify({ scenario: "ephemeral-inspector", status: "ok", authenticatedHttpMcp: true, outboundConnector: true,
     ownerIsolation: true, machineIsolation: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativePrograms: nativeResults }));
