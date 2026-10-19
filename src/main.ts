@@ -1,41 +1,76 @@
-import { Config, Console, Context, Effect, Layer, Schema, Stdio } from "effect";
+#!/usr/bin/env node
+import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { Console, Context, Effect, Layer, Schema } from "effect";
+import { HttpServer } from "effect/http";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
-import { BrokerConfig, RunnerConfig, command, CommandError, type CommandInput } from "./contracts.ts";
-import { Broker } from "./broker.ts";
-import { Runner } from "./runner.ts";
-import { Platform } from "./platform.ts";
-import { Mcp } from "./mcp.ts";
+import { Inspector } from "./inspector.ts";
+import { Mcp, serverLayer } from "./mcp.ts";
+import { InspectorConfig, InspectionTools, SessionInspectInput } from "./inspection.ts";
+import { NativeError, connectExternal, loadConnectorConfig, readConnectorToken, readPrivateFile, projectHook, projectClaudeStatus, projectCodexNotification, writeNativeCache, writeHermesHook } from "./native.ts";
 
-const absolutePath = Schema.String.check(Schema.isPattern(/^\/[^\r\n\u0000]*$/));
-const brokerCommand = command("program.broker", "program", "runBroker", "Start the broker using COORDINATOR_CONFIG private file and remain serving.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" });
-const runnerCommand = command("program.runner", "program", "runRunner", "Start the isolated runner using COORDINATOR_CONFIG private file and await failure.", Schema.Struct({ configFile: absolutePath }), Schema.Void, { exposure: "private" });
+const readInput = Effect.tryPromise({ try: async (): Promise<unknown> => {
+  let bytes = 0;
+  let text = "";
+  for await (const chunk of process.stdin) {
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > 65536) throw new Error("bound");
+    text += chunk;
+  }
+  return JSON.parse(text);
+}, catch: () => new NativeError({ operation: "Invalid bounded JSON input" }) });
 
-const services = Layer.mergeAll(Platform.layer, Mcp.layer, NodeServices.layer);
-NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
-  // Effect has no process umask API; credentials and adapter-created files must be private.
+export const cli = (args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(function*() {
+  const mode = args.at(0) ?? "help";
+  if (mode === "help" || mode === "--help") {
+    return yield* Console.log(JSON.stringify({ commands: ["inspector", "connector", "mcp", "hook claude|codex|hermes", "claude-statusline", "codex-notification", "list", "inspect"], inspectorConfiguration: "COORDINATOR_CONFIG: private inspector server configuration", configuration: "COORDINATOR_CONNECTOR_CONFIG or XDG_CONFIG_HOME/coordinator/inspector.json", statusline: "Optional manual composition only; consumes stdin without producing display output", codexNotification: "Version 2 envelope, source attached-app-server, thread/tokenUsage/updated only; does not observe other TUIs" }));
+  }
+  if (mode === "inspector") {
+    const file = process.env.COORDINATOR_CONFIG;
+    if (!file) return yield* new NativeError({ operation: "Inspector private configuration required" });
+    const config = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(InspectorConfig), { onExcessProperty: "error" })(yield* readPrivateFile(file));
+    const inspector = yield* Inspector.make(config);
+    const context = yield* Layer.build(serverLayer(config.host, config.port));
+    const mcp = yield* Mcp;
+    yield* mcp.serve(Context.get(context, HttpServer.HttpServer), inspector);
+    return yield* Effect.never;
+  }
+  const config = yield* loadConnectorConfig();
+  if (!config) return yield* new NativeError({ operation: "Connector configuration required" });
+  if (mode === "hook" || mode === "claude-statusline" || mode === "codex-notification") {
+    const input = yield* readInput;
+    const harness = args.at(1);
+    if (mode === "hook" && harness === "hermes") return yield* writeHermesHook(config, input);
+    const observation = mode === "claude-statusline" ? yield* projectClaudeStatus(config.machineId, input) : mode === "codex-notification" ? yield* projectCodexNotification(config.machineId, input) : harness === "claude" || harness === "codex" ? yield* projectHook(harness, config.machineId, input) : yield* new NativeError({ operation: "Expected native hook harness" });
+    yield* writeNativeCache(config, observation);
+    return;
+  }
+  if (mode === "connector") return yield* connectExternal(config);
+  const token = yield* readConnectorToken(config);
+  const mcp = yield* Mcp;
+  const reader = {
+    list: (input: typeof InspectionTools.list.input.Type) => mcp.call(config.inspectorUrl, token, InspectionTools.list, input),
+    inspect: (input: typeof SessionInspectInput.Type) => mcp.call(config.inspectorUrl, token, InspectionTools.inspect, input),
+  };
+  if (mode === "mcp") return yield* mcp.serveStdio(reader);
+  if (mode === "list") return yield* Console.log(JSON.stringify(yield* reader.list({ limit: 100 })));
+  if (mode === "inspect") {
+    const input = yield* Schema.decodeUnknownEffect(SessionInspectInput)(yield* readInput);
+    return yield* Console.log(JSON.stringify(yield* reader.inspect(input)));
+  }
+  return yield* new NativeError({ operation: "Unknown inspector command" });
+}));
+
+// Imports are inert for fixture tests and native adapters.
+if (process.argv.at(1) && import.meta.url === pathToFileURL(realpathSync(process.argv.at(1) ?? "")).href) {
   process.umask(0o077);
-  const args = yield* (yield* Stdio.Stdio).args;
-  if (args.length !== 1 || (args[0] !== "broker" && args[0] !== "runner")) return yield* new CommandError({ message: "Expected broker or runner" });
-  const configPath = yield* Config.String("COORDINATOR_CONFIG");
-  const platform = yield* Platform;
-  const runBroker = Effect.fnUntraced(function*({ configFile }: CommandInput<typeof brokerCommand>) {
-    const contents = yield* platform.privateFile(configFile);
-    const config = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.toCodecJson(BrokerConfig)), { onExcessProperty: "error" })(contents);
-    const context = yield* Layer.build(Broker.layer(config));
-    const broker = Context.get(context, Broker);
-    yield* Console.log(`coordinator broker listening on ${broker.config.host}:${broker.config.port}`);
-    return yield* Effect.never;
-  });
-  const runRunner = Effect.fnUntraced(function*({ configFile }: CommandInput<typeof runnerCommand>) {
-    const contents = yield* platform.privateFile(configFile);
-    const config = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.toCodecJson(RunnerConfig)), { onExcessProperty: "error" })(contents);
-    const context = yield* Layer.build(Runner.layer(config));
-    const runner = Context.get(context, Runner);
-    yield* Console.log(`coordinator runner listening on ${runner.config.host}:${runner.config.port}`);
-    // Fenced PostgreSQL serving must not dispose accepted agent work.
-    return yield* Effect.never;
-  });
-  return yield* (args[0] === "broker"
-    ? brokerCommand.execute({ runBroker }, { configFile: configPath })
-    : runnerCommand.execute({ runRunner }, { configFile: configPath }));
-})).pipe(Effect.provide(services)));
+  const args = process.argv.slice(2);
+  const hook = args.at(0) === "hook" || args.at(0) === "claude-statusline" || args.at(0) === "codex-notification";
+  NodeRuntime.runMain(cli(args).pipe(
+    Effect.provide(Layer.mergeAll(NodeServices.layer, Mcp.layer)),
+    Effect.catchCause((cause) => Console.error(JSON.stringify({
+      error: "Native inspector operation unavailable",
+      reasons: cause.reasons.map((reason) => reason._tag === "Fail" ? { kind: reason._tag, code: reason.error._tag } : { kind: reason._tag }),
+    })).pipe(Effect.andThen(Effect.sync(() => { process.exitCode = hook ? 0 : 1; })))),
+  ));
+}

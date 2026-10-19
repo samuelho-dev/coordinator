@@ -1,111 +1,355 @@
 # Coordinator
 
-One application and source tree, with separate broker and runner processes and a Pi/OMP plugin. No automatic apply, merge, deploy, activation or replay of uncertain work.
+A lightweight, read-only inspector for **existing native Pi, OMP, Hermes, Codex CLI and Claude Code sessions** on Linux/macOS. Native agents retain their conversations, execution, approvals and lifecycle; Coordinator publishes bounded presence and answers on-demand counter/resource queries without creating another agent session.
 
-## Roles and layout
+## Workflow and boundaries
 
-- **Broker coordinator** (`src/main.ts broker`): authenticates participants, routes peer offers, persists the task ledger and dispatch queue, and records independent evidence and consented archive metadata. It does not execute model work.
-- **Isolated runner** (`src/main.ts runner`): owns capacity, durable acceptance, pinned worktrees and distinct-UID child processes. It executes approved work, independently checks assignment and deadlines, and preserves occupied uncertainty across restart.
-- **Plugin integration** (`src/plugin.ts`): enrolls the host, delivers broker messages and owns separate SDK sessions inside ordinary Pi/OMP. It does not drive the surrounding TUI through a void host API or add an OS sandbox to the host user's session.
-- **Agent session control** (`src/agent/`, `src/agent-session.ts`): binding, admission, whole-run settlement, cancellation and MCP session control for those owned SDK sessions. This is not the broker coordinator.
-- **Runner extension** (`src/agent-session.ts` default entrypoint): session control inside an isolated runner child, without enrolling that child as a desktop plugin.
-- **MCP transport** (`src/mcp.ts`): broker/runner commands use stateless MCP **2026-07-28**; interactive agent control uses stateful **2025-11-25**. Both use Streamable HTTP JSON/SSE. Preserve incremental delivery, cancellation/backpressure, per-message limits, bearer/Origin/version/media boundaries and ambiguous abrupt-close outcomes.
-- **Database** (`src/database.ts`): owned PostgreSQL connection and schema readiness; `src/broker.ts` owns durable dispatch storage and GitHub observation factories. `prisma/contract.prisma` owns the schema; generated Effect/Kysely types are authoritative.
+1. An explicitly configured native extension or metadata connector announces existing sessions to an authenticated, ephemeral inspector registry. Connectors initiate outbound HTTP; a Mac terminal needs no inbound listener.
+2. Same-owner connected agents use **`session.list`** for presence and **`session.inspect`** for one session's native counters and attributable process resources. These are the entire model-facing tool catalog, both read-only. Other owners cannot read the sessions; publishers can write only their authenticated machine's observations.
+3. Presence repeats every 10 seconds. Native detail getters and an approximately 200 ms OS CPU/RSS sample run only on demand. Connector announce/poll/result/disconnect are bounded transient read RPCs, not durable jobs. Registry restart loses discovery until reannouncement, never native work.
+4. In OMP, a leading `coordinate` word transforms the **current input** with a real presence snapshot and read-only inspection cue. It is not a role, forwarding operation or executor. Other input is unchanged. Native keyword highlighting preserves enabled core words and the custom editor; the replace-only keyword API cannot enumerate arbitrary third-party registrations, so composition with those registrations is not guaranteed.
 
-## Build, install and run
+Rex remains the terminal owner; Hermes workflows/cron, native CI and collaboration remain external execution authorities. Coordinator has no task board, queue/executor, broker/runner, role/lease/handoff, background model, independent pricing engine, account quota subsystem, transcript archive or tool-result history. Inspection never reads queued prompt text, conversations, system prompts or tool inputs/results.
 
-Use the exact lockfile and pinned public SDKs (Pi **1.0.4**, OMP **18.6.1**); do not replace global binaries or user profiles.
+## Source
+
+There are **seven handwritten `src/` files** and only two Effect application service owners: `Inspector` and `Mcp`. Imports are inert; native projections and resource collectors are plain functions, not additional service owners.
+
+```text
+src/
+├── inspection.ts   # boundary schemas, metric/provenance contracts, two tool descriptors
+├── resources.ts    # Linux/Darwin process identity and on-demand resource sampling
+├── inspector.ts    # Inspector: authenticated ephemeral registry and read RPC owner
+├── mcp.ts          # Mcp: bounded HTTP/MCP client/server and stdio transport
+├── native.ts       # native projections, private metadata cache, outbound connectors
+├── plugin.ts       # actual-session Pi/OMP observer and extension entrypoint
+└── main.ts         # CLI and root composition
+scripts/
+├── install.ts      # explicit native-host artifact installer
+├── smoke.ts        # disposable native CLI/HTTP/connector smoke
+└── deployment-smoke.ts # exact-image authenticated inspector smoke
+```
+
+| File / owner | Callable surface and responsibility |
+| --- | --- |
+| [inspection.ts](src/inspection.ts) | `SessionRef`, presence/metric/observation/config schemas, strict `decode*` boundaries; `sessionRefKey`, `metric`, `unavailableMetric`, `createInspection`; `InspectionTools.list` / `.inspect` descriptors. `HttpError` uses `Schema.TaggedError`; no layer/state owner. |
+| [inspector.ts](src/inspector.ts) / `Inspector` | Scoped `make(config)` and `layer(config)`; `authorize(token)`, `list(principal,input)`, `inspect(principal,input)`, `announce(principal,input)`, `poll(principal,input)`, `complete(principal,input)`, `disconnect(principal,input)`. Typed Effects with `HttpError`; receiver clock owns liveness. No database or native execution. |
+| [mcp.ts](src/mcp.ts) / `Mcp` | `make`, `layer`; generic `call(url,token,descriptor,params,timeoutMs?)`, typed `post(url,token,path,inputSchema,outputSchema,params,timeoutMs?)`, scoped `serve(server,inspector)`, generic `serveStdio(reader)` with `list(input)` / `inspect(input)` Effects. `serverLayer(host,port)` supplies the Node HTTP server. |
+| [resources.ts](src/resources.ts) | `identifyProcess(pid)`, `observeResources(roots)`, `parseDarwinSnapshot(output)`; process birth/parent identity and bounded resource sampling. `ResourceError`; no service/layer. |
+| [native.ts](src/native.ts) | `readPrivateFile`, `loadConnectorConfig(file?)`, `readConnectorToken`, scoped `connectNative(config,{presence,inspect})`, `withProcessResources`; `projectHook`, `projectClaudeStatus`, `projectCodexNotification`, `writeHermesHook(config,envelope,at=Date.now(),hostPid=process.ppid)`; `writeNativeCache` / `readNativeCache`, `claudeRoster(config)`, `connectExternal(config)`. `NativeError`; no native SDK/session owner. |
+| [plugin.ts](src/plugin.ts) | `createNativeObserver(harness,machineId,processes?)` returns `update`, `presence`, `inspect`, `clear`; retains current native context, scalar latest usage and active tool identifiers, not message/event history. `isCoordinateInput`, `transformCoordinateInput`, `registerCoordinateKeyword`; default extension registers lifecycle/input hooks and a scoped outbound connector through Node/Mcp ManagedRuntime. |
+| [main.ts](src/main.ts) | `cli(args)` scopes modes. Inspector mode composes `Inspector.make`, `serverLayer`, `Mcp.serve`; connector uses `connectExternal`; MCP mode supplies a remote descriptor reader to `serveStdio`; list/inspect use those same descriptors; native stdin adapters project/cache bounded metadata. Executable root provides `Layer.mergeAll(NodeServices.layer,Mcp.layer)` through `NodeRuntime.runMain`. |
+
+`Inspector.inspect` forwards one read request to the current connector incarnation; timeout/cancellation removes it. Bearer-authenticated `/connector/announce`, `/connector/poll`, `/connector/result` and `/connector/disconnect` are transport endpoints, not model tools. `/mcp` exposes the two tools with read-only hints. Receiver liveness is 30 seconds, discovery expiry 120 seconds, registry query deadline 10 seconds and detail callback deadline 8 seconds. HTTP/native JSON input is bounded to 64 KiB; detail is bounded to 48 KiB with explicit partial flags and retained aggregate scope. Framing/SSE output is bounded; redirects/token forwarding and unsafe Origins are rejected.
+
+`prisma/` and `migrations/` are historical rollback source assets, **not** current database dependencies or schema setup. There is no automatic historical import or deletion; see [deployment and rollback](#deployment-and-rollback).
+
+### Build and entrypoints
+
+Use the pinned lockfile and an authorized exact-source checkout. The package declares Node **>=22.19** and pnpm **11.9.0**; the production image uses Node **24.21.0**. Pi is pinned to **1.0.4**, the OMP development SDK to **18.6.1**, and Effect to **4.0.3**. Source-package OMP requires **Bun >=1.3.14** (CI pins **1.4.2**); do not load its SDK as a Node SDK or replace global binaries/profiles. A compiled OMP executable has its own runtime/version boundary; the observed native smoke used compiled **18.11.3**, not the pinned SDK artifact.
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
-omp plugin link /absolute/coordinator
-# Pi instead: pi install /absolute/coordinator
 ```
 
-The root build emits exactly three standalone ESM/declaration pairs, `dist/agent/{protocol,client,server}.{js,d.ts}`, plus two bundles, `dist/plugins/plugin.js` and `dist/plugins/agent-session.js`. Effect and its Node adapter share one bundled module graph; public SDKs and runtime transports remain external. Pi uses a static ESM namespace import; Bun-only OMP imports load only in the OMP branch. There is no separate session-control package or workspace install. Ordinary host manifests load only `dist/plugins/plugin.js`; isolated runner children load only `dist/plugins/agent-session.js` with `--mode rpc --no-extensions`. Never load both owners into one host. Build a clean distribution without obsolete emitted modules/bundles; generated `dist/` is rebuilt, not committed. Migrate matching installed deep imports and rebuild/reload every consumer before activation; there are no old-path aliases.
+`build` clears generated `dist/`, patches the installed TypeScript integration, emits ESM/declarations for `src/` and the three scripts, and creates **`dist/plugins/pi.js`** and **`dist/plugins/omp.js`**. Host manifests select their corresponding bundle. Native SDKs are host/development dependencies, not inspector runtime dependencies. The CLI is **`dist/src/main.js`** (package bin `coordinator`), not the retired `dist/agent/` distribution.
 
-**Breaking source paths:** database-service→database; dispatch-store/evidence→broker; journal/plugin-status→plugin; runner-plugin→agent-session; agent/{contracts,lifecycle,pure presentation wire}→agent/protocol and agent/{interaction,concrete MCP protocol}→agent/server. No compatibility modules. The [current18-file service/factory/method map](docs/src-consolidation-plan.md#current-callablelayer-map-and-counts) distinguishes six application Context owners from plain factories.
+| Package command | Exact entrypoint / purpose |
+| --- | --- |
+| `pnpm inspector` | `node dist/src/main.js inspector`: ephemeral HTTP registry, private server config through `COORDINATOR_CONFIG`. |
+| `pnpm connector` | `node dist/src/main.js connector`: outbound external-native metadata/roster publisher. |
+| `pnpm mcp` | `node dist/src/main.js mcp`: stdio bridge to the same two remote read-only tools. |
+| `pnpm install:host` | `node dist/scripts/install.js`: explicit artifact generation; manual native activation below. |
+| `pnpm smoke` | `node dist/scripts/smoke.js`: disposable native CLI/HTTP/connector smoke, not deployment. |
+| `pnpm check` | `tsc --noEmit`; no database generation/URL. |
+| `pnpm test` | `vitest run --configLoader native`; no PostgreSQL prerequisite. |
 
-`pnpm check` builds, regenerates database contracts, loads their ESM entrypoint and runs the installed `tsc --noEmit`. `pnpm test` requires the independent secret environment variable `COORDINATOR_TEST_POSTGRES_URL` before building and invokes the installed Vitest with `--configLoader native`. Offline generation needs no database URL; a supplied URL is accepted through `DatabaseService.connection()`.
+Additional CLI modes are `help` / `--help` (also the no-argument default), `list`, `inspect`, `hook claude|codex|hermes`, `claude-statusline` and `codex-notification`. `inspect` consumes bounded JSON on **stdin**, not a session-ID flag. Hook/statusline/notification adapters whitelist metadata into private cache, produce no display output and never echo input/secrets. Ordinary command failures exit **1**; native observer failures report redacted errors to stderr and exit **0**, so inspection cannot block native work.
 
-Start ordinary `omp` or `pi` in the target Git worktree; no Coordinator launcher is needed. The plugin discovers private `PluginConfig` at `$XDG_CONFIG_HOME/coordinator/plugin.json` (otherwise `~/.config/coordinator/plugin.json`), containing `brokerUrl`, `tokenFile`, `machineId`, `stateDirectory` and `host`. Files/tokens are mode0600 with private0700 parents. Missing default configuration disables the plugin; malformed/insecure configuration fails closed. `COORDINATOR_CONFIG` optionally selects an absolute config path. `COORDINATOR_AGENT_CONFIG` optionally selects explicit private `AgentConfig` paths for the session-control owner; otherwise its agent endpoint/token lives below the state directory. `connectHosts` changes socket DNS only, preserving authority/SNI/certificate checks. Registration and explicit `-e` loading are exclusive.
+## Configuration
 
-Inject the role's `COORDINATOR_DATABASE_URL` from your secret manager into the broker or runner service environment before starting it; the runner uses its own database/login, never the broker's. URLs do not belong in configuration JSON, application URL files, CLI arguments or logs. `DatabaseService.connection()` reads redacted configuration and validates it once; `DatabaseService.layer()` owns the scoped connection. Native agent/model/provider children and unrelated Git/subprocesses must not inherit database credentials. Paired offline recovery additionally reads the independent runner URL from `COORDINATOR_RUNNER_DATABASE_URL`; fixtures use `COORDINATOR_TEST_POSTGRES_URL`. Native Kubernetes Secrets and the installer's private systemd EnvironmentFile provision service environments, not application URL readers.
+[inspection.ts](src/inspection.ts) defines **different, strict JSON shapes** for server and connector; unknown properties are rejected. [native.ts](src/native.ts) owns private-file checks. Old `plugin.json`, database URLs, repository enrollment, execution roles and model credentials are not current interfaces.
+
+Use separate bearer tokens for each owner/machine principal. Each enrollment has `id`, `owner`, `machineId` and a lowercase SHA-256 `tokenHash`. Same-owner principals can read one another's observations; publishing is restricted to the authenticated machine. **There is no read-only token role.** Protect every enrolled token accordingly. Hash the exact token bytes consumed after trimming; token files accept 16–4096 non-whitespace characters.
+
+Run as the actual nonroot native host owner. Config/token files must be owner-owned regular files with no group/other permissions (**0600**) in an owner-owned canonical immediate parent with no group/other permissions (**0700**). Reads reject final symlinks, noncanonical paths (including `..`) and files over 64 KiB. Protect the state directory the same way; use a new directory, not an old runtime store. It holds bounded metadata, not conversations or task journals.
+
+### Private bootstrap
+
+Keep shell tracing off. Select a **new canonical absolute directory** and adapt this example to the actual owner/OS. It refuses an existing directory and exclusively creates token/hash files; raw tokens never enter argv, environment, logs or Git.
 
 ```sh
-COORDINATOR_CONFIG=/absolute/private/broker.json node --import tsx src/main.ts broker
-# Linux isolated runner, only under the documented supervisor capabilities:
-COORDINATOR_CONFIG=/absolute/private/runner.json node --import tsx src/main.ts runner
-node --import tsx scripts/install.ts --help
+(
+  set -eu
+  umask 077
+  export PRIVATE=/home/operator/.config/coordinator-inspector-private
+  mkdir -m 700 "$PRIVATE"
+  node --input-type=module <<'JS'
+import { randomBytes, createHash } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
+const token = randomBytes(32).toString('hex');
+writeFileSync(`${process.env.PRIVATE}/machine.token`, token, { mode: 0o600, flag: 'wx' });
+writeFileSync(`${process.env.PRIVATE}/machine.sha256`, createHash('sha256').update(token).digest('hex'), { mode: 0o600, flag: 'wx' });
+JS
+  mkdir -m 700 "$PRIVATE/state"
+)
 ```
 
-`--plugin-only --plugin-config <file>` installs host integration as the native user; Linux root `--runner-only` installs the separate isolated service. macOS is plugin-only. [Self-hosting](docs/self-hosting.md) specifies credentials, supervisor setup, external PostgreSQL, chart and recovery requirements.
+Using protected editor/secret tooling, create **new** owner-only files below; do not overwrite existing configuration. Copy only the generated hash into enrollment and replace `REPLACE_WITH_64_LOWERCASE_HEX_SHA256` before use. The example contains no real credential. Provision raw tokens only through private files/your secret backend, never native MCP settings or plaintext Git.
 
-## Participation and JSON output
+**Server** `/home/operator/.config/coordinator-inspector-private/server.json`:
 
-`/coordinator off` stops this host's coordination and sharing, revokes/deletes its broker archive and retires enrollment. Accepted agent work continues locally; its pre-off outcomes remain for explicit reconciliation even if `/coordinator on` runs before settlement. Delivery/no-replay records are retained. This does not stop the broker, isolated runners or other agents.
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "principals": [
+    {
+      "id": "workstation-publisher",
+      "owner": "example-owner",
+      "machineId": "example-workstation",
+      "tokenHash": "REPLACE_WITH_64_LOWERCASE_HEX_SHA256"
+    }
+  ]
+}
+```
 
-The private `stateDirectory/off.json` preference survives restart; an opted-out startup creates no private SDK owner or endpoint. `/coordinator on` explicitly resumes participation, never archive consent. `/coordinator optout` remains the separate archive-only operation. Other already-running hosts must opt out separately, even if they share a state directory.
+**Connector/client** `/home/operator/.config/coordinator-inspector-private/inspector.json`:
 
-If remote cleanup fails, local participation stays off and the exact pending archive binding is retained. Restore connectivity and retry `/coordinator off` explicitly; `on` refuses while sharing revocation remains unconfirmed. In-flight network effects cannot be rolled back by a command.
+```json
+{
+  "inspectorUrl": "http://127.0.0.1:8787",
+  "tokenFile": "/home/operator/.config/coordinator-inspector-private/machine.token",
+  "machineId": "example-workstation",
+  "stateDirectory": "/home/operator/.config/coordinator-inspector-private/state"
+}
+```
 
-Client/operator JSON uses Effect `Formatter.formatJson(value, { space: 2 })`; MCP successes and sanitized failures include readable text as well as structured data. Strict Effect Schema codecs retain compact wire/storage framing and canonical fingerprints. Root broker/runner successful responses allow192KiB for both JSON representations; requests and rejected HTTP bodies remain64KiB, discovery512KiB, and original structured payload limits remain enforced. Standalone private-agent wire/resource limits are unchanged; oversized private results retain their existing resource path.
+For another machine, enroll a distinct token/principal with the same owner and its own machine ID. Use real private HTTPS DNS and OS-local paths; do not copy Linux paths unchanged to a Mac. TLS is required except loopback (`localhost`, `127.0.0.1`, `[::1]`); URLs cannot contain credentials, query or fragment. Preserve system DNS and certificate-chain/hostname validation; no custom relay or verification bypass. If needed, supply a trusted public CA bundle through `NODE_EXTRA_CA_CERTS`, restarting Node after trust rotation. Never distribute a CA private key.
 
+The connector defaults to `$XDG_CONFIG_HOME/coordinator/inspector.json`, otherwise `~/.config/coordinator/inspector.json`; `COORDINATOR_CONNECTOR_CONFIG` selects an explicit file. Missing default config disables native extension enrollment; an explicit missing, invalid or insecure config fails. CLI reader/connector modes require configuration. Never point the connector at server JSON. Server mode requires explicit `COORDINATOR_CONFIG`.
 
-## Execution and durability contracts
+### Foreground commands
 
-**Typed contracts.** `Commands` and `AgentTools` own each operation's wire name, schemas, routing and policy in one descriptor. Persisted states come from the generated Prisma enums; runtime SDK vocabularies use one frozen value object and its derived Effect codec. Raw transport arguments are decoded once before typed dispatch; `executeDecoded` consumes accepted domain values without validation. Services preserve inferred or explicitly generic Effect success, error and environment channels—never `unknown` error/environment annotations. Unknown SDK/wire data and opaque Promise failures stay at their acceptance boundary.
+Select the same private directory in each shell; these commands do not install services:
 
-Model IDs use the generator's singular names (`Session.id: SessionId`, `Task.id: TaskId`). Opaque IDs are primitive brands, not custom regex formats; non-string values are rejected at acceptance boundaries. Prisma `@@map` preserves the physical table names.
-Stored hash fields likewise use the short generated `Hash` brand without format checks. One acceptance codec in `src/contracts.ts` validates SHA-256 values for configuration, wire data and private JSON; generated database row types do not repeat that validation.
+```sh
+export PRIVATE=/home/operator/.config/coordinator-inspector-private
+COORDINATOR_CONFIG="$PRIVATE/server.json" node dist/src/main.js inspector
+```
 
-**Peer first.** Enrollment binds machine, host, session/incarnation and agent worker. Only verified-live, actively polling, matching repository/worker receives offers. Receipt is not acceptance; decline/expiry/unavailability or explicit bypass permits runner dispatch. Broker restart requires fresh heartbeat. `/coordinator sessions` lists same-owner Coordinator participants, not unrelated host sessions or saved conversations; registration/listing does not require repository enrollment or grant execution authority.
+In another shell:
 
-**Durable dispatch.** Persist unique QUEUED task/request material before offering it; repair missing offers. Same ID/fingerprint is idempotent, changed material conflicts. Persist ASSIGNING and target runner before acceptance. Runner rechecks assignment/fingerprint/deadline after waits, commits acceptance/material/worktree before reply or launch, and only durable acceptance acknowledges the claim. Timeout or pending admission means unknown, never nonacceptance: reconcile the same runner and block reassignment. Accepted-but-unlaunched work can resume; uncertain child/prompt remains HELD and occupied, never automatically replayed. Dispatch storage uses `dispatch_queue` (`queue`, `payload`, `failure`, `available_at`, `leased_at`, `lease_id`); invalid persisted payloads fail rather than being delivered. Upstream Effect queue option names remain unchanged.
+```sh
+export PRIVATE=/home/operator/.config/coordinator-inspector-private
+export COORDINATOR_CONNECTOR_CONFIG="$PRIVATE/inspector.json"
+node dist/src/main.js help
+node dist/src/main.js list
+node dist/src/main.js inspect <<'JSON'
+{"ref":{"machineId":"example-workstation","harness":"pi","nativeSessionId":"COPY_EXACT_ID_FROM_LIST"}}
+JSON
+```
 
-**PostgreSQL only.** Broker and runner require separate external PostgreSQL18 databases/logins supplied through their own service environments. One initial attested PostgreSQL migration creates the complete schema for both roles, including dispatch and runner journal tables. There is no historical migration chain, runtime DDL, alternate backend, importer or compatibility workflow. Apply the exact committed schema separately to each database with owners stopped. Runtime readiness checks generated storage/profile identity, concrete tables, dispatch and recovery readiness; Prisma tooling owns migration history.
+Copy the **complete `ref`** from `list`, including `nativeAgentId` when supplied. CLI `list` requests up to 100 entries; native MCP `session.list` accepts its schema's pagination/filter inputs. `node dist/src/main.js mcp` is a stdio bridge for a native MCP launcher, not an interactive prompt.
 
-`DatabaseService` owns one advisory-fenced `Kysely<DB>` connection, `query` and `transaction(effect)` with typed `DatabaseError` failures; no second pool, Effect SQL runtime or automatic reconnect/retry. Consumers acquire it through `yield* DatabaseService`, not direct clients. Generated typed rows return directly; serialized JSON TEXT payloads are decoded once when read, with `SchemaError` in the failure channel. Accepted domain inputs and typed SDK results are not re-decoded. PostgreSQL ownership loss stops DB serving/writes/readiness while cheap liveness stays200 and admitted agent work survives to validated completion. Drain explicitly before restart; local kernel ownership loss remains a hard fence. Never weaken durability or infer completion from a PID.
+Pi/OMP extensions connect directly from their actual sessions. Claude/Codex/Hermes hooks need a separately started external connector as the same owner:
 
-**Isolation.** Runner supervisor UID1000 has exactly CHOWN/DAC_OVERRIDE/KILL/SETUID/SETGID/SETPCAP, no FOWNER. Each child has its own reserved UID, zero capabilities/groups, NoNewPrivs, private repo/session/model HOME and model-only environment. Reserve nonoverlapping million-UID ranges; credentials/journals/sibling work are inaccessible. Kernel `flock` owns runner files, not persisted PIDs. Lost stdio cannot prove completion or permit replay; capacity releases only after scoped physical closure. Host SDK journals remain private host data.
+```sh
+COORDINATOR_CONNECTOR_CONFIG="$PRIVATE/inspector.json" node dist/src/main.js connector
+```
 
-**Capacity/wire migration.** Runner configuration and `runner.heartbeat` share integer **slots1–64**; old65–128 configurations fail, never clamp. Heartbeat carries only runnerId/slots/load; the removed `journal` field is rejected. Drain/reconcile without clearing occupied uncertainty, choose a valid capacity, and rebuild/reload both broker and runner together. Separate report rows/reports and assign/handoff journal reconciliation remain.
+## Native host setup
 
-**Addressed release and whole runs.** Read back task, worker, session/incarnation, message/revision, repo/ref/SHA, scope/restrictions/evidence/deadline; coordinator confirms the matching ready revision before prompting. Confirmed releases cannot reset through instruction changes. Explicit handoff reconciles acceptance, binds the new worker and requires fresh readback/confirmation; live/uncertain release blocks handoff. `agent.prompt` acknowledges actual SDK admission under submission/run IDs. Independent submissions use owner FIFO; SDK-queued steer/followUp shares the active run. Settlement requires prompt promise, SDK terminal result, idle/persistence barriers and OMP owned async-generation drain. Cancellation awaits actual abort/closure; acknowledgement alone is not an outcome. Missing proof retires the binding instead of inventing completion. SDK SUCCEEDED does not certify deliverable, CI, review or deployment evidence.
+Build first and check installed native versions/API availability before activation. The installer creates a **new directory beneath an existing private owner directory**, validates private config/token access, and refuses root/existing destinations. It never overwrites settings, hooks, profiles, statusLine or credentials; it does not reload a TUI, start a connector, install remotely or manage services. `--runtime /absolute/path/to/node` optionally selects Node (default: the installer's executable). Generated artifacts refer to exact-source absolute paths: do not move/delete that build afterward.
 
-**Recovery, privacy and evidence.** One owner-scoped control recovery schedule restores heartbeat then poll after classified transient failure; it never retransmits a failed business operation or whole tick. Command deadline is10s; backoff targets1/2/4/8/16/30s with local1–30s jitter, and valid Retry-After may exceed30s. Permanent auth/config/protocol/local faults pause traffic while admitted work survives. See [recovery policy and standards](docs/control-recovery-research.md). Held diagnostics name allowlisted causes/status, never payloads/paths/credentials or exception text.
+Use a separate new destination per target. `--dry-run` validates prerequisites and prints activation instructions without writing:
 
-Peer messages commit bounded incarnation/TTL metadata before ack and deduplicate before handling; redelivery is not exactly-once external effects. Evidence binds repository ID/ref/full tested SHA and lanes to actual run/attempt/jobs; pending/skipped/cancelled/stale observations cannot borrow older green. Completion and evidence never authorize execution. Consent from every participant precedes archive scanning; only bounded metadata enters spool/archive, never content/tools/thinking/credentials. Opt-out revokes then deletes. Sanitized online snapshots omit archive/consents and are not complete paired disaster recovery. Protected PostgreSQL+runner-file recovery stays confidential, excludes credentials, fences partial targets and holds uncertain accepted work. PVC retention, an object upload and Git revert are not restore/no-replay proof.
+```sh
+pnpm install:host --target pi --destination "$PRIVATE/pi-host" --config "$PRIVATE/inspector.json" --dry-run
+pnpm install:host --target pi --destination "$PRIVATE/pi-host" --config "$PRIVATE/inspector.json"
+pnpm install:host --target omp --destination "$PRIVATE/omp-host" --config "$PRIVATE/inspector.json"
+pnpm install:host --target claude --destination "$PRIVATE/claude-host" --config "$PRIVATE/inspector.json"
+pnpm install:host --target codex --destination "$PRIVATE/codex-host" --config "$PRIVATE/inspector.json"
+pnpm install:host --target hermes --destination "$PRIVATE/hermes-host" --config "$PRIVATE/inspector.json"
+```
 
-**Trust and release.** Private authenticated TLS, never Funnel; broker plaintext is not E2EE. `NODE_EXTRA_CA_CERTS` must be a trusted canonical public CA bundle; restart all owners/clients after rotation, never export CA private keys. Release once from exact-source green CI, verify immutable image digest, expected signer and SLSA source identity, then propose reviewed chart/image/source pins in operator Git for Argo reconciliation. No local docs/config/build command authorizes deployment. [Deployment decisions and evidence](docs/deployment-research.md) retain governance, storage and public-distribution limits.
+Every target includes private `connector.sh` and `mcp.sh` launchers. Review the printed instructions and manually activate only intended entries, preserving existing native hooks/settings/MCP servers:
 
-## Complete configuration and protocol cutover
+| Harness | Generated artifacts and manual activation |
+| --- | --- |
+| Pi | `package.json` references `dist/plugins/pi.js`; run `pi install "$PRIVATE/pi-host"`. Merge **only** `mcpServers.coordinator` from generated `mcp.json` into selected `~/.pi/agent/mcp.json` or project `.pi/mcp.json`. Launch with `COORDINATOR_CONNECTOR_CONFIG`; native trust/reload requirements still apply. |
+| OMP | `package.json` references `dist/plugins/omp.js`; run `omp plugin link "$PRIVATE/omp-host"`. Merge only the generated coordinator entry from `mcp.json` into selected `.omp/mcp.json`; launch with the explicit connector-config environment. |
+| Claude Code | `.claude-plugin/plugin.json`, `hooks/hooks.json`, `.mcp.json`; launch `claude --plugin-dir "$PRIVATE/claude-host"`, approve the read-only MCP tools/metadata hooks, and separately start generated `connector.sh` as the same owner. Existing statusLine remains untouched. |
+| Codex CLI | `hooks/hooks.json`, `mcp.toml`; merge generated hook entries into selected `~/.codex/hooks.json` or project `.codex/hooks.json`, and only `[mcp_servers.coordinator]` plus its env table into selected `config.toml`. Preserve all other entries/tables, approve native hooks and separately start generated `connector.sh`. |
+| Hermes | `hooks.yaml` (JSON-compatible YAML), `mcp.yaml`, equivalent `mcp.json`; append only generated observer entries to `hooks:` in the selected profile's `config.yaml`, and merge only `mcp_servers.coordinator` from `mcp.yaml` into the same file. Preserve everything else, review/approve the intended native commands and separately start generated `connector.sh`. No plugin install/enable step or profile overwrite. Reader-only Hermes can merge just the MCP entry and omit observation hooks/connector. |
 
-Close new submissions and approved releases at **every** client; suspend operator reconciliation/acceptance hooks where applicable. Reconcile known tasks and actual owned children; do not clear HELD/occupied uncertainty. Drain and stop old owners, preserving private state. Rebuild/install every plugin, runner extension, CLI and compiled-module consumer. Replace all owned wire names with `agent.*`, resources with `agent://`, metadata with `io.coordinator.agent/*`, state/endpoint names with agent-prefixed paths and explicit owner config with `COORDINATOR_AGENT_CONFIG`; stored/configured bindings use `agentBinding`, `agentRunId`, `agentCursor`. No old-name acceptance, aliases or automatic metadata rewrite is supported. Keep SDK-owned API/event names unchanged.
+The generated Claude/Codex hooks cover `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest` and `Stop`; Claude also includes `PostToolUseFailure`, `PostModelSwitch`, `PreCompact`, while Codex includes `Interrupt`. They use bounded metadata projections, not prompt/tool payload archival.
 
-Initialize fresh PostgreSQL databases with the one initial schema. Update all private configurations and reviewed desired artifact pins together under maintenance; fully restart/reload every process (linking/building alone does not reload a TUI). Start the matching broker, then runner and fresh clients; prove source, protocol, agent binding, TLS/auth, occupied-state/no-replay and no-dispatch route acceptance before explicitly reopening work. This documentation update performs no migration, reload, deploy or activation.
+### Hermes native hooks
 
-## Verification status
+Hermes uses the **shared TypeScript CLI**, `node dist/src/main.js hook hermes`, not an in-process Python plugin or separate Coordinator runtime. Upstream Hermes retains its own native runtime; Coordinator adds no Python dependency or `HERMES_HOME/plugins` installation.
 
-Source phases1–5 are implemented: **13 handwritten +5 generated files**, now **66 shared root +9 localized program descriptors** including participation off/on, and **69 agent catalog descriptors /9 actual handlers**. See the [complete method map, report and bounded evidence](docs/src-consolidation-plan.md#8-evidence-and-unexecuted-gates).
+Exactly four native events are supported:
 
-**Participation/output follow-up:** source-tree and Node24 checks and **unfiltered132/132 tests across18 files, zero skips** passed. Actual native Pi/OMP RPC off/on preserved accepted runs, persistent opt-out and consent separation, fenced pre-off completion reports and emitted Effect-formatted JSON without slash-command model calls. Stock-host controls, UID1000001/cap0 isolation, paired PostgreSQL recovery and real installer JSON dry-run also passed. The original16000-character-scope task lifecycle remains intact; only bounded successful-response presentation headroom increased. No deployment or terminal-pixel acceptance is established.
+- `on_session_start` establishes the record.
+- `post_api_request` updates latest successful request usage, not account spend or lifetime totals.
+- `on_session_end` means idle/turn end, not removal.
+- `on_session_finalize` closes the old session, preferring `extra.old_session_id`; late callbacks cannot recreate a closed/absent record.
 
-Baseline consolidation verification, **before the participation/output follow-up**: source-tree and Node24 checks passed, along with **unfiltered128/128 tests in18 files, zero skips**, real pinned Pi/OMP stock-host smoke, UID1000001/cap0 isolation with **zero model-provider requests**, paired PostgreSQL recovery and real disposable S3 upload/restore/expiry/privacy smoke. The distribution was exactly3 ESM+3 declarations+2 bundles; installer help/dry-run/missing-artifact rejection passed. Cold generation also passed with generated runtime schemas absent; all five generated artifacts remained unchanged.
+The supported native dispatcher parses argv and executes directly (`shell=False`). Generated commands use `/usr/bin/env COORDINATOR_CONNECTOR_CONFIG='<config>' '<node>' '<main>' hook hermes`; `env` replaces itself with Node, preserving the actual in-process native dispatcher parent PID. That verified PID plus OS birth identity is a **shared hook host**, never an exclusive session process, wire-supplied PID or guessed TUI ancestor. While the exact host lives, cache reads refresh presence only, not native activity or usage ages; dead/reused hosts are absent. Without verified host identity, metadata lasts at most 120 seconds and process/resources remain unavailable. There is no heartbeat daemon, periodic resource sampler or extra model session. Unknown/legacy cache files are retained, not migrated/deleted.
 
-**Current limitation:** ordinary Plugin still executes through a separate private SDK session, not the actual human conversation. A native RPC probe proved passive context insertion and inclusion in a later explicit prompt, not durable admission or consumption. Native cutover and work/context/coordinator/CI-link extensions remain blocked on precise per-ID native outcome/receipt semantics, real native profile migration and any required supported Rex Linux/headless/security prerequisites. ModelProfile still has setup/smoke consumers. Hermes is optional client/invoker, not a second board. No installation, deployment, live human-session attachment or public release approval is established. The historical service/image observations below precede consolidation.
+### Claude and Codex optional sources
 
-The newest candidate is **0.2.0-beta.5**, not published or deployed. The service-owned database configuration cutover passed `pnpm check`, native migration integrity, and **127/127 tests across 18 files with zero skips**, under actual UID/GID1000, the six-capability/no-FOWNER boundary and NoNewPrivs. Disposable executable tmpfs scratch isolated journal I/O from measured host disk stalls; application/test deadlines and durability settings were unchanged. Public compiled artifacts retained readable/traversable permissions for distinct-UID children.
+Claude's connector can use native `claude agents --json` for independently checked PID roster identity when supported; ordinary hooks supply metadata. For optional metrics, manually compose the existing status-line command to pass the **same stdin JSON** to `node /absolute/coordinator/dist/src/main.js claude-statusline` with the connector-config environment, preserving existing display output. Never replace custom statusLine configuration; this adapter displays nothing. Current-context/latest-response tokens are not lifetime totals; context input/cache basis excludes output and cost is the native client estimate.
 
-Pre-consolidation stock Pi/OMP smoke accepted all nine controls, recovery/retirement and whole-run settlement with **56 local model calls, zero external calls and zero retired-owner requests**. Protected paired PostgreSQL recovery retained occupied uncertainty without launching work. The actual broker CLI applied migration twice, served authenticated live/readiness/MCP checks without a database URL file, and rejected invalid remote TLS configuration without leaking credentials. A freshly built production-only image independently passed repeated migration, both schema-readiness checks and live200/ready200/authenticated MCP with zero enrolled sessions, UID/GID1000, zero capabilities, NoNewPrivs and a read-only root. Disposable initializer proof reproduced the original opaque-ID traversal and verified hashed token filenames; installer proof verified root-private native systemd environment provisioning and secret exclusion from units/diagnostics, but service start was not exercised because the fixture has no systemd manager. These are local functional checks, not trusted release CI, deployment approval, power-loss durability, terminal pixels or operator TLS/rotation acceptance.
+Codex ordinary hooks provide metadata, not invented PID/token counters. Only an **already attached native app-server source** may feed bounded stdin to `node dist/src/main.js codex-notification`: envelope `version: 2`, `source: "attached-app-server"`, `method: "thread/tokenUsage/updated"`, with native thread/turn/tokenUsage params. It does not launch an app-server, new thread or hidden SDK session, nor observe unrelated TUIs. Without that real source, counters remain unavailable.
 
-The earlier semantic and strict-channel cutover passed root `pnpm check` (generation, compiled ESM modules and full types) and the unfiltered suite: **123/123 tests across18 files, zero skips**, using disposable PostgreSQL18 and actual UID/GID1000 with exactly six capabilities and NoNewPrivs. Real stock Pi1.0.4/OMP18.6.1 smoke accepted all nine agent controls, whole-run admission/settlement and owner-scoped recovery/retirement with **56 local model calls and zero external calls**. Protected offline recovery reopened the real broker and runner, retained workspace/session files and HELD occupied uncertainty, excluded model credentials and launched no work.
+## Metrics and provenance
 
-The earlier production-dependencies-only image passed migration twice, both schema-readiness checks, live200/ready200 and authenticated MCP health with zero enrolled sessions, under UID/GID1000, zero capabilities, NoNewPrivs and a read-only root. Its installer help interface was exercised without installation. These are disposable local checks, not current-source release approval, production deployment, terminal-pixel/consented-capture proof, operator TLS/rotation or off-cluster recovery acceptance. Current checks require private `COORDINATOR_TEST_POSTGRES_URL`; host smoke also requires exact `COORDINATOR_TEST_PI`, `COORDINATOR_TEST_OMP` and matching `_VERSION` values. Preserve native Node/tsx config loading and the six-capability/private-HOME boundary.
+Metrics report only native fields and attributable OS measurements that are actually available; missing/unsupported values are unavailable, never fabricated zeroes. Source, scope, freshness, estimate/shared/partial flags and aggregation boundaries accompany values; a schema field is not a claim that every harness supplies it.
 
-The singular-ID follow-up additionally passed all three identity boundary checks, full TypeScript compilation and the native initial-migration integrity check. A newly built production image applied migration twice and exercised opaque IDs containing slashes, spaces and Unicode through authenticated MCP registration/poll/list/stop and PostgreSQL roundtrips; numeric IDs were rejected. This ran under UID/GID1000, zero capabilities, NoNewPrivs and a read-only root, without dispatch. The 123-test and stock-host results above precede this ID follow-up; deployment remains paused.
+### Identity, availability and freshness
 
-The source-simplification follow-up removed unused host interaction APIs, redundant exports/schema forwarding, comparison-only HMAC verification and fallback recovery-owner rebinding. Recovery checks now wait for real I/O and owner scheduling before advancing virtual time; fixture endpoints publish atomically, and runner fixtures share idempotent cleanup with test-finished hooks. Removed only a redundant, overlap-sensitive heartbeat assertion from the security scenario; dedicated outage coverage remains. Final verification passed `pnpm check`, **123/123 tests across 18 files with zero skips**, all nine real stock Pi/OMP controls (**56 local model calls, zero external calls**), and protected offline recovery. The disposable PostgreSQL18 database used tmpfs to isolate shared-host disk contention, with `fsync`, `synchronous_commit` and `full_page_writes` all enabled; executable scratch ancestors retained trusted permissions. These are functional checks, not power-loss durability proof or deployment approval. Deployment remains paused.
+[`inspection.ts`](src/inspection.ts) defines the complete numeric allowlist below; [`plugin.ts`](src/plugin.ts) and [`native.ts`](src/native.ts) supply native projections. `SessionRef` is `machineId + harness + nativeSessionId`, plus optional actual `nativeAgentId` to distinguish actors when supplied. Presence may include native parent/label/kind, provider/model/profile/agent, cwd/repository, Rex identifiers, machine/OS/version, PID/birth/ownership, activity/wait/approval/streaming/compaction/current tool, and bounded goals/todos. These are conditional native metadata, not a promise that every adapter collects every schema field. Pi/OMP expose current model/cwd/activity, OMP actual agent identity, and available Rex session/block environment metadata; external adapters project whitelisted fields only. No prompts, conversation, queued text, system prompt or tool input/results are transmitted.
 
-Sources: [agent protocol](src/agent/protocol.ts), [MCP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http), [Effect MCP](https://github.com/Effect-TS/effect/blob/effect%404.0.3/packages/effect/src/ai/McpServer.ts), [Effect persisted queue](https://github.com/Effect-TS/effect/blob/effect%404.0.3/packages/effect/src/persistence/PersistedQueue.ts), [GitHub attempts](https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run-attempt).
+Each numeric metric is either `available` with value/unit, or `unavailable` with null/reason; missing is never zero. `routedModelCounts` uses `values` rather than a scalar `value`. Provenance contains `source`, `scope`, `scopeDescription`, `observedAt`, nullable `nativeUpdatedAt`, `estimated`, `derived`, `shared`, `partial`, `stale`, and optional `sampleWindow` (`startedAt`, `endedAt`). `queriedAt` is the inspection time, not the native counter update time. Cached counters keep their original observation/native timestamps; unknown update times stay null.
+
+Source-host presence timestamps, native activity and counter freshness are separate from receiver-clock connection receipt/liveness (`receivedAt`, `liveUntil`). Presence repeats every 10 seconds; receiver liveness is 30 seconds and registry expiry 120 seconds. A live connector does not prove a metadata-only Codex process is alive. Hermes cache reads refresh only presence `observedAt` while the exact bound host identity remains alive, not usage/native-update/activity timestamps. Without a host identity, Hermes has no process attribution and metadata expires after 120 seconds; a dead/reused bound host is absent from reads immediately. See the [registry](src/inspector.ts) and [native cache](src/native.ts).
+
+All getters and optional fields are conditional on the actual installed host/provider. No transcript reconstruction, full SessionStats/history scan, event-accumulated lifetime estimates, independent ratecard pricing or parent/child sum fills missing counters.
+
+### Source legend
+
+| Alias | Native source and scope |
+| --- | --- |
+| OS | [`resources.ts`](src/resources.ts): Linux `/proc/<pid>/stat`, boot identity and native `getconf` units; Darwin `/bin/ps -axo pid=,ppid=,lstart=,time=,rss=`. Two on-demand snapshots approximately 200 ms apart, validated ancestry/birth; no command lines or host totals. [`withProcessResources`](src/native.ts) projects the measurements. |
+| P/O context | Pi/OMP public `ctx.getContextUsage()`: `contextWindow`, nullable `tokens`/`percent`; estimated `current-context`. Unknown after compaction stays unknown. |
+| P/O latest | Whitelisted latest native assistant `usage`, `latest-native-update`, original native timestamp if supplied. Native client costs are estimates, not a new price engine. |
+| O aggregate | OMP optional `ctx.sessionManager.getUsageStatistics()`, `native-aggregate`: finalized cached indexed session entries, not selected branch or assumed lifetime. Total cost includes completed direct-child spend; never add child cost again. No aggregate reasoning/component-cost/credit counters. |
+| O async | OMP optional `ctx.getAsyncJobSnapshot()`: current-session native snapshot; no job commands/labels read. |
+| H latest | Successful Hermes `post_api_request` hook `extra.usage`, `latest-native-update`, not a session/account aggregate. Unknown native update time stays null. Input/output aliases take the first non-null supplied value, preserving zero; a later request missing usage does not reuse older request counters. Lifecycle metadata updates preserve latest-request counters and their original freshness. |
+| C status | Optionally manually composed Claude statusline: token/context figures are current-context/latest-response, not lifetime totals. Native client session cost is estimated; native duration semantics retained. |
+| X attached | Codex v2 `thread/tokenUsage/updated` from an already attached app-server: `last` → latest update, `total` → native attached-thread aggregate. Ordinary hooks are metadata only; no arbitrary-TUI observer, hidden app-server, fabricated PID or thread USD cost. |
+
+### Process resources
+
+PID plus birth protects attribution/reuse: Linux boot UUID plus start ticks; Darwin C-locale UTC `lstart` has one-second resolution, so same-second PID reuse cannot be distinguished. The registry resolves competing process claims without double owned charging. Shared/unknown processes may have per-process measurements but no fabricated owned aggregate; OMP and Hermes host PIDs are shared. OS projections retain actual observation times/windows with `derived:true`, `nativeUpdatedAt:null`. Unsupported, inaccessible, exited or reused processes are unavailable, not zero. Truncated details mark partial and retain the actual aggregate scope rather than recomputing from displayed rows.
+
+| Exact metric | Unit / scope | Source and limits |
+| --- | --- | --- |
+| `cpuPercent` | percent-one-core / process sample | OS CPU-time delta divided by actual monotonic sample interval; 100% means one core. Requires a stable readable identified process/sample. |
+| `cpuTimeMs` | milliseconds / process | OS cumulative process CPU time, not session running time; derived native unit conversion. Same identity/readability limits. |
+| `rssBytes` | bytes / process | Linux resident pages × page size; Darwin RSS KiB × 1024. Not unique physical RAM. |
+| `ownedProcessCount` | count / owned-processes | Unique exclusively attributable roots/descendants; unavailable on partial/truncated/shared/unknown attribution or absent roots, not invented zero. |
+| `ownedCpuPercent` | percent-one-core / owned-processes | Unique exclusively attributable OS CPU sum; may exceed 100%. Shared/unknown attribution makes the aggregate unavailable; partial flags retained. |
+| `ownedRssBytes` | bytes / owned-processes | Unique exclusively attributable RSS sum, not unique physical RAM. Shared/unknown attribution makes the aggregate unavailable; partial flags retained. |
+
+### Context
+
+| Exact metric | Unit / scope | Native source and limits |
+| --- | --- | --- |
+| `contextWindowTokens` | tokens / current-context | P/O context `contextWindow`; C status `context_window.context_window_size`; X attached non-null `modelContextWindow`. Hermes unavailable. |
+| `contextUsedTokens` | tokens / current-context | P/O context known `tokens`; C status derived only with all current input + cache-read + cache-creation operands, excluding output. Codex/Hermes unavailable: no compatible input-only used basis. |
+| `contextRemainingTokens` | tokens / current-context | Derived `max(0,window-used)` for known compatible P/O (positive window) or C status operands. Codex/Hermes unavailable. |
+| `contextUsedPercent` | percent / current-context | P/O context `percent`; C status native `used_percentage`. Preserve over-limit values. Codex/Hermes unavailable. |
+| `contextRemainingPercent` | percent / current-context | P/O derived `100-percent` with valid positive window; C status native `remaining_percentage`. Codex/Hermes unavailable. |
+| `systemPromptTokens` | tokens | Unavailable in all adapters: no public native breakdown; never read/tokenize system prompt text. |
+| `systemToolsTokens` | tokens | Unavailable in all adapters: no public native breakdown counter. |
+| `systemContextTokens` | tokens | Unavailable in all adapters: no public native breakdown counter. |
+| `skillsTokens` | tokens | Unavailable in all adapters: no public native breakdown counter. |
+| `messagesTokens` | tokens | Unavailable in all adapters: no public native breakdown counter; no history scan. |
+
+### Tokens
+
+Every name below occurs in both `tokens.latestNativeUpdate` and `tokens.nativeAggregate`. Latest values are not copied into aggregate. Cache may be a subset of input and reasoning a subset of output: never blindly sum fields to invent total. All units are `tokens`.
+
+| Exact metric | Latest native update | Native aggregate / limits |
+| --- | --- | --- |
+| `inputTokens` | P/O latest `input`; H latest `input_tokens` then `prompt_tokens`; C status `context_window.total_input_tokens` (current-context/latest semantics); X attached `last.inputTokens`. | O aggregate `input`; X attached `total.inputTokens`. Pi/Hermes/Claude aggregate unavailable. |
+| `outputTokens` | P/O latest `output`; H latest `output_tokens` then `completion_tokens`; C status `context_window.total_output_tokens` (not lifetime); X attached `last.outputTokens`. | O aggregate `output`; X attached `total.outputTokens`. Others unavailable. |
+| `cacheReadTokens` | P/O latest `cacheRead`; H latest `cache_read_tokens`; C status `context_window.current_usage.cache_read_input_tokens`; X attached `last.cachedInputTokens`. | O aggregate `cacheRead`; X attached `total.cachedInputTokens`. Others unavailable. |
+| `cacheWriteTokens` | P/O latest `cacheWrite`; H latest `cache_write_tokens`; C status `context_window.current_usage.cache_creation_input_tokens`; optional X attached `last.cacheWriteInputTokens`. | O aggregate `cacheWrite`; optional X attached `total.cacheWriteInputTokens`. Missing optional counters unavailable. |
+| `reasoningOutputTokens` | Pi latest `reasoning`; OMP latest `reasoningTokens`; H latest `reasoning_tokens`; X attached `last.reasoningOutputTokens`, only if supplied. Claude unavailable. | X attached `total.reasoningOutputTokens`; O aggregate has no reasoning counter; other aggregates unavailable. |
+| `totalTokens` | P/O latest `totalTokens`; H latest `total_tokens`; X attached `last.totalTokens`. Claude unavailable; no inferred sum. | O aggregate `totalTokens`; X attached `total.totalTokens`. Others unavailable. |
+
+### Cost and provider usage
+
+Every name below occurs in both `cost.latestNativeUpdate` and `cost.nativeAggregate`. Native client USD estimates are not invoiced spend. Ratecards are not actual usage counters; Hermes account usage is not session usage.
+
+| Exact metric | Unit | Latest native update | Native aggregate / limits |
+| --- | --- | --- | --- |
+| `totalCostUsd` | usd | P/O latest `usage.cost.total`, estimated. Other latest scopes unavailable. | O aggregate `cost`, estimated, including completed direct-child spend; C status `cost.total_cost_usd`, client-estimated session cost. Pi/Hermes/Codex unavailable. |
+| `inputCostUsd` | usd | P/O latest `usage.cost.input`, estimated. | Unavailable: no public aggregate component counter. |
+| `outputCostUsd` | usd | P/O latest `usage.cost.output`, estimated. | Unavailable: no public aggregate component counter. |
+| `cacheReadCostUsd` | usd | P/O latest `usage.cost.cacheRead`, estimated. | Unavailable: no public aggregate component counter. |
+| `cacheWriteCostUsd` | usd | P/O latest `usage.cost.cacheWrite`, estimated. | Unavailable: no public aggregate component counter. |
+| `premiumRequests` | premium-requests | P/O latest `usage.premiumRequests` only when provider-supplied; not inferred from requests. | O aggregate `premiumRequests`; other aggregates unavailable. |
+| `creditCost` | provider-defined | P/O latest optional `usage.credits.cost`; retain native units. | Unavailable: no aggregate credit counter. |
+| `committedCreditCost` | provider-defined | P/O latest optional `usage.credits.committedCost`; retain native units. | Unavailable: no aggregate committed-credit counter. |
+| `acuCost` | provider-defined | P/O latest optional `usage.credits.acuCost`; retain native units. | Unavailable: no aggregate ACU counter. |
+
+Claude, Codex and Hermes provide none of these latest component/premium/credit/ACU cost counters in implemented projections. Missing optional Pi/OMP host/provider fields remain unavailable, not zero.
+
+### Activity and timing
+
+| Exact metric | Unit / scope | Native source and limits |
+| --- | --- | --- |
+| `userMessageCount` | count | Unavailable in all adapters; no public native total used, no history/event approximation. |
+| `assistantMessageCount` | count | Unavailable in all adapters; no public native total used. |
+| `toolCallCount` | count | Unavailable in all adapters; current tool metadata is not cumulative. |
+| `toolResultCount` | count | Unavailable in all adapters; tool results/history are not read. |
+| `totalMessageCount` | count | Unavailable in all adapters; no public native total used. |
+| `pendingMessageCount` | count | Unavailable in all adapters; no queued-prompt text or approximated count. |
+| `pendingAsyncWorkCount` | count / native-aggregate snapshot | O async `delivery.queued`: queued plus in-flight deliveries; `delivering` is boolean, never added as another count. Other harnesses unavailable. |
+| `activeAsyncJobCount` | count / native-aggregate snapshot | Derived length of O async `running` only; no recent jobs or deliveries added. Other harnesses unavailable. |
+| `routedModelCounts` | model/provider rows with count metric | Unavailable in all adapters: no finalized public native routed-model counter. Model metadata is not a routed count; no event approximation. |
+| `sessionRunningMs` | milliseconds / native-aggregate | C status `cost.total_duration_ms`: native accumulated running duration across resumes, excluding not-running time. Other adapters unavailable. |
+| `apiWaitMs` | milliseconds / native-aggregate | C status `cost.total_api_duration_ms`: native accumulated API duration. Other adapters unavailable; hook wait state is not a duration counter. |
+
+No host-wide disk/network/GPU/heap telemetry, account spend limits or additional numeric metrics are collected. Non-numeric goals/todos/activity remain conditional native presence metadata, not counters.
+
+## Native API references
+
+Implementation and installed-version APIs are authoritative; optional getters/fields are not attach guarantees for older hosts. Public upstream main branches may differ from pinned distributions.
+
+- **Effect 4.0.3:** pinned public [Context](https://github.com/Effect-TS/effect/blob/effect%404.0.3/packages/effect/src/Context.ts), [Layer](https://github.com/Effect-TS/effect/blob/effect%404.0.3/packages/effect/src/Layer.ts), [Schema](https://github.com/Effect-TS/effect/blob/effect%404.0.3/packages/effect/src/Schema.ts) and [McpServer](https://github.com/Effect-TS/effect/blob/effect%404.0.3/packages/effect/src/ai/McpServer.ts). The implementation uses v4 `Context.Service`, `Layer.effect`, `Schema.TaggedError` and native MCP protocol adapters.
+- **Pi 1.0.4:** [published native package](https://www.npmjs.com/package/@earendil-works/pi-coding-agent/v/1.0.4), upstream [MCP configuration documentation](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/mcp.md), and [implemented native observer](src/plugin.ts). `getContextUsage` and latest assistant usage are used without a history/SessionStats scan; context source can be unknown after compaction.
+- **OMP:** [published 18.6.1 SDK](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent/v/18.6.1) and [implemented observer](src/plugin.ts) use native `getContextUsage`, optional `getAsyncJobSnapshot` and `SessionManager.getUsageStatistics()` indexed snapshots. Development SDK 18.6.1 and observed compiled host 18.11.3 are different artifacts. Finalized native totals include completed delegated spend; keyword registration is replace-only, not a third-party registry merge.
+- **Hermes:** native [shell-hook documentation](https://hermes-agent.nousresearch.com/docs/user-guide/features/hooks#shell-hooks), inspected [revision `acc3cada0da8` dispatcher source](https://github.com/NousResearch/hermes-agent/blob/acc3cada0da8/agent/shell_hooks.py), and [TypeScript command-hook implementation](src/native.ts). Installed Mac evidence used `0.22.1+233.gacc3cad`; this is not a compatibility claim for every stable Hermes release.
+- **Claude Code:** native [hooks](https://code.claude.com/docs/en/hooks), [status-line payload/semantics](https://code.claude.com/docs/en/statusline), [CLI roster reference](https://code.claude.com/docs/en/cli-reference) and [implemented projectors/roster](src/native.ts). Optional status-line metrics retain native current-context, estimated-cost and duration scopes.
+- **Codex:** native [app-server contract](https://developers.openai.com/codex/app-server/), [protocol source](https://github.com/openai/codex/tree/main/codex-rs/app-server-protocol) and [implemented v2 ingestion](src/native.ts). Native total/cache/reasoning overlap is preserved; no arbitrary-TUI attachment or invented per-thread USD cost.
+
+## Deployment and rollback
+
+Use the [chart operator README](deploy/helm/coordinator/README.md) for Kubernetes values, Secret keys, private staging, probes, retained legacy PVC declarations and release procedures. The chart supplies an inspector Deployment/internal Service, not a database, migration, agent runtime, controller, TLS ingress, DNS, NetworkPolicy or secret manager. Private TLS routing and policy remain operator-owned.
+
+This is a breaking product/protocol cutover, not a task-store upgrade. Preserve **real databases, journals, backups, PVCs, old images and rollback coordinates**. Inventory actual live desired state and storage, drain old clients/work using old-release procedures, **fence old owners**, then explicitly change downstream routes from `<release>-broker` to `<release>-inspector` and reload selected clients. A new chart render, `Recreate` or retention annotation does not drain/fence owners. Do not overlay a fresh release onto a stateful old installation or let GitOps prune storage. The new CLI cannot import/recover old tasks; retired broker/runner/backup/remote-install commands are not aliases.
+
+`/livez` is minimal public liveness; `/readyz` and `/healthz` require bearer authorization. Authenticated readiness returns baked `COORDINATOR_IMAGE_SHA` in `x-coordinator-source-sha`; chart `sourceSha` supplies separate `COORDINATOR_EXPECTED_SOURCE_SHA`. Never override baked image identity to make the comparison pass. Matching hash/header syntax is not provenance.
+
+Promotion requires exact immutable-source CI, hardened exact-image smoke, verified digest/signature/expected OIDC producer, SBOM/SLSA repository/commit attestation, verified chart artifact and reviewed GitOps digest/source-SHA pins. Source/image/chart remain private pending a separate visibility/legal decision; read [third-party notices](THIRD_PARTY_NOTICES.md) before redistribution. Local proofs or GitOps health do not prove real private TLS/MCP/native-host acceptance. **Nothing here implicitly authorizes deployment, service stops, state migration or pruning.**
+
+CI uses only repository-scoped homelab ARC pools: `coordinator-runners` for supplementary and chart checks, and `coordinator-dind-runners` for image publication and both release jobs. There is no GitHub-hosted fallback. PR jobs retain read-only contents permission without publish or OIDC credentials. Keep the private repository's server-side **Run workflows from fork pull requests** setting disabled, with fork write tokens and secrets disabled; same-repository PR source checks are defense in depth, not protection against a fork changing workflow YAML. The pinned runner image already includes Ruby/Psych, GitHub CLI and the native tools used by these workflows.
+
+## Verification
+
+After building, the normal local checks are:
+
+```sh
+pnpm check
+pnpm test
+pnpm smoke
+```
+
+`COORDINATOR_TEST_PI` and `COORDINATOR_TEST_OMP` may select existing absolute native CLI paths for smoke; do not upgrade global tools to match a disposable check.
+
+Recorded implementation evidence (not a claim that these checks ran during this README edit):
+
+- Final build/typecheck and **52 tests across six suites** passed. Real Linux disposable Pi **1.0.4** and compiled OMP **18.11.3** extension/HTTP/connector smoke exercised owner/machine isolation and on-demand OS resources with **zero prompts/provider calls**.
+- Built Hermes TypeScript CLI/private-cache/connector/authenticated-MCP paths passed with **synthetic native envelopes**, including shared host identity/resources, zero/missing usage, privacy, turn end, finalize and late callbacks—not live provider callbacks.
+- Official SDK stdio, all five installer targets (private artifacts, existing-destination refusal, no raw bearer), Darwin OS sampling, native OMP keyword/current-input TUI behavior and chart validation were exercised in disposable checks.
+- Hardened image smoke used UID/GID 1000, all capabilities dropped, no-new-privileges, read-only root and `/tmp` tmpfs, including the synthetic Hermes path and baked/expected SHA comparison. Pi/OMP executables are intentionally absent from the image; real CLI smoke ran on the host.
+- Installed Mac Hermes **`0.22.1+233.gacc3cad`** ran all four commands through actual `hooks doctor` with a disposable TypeScript build and **synthetic payloads**. Commands returned empty stdout/exit 0; observations checked shared dispatcher PID/birth, unknown start/API state, turn-idle/finalized state and unchanged usage ages. A config path containing spaces/apostrophe worked.
+
+These are local disposable proofs, **not** live provider usage, physical cross-machine TLS acceptance, signed release/publication or production deployment. No global native settings change, live-service stop or historical state migration is implied.

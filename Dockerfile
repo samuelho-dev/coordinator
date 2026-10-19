@@ -3,47 +3,25 @@ RUN npm install --global pnpm@11.9.0
 WORKDIR /build
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json tsconfig.build.json ./
 COPY src ./src
-RUN pnpm install --frozen-lockfile && pnpm run build && chmod -R a+rX /build
+COPY scripts/install.ts scripts/smoke.ts scripts/deployment-smoke.ts ./scripts/
+RUN pnpm install --frozen-lockfile && pnpm run build
+
+FROM node:24.21.0-bookworm-slim AS production-dependencies
+RUN npm install --global pnpm@11.9.0
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --prod --frozen-lockfile
 
 FROM node:24.21.0-bookworm-slim
 LABEL org.opencontainers.image.licenses="MIT"
-# Bootstrap on 443-only networks with Node's trusted roots; apt still verifies TLS and repository signatures.
-RUN node -e "const fs = require('node:fs'); \
-    const ca = '/etc/ssl/certs/ca-certificates.crt'; \
-    if (!fs.existsSync(ca)) { fs.mkdirSync('/etc/ssl/certs', { recursive: true }); fs.writeFileSync(ca, require('node:tls').rootCertificates.join('\n') + '\n'); } \
-    const sources = ['/etc/apt/sources.list', ...fs.readdirSync('/etc/apt/sources.list.d').filter(name => /\.(list|sources)$/.test(name)).map(name => '/etc/apt/sources.list.d/' + name)]; \
-    for (const path of sources) { if (fs.existsSync(path)) fs.writeFileSync(path, fs.readFileSync(path, 'utf8').replaceAll('http://deb.debian.org/', 'https://deb.debian.org/')); }" \
-    && apt-get update -o APT::Update::Error-Mode=any \
-    && apt-get install -y --no-install-recommends ca-certificates curl git util-linux \
-    && rm -rf /var/lib/apt/lists/*
-# PGDG's signed repository supplies only the PostgreSQL 18 client, never a server.
-RUN install -d /usr/share/postgresql-common/pgdg \
-    && curl --fail --silent --show-error --location https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
-    && printf '%s\n' 'Types: deb' 'URIs: https://apt.postgresql.org/pub/repos/apt' 'Suites: bookworm-pgdg' 'Architectures: amd64' 'Components: main' 'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' > /etc/apt/sources.list.d/pgdg.sources \
-    && apt-get update -o APT::Update::Error-Mode=any \
-    && apt-get install -y --no-install-recommends postgresql-client-18 \
-    && /usr/bin/pg_dump --version && /usr/bin/pg_restore --version \
-    && rm -rf /var/lib/apt/lists/*
-RUN npm install --global pnpm@11.9.0
-RUN curl --fail --silent --show-error --location https://github.com/can1357/oh-my-pi/releases/download/v18.6.1/omp-linux-x64 --output /usr/local/bin/omp \
-    && echo 'c92a6846d02984e84f07c6362d18add3783f528f494ffcf1e0f26e594f327463  /usr/local/bin/omp' | sha256sum --check \
-    && chmod 0755 /usr/local/bin/omp && omp --version
+ARG COORDINATOR_IMAGE_SHA
+ENV COORDINATOR_IMAGE_SHA=${COORDINATOR_IMAGE_SHA}
+LABEL org.opencontainers.image.revision=${COORDINATOR_IMAGE_SHA}
 WORKDIR /app
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY --from=build /build/dist ./dist
-RUN pnpm install --prod --frozen-lockfile
-COPY src ./src
-COPY scripts ./scripts
-COPY prisma.config.ts ./
-COPY prisma ./prisma
-COPY migrations ./migrations
-COPY deploy/helm/coordinator ./deploy/helm/coordinator
-COPY LICENSE THIRD_PARTY_NOTICES.md ./
-RUN mkdir -p /usr/local/share/coordinator/third-party \
-    && cp node_modules/@oh-my-pi/pi-coding-agent/LICENSE /usr/local/share/coordinator/third-party/OMP-LICENSE \
-    && cp node_modules/@oh-my-pi/pi-coding-agent/THIRD-PARTY-NOTICES.txt /usr/local/share/coordinator/third-party/OMP-THIRD-PARTY-NOTICES.txt \
-    && cp LICENSE THIRD_PARTY_NOTICES.md /usr/local/share/coordinator/
-RUN chmod -R a+rX /app
+COPY --chown=node:node --from=production-dependencies /app/node_modules ./node_modules
+COPY --chown=node:node package.json ./
+COPY --chown=node:node --from=build /build/dist ./dist
+COPY --chown=node:node LICENSE THIRD_PARTY_NOTICES.md ./
 USER node
 ENV NODE_ENV=production
-CMD ["node", "--import", "tsx", "src/main.ts", "broker"]
+CMD ["node", "dist/src/main.js", "inspector"]

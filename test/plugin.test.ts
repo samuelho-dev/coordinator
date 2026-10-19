@@ -1,284 +1,171 @@
-import { Commands, type CommandOutput, RoleEnum, DispositionEnum } from "../src/contracts.ts";
-import { TaskStateEnum } from "../src/generated/database/enums.ts";
 import assert from "node:assert/strict";
-import { it } from "@effect/vitest";
-import { Cause, Clock, ConfigProvider, Context as EffectContext, Deferred, Duration, Effect, Layer, Schema, Sink, Stdio } from "effect";
-import { ChildProcess } from "effect/process";
-import { TestClock } from "effect/testing";
-import { HttpServer } from "effect/http";
-import { AgentRunOutcomeEnum, AgentRunPhaseEnum, AgentPhaseTransitionEnum, AgentHostEnum, AgentBinding, AgentEventSequence, AgentRunId } from "../src/agent/protocol.ts";
-import { Mcp, serverLayer } from "../src/mcp.ts";
-import { Platform, redactedCause } from "../src/platform.ts";
-import { CommandError, Delivery, HttpError, MachineId, Task, Principal, PluginConfig } from "../src/contracts.ts";
-import { SessionId } from "../src/generated/database/types.ts";
-import type { BrokerRequest } from "../src/contracts.ts";
-import { Plugin, makeJournal, JournalReleaseStateEnum, JournalReleaseKey, type Context } from "../src/plugin.ts";
+import { execFileSync } from "node:child_process";
+import { it } from "vitest";
+import { createNativeObserver, isCoordinateInput, transformCoordinateInput } from "../src/plugin.ts";
+import type { Context } from "../src/plugin.ts";
+import type { SessionListOutput } from "../src/inspection.ts";
 
+const context = (id = "surrounding-session"): Context => ({
+  cwd: "/workspace", mode: "rpc", hasUI: false,
+  model: { provider: "native-provider", id: "native-model" },
+  sessionManager: { getSessionId: () => id },
+  getContextUsage: () => ({ tokens: null, contextWindow: 1000, percent: null }),
+  isIdle: () => true, ui: { notify: () => {} },
+});
+const usage = { input: 10, output: 3, cacheRead: 5, cacheWrite: 2, totalTokens: 20, cost: { input: 0.1, output: 0.2, cacheRead: 0.01, cacheWrite: 0.02, total: 0.33 } };
 
-it.live("ordinary host startup discovers private plugin config and fences owned SDK delivery", () => Effect.scoped(Effect.gen(function*() {
-  const platform = yield* Platform;
-  const mcp = yield* Mcp;
-  const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-plugin-" });
-  yield* platform.fs.chmod(directory, 0o700);
-  const agentDir = platform.path.join(directory, "agent");
-  yield* platform.fs.makeDirectory(agentDir, { mode: 0o700 });
-  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  yield* Effect.addFinalizer(() => Effect.sync(() => {
-    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-  }));
-  yield* platform.exec(ChildProcess.make("git", ["init", "-b", "main"], { cwd: directory }));
-  yield* platform.exec(ChildProcess.make("git", ["-c", "user.name=Coordinator Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "test"], { cwd: directory }));
-  yield* platform.exec(ChildProcess.make("git", ["remote", "add", "origin", "https://github.com/example/repo.git"], { cwd: directory }));
-  const sha = (yield* platform.exec(ChildProcess.make("git", ["rev-parse", "HEAD"], { cwd: directory }))).trim();
-  const stateDirectory = platform.path.join(directory, "state"), tokenFile = platform.path.join(directory, "token");
-  const configDirectory = platform.path.join(directory, "config", "coordinator"), config = platform.path.join(configDirectory, "plugin.json");
-  yield* platform.fs.makeDirectory(configDirectory, { recursive: true, mode: 0o700 });
-  yield* platform.fs.writeFileString(tokenFile, "test-token", { mode: 0o600 });
-  const terminalOutput: string[] = [], notifications: string[] = [];
-  let terminalInput: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
-  const ctx: Context = { cwd: directory, mode: "tui", hasUI: true, model: { provider: "coordinator-unavailable", id: "unavailable" },
-    sessionManager: { getSessionId: () => "surrounding-host-session" },
-    ui: { notify: (text) => { notifications.push(text); }, confirm: async () => false,
-      onTerminalInput: (handler) => { terminalInput = handler; return () => { terminalInput = undefined; }; } } };
-  let identity: { sessionId: string; incarnation: string; workerId?: string | undefined } | undefined;
-  let task: Task | undefined;
-  let attempts = 0;
-  let brokerRequests = 0;
-  let delivered = false, conflictPolls = 0;
-  let polled = yield* Deferred.make<void>();
-  const admitted = yield* Deferred.make<void>();
-  const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
-  yield* mcp.serve(server, { target: "broker",
-    authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: RoleEnum.session, owner: "owner", tokenHash: "a".repeat(64), roles: [RoleEnum.session], repos: ["github.com/example/repo"] })),
-    handle: (_principal, request) => Effect.gen(function*() {
-      brokerRequests++;
-      const now = yield* Clock.currentTimeMillis;
-      if (request.method === Commands.heartbeatSession.name) {
-        identity = request.params;
-        if (task === undefined) {
-          const address = { messageId: "message", revision: 1, sessionId: identity.sessionId, incarnation: identity.incarnation, workerId: identity.workerId,
-            repo: "github.com/example/repo", ref: "refs/heads/main", sha, scope: "test", restrictions: "none", expectedEvidence: [], deadline: now + 60000 };
-          const work = { taskId: "task", prompt: "SDK_UNAVAILABLE_PROVIDER", repo: address.repo, ref: address.ref, sha,
-            launcher: AgentHostEnum.pi, scope: address.scope, restrictions: address.restrictions, expectedEvidence: [], deadline: address.deadline, workerId: address.workerId,
-            githubRepoId: 1, requiredLanes: [], bypassPeer: false, approved: true };
-          task = Schema.decodeUnknownSync(Task)({ taskId: "task", owner: "owner", fingerprint: yield* platform.fingerprint(work), state: TaskStateEnum.ACCEPTED, createdAt: now, updatedAt: now,
-            address, readback: address, confirmedRevision: 1, disposition: DispositionEnum.ready, request: work });
-        }
-        const output: CommandOutput<typeof Commands.heartbeatSession> = { liveUntil: now + 30000 }; return output;
-      }
-      if (request.method === Commands.pollSession.name) {
-        yield* Deferred.succeed(polled, undefined);
-        const messages = delivered ? [Schema.decodeUnknownSync(Delivery)({ messageId: "delivery-conflict", incarnation: request.params.incarnation,
-          payload: ++conflictPolls, expiresAt: now + 60000 })] : [];
-        const output: CommandOutput<typeof Commands.pollSession> = { messages, offers: [], releases: task === undefined ? [] : [task] }; return output;
-      }
-      if (request.method === Commands.acknowledgePeer.name) { const output: CommandOutput<typeof Commands.acknowledgePeer> = { handled: true }; return output; }
-      if (request.method === Commands.stopSession.name) { const output: CommandOutput<typeof Commands.stopSession> = { stopped: true }; return output; }
-      if (request.method === Commands.reportTask.name && task !== undefined) {
-        const persisted = yield* makeJournal(stateDirectory, request.params.sessionId);
-        assert.equal(persisted.state.releases[JournalReleaseKey.make("task:1")], JournalReleaseStateEnum.sent, "SDK admission must follow durable intent before reporting");
-        if (request.params.state === TaskStateEnum.RUNNING) {
-          attempts++;
-          yield* Deferred.succeed(admitted, undefined);
-          return yield* new HttpError({ status: 503, message: "PRIVATE_LOST_ADMISSION_REPORT" });
-        } else {
-          assert.ok(request.params.state === TaskStateEnum.FAILED || request.params.state === TaskStateEnum.HELD);
-          delivered = true;
-        }
-        const output: CommandOutput<typeof Commands.reportTask> = { ...task, state: request.params.state, result: request.params.result }; return output;
-      }
-      return yield* new CommandError({ message: "Unexpected broker route" });
-    }).pipe(Effect.scoped, Effect.provideService(Platform, platform)),
-  });
-  if (server.address._tag !== "InetAddressV4") return yield* new CommandError({ message: "Expected TCP server" });
-  yield* platform.fs.writeFileString(platform.path.join(agentDir, "models.json"), JSON.stringify({ providers: {
-    "coordinator-unavailable": { baseUrl: `http://127.0.0.1:${server.address.port}/unavailable/v1`, api: "openai-completions", apiKey: "isolated-fixture-only", models: [{ id: "unavailable" }] },
-  } }), { mode: 0o600 });
-  yield* platform.fs.writeFileString(config, Schema.encodeSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: MachineId.make("workstation/東京"), host: AgentHostEnum.pi }), { mode: 0o600 });
-  const service = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
-    Layer.provide(Layer.succeed(Platform, platform)),
-    Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ XDG_CONFIG_HOME: platform.path.join(directory, "config") }))),
-    Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(true), stdout: () => Sink.forEach((chunk: string | Uint8Array) => Effect.sync(() => {
-      if (typeof chunk !== "string") return;
-      terminalOutput.push(chunk);
-      if (chunk.includes("7501;?")) queueMicrotask(() => terminalInput?.("\x1b]7501;?\x1b\\"));
-    })) })),
-  )), Plugin);
-  assert.ok(service);
-  yield* service.command("hi", ctx);
-  assert.match(notifications.at(-1) ?? "", /\/coordinator help/, "Unknown actions must give a usable help command");
-  assert.equal(brokerRequests, 0, "Unknown actions must not reach the broker or enroll a session");
-  yield* service.start(ctx);
-  yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
-  yield* Deferred.await(admitted).pipe(Effect.timeout("15 seconds"));
-  polled = yield* Deferred.make<void>();
-  assert.ok(identity);
-  assert.notEqual(identity.sessionId, ctx.sessionManager.getSessionId());
-  assert.equal(identity.workerId, identity.sessionId);
-  const binding = Schema.decodeUnknownSync(AgentBinding)({ host: AgentHostEnum.pi, sessionId: identity.sessionId, incarnation: identity.incarnation, generation: 1 });
-  const runId = AgentRunId.make("consumer-run"), seq = AgentEventSequence.make(1);
-  yield* service.agent({ type: "agent_lifecycle", kind: "run_started", binding, runId, at: 1, seq }, ctx);
-  assert.match(terminalOutput.at(-1) ?? "", /state=working/);
-  yield* service.agent({ type: "agent_lifecycle", kind: "run_phase", binding, runId, at: 2, seq, phase: AgentRunPhaseEnum.continuation, transition: AgentPhaseTransitionEnum.ended }, ctx);
-  assert.match(terminalOutput.at(-1) ?? "", /state=working/, "A continuation boundary is not settlement");
-  yield* service.agent({ type: "agent_lifecycle", kind: "run_settled", binding, runId, at: 3, seq, outcome: AgentRunOutcomeEnum.completed }, ctx);
-  assert.match(terminalOutput.at(-1) ?? "", /state=done/);
-  yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
-  assert.equal(attempts, 1, "A lost admission report cannot replay an already admitted native prompt during recovery");
-  const retained = yield* makeJournal(stateDirectory, SessionId.make(identity.sessionId));
-  assert.equal(retained.state.releases[JournalReleaseKey.make("task:1")], JournalReleaseStateEnum.sent, "Journal pause cannot clear admitted release uncertainty");
-  for (const frame of terminalOutput.filter(frame => !frame.includes("7501;?"))) {
-    assert.match(frame, /id=coordinator/);
-    assert.match(frame, /app=coordinator/);
-  }
-  const beforeMalformed = notifications.length;
-  assert.equal((yield* Effect.exit(service.command('report {"secret":"private-command-content"', ctx)))._tag, "Failure");
-  assert.ok(notifications.length > beforeMalformed);
-  assert.ok(!notifications.some((text) => text.includes("private-command-content")));
-  yield* service.command('confirm {"taskId":"task","revision":1}', ctx);
-  yield* service.stop();
-  assert.ok(terminalOutput.some(frame => /id=coordinator/.test(frame) && /state=clear/.test(frame)), "Retirement clears only the owned PSP record");
-  assert.equal((yield* Effect.exit(service.command("identity", ctx)))._tag, "Failure");
-  polled = yield* Deferred.make<void>();
-  yield* service.start(ctx);
-  yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
-  assert.equal(attempts, 1, "A new actual SDK identity cannot replay the prior addressed revision");
-  for (const frame of terminalOutput) assert.ok(!/consumer-run|surrounding-host-session|private|test-token/.test(frame), "Terminal status contains only constant metadata");
-})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))));
-
-it.live("a refused startup heartbeat retains scoped enrollment until its lease fence clears", () => Effect.scoped(Effect.gen(function*() {
-  const platform = yield* Platform, mcp = yield* Mcp;
-  const clock = yield* TestClock.make({ warningDelay: "1 minute" });
-  yield* clock.setTime(Date.now());
-  const directory = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-enrollment-" });
-  yield* platform.fs.chmod(directory, 0o700);
-  const agentDir = platform.path.join(directory, "agent");
-  yield* platform.fs.makeDirectory(agentDir, { mode: 0o700 });
-  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  yield* Effect.addFinalizer(() => Effect.sync(() => { if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; }));
-  yield* platform.exec(ChildProcess.make("git", ["init", "-b", "main"], { cwd: directory }));
-  yield* platform.exec(ChildProcess.make("git", ["remote", "add", "origin", "https://github.com/example/repo.git"], { cwd: directory }));
-  const stateDirectory = platform.path.join(directory, "state"), tokenFile = platform.path.join(directory, "token"), config = platform.path.join(directory, "config.json");
-  yield* platform.fs.writeFileString(tokenFile, "test-token", { mode: 0o600 });
-  const server = EffectContext.get(yield* Layer.build(serverLayer("127.0.0.1", 0)), HttpServer.HttpServer);
-  const polled = yield* Deferred.make<void>(), retrying = yield* Deferred.make<void>();
-  const received = yield* Deferred.make<void>(), journalHeld = yield* Deferred.make<void>();
-  const retrySleeping = yield* Deferred.make<void>(), pollSleeping = yield* Deferred.make<void>();
-  const traffic: { method: string; sessionId: string; incarnation: string }[] = [];
-  let heartbeatAttempts = 0, polls = 0, liveUntil = 0, polledAt: number | undefined;
-  const eligible = () => polledAt !== undefined && clock.currentTimeMillisUnsafe() < liveUntil && clock.currentTimeMillisUnsafe() - polledAt < 10000;
-  const ownerClock: Clock.Clock = { ...clock, sleep: duration => Effect.gen(function*() {
-    // Synchronize socket completion with the loop's next virtual sleep, not wall time.
-    if (Duration.toMillis(duration) <= 1250) {
-      if (heartbeatAttempts === 1 && polls === 0) yield* Deferred.succeed(retrySleeping, undefined);
-      if (polls === 1) yield* Deferred.succeed(pollSleeping, undefined);
-    }
-    yield* clock.sleep(duration);
-  }) };
-  yield* mcp.serve(server, { target: "broker", authorize: () => Effect.succeed(Schema.decodeUnknownSync(Principal)({ id: RoleEnum.session, owner: "owner", tokenHash: "a".repeat(64), roles: [RoleEnum.session], repos: ["github.com/example/repo"] })),
-    handle: (_principal, request: BrokerRequest) => Effect.gen(function*() {
-      if (request.method === Commands.heartbeatSession.name) {
-        traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
-        heartbeatAttempts++;
-        if (heartbeatAttempts === 1) return yield* new HttpError({ status: 409, message: "PRIVATE_ENDPOINT_TOKEN_PATH" });
-        liveUntil = clock.currentTimeMillisUnsafe() + 30000;
-        const output: CommandOutput<typeof Commands.heartbeatSession> = { liveUntil }; return output;
-      }
-      if (request.method === Commands.pollSession.name) {
-        traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
-        polledAt = clock.currentTimeMillisUnsafe();
-        polls++;
-        yield* Deferred.succeed(polled, undefined);
-        return { messages: [Schema.decodeUnknownSync(Delivery)({ messageId: "private-fixture-message", incarnation: request.params.incarnation,
-          payload: polls === 1 ? "PRIVATE_INITIAL_PAYLOAD" : "PRIVATE_CONFLICT_PAYLOAD", expiresAt: clock.currentTimeMillisUnsafe() + 60000 })], offers: [], releases: [] };
-      }
-      if (request.method === Commands.acknowledgePeer.name) { const output: CommandOutput<typeof Commands.acknowledgePeer> = { handled: true }; return output; }
-      if (request.method === Commands.stopSession.name) {
-        traffic.push({ method: request.method, sessionId: request.params.sessionId, incarnation: request.params.incarnation });
-        const output: CommandOutput<typeof Commands.stopSession> = { stopped: true }; return output;
-      }
-      return yield* new CommandError({ message: "Unexpected broker route" });
-    }),
-  });
-  if (server.address._tag !== "InetAddressV4") return yield* new CommandError({ message: "Expected TCP server" });
-  yield* platform.fs.writeFileString(config, Schema.encodeSync(Schema.fromJsonString(PluginConfig))({ brokerUrl: `http://127.0.0.1:${server.address.port}`, tokenFile, stateDirectory, machineId: MachineId.make("machine"), host: AgentHostEnum.pi }), { mode: 0o600 });
-  const notifications: string[] = [], statuses = new Map<string, string>();
-  const ctx: Context = { cwd: directory, mode: "rpc", hasUI: true,
-    sessionManager: { getSessionId: () => "parent-session" }, ui: { notify: (text) => {
-      notifications.push(text);
-      if (text.includes("control paused")) Effect.runSync(Deferred.succeed(journalHeld, undefined));
-      if (text.includes("durably received")) Effect.runSync(Deferred.succeed(received, undefined));
-    }, setStatus: (key, value) => {
-      if (value === undefined) statuses.delete(key); else statuses.set(key, value);
-      if (key === "coordinator.network" && value === "Coordinator reconnecting") Effect.runSync(Deferred.succeed(retrying, undefined));
-    }, confirm: async () => false } };
-  const plugin = EffectContext.get(yield* Layer.build(Plugin.layer.pipe(
-    Layer.provide(Layer.succeed(Platform, platform)),
-    Layer.provide(Layer.succeed(Clock.Clock, ownerClock)),
-    Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ COORDINATOR_CONFIG: config }))),
-    Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(false) })),
-  )), Plugin);
-  assert.ok(plugin);
-  assert.equal((yield* Effect.exit(plugin.start(ctx).pipe(Effect.provideService(Clock.Clock, ownerClock), Effect.timeout("5 seconds"))))._tag, "Success", "Startup returns without waiting for broker recovery");
-  yield* Deferred.await(retrying).pipe(Effect.timeout("15 seconds"));
-  yield* Deferred.await(retrySleeping).pipe(Effect.timeout("15 seconds"));
-  assert.ok(!notifications.some(text => text.includes("PRIVATE_ENDPOINT_TOKEN_PATH") || text.includes(directory) || text.includes("test-token")), "Startup diagnostics do not expose broker secrets or private paths");
-  assert.equal(heartbeatAttempts, 1);
-  assert.equal(polls, 0);
-  assert.equal(eligible(), false, "A refused heartbeat cannot make the retained owner delivery eligible");
-  assert.equal((yield* Effect.exit(plugin.command("identity", ctx)))._tag, "Failure", "Broker control remains unavailable while enrollment is fenced; the retained scope must still recover below");
-  const refused = traffic[0];
-  assert.ok(refused);
-  yield* clock.adjust(999);
-  assert.deepEqual(traffic, [refused], "No polling or owner retirement occurs before the retry fence");
-  assert.equal(eligible(), false);
-  yield* clock.adjust(251);
-  yield* Deferred.await(polled).pipe(Effect.timeout("15 seconds"));
-  assert.equal(heartbeatAttempts, 2);
-  const recovered = traffic.find(call => call.method === Commands.pollSession.name);
-  assert.ok(recovered);
-  assert.notEqual(recovered.incarnation, refused.incarnation, "Recovery must not reuse the refused native incarnation");
-  assert.deepEqual(traffic.map(call => call.method), ["session.heartbeat", "session.stop", "session.heartbeat", "session.poll"], "The old enrollment retires before a fresh heartbeat permits delivery");
-  assert.equal(traffic[1]?.incarnation, refused.incarnation);
-  assert.equal(traffic[2]?.incarnation, recovered.incarnation);
-  assert.equal(eligible(), true, "An actual fresh heartbeat and poll restore delivery eligibility");
-  yield* Deferred.await(received).pipe(Effect.timeout("15 seconds"));
-  yield* Deferred.await(pollSleeping).pipe(Effect.timeout("15 seconds"));
-  yield* clock.adjust(1000);
-  yield* Deferred.await(journalHeld).pipe(Effect.timeout("15 seconds"));
-  assert.equal(polls, 2, "The repeated message reaches the real journal conflict fence");
-  yield* clock.adjust(2200);
-  assert.equal(polls, 2, "A latched inbox conflict pauses unchanged polling until reconciliation");
-  assert.equal(statuses.get("coordinator.paused"), "Coordinator network paused", "A local journal failure remains visibly paused");
-  assert.ok(!notifications.some((text) => /PRIVATE_|test-token/.test(text)), "Private causal messages and inbox payloads stay redacted");
-  yield* plugin.stop();
-  const stoppedPolls = polls;
-  yield* clock.adjust(1200);
-  assert.equal(polls, stoppedPolls, "Retirement cancels periodic polling");
-})).pipe(Effect.provide(Layer.merge(Platform.layer, Mcp.layer))));
-
-it("safe causal summaries never decode unknown defects as typed success", () => {
-  assert.match(redactedCause(Cause.die({ _tag: "HttpError", status: 200, message: "PRIVATE" })), /unknown defect/);
-  assert.match(redactedCause(Cause.fail({ _tag: "UnknownPrivateTag", token: "PRIVATE" })), /unknown failure/);
-  assert.ok(!redactedCause(Cause.fail(new HttpError({ status: 503, message: "PRIVATE" }))).includes("PRIVATE"));
+it("publishes surrounding native identity and clears cached counters only on real switches", () => {
+  const observer = createNativeObserver("omp", "machine");
+  const native: Context = { ...context(), agent: { kind: "main", id: "Main", name: "main" } };
+  observer.update(native, { message: { role: "assistant", timestamp: 12, usage } }, 20);
+  assert.deepEqual(observer.presence(21)?.ref, { machineId: "machine", harness: "omp", nativeSessionId: "surrounding-session", nativeAgentId: "Main" });
+  observer.update(native, undefined, 22);
+  assert.equal(observer.inspect(30)?.tokens.latestNativeUpdate.inputTokens.value, 10);
+  assert.equal(observer.inspect(30)?.tokens.latestNativeUpdate.inputTokens.provenance.observedAt, 20);
+  assert.equal(observer.inspect(30)?.tokens.latestNativeUpdate.inputTokens.provenance.nativeUpdatedAt, 12);
+  assert.equal(observer.inspect(3000)?.tokens.latestNativeUpdate.inputTokens.provenance.stale, false);
+  assert.equal(typeof observer.presence()?.machineName, "string");
+  observer.update({ ...native, agent: { kind: "sub", id: "child" } }, undefined, 31);
+  assert.equal(observer.inspect(32)?.tokens.latestNativeUpdate.inputTokens.status, "unavailable");
+  observer.update(context("next-session"), undefined, 33);
+  assert.equal(observer.presence(34)?.ref.nativeSessionId, "next-session");
+  observer.clear();
+  assert.equal(observer.inspect(35), undefined);
 });
 
-it.live("unconfigured hosts stay disabled but present insecure or malformed plugin config fails closed", () => Effect.scoped(Effect.gen(function*() {
-  const platform = yield* Platform;
-  const home = yield* platform.fs.makeTempDirectoryScoped({ prefix: "coordinator-config-" });
-  const directory = platform.path.join(home, ".config", "coordinator"), config = platform.path.join(directory, "plugin.json");
-  const layer = Plugin.layer.pipe(
-    Layer.provide(Layer.succeed(Platform, platform)),
-    Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ HOME: home }))),
-    Layer.provide(Stdio.layerTest({ stdoutIsTerminal: Effect.succeed(false) })),
-  );
-  assert.equal(EffectContext.get(yield* Layer.build(layer), Plugin), undefined);
-  yield* platform.fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
-  yield* platform.fs.writeFileString(config, "{}", { mode: 0o644 });
-  assert.equal((yield* Effect.exit(Layer.build(layer)))._tag, "Failure", "Present public-readable enrollment must not silently disable the plugin");
-  yield* platform.fs.chmod(config, 0o600);
-  assert.equal((yield* Effect.exit(Layer.build(layer)))._tag, "Failure", "Present malformed enrollment must not silently disable the plugin");
-})).pipe(Effect.provide(Platform.layer)));
+it("queries context only on demand, preserving unknown and over-limit native estimates", () => {
+  const observer = createNativeObserver("pi", "machine");
+  let queries = 0;
+  const ctx: Context = { ...context(), getContextUsage: () => { queries++; return { tokens: null, contextWindow: 1000, percent: null }; } };
+  observer.update(ctx, undefined, 1);
+  observer.presence(2);
+  assert.equal(queries, 0);
+  const unknown = observer.inspect(3);
+  assert.equal(queries, 1);
+  assert.equal(unknown?.context.contextUsedTokens.value, null);
+  assert.equal(unknown?.context.contextRemainingTokens.status, "unavailable");
+  assert.equal(unknown?.activity.pendingMessageCount.status, "unavailable");
+  observer.update({ ...ctx, getContextUsage: () => ({ tokens: 1200, contextWindow: 1000, percent: 120 }) }, undefined, 4);
+  const over = observer.inspect(5);
+  assert.equal(over?.context.contextUsedTokens.value, 1200);
+  assert.equal(over?.context.contextUsedPercent.value, 120);
+  assert.equal(over?.context.contextRemainingPercent.value, -20);
+});
+
+it("projects native cached aggregate and async counts without adding child costs or leaking payloads", () => {
+  const observer = createNativeObserver("omp", "machine");
+  const aggregate = { input: 50, output: 20, cacheRead: 15, cacheWrite: 5, totalTokens: 90, premiumRequests: 2, cost: 1.5, subagentCost: 0.7 };
+  const job = { command: "PRIVATE_COMMAND", label: "PRIVATE_LABEL" };
+  const ctx: Context = {
+    ...context(), sessionManager: { getSessionId: () => "native", getUsageStatistics: () => aggregate },
+    getAsyncJobSnapshot: () => ({ running: [job], delivery: { queued: 1, delivering: true, pendingJobIds: ["PRIVATE_JOB_ID"] } }),
+  };
+  const privateMessage = { role: "assistant", timestamp: 5, usage: { ...usage, cost: { ...usage.cost }, reasoningTokens: 2, premiumRequests: 0, credits: { cost: 0.5, committedCost: 0.4, acuCost: 0 } }, content: "PRIVATE_MESSAGE", toolResults: ["PRIVATE_TOOL_RESULT"] };
+  observer.update(ctx, { message: privateMessage }, 6);
+  const result = observer.inspect(10);
+  assert.equal(result?.cost.nativeAggregate.totalCostUsd.value, 1.5);
+  assert.equal(result?.tokens.nativeAggregate.totalTokens.value, 90);
+  assert.equal(result?.tokens.nativeAggregate.inputTokens.provenance.nativeUpdatedAt, null);
+  assert.equal(result?.activity.activeAsyncJobCount.value, 1);
+  assert.equal(result?.activity.pendingAsyncWorkCount.value, 1);
+  assert.equal(result?.activity.activeAsyncJobCount.provenance.derived, true);
+  assert.equal(result?.activity.pendingAsyncWorkCount.provenance.derived, false);
+  assert.equal(result?.tokens.latestNativeUpdate.reasoningOutputTokens.value, 2);
+  assert.equal(result?.cost.latestNativeUpdate.premiumRequests.value, 0);
+  assert.equal(result?.cost.latestNativeUpdate.creditCost.value, 0.5);
+  assert.equal(result?.cost.latestNativeUpdate.committedCreditCost.value, 0.4);
+  assert.equal(result?.cost.latestNativeUpdate.acuCost.value, 0);
+  assert.equal(result?.tokens.nativeAggregate.reasoningOutputTokens.status, "unavailable");
+  assert.equal(result?.cost.nativeAggregate.creditCost.status, "unavailable");
+  assert.equal(result?.presence.profile, undefined);
+  const serialized = JSON.stringify(result);
+  for (const secret of ["PRIVATE_COMMAND", "PRIVATE_LABEL", "PRIVATE_JOB_ID", "PRIVATE_MESSAGE", "PRIVATE_TOOL_RESULT"]) assert.equal(serialized.includes(secret), false);
+  // Later mutations of the native payload cannot change the retained scalar snapshot.
+  privateMessage.usage.input = 999;
+  privateMessage.usage.credits.cost = 999;
+  assert.equal(observer.inspect(11)?.tokens.latestNativeUpdate.inputTokens.value, 10);
+  assert.equal(observer.inspect(11)?.cost.latestNativeUpdate.creditCost.value, 0.5);
+  observer.update(ctx, { message: { role: "assistant", usage } }, 12);
+  assert.equal(observer.inspect(13)?.tokens.latestNativeUpdate.reasoningOutputTokens.status, "unavailable");
+  assert.equal(observer.inspect(13)?.cost.latestNativeUpdate.creditCost.status, "unavailable");
+});
+
+it("does not infer Pi aggregate or async counts from native activity", () => {
+  const observer = createNativeObserver("pi", "machine");
+  observer.update({ ...context(), isIdle: () => false });
+  const result = observer.inspect();
+  assert.equal(result?.presence.activity?.state, "working");
+  assert.equal(result?.tokens.nativeAggregate.totalTokens.status, "unavailable");
+  assert.equal(result?.activity.activeAsyncJobCount.status, "unavailable");
+  assert.equal(result?.activity.pendingAsyncWorkCount.status, "unavailable");
+});
+
+it("preserves Pi native reasoning subsets without inventing unsupported provider counters", () => {
+  const observer = createNativeObserver("pi", "machine");
+  observer.update(context(), { message: { role: "assistant", usage: { ...usage, reasoning: 0 } } }, 1);
+  const result = observer.inspect(2);
+  assert.equal(result?.tokens.latestNativeUpdate.reasoningOutputTokens.value, 0);
+  assert.equal(result?.tokens.latestNativeUpdate.outputTokens.value, 3);
+  assert.equal(result?.cost.latestNativeUpdate.premiumRequests.status, "unavailable");
+});
+
+it("retains only active tool IDs and names across concurrent executions and native switches", () => {
+  const observer = createNativeObserver("omp", "machine");
+  const ctx = context();
+  const start = { type: "tool_execution_start", toolCallId: "a", toolName: "read", args: "PRIVATE_ARGS" };
+  observer.update(ctx, start, 1);
+  observer.update(ctx, { type: "tool_execution_start", toolCallId: "b", toolName: "search" }, 2);
+  assert.equal(observer.presence()?.activity?.currentToolName, "read");
+  assert.equal(observer.presence()?.activity?.wait, "tool");
+  const end = { type: "tool_execution_end", toolCallId: "a", toolName: "read", result: "PRIVATE_RESULT" };
+  observer.update(ctx, end, 3);
+  assert.equal(observer.presence()?.activity?.currentToolName, "search");
+  const serialized = JSON.stringify(observer.inspect(4));
+  assert.equal(serialized.includes("PRIVATE_ARGS"), false);
+  assert.equal(serialized.includes("PRIVATE_RESULT"), false);
+  observer.update(ctx, { type: "tool_execution_end", toolCallId: "b" }, 5);
+  assert.equal(observer.presence()?.activity?.currentToolName, undefined);
+  observer.update(ctx, start, 6);
+  observer.update(context("switched"), undefined, 7);
+  assert.equal(observer.presence()?.activity?.currentToolName, undefined);
+});
+
+it("matches only a leading bounded coordinate token and preserves native input result shapes and images", () => {
+  for (const text of ["coordinate", "coordinate inspect", "coordinate\ninspect"]) assert.equal(isCoordinateInput(text), true);
+  for (const text of ["/coordinate", "please coordinate", " coordinate", "coordinates", "coordinate_task", "coordinate/file", "Coordinate"]) {
+    assert.equal(isCoordinateInput(text), false);
+    assert.equal(transformCoordinateInput("omp", { text }, { sessions: [], nextCursor: null }), undefined);
+  }
+  const images: Array<{ type: "image"; data: string; mimeType: string }> = [{ type: "image", data: "IMAGE", mimeType: "image/png" }];
+  const snapshot: SessionListOutput = { sessions: [{ ref: { machineId: "remote", harness: "omp", nativeSessionId: "actual-fleet-session" }, observedAt: 1 }], nextCursor: null };
+  const omp = transformCoordinateInput("omp", { text: "coordinate inspect", images }, snapshot);
+  const pi = transformCoordinateInput("pi", { text: "coordinate inspect", images }, snapshot);
+  assert.equal(omp?.images, images);
+  assert.equal(pi?.images, images);
+  assert.equal(omp?.text.includes("actual-fleet-session"), true);
+  assert.equal(omp && "action" in omp, false);
+  assert.equal(pi && "action" in pi ? pi.action : undefined, "transform");
+});
+
+it("adds the real native coordinate shortcut without enabling disabled core keywords", () => {
+  // Native keyword definitions import text assets and require OMP's Bun runtime.
+  execFileSync("bun", ["--eval", `
+    import assert from "node:assert/strict";
+    import { Effect } from "effect";
+    import { registerCoordinateKeyword } from "./src/plugin.ts";
+    import { MAGIC_KEYWORDS } from "@oh-my-pi/pi-coding-agent/modes/magic-keywords";
+    import { isMagicKeyword, magicKeywordRanges, setMagicKeywords } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
+    for (const enabled of [[], MAGIC_KEYWORDS.slice(0, 1), MAGIC_KEYWORDS]) {
+      setMagicKeywords(enabled);
+      const before = MAGIC_KEYWORDS.map(({ word }) => isMagicKeyword(word));
+      await Effect.runPromise(registerCoordinateKeyword);
+      assert.deepEqual(MAGIC_KEYWORDS.map(({ word }) => isMagicKeyword(word)), before);
+      assert.equal(isMagicKeyword("coordinate"), true);
+      assert.deepEqual(magicKeywordRanges("coordinate"), [{ from: 0, to: 10 }]);
+      assert.deepEqual(magicKeywordRanges("coordinate_task"), []);
+      await Effect.runPromise(registerCoordinateKeyword);
+      assert.deepEqual(MAGIC_KEYWORDS.map(({ word }) => isMagicKeyword(word)), before);
+      assert.deepEqual(magicKeywordRanges("coordinate"), [{ from: 0, to: 10 }]);
+    }
+  `], { stdio: "pipe" });
+});

@@ -1,12 +1,12 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "rootDir": "./src/agent",
-    "outDir": "./dist/agent",
+    "rootDir": ".",
+    "outDir": "./dist",
     "noEmit": false,
     "noEmitOnError": true,
     "rewriteRelativeImportExtensions": true,
     "declaration": true
   },
-  "include": ["src/agent/**/*.ts"]
+  "include": ["src/**/*.ts", "scripts/install.ts", "scripts/smoke.ts", "scripts/deployment-smoke.ts"]
 }
