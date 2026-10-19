@@ -3,42 +3,29 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 sourceSha: ""
-# ponytail: fence both owners during the offline database cutover.
-suspended: false
 imagePullSecrets: []
-nodeSelector:
-  kubernetes.io/arch: amd64
-# ponytail: Kubernetes validates native toleration fields.
+nodeSelector: {}
 tolerations: []
 tls:
   existingCaSecret: ""
-broker:
+inspector:
+  # Existing Secret keys: inspector.json (InspectorConfig), health.token (bearer).
+  # Config must listen on 0.0.0.0 at this port and authorize health.token's hash.
   existingSecret: ""
-  deploymentAnnotations: {}
-  podAnnotations: {}
   port: 8787
-  connectHosts: {}
-  extraEnv: []
-  resources: {}
-runner:
-  enabled: false
-  existingSecret: ""
   deploymentAnnotations: {}
   podAnnotations: {}
-  port: 8788
-  connectHosts: {}
-  extraEnv: []
   resources: {}
-persistence:
-  backups:
-    existingClaim: ""
-    storageClass: null
-    size: 10Gi
-    accessModes: [ReadWriteOnce]
-  work:
-    existingClaim: ""
-    storageClass: null
-    size: 20Gi
-    accessModes: [ReadWriteOnce]
-# TLS termination and NetworkPolicies are operator-owned integration inputs.
-# No ingress, provider CRDs, HPA, or public service are created.
+legacyStorage:
+  # REQUIRED operator decision, never inferred from a source/image update:
+  # fresh: inventory confirms this release tracks no legacy PVCs; claims stays [].
+  # retain: list EVERY previously tracked PVC with its unchanged live spec.
+  # Retained claims are protected against Helm deletion AND Argo prune/delete;
+  # none is mounted by the inspector. External DBs/journals/backups stay untouched.
+  mode: ""
+  # Each entry: {name: old-release-backups, size: 10Gi,
+  #              accessModes: [ReadWriteOnce], storageClass: null}
+  # null omits storageClassName; use "" only if live spec explicitly disables it.
+  claims: []
+# Operator-owned TLS termination and NetworkPolicies must route to <release>-inspector.
+# No ingress, public Service, database, runner, shared PVC mounts or migrations.

@@ -27,81 +27,11 @@ jobs:
         with:
           bun-version: '1.4.2'
       - run: pnpm install --frozen-lockfile
-      - name: Reproduce committed database contracts and check actual generated ESM
-        run: |
-          set -euo pipefail
-          EXPECTED="$(mktemp -d "$RUNNER_TEMP/coordinator-generated.XXXXXX")"
-          trap 'rm -rf -- "$EXPECTED"' EXIT
-          cp -a src/generated/. "$EXPECTED/"
-          pnpm check
-          diff --recursive --unified "$EXPECTED" src/generated
-      - name: Provision disposable loopback PostgreSQL 18
-        run: |
-          set -euo pipefail
-          sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
-          curl --fail --silent --show-error https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
-          . /etc/os-release
-          printf 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt %s-pgdg main\n' "$VERSION_CODENAME" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
-          sudo apt-get update
-          sudo apt-get install -y postgresql-18 postgresql-client-18
-          sudo ln -sf /usr/lib/postgresql/18/bin/pg_dump /usr/bin/pg_dump
-          sudo ln -sf /usr/lib/postgresql/18/bin/pg_restore /usr/bin/pg_restore
-          umask 077
-          mkdir "$RUNNER_TEMP/coordinator-postgres"
-          node --import tsx --input-type=module <<'NODE'
-          import { randomBytes } from 'node:crypto';
-          import { appendFileSync, writeFileSync } from 'node:fs';
-          import { join } from 'node:path';
-          const password = randomBytes(32).toString('hex');
-          const url = `postgresql://postgres:${password}@127.0.0.1:55432/postgres?sslmode=disable`;
-          console.log(`::add-mask::${password}`);
-          console.log(`::add-mask::${url}`);
-          writeFileSync(join(process.env.RUNNER_TEMP, 'coordinator-postgres/password'), password, { flag: 'wx', mode: 0o600 });
-          appendFileSync(process.env.GITHUB_ENV, `COORDINATOR_TEST_POSTGRES_URL=${url}\n`);
-          NODE
-          /usr/lib/postgresql/18/bin/initdb -D "$RUNNER_TEMP/coordinator-postgres/data" --username=postgres --auth-local=trust --auth-host=scram-sha-256 --pwfile="$RUNNER_TEMP/coordinator-postgres/password"
-          /usr/lib/postgresql/18/bin/pg_ctl -D "$RUNNER_TEMP/coordinator-postgres/data" -l "$RUNNER_TEMP/coordinator-postgres/server.log" -o "-h 127.0.0.1 -p 55432 -k ''" -w start
-          rm "$RUNNER_TEMP/coordinator-postgres/password"
-      - name: Run isolated agent suite outside private runner home
-        run: |
-          TEST_ROOT="$(mktemp -d /tmp/coordinator-test.XXXXXX)"
-          trap 'rm -rf -- "$TEST_ROOT"' EXIT
-          chmod 0755 "$TEST_ROOT"
-          cp -a package.json tsconfig.json tsconfig.build.json vitest.config.ts prisma.config.ts prisma migrations src scripts test dist node_modules "$TEST_ROOT/"
-          chmod -R a+rX "$TEST_ROOT"
-          mkdir -m 0700 "$TEST_ROOT/private-home"
-          export HOME="$TEST_ROOT/private-home"
-          cd "$TEST_ROOT"
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" node_modules/vitest/vitest.mjs run --configLoader native
-      - name: Run stock public controls, broker plugin and offline recovery smokes
-        run: |
-          TEST_ROOT="$(mktemp -d /tmp/coordinator-hosts.XXXXXX)"
-          trap 'rm -rf -- "$TEST_ROOT"' EXIT
-          chmod 0755 "$TEST_ROOT"
-          # Clone only Git objects/refs, never checkout credentials, hooks, or local config.
-          git clone --no-hardlinks --no-checkout . "$TEST_ROOT"
-          git -C "$TEST_ROOT" remote set-url origin "$(git remote get-url origin)"
-          git -C "$TEST_ROOT" update-ref --no-deref HEAD "$(git rev-parse HEAD)"
-          cp -a package.json tsconfig.json tsconfig.build.json prisma.config.ts prisma migrations src scripts test dist node_modules "$TEST_ROOT/"
-          chmod -R a+rX "$TEST_ROOT"
-          mkdir -m 0700 "$TEST_ROOT/private-home"
-          export HOME="$TEST_ROOT/private-home"
-          export COORDINATOR_TEST_PI="$TEST_ROOT/node_modules/.bin/pi"
-          export COORDINATOR_TEST_OMP="$TEST_ROOT/node_modules/.bin/omp"
-          export COORDINATOR_TEST_PI_VERSION='1.0.4'
-          export COORDINATOR_TEST_OMP_VERSION='omp/18.6.1'
-          cd "$TEST_ROOT"
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL,COORDINATOR_TEST_PI,COORDINATOR_TEST_OMP,COORDINATOR_TEST_PI_VERSION,COORDINATOR_TEST_OMP_VERSION /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx scripts/host-smoke.ts
-          timeout --signal=TERM --kill-after=5s 600s sudo --preserve-env=PATH,HOME,COORDINATOR_TEST_POSTGRES_URL /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups --bounding-set=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --inh-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --ambient-caps=-all,+chown,+dac_override,+kill,+setuid,+setgid,+setpcap --no-new-privs "$(command -v node)" --import tsx scripts/recovery-smoke.ts
-      - name: Remove disposable PostgreSQL and credentials
-        if: always()
-        run: |
-          if [ -f "$RUNNER_TEMP/coordinator-postgres/data/postmaster.pid" ]; then
-            /usr/lib/postgresql/18/bin/pg_ctl -D "$RUNNER_TEMP/coordinator-postgres/data" -m immediate -w stop
-          fi
-          rm -rf -- "$RUNNER_TEMP/coordinator-postgres"
-  # Stock CLIs exercise plugin-owned SDK admission/outcomes against a private local provider.
-  # Ghostty rendering and real keyboard input remain separate acceptance.
+      - run: pnpm build
+      - run: pnpm check
+      - run: pnpm test
+      - name: Exercise ephemeral inspector and available native extensions without provider calls
+        run: pnpm smoke
 
   chart:
     runs-on: ubuntu-latest
@@ -124,19 +54,19 @@ jobs:
           VERSION="$(helm show chart "$CHART" | ruby -ryaml -e 'puts YAML.load(STDIN.read)["version"]')"
           [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$ ]]
           VALUES="$RUNNER_TEMP/chart-values.json"
-          jq -n --arg sha "$SOURCE_SHA" --arg image "ghcr.io/${REPOSITORY,,}" '{image:{repository:$image,digest:("sha256:"+("a"*64))},sourceSha:$sha,broker:{existingSecret:"broker-input"},runner:{enabled:true,existingSecret:"runner-input"}}' > "$VALUES"
+          jq -n --arg sha "$SOURCE_SHA" --arg image "ghcr.io/${REPOSITORY,,}" '{image:{repository:$image,digest:("sha256:"+("a"*64))},sourceSha:$sha,inspector:{existingSecret:"inspector-input"},legacyStorage:{mode:"fresh"}}' > "$VALUES"
           helm lint --strict "$CHART" -f "$VALUES"
           helm template acceptance "$CHART" -f "$VALUES" > "$RUNNER_TEMP/chart-render.yaml"
-          ruby -ryaml -e 'docs=YAML.load_stream(File.read(ARGV[0])).compact; deployments=docs.select{|d| d["kind"]=="Deployment"}; abort "missing broker/runner" unless deployments.map{|d| d.dig("metadata","name")}.sort==["acceptance-broker","acceptance-runner"]; deployments.each{|d| s=d.dig("spec","template","spec"); abort "mutable image or missing init" unless (s["containers"]+s["initContainers"]).all?{|c| c["image"]==ARGV[1]}; abort "source mismatch" unless s["containers"][0]["env"].any?{|e| e["name"]=="COORDINATOR_IMAGE_SHA" && e["value"]==ARGV[2]}}; abort "missing persistence" unless docs.count{|d| d["kind"]=="PersistentVolumeClaim"}==2' "$RUNNER_TEMP/chart-render.yaml" "ghcr.io/${REPOSITORY,,}@sha256:$(printf 'a%.0s' {1..64})" "$SOURCE_SHA"
-          ruby -ryaml -e 'YAML.load_stream(File.read(ARGV[0])).compact.select{|d| d["kind"]=="Deployment"}.each{|d| role=d.dig("metadata","name").delete_prefix("acceptance-"); s=d.dig("spec","template","spec"); targets=s["containers"]+s["initContainers"].select{|c| c["name"]=="migrate"}; targets.each{|c| env=c.fetch("env",[]).select{|e| e["name"]=="COORDINATOR_DATABASE_URL"}; abort "database must use role Secret environment" unless env==[{"name"=>"COORDINATOR_DATABASE_URL","valueFrom"=>{"secretKeyRef"=>{"name"=>"#{role}-input","key"=>"database.url"}}}]}}' "$RUNNER_TEMP/chart-render.yaml"
-          helm template broker-only "$CHART" -f "$VALUES" --set runner.enabled=false > "$RUNNER_TEMP/broker-render.yaml"
-          ruby -ryaml -e 'd=YAML.load_stream(File.read(ARGV[0])).compact; abort "runner unexpectedly enabled" unless d.select{|x| x["kind"]=="Deployment"}.map{|x| x.dig("metadata","name")}==["broker-only-broker"]' "$RUNNER_TEMP/broker-render.yaml"
+          ruby -ryaml -e 'docs=YAML.load_stream(File.read(ARGV[0])).compact; deployments=docs.select{|d| d["kind"]=="Deployment"}; abort "unexpected workloads" unless deployments.map{|d| d.dig("metadata","name")}==["acceptance-inspector"]; deployments.each{|d| s=d.dig("spec","template","spec"); (s.fetch("containers")+s.fetch("initContainers",[])).each{|c| abort "mutable image" unless c["image"]==ARGV[1]; abort "unsafe container" unless c.dig("securityContext","readOnlyRootFilesystem")==true && c.dig("securityContext","allowPrivilegeEscalation")==false && c.dig("securityContext","capabilities","drop")==["ALL"]}; e=s["containers"][0]["env"]; abort "source mismatch" unless e.any?{|v| v["name"]=="COORDINATOR_EXPECTED_SOURCE_SHA" && v["value"]==ARGV[2]}; abort "baked revision override" if e.any?{|v| v["name"]=="COORDINATOR_IMAGE_SHA"}; abort "legacy volume" if s.fetch("volumes",[]).any?{|v| v.key?("persistentVolumeClaim")}}; abort "fresh install creates PVC" if docs.any?{|d| d["kind"]=="PersistentVolumeClaim"}; abort "private service required" unless docs.select{|d| d["kind"]=="Service"}.all?{|d| d.dig("spec","type")=="ClusterIP"}' "$RUNNER_TEMP/chart-render.yaml" "ghcr.io/${REPOSITORY,,}@sha256:$(printf 'a%.0s' {1..64})" "$SOURCE_SHA"
+          jq '.legacyStorage={mode:"retain",claims:[{name:"legacy-backups",size:"1Gi",accessModes:["ReadWriteOnce"],storageClass:null}]}' "$VALUES" > "$RUNNER_TEMP/retain-values.json"
+          helm template acceptance "$CHART" -f "$RUNNER_TEMP/retain-values.json" > "$RUNNER_TEMP/retain-render.yaml"
+          ruby -ryaml -e 'd=YAML.load_stream(File.read(ARGV[0])).compact; p=d.select{|x| x["kind"]=="PersistentVolumeClaim"}; abort "retention inventory mismatch" unless p.map{|x| x.dig("metadata","name")}==["legacy-backups"]; p.each{|x| a=x.dig("metadata","annotations"); abort "unsafe retention" unless a["helm.sh/resource-policy"]=="keep" && a["argocd.argoproj.io/sync-options"]=="Prune=false,Delete=false"}; abort "legacy mount" if d.select{|x| x["kind"]=="Deployment"}.any?{|x| x.dig("spec","template","spec","volumes").any?{|v| v.key?("persistentVolumeClaim")}}' "$RUNNER_TEMP/retain-render.yaml"
           if helm template invalid "$CHART" >/dev/null 2>&1; then echo 'Missing required inputs accepted' >&2; exit 1; fi
-          for override in 'image.repository=' 'image.digest=' 'image.digest=latest' 'sourceSha=' 'sourceSha=abc' 'broker.existingSecret=' 'broker.existingSecret=Bad/Name' 'runner.existingSecret=' 'broker.extraEnv[0].name=COORDINATOR_DATABASE_URL' 'runner.extraEnv[0].name=COORDINATOR_DATABASE_URL'; do
+          for override in 'image.repository=' 'image.digest=' 'image.digest=latest' 'sourceSha=' 'sourceSha=abc' 'inspector.existingSecret=' 'inspector.existingSecret=Bad/Name' 'legacyStorage.mode=' 'legacyStorage.mode=retain' 'runner.enabled=true' 'broker.port=8787' 'inspector.extraEnv[0].name=COORDINATOR_DATABASE_URL'; do
             if helm template invalid "$CHART" -f "$VALUES" --set-string "$override" >/dev/null 2>&1; then echo "Invalid input accepted: $override" >&2; exit 1; fi
           done
           for port in 0 65536; do
-            if helm template invalid "$CHART" -f "$VALUES" --set "broker.port=$port" >/dev/null 2>&1; then echo "Invalid port accepted: $port" >&2; exit 1; fi
+            if helm template invalid "$CHART" -f "$VALUES" --set "inspector.port=$port" >/dev/null 2>&1; then echo "Invalid port accepted: $port" >&2; exit 1; fi
           done
           mkdir -p chart-evidence
           helm package "$CHART" --destination chart-evidence
@@ -162,6 +92,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Require current main source before producing an image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SOURCE_SHA"
       - name: Derive repository-owned image coordinate
         id: coordinates
         env:
@@ -179,6 +118,7 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.coordinates.outputs.image }}:${{ github.sha }}
+          build-args: COORDINATOR_IMAGE_SHA=${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -188,89 +128,25 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Prove committed migrations and broker startup in exact production image
+      - name: Prove read-only inspector in exact production image
         env:
           IMAGE: ${{ steps.coordinates.outputs.image }}@${{ steps.build.outputs.digest }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          umask 077
-          PG_ROOT="$(mktemp -d "$RUNNER_TEMP/coordinator-image-postgres.XXXXXX")"
-          PG_CONTAINER="coordinator-image-postgres-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          IMAGE_CONTAINER="coordinator-image-proof-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          cleanup() {
-            docker rm -f "$IMAGE_CONTAINER" "$PG_CONTAINER" >/dev/null 2>&1 || true
-            sudo rm -rf -- "$PG_ROOT"
-          }
-          trap cleanup EXIT
-          timeout --signal=TERM --kill-after=5s 120s docker run --rm --interactive --name "$IMAGE_CONTAINER" --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --mount "type=bind,src=$PG_ROOT,dst=/proof" --env HOME=/tmp "$IMAGE" node --import tsx --input-type=module <<'NODE'
-          import { Effect } from 'effect';
-          import { Hex } from 'effect/encoding';
-          import { Platform } from './src/platform.ts';
-          await Effect.runPromise(Effect.gen(function*() {
-            const platform = yield* Platform;
-            const password = Hex.encode(yield* platform.crypto.randomBytes(32));
-            yield* platform.fs.writeFileString('/proof/password', password, { flag: 'wx', mode: 0o600 });
-          }).pipe(Effect.provide(Platform.layer))).catch(() => {
-            console.error('Production image PostgreSQL credential provisioning failed; diagnostics withheld');
-            process.exitCode = 1;
-          });
-          NODE
-          PASSWORD="$(cat "$PG_ROOT/password")"
-          printf '::add-mask::%s\n' "$PASSWORD"
-          export COORDINATOR_DATABASE_URL="postgresql://postgres:${PASSWORD}@127.0.0.1:55433/postgres?sslmode=disable"
-          printf '::add-mask::%s\n' "$COORDINATOR_DATABASE_URL"
-          unset PASSWORD
-          sudo chown 999:999 "$PG_ROOT/password"
-          docker run --detach --rm --name "$PG_CONTAINER" --publish 127.0.0.1:55433:5432 --mount "type=bind,src=$PG_ROOT/password,dst=/run/secrets/postgres-password,readonly" --env POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password postgres:18 >/dev/null
-          ready=false
-          for attempt in {1..60}; do
-            if docker exec "$PG_CONTAINER" pg_isready --host=127.0.0.1 --username=postgres --dbname=postgres >/dev/null 2>&1; then ready=true; break; fi
-            sleep 1
-          done
-          if [ "$ready" != true ]; then echo 'Disposable PostgreSQL did not become ready' >&2; exit 1; fi
-          image_run() {
-            timeout --signal=TERM --kill-after=5s 120s docker run --rm --interactive --name "$IMAGE_CONTAINER" --network host --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --env HOME=/tmp --env COORDINATOR_DATABASE_URL "$IMAGE" "$@"
-          }
-          image_run node --import tsx scripts/migrate.ts
-          image_run node --import tsx scripts/migrate.ts
-          image_run node --import tsx --input-type=module <<'NODE'
-          import assert from 'node:assert/strict';
-          import { Layer, ManagedRuntime, Schema } from 'effect';
-          import { Broker } from './src/broker.ts';
-          import { BrokerConfig } from './src/contracts.ts';
-          import { assertBrokerSchema } from './src/database.ts';
-          import { Mcp } from './src/mcp.ts';
-          import { Platform } from './src/platform.ts';
-          const config = Schema.decodeUnknownSync(BrokerConfig)({
-            host: '127.0.0.1', port: 0,
-            principals: [], repositoryIds: {}, backupDirectory: '/tmp/backups',
-            archiveRetentionMs: 86400000, backupRetentionMs: 3600000
-          });
-          const runtime = ManagedRuntime.make(Broker.layer(config).pipe(Layer.provide(Layer.merge(Platform.layer, Mcp.layer))));
-          try {
-            const broker = await runtime.runPromise(Broker);
-            await runtime.runPromise(assertBrokerSchema(broker.database));
-            const address = broker.server.address;
-            assert.equal(address._tag, 'InetAddressV4');
-            const response = await fetch(`http://127.0.0.1:${address.port}/livez`);
-            assert.equal(response.status, 200);
-            assert.deepEqual(await response.json(), { status: 'ok' });
-          } catch {
-            console.error('Production image migration/startup proof failed; credentials and diagnostics withheld');
-            process.exitCode = 1;
-          } finally {
-            await runtime.dispose();
-          }
-          NODE
+          timeout --signal=TERM --kill-after=5s 180s docker run --rm --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --env HOME=/tmp --env COORDINATOR_EXPECTED_SOURCE_SHA="$SOURCE_SHA" "$IMAGE" node dist/scripts/smoke.js
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign and attest exact image source
         env:
+          GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ steps.coordinates.outputs.image }}@${{ steps.build.outputs.digest }}
           REPOSITORY: ${{ github.repository }}
           SOURCE_SHA: ${{ github.sha }}
           SOURCE_REF: ${{ github.ref }}
           INVOCATION: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: |
+          set -euo pipefail
+          test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SOURCE_SHA"
           # Kyverno verifyImages consumes legacy cosign storage.
           cosign sign --yes --new-bundle-format=false --use-signing-config=false --registry-referrers-mode=legacy "$IMAGE"
           jq -n --arg repo "$REPOSITORY" --arg sha "$SOURCE_SHA" --arg ref "$SOURCE_REF" --arg invocation "$INVOCATION" '{buildDefinition:{buildType:"https://actions.github.io/buildtypes/workflow/v1",externalParameters:{repository:$repo,ref:$ref,sha:$sha},resolvedDependencies:[{uri:("git+https://github.com/"+$repo),digest:{gitCommit:$sha}}]},runDetails:{builder:{id:("https://github.com/"+$repo+"/.github/workflows/ci.yaml@"+$ref)},metadata:{invocationId:$invocation}}}' > "$RUNNER_TEMP/provenance.json"
@@ -287,7 +163,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           mkdir -p release-evidence
-          jq -n --arg repository "$REPOSITORY" --arg sha "$SOURCE_SHA" --arg image "$IMAGE_REPOSITORY" --arg digest "$IMAGE_DIGEST" --arg run "$RUN_ID" '{repository:$repository,sourceSha:$sha,imageRepository:$image,imageDigest:$digest,ciRunId:$run,platform:"linux/amd64",protocol:"2026-07-28",pi:"1.0.4",omp:"18.6.1"}' > release-evidence/image.json
+          jq -n --arg repository "$REPOSITORY" --arg sha "$SOURCE_SHA" --arg image "$IMAGE_REPOSITORY" --arg digest "$IMAGE_DIGEST" --arg run "$RUN_ID" '{repository:$repository,sourceSha:$sha,imageRepository:$image,imageDigest:$digest,ciRunId:$run,platform:"linux/amd64",protocol:"2026-07-28",product:"native-session-inspector",acceptance:"ephemeral-authenticated-read-only-inspection"}' > release-evidence/image.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: image-${{ github.sha }}

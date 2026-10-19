@@ -1,5 +1,7 @@
 # Coordinator deployment and self-hosting decisions
 
+> **HISTORICAL — superseded by the implemented inspector cutover (2026-10-19).** The broker/runner/PostgreSQL/SDK-session architecture, consolidation paths, beta status, test counts and gate ledger below describe earlier source and releases, not current inspector requirements or release acceptance. Current Coordinator is an ephemeral, read-only native-session inspector, with no application database, queue or execution/control engine. Historical migration/schema source and real databases, journals, backups, PVCs and old images remain rollback evidence; neither this cutover nor this banner authorizes their deletion, migration or live activation. Use the [README](../README.md), [current source map](src-consolidation-plan.md), [operator guide](self-hosting.md), and [third-party/release boundaries](../THIRD_PARTY_NOTICES.md) for current behavior and unestablished public-ready status.
+
 **Status:** private beta.5 candidate prepared, not published, deployed or accepted. Historical October12–13 observations below are not current-source/artifact/operator acceptance, including the service-owned database configuration cutover. This documentation task runs no gates, accesses no production and performs no automatic deployment/activation.
 
 ## Current PostgreSQL-first private beta decision

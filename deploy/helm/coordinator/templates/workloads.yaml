@@ -3,173 +3,125 @@
 {{- $sha := required "sourceSha is required" .Values.sourceSha -}}
 {{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) }}{{ fail "image.digest must be sha256 plus 64 lowercase hexadecimal digits" }}{{ end -}}
 {{- if not (regexMatch "^[a-f0-9]{40}$" $sha) }}{{ fail "sourceSha must be the full 40-character source commit" }}{{ end -}}
-{{- if or (contains "@" $repository) (contains " " $repository) }}{{ fail "image.repository must not contain a digest or whitespace" }}{{ end -}}
+{{- if not (regexMatch "^[^@\\s]+$" $repository) }}{{ fail "image.repository must not contain a digest or whitespace" }}{{ end -}}
+{{- $settings := .Values.inspector -}}
+{{- $secret := required "inspector.existingSecret is required" $settings.existingSecret -}}
 {{- $caSecret := .Values.tls.existingCaSecret -}}
-{{- if and $caSecret (or (gt (len $caSecret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caSecret))) }}{{ fail "tls.existingCaSecret must be a Kubernetes Secret name" }}{{ end -}}
-{{- range $role := list "broker" "runner" }}
-{{- $settings := index $.Values $role }}
-{{- if or (eq $role "broker") $settings.enabled }}
-{{- $secret := required (printf "%s.existingSecret is required" $role) $settings.existingSecret }}
-{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $secret) }}{{ fail "existingSecret must be a Kubernetes Secret name" }}{{ end }}
-{{- if hasKey $settings.podAnnotations "checksum/values" }}{{ fail "podAnnotations must not override checksum/values" }}{{ end }}
-{{- range $env := $settings.extraEnv }}
-{{- if eq $env.name "NODE_EXTRA_CA_CERTS" }}{{ fail "NODE_EXTRA_CA_CERTS is reserved; use tls.existingCaSecret" }}{{ end }}
-{{- if eq $env.name "COORDINATOR_DATABASE_URL" }}{{ fail "COORDINATOR_DATABASE_URL is reserved; use existingSecret database.url" }}{{ end }}
-{{- end }}
----
+{{- if hasKey $settings.podAnnotations "checksum/values" }}{{ fail "podAnnotations must not override checksum/values" }}{{ end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ $.Release.Name }}-{{ $role }}
+  name: {{ .Release.Name }}-inspector
   {{- with $settings.deploymentAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  replicas: {{ ternary 0 1 $.Values.suspended }}
+  replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: coordinator
-      app.kubernetes.io/instance: {{ $.Release.Name }}
-      app.kubernetes.io/component: {{ $role }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: inspector
   template:
     metadata:
       labels:
         app.kubernetes.io/name: coordinator
-        app.kubernetes.io/instance: {{ $.Release.Name }}
-        app.kubernetes.io/component: {{ $role }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: inspector
       annotations:
-        checksum/values: {{ toJson $.Values | sha256sum }}
+        checksum/values: {{ toJson .Values | sha256sum }}
         {{- with $settings.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.nodeSelector }}
       nodeSelector:
-        {{- toYaml $.Values.nodeSelector | nindent 8 }}
-      {{- with $.Values.tolerations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with $.Values.imagePullSecrets }}
+      {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       initContainers:
         - name: stage-config
           image: {{ printf "%s@%s" $repository $digest | quote }}
-          imagePullPolicy: {{ $.Values.image.pullPolicy }}
-          command: [node, --import, tsx, scripts/deploy-init.ts, {{ $role }}, --input, /input, --config, /config]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - node
+            - --input-type=module
+            - -e
+            - |
+              import { mkdir, readFile, writeFile } from 'node:fs/promises';
+              process.umask(0o077);
+              await mkdir('/config/private', { mode: 0o700, recursive: true });
+              for (const name of ['inspector.json', 'health.token']) {
+                await writeFile(`/config/private/${name}`, await readFile(`/input/${name}`), { mode: 0o600 });
+              }
           securityContext:
-            runAsUser: 0
-            runAsGroup: 0
-            runAsNonRoot: false
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-              add: [CHOWN, FOWNER, DAC_OVERRIDE]
           volumeMounts:
             - {name: input, mountPath: /input, readOnly: true}
             - {name: config, mountPath: /config}
-            - {name: tmp, mountPath: /tmp}
-            {{- if eq $role "broker" }}
-            - {name: backups, mountPath: /backups}
-            {{- else }}
-            - {name: work, mountPath: /work}
-            {{- end }}
-        - name: migrate
+      containers:
+        - name: inspector
           image: {{ printf "%s@%s" $repository $digest | quote }}
-          imagePullPolicy: {{ $.Values.image.pullPolicy }}
-          command: [node, --import, tsx, scripts/migrate.ts]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [node, dist/src/main.js, inspector]
           securityContext:
-            runAsUser: 1000
-            runAsGroup: 1000
-            runAsNonRoot: true
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
           env:
-            - name: COORDINATOR_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $secret | quote }}
-                  key: database.url
+            - {name: COORDINATOR_CONFIG, value: /config/private/inspector.json}
+            - {name: COORDINATOR_EXPECTED_SOURCE_SHA, value: {{ $sha | quote }}}
             - {name: HOME, value: /tmp}
             {{- if $caSecret }}
             - {name: NODE_EXTRA_CA_CERTS, value: /etc/coordinator/ca/ca.crt}
-            {{- end }}
-          volumeMounts:
-            - {name: tmp, mountPath: /tmp}
-            {{- if $caSecret }}
-            - {name: ca, mountPath: /etc/coordinator/ca, readOnly: true}
-            {{- end }}
-      containers:
-        - name: {{ $role }}
-          image: {{ printf "%s@%s" $repository $digest | quote }}
-          imagePullPolicy: {{ $.Values.image.pullPolicy }}
-          {{- if eq $role "runner" }}
-          command: [/usr/bin/setpriv, --reuid=1000, --regid=1000, --clear-groups, "--inh-caps=+chown,+dac_override,+kill,+setuid,+setgid,+setpcap", "--ambient-caps=+chown,+dac_override,+kill,+setuid,+setgid,+setpcap", --no-new-privs, node, --import, tsx, src/main.ts, runner]
-          {{- else }}
-          command: [node, --import, tsx, src/main.ts, broker]
-          {{- end }}
-          securityContext:
-            {{- if eq $role "runner" }}
-            runAsUser: 0
-            runAsGroup: 0
-            runAsNonRoot: false
-            {{- else }}
-            runAsUser: 1000
-            runAsGroup: 1000
-            runAsNonRoot: true
-            {{- end }}
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: [ALL]
-              {{- if eq $role "runner" }}
-              add: [CHOWN, DAC_OVERRIDE, KILL, SETUID, SETGID, SETPCAP]
-              {{- end }}
-          env:
-            - name: COORDINATOR_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $secret | quote }}
-                  key: database.url
-            - {name: COORDINATOR_CONFIG, value: {{ printf "/config/%s.json" $role | quote }}}
-            - {name: COORDINATOR_IMAGE_SHA, value: {{ $sha | quote }}}
-            - {name: COORDINATOR_CONNECT_HOSTS_JSON, value: {{ toJson $settings.connectHosts | quote }}}
-            {{- if $caSecret }}
-            - {name: NODE_EXTRA_CA_CERTS, value: /etc/coordinator/ca/ca.crt}
-            {{- end }}
-            {{- if eq $role "broker" }}
-            - {name: COORDINATOR_RUNNER_TOKEN_DIRECTORY, value: /config/tokens}
-            {{- else }}
-            - {name: HOME, value: /work/home}
-            {{- end }}
-            {{- with $settings.extraEnv }}
-            {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - {name: http, containerPort: {{ $settings.port }}, protocol: TCP}
           startupProbe:
             httpGet: {path: /livez, port: http}
             periodSeconds: 5
-            failureThreshold: 60
+            failureThreshold: 30
           livenessProbe:
             httpGet: {path: /livez, port: http}
             periodSeconds: 20
           readinessProbe:
             exec:
-              command: [curl, --fail, --silent, --show-error, --max-time, "3", --header, "@/config/health.header", {{ printf "http://127.0.0.1:%v/readyz" $settings.port | quote }}]
+              command:
+                - node
+                - --input-type=module
+                - -e
+                - |
+                  import { readFile } from 'node:fs/promises';
+                  const token = (await readFile('/config/private/health.token', 'utf8')).trim();
+                  if (!token || /[\r\n]/.test(token)) process.exit(1);
+                  const response = await fetch('http://127.0.0.1:{{ $settings.port }}/readyz', {
+                    headers: { authorization: `Bearer ${token}` },
+                    redirect: 'error', signal: AbortSignal.timeout(3000)
+                  });
+                  if (!response.ok || response.headers.get('x-coordinator-source-sha') !== process.env.COORDINATOR_EXPECTED_SOURCE_SHA) process.exit(1);
             periodSeconds: 5
             timeoutSeconds: 5
           resources:
@@ -180,16 +132,18 @@ spec:
             {{- if $caSecret }}
             - {name: ca, mountPath: /etc/coordinator/ca, readOnly: true}
             {{- end }}
-            {{- if eq $role "broker" }}
-            - {name: backups, mountPath: /backups}
-            {{- else }}
-            - {name: work, mountPath: /work}
-            {{- end }}
       volumes:
         - name: input
           secret:
-            secretName: {{ $secret }}
-            defaultMode: 0400
+            secretName: {{ $secret | quote }}
+            defaultMode: 0440
+            items:
+              - {key: inspector.json, path: inspector.json}
+              - {key: health.token, path: health.token}
+        - name: config
+          emptyDir: {medium: Memory}
+        - name: tmp
+          emptyDir: {}
         {{- if $caSecret }}
         - name: ca
           secret:
@@ -198,27 +152,16 @@ spec:
             items:
               - {key: ca.crt, path: ca.crt}
         {{- end }}
-        - name: config
-          emptyDir: {medium: Memory}
-        - name: tmp
-          emptyDir: {}
-        {{- range $volume := ternary (list "backups") (list "work") (eq $role "broker") }}
-        - name: {{ $volume }}
-          persistentVolumeClaim:
-            claimName: {{ (index $.Values.persistence $volume).existingClaim | default (printf "%s-%s" $.Release.Name $volume) }}
-        {{- end }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ $.Release.Name }}-{{ $role }}
+  name: {{ .Release.Name }}-inspector
 spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: coordinator
-    app.kubernetes.io/instance: {{ $.Release.Name }}
-    app.kubernetes.io/component: {{ $role }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: inspector
   ports:
     - {name: http, port: {{ $settings.port }}, targetPort: http, protocol: TCP}
-{{- end }}
-{{- end }}

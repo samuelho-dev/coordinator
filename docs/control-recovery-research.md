@@ -1,5 +1,7 @@
 # Coordinator control recovery: program status, MCP and HTTP standards
 
+> **HISTORICAL — superseded by the implemented inspector cutover (2026-10-19).** This document preserves broker/runner/owned-SDK recovery observations, dated protocol evidence, rollback context and old test counts. “Current,” “implemented,” source anchors and pending gates below refer to that earlier source, not the inspector tree or its 50-test suite. Current Coordinator has only read-only native visibility and ephemeral connector RPCs; it has no task execution/acceptance, owned SDK session or recovery engine to which these procedures apply. Preserve real legacy state, journals, backups and rollback artifacts; this banner authorizes no deletion or live change. Use the [README](../README.md), [current source map](src-consolidation-plan.md), and [operator guide](self-hosting.md), not the old procedures below, for current operation.
+
 ## Question and conclusion
 
 How should Coordinator handle repeated `session.poll` / `session.heartbeat` timeouts without confusing transport recovery with task acceptance, native host lifecycle, or terminal status?

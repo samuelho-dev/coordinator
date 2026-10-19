@@ -1,21 +1,32 @@
-{{- range $name := list "backups" "work" }}
-{{- $settings := index $.Values.persistence $name }}
-{{- if and (or (ne $name "work") $.Values.runner.enabled) (not $settings.existingClaim) }}
+{{- $storage := .Values.legacyStorage -}}
+{{- if not (has $storage.mode (list "fresh" "retain")) -}}
+{{- fail "legacyStorage.mode must explicitly be fresh (inventory confirms no tracked legacy PVCs) or retain (list every tracked legacy PVC); a source update does not authorize pruning state" -}}
+{{- end -}}
+{{- if and (eq $storage.mode "fresh") (gt (len $storage.claims) 0) -}}
+{{- fail "legacyStorage.claims must be empty for a fresh release" -}}
+{{- end -}}
+{{- if and (eq $storage.mode "retain") (eq (len $storage.claims) 0) -}}
+{{- fail "legacyStorage.claims must include every previously tracked PVC before cutover" -}}
+{{- end -}}
+{{- $names := dict -}}
+{{- range $claim := $storage.claims }}
+{{- if hasKey $names $claim.name }}{{ fail "legacyStorage.claims names must be unique" }}{{ end }}
+{{- $_ := set $names $claim.name true }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ $.Release.Name }}-{{ $name }}
+  name: {{ $claim.name | quote }}
   annotations:
     helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
 spec:
   accessModes:
-    {{- toYaml $settings.accessModes | nindent 4 }}
-  {{- if ne $settings.storageClass nil }}
-  storageClassName: {{ $settings.storageClass | quote }}
+    {{- toYaml $claim.accessModes | nindent 4 }}
+  {{- if ne $claim.storageClass nil }}
+  storageClassName: {{ $claim.storageClass | quote }}
   {{- end }}
   resources:
     requests:
-      storage: {{ required (printf "persistence.%s.size required" $name) $settings.size }}
-{{- end }}
+      storage: {{ required "Each retained legacy claim requires its unchanged size" $claim.size | quote }}
 {{- end }}

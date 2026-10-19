@@ -47,11 +47,11 @@ jobs:
           gh api "repos/$REPOSITORY/actions/runs/$CI_RUN" > "$RUNNER_TEMP/ci.json"
           jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" '.repository.full_name == $repo and .head_repository.full_name == $repo and .head_sha == $sha and .head_branch == "main" and .path == ".github/workflows/ci.yaml" and (.event == "push" or .event == "workflow_dispatch") and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/ci.json"
           gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/jobs?filter=latest&per_page=100" --jq '.jobs[] | {name,conclusion}' | jq -s -e 'all(.[]; .conclusion == "success") and any(.[]; .name == "supplementary") and any(.[]; .name == "chart") and any(.[]; .name == "publish")'
-          # A main SHA must be in this repository's main history, not merely a named foreign object.
-          gh api "repos/$REPOSITORY/compare/$SHA...main" --jq '.status' | grep -Ex 'ahead|identical'
+          # Release only the current immutable main source, never an older green run or mutable PR association.
+          test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SHA"
           mkdir -p producer
           gh run download "$CI_RUN" --repo "$REPOSITORY" --name "image-$SHA" --dir producer
-          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg image "ghcr.io/${REPOSITORY,,}" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .imageRepository == $image and (.imageDigest | test("^sha256:[0-9a-f]{64}$")) and .platform == "linux/amd64" and .protocol == "2026-07-28" and .pi == "1.0.4" and .omp == "18.6.1"' producer/image.json
+          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg image "ghcr.io/${REPOSITORY,,}" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .imageRepository == $image and (.imageDigest | test("^sha256:[0-9a-f]{64}$")) and .platform == "linux/amd64" and .protocol == "2026-07-28" and .product == "native-session-inspector" and .acceptance == "ephemeral-authenticated-read-only-inspection"' producer/image.json
           gh run download "$CI_RUN" --repo "$REPOSITORY" --name "chart-$SHA" --dir producer
           jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg version "$VERSION" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .gate == "chart" and .chartVersion == $version and (.chartArchiveSha256 | test("^[0-9a-f]{64}$"))' producer/chart.json
           test "$(sha256sum "producer/coordinator-$VERSION.tgz" | cut -d' ' -f1)" = "$(jq -r .chartArchiveSha256 producer/chart.json)"
@@ -138,6 +138,9 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SHA"
+          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg version "$VERSION" '.repository == $repo and .sourceSha == $sha and .releaseVersion == $version and .product == "native-session-inspector"' release/release-manifest.json
+          test "$(sha256sum "release/coordinator-$VERSION.tgz" | cut -d' ' -f1)" = "$(jq -r .chartArchiveSha256 release/release-manifest.json)"
           OWNER="${REPOSITORY%%/*}"
           CHART="ghcr.io/${OWNER,,}/charts/coordinator"
           printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
@@ -158,7 +161,7 @@ jobs:
           jq -s -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg digest "${DIGEST#sha256:}" 'any(.[]; (.payload | @base64d | fromjson) as $s | any($s.subject[]; .digest.sha256 == $digest) and $s.predicate.buildDefinition.externalParameters == {repository:$repo,ref:"refs/heads/main",sha:$sha})' release/chart-attestation.json
           jq --arg digest "$DIGEST" '.chartOciDigest=$digest | .publication="published-existing-visibility"' release/release-manifest.json > "$RUNNER_TEMP/manifest.json"
           mv "$RUNNER_TEMP/manifest.json" release/release-manifest.json
-          printf 'Exact source: `%s`\n\nImage: `%s`\n\nChart: `oci://%s@%s`\n\nPlatform: linux/amd64; protocol: 2026-07-28; Pi: 1.0.4; OMP: 18.6.1.\n\nRedistribution audit is incomplete; this is not a public-ready certification. Package/repository visibility is unchanged.\n' "$SHA" "$IMAGE" "$CHART" "$DIGEST" > "$RUNNER_TEMP/release-notes.txt"
+          printf 'Exact source: `%s`\n\nImage: `%s`\n\nChart: `oci://%s@%s`\n\nNative-session inspector; platform: linux/amd64; protocol: 2026-07-28. Native programs run on connected hosts, not inside this image.\n\nRedistribution audit is incomplete; this is not a public-ready certification. Package/repository visibility is unchanged.\n' "$SHA" "$IMAGE" "$CHART" "$DIGEST" > "$RUNNER_TEMP/release-notes.txt"
           PRERELEASE=()
           if [[ "$VERSION" == *-beta.* ]]; then PRERELEASE=(--prerelease); fi
-          gh release create "v$VERSION" release/* --repo "$REPOSITORY" --target "$SHA" --title "Coordinator $VERSION" --notes-file "$RUNNER_TEMP/release-notes.txt" "${PRERELEASE[@]}"
+          gh release create "v$VERSION" release/* --repo "$REPOSITORY" --target "$SHA" --title "Native-session inspector $VERSION" --notes-file "$RUNNER_TEMP/release-notes.txt" "${PRERELEASE[@]}"
