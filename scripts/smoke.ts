@@ -261,7 +261,9 @@ const program = Effect.gen(function*() {
           assert.ok(listing.sessions.some((entry) => entry.ref.nativeSessionId === native.ref.nativeSessionId), "Native reader must discover the real CLI session");
           const detail = Schema.decodeUnknownSync(InspectionTools.inspect.output)((await inspect.execute("native-smoke-inspect", { ref: native.ref })).details);
           assert.deepEqual(detail.presence.ref, native.ref);
-          assert.equal(detail.resources.ownedRssBytes.status, "available");
+          const rootProcess = detail.resources.processes.find((entry) => entry.process.pid === child.pid);
+          assert.ok(rootProcess?.rssBytes.status === "available" && rootProcess.rssBytes.value > 0, "Native reader must measure the actual spawned CLI root");
+          assert.equal(rootProcess.cpuTimeMs.status, "available");
         } finally {
           await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
           session.dispose();
