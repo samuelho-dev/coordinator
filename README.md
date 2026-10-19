@@ -330,6 +330,8 @@ This is a breaking product/protocol cutover, not a task-store upgrade. Preserve 
 
 Promotion requires exact immutable-source CI, hardened exact-image smoke, verified digest/signature/expected OIDC producer, SBOM/SLSA repository/commit attestation, verified chart artifact and reviewed GitOps digest/source-SHA pins. Source/image/chart remain private pending a separate visibility/legal decision; read [third-party notices](THIRD_PARTY_NOTICES.md) before redistribution. Local proofs or GitOps health do not prove real private TLS/MCP/native-host acceptance. **Nothing here implicitly authorizes deployment, service stops, state migration or pruning.**
 
+CI uses only repository-scoped homelab ARC pools: `coordinator-runners` for supplementary and chart checks, and `coordinator-dind-runners` for image publication and both release jobs. There is no GitHub-hosted fallback. PR jobs retain read-only contents permission without publish or OIDC credentials. Keep the private repository's server-side **Run workflows from fork pull requests** setting disabled, with fork write tokens and secrets disabled; same-repository PR source checks are defense in depth, not protection against a fork changing workflow YAML. The pinned runner image already includes Ruby/Psych, GitHub CLI and the native tools used by these workflows.
+
 ## Verification
 
 After building, the normal local checks are:

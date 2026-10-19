@@ -27,7 +27,7 @@ concurrency:
 jobs:
   prepare:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: coordinator-dind-runners
     timeout-minutes: 20
     permissions:
       contents: read
@@ -110,7 +110,7 @@ jobs:
   publish:
     needs: prepare
     if: github.ref == 'refs/heads/main' && inputs.mode == 'publish'
-    runs-on: ubuntu-latest
+    runs-on: coordinator-dind-runners
     timeout-minutes: 15
     permissions:
       contents: write

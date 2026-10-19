@@ -4,6 +4,7 @@
   "additionalProperties": false,
   "required": ["image", "sourceSha", "imagePullSecrets", "nodeSelector", "tolerations", "tls", "inspector", "legacyStorage"],
   "properties": {
+    "global": {"type": "object"},
     "image": {
       "type": "object",
       "additionalProperties": false,

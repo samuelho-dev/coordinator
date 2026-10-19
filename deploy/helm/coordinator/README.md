@@ -23,6 +23,8 @@ The placeholders are deliberately not valid release coordinates. `image.reposito
 
 Optional values are `image.pullPolicy`, native `imagePullSecrets`, `nodeSelector`, `tolerations`, `tls.existingCaSecret`, `inspector.resources`, `inspector.deploymentAnnotations`, and `inspector.podAnnotations`. These apply to the single inspector; there are no role-specific runner settings, database URLs, `connectHosts` or `extraEnv`. Native tolerations grant scheduling eligibility, not isolation/HA. Pod `checksum/values` is chart-owned and cannot be overridden. Secret contents are not part of that checksum; arrange an explicit controlled restart after Secret rotation. An annotation does not install a reload controller.
 
+The optional native Helm `global` object is accepted for umbrella-chart composition and ignored by this chart. Runtime configuration remains confined to the validated fields above.
+
 ## Existing Secret and private staging
 
 | Required key | Contents |
