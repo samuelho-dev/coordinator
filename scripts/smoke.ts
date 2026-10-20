@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { Context, Effect, Fiber, FileSystem, Layer, Schema, Stream } from "effect";
 import { HttpServer } from "effect/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -224,11 +224,25 @@ const program = Effect.gen(function*() {
     }
     const configFile = join(home, "inspector.json");
     yield* fs.writeFileString(configFile, JSON.stringify({ inspectorUrl, tokenFile, machineId, stateDirectory: home }), { mode: 0o600 });
+    const nativeEnv = { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin", COORDINATOR_CONNECTOR_CONFIG: configFile };
+    const install = yield* spawner.spawn(ChildProcess.make(process.execPath, [resolve(dirname(main), "../scripts/install.js"), "--target", harness, "--destination", join(home, "native-host"), "--config", configFile], {
+      cwd: home, env: nativeEnv, extendEnv: false,
+    }));
+    const instructions = yield* install.stdout.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
+    const installError = yield* install.stderr.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
+    assert.equal(yield* install.exitCode, 0, yield* Fiber.join(installError));
+    const activation = (yield* Fiber.join(instructions)).split("\n").find((line) => line.startsWith(`${harness} `));
+    assert.ok(activation, "Installer must supply a native activation command");
+    const activated = yield* spawner.spawn(ChildProcess.make("/bin/sh", ["-c", `exec '${executable.replaceAll("'", "'\\''")}'${activation.slice(harness.length)}`], {
+      cwd: home, env: nativeEnv, extendEnv: false,
+    }));
+    yield* activated.stdout.pipe(Stream.runDrain, Effect.forkScoped);
+    const activationError = yield* activated.stderr.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
+    assert.equal(yield* activated.exitCode, 0, yield* Fiber.join(activationError));
     const extension = resolve(import.meta.dirname, "../..", "dist/plugins", `${harness}.js`);
     const sourceExtension = resolve(import.meta.dirname, "..", "dist/plugins", `${harness}.js`);
-    const child = yield* spawner.spawn(ChildProcess.make(executable, ["--mode", "rpc", "--no-extensions", "-e", existsSync(extension) ? extension : sourceExtension, "--session-dir", home, ...modelArgs], {
-      cwd: home, env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin", COORDINATOR_CONNECTOR_CONFIG: configFile }, extendEnv: false,
-      stdin: Stream.never, forceKillAfter: "1 second",
+    const child = yield* spawner.spawn(ChildProcess.make(executable, ["--mode", "rpc", "--session-dir", home, ...modelArgs], {
+      cwd: home, env: nativeEnv, extendEnv: false, stdin: Stream.never, forceKillAfter: "1 second",
     }));
     yield* child.stdout.pipe(Stream.runDrain, Effect.forkScoped);
     let nativeStderr = "";

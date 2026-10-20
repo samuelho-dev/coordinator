@@ -15,7 +15,7 @@ const help = `Usage: pnpm install:host --target pi|omp|claude|codex|hermes --des
 Build first with pnpm build. Run as the native session owner. --destination must be a NEW directory under an existing private owner directory; no existing native files are overwritten.
 --config is an existing private connector config (and private tokenFile), never a bearer argument. --runtime defaults to this Node executable.
 --dry-run validates prerequisites and prints activation instructions without writing.
-Generated native extension/plugin or include artifacts require explicit activation shown on success. Start the connector separately with COORDINATOR_CONNECTOR_CONFIG and coordinator connector.
+Printed native install/link commands activate this exact built package. Generated include artifacts require separate explicit activation; start the connector separately with COORDINATOR_CONNECTOR_CONFIG and coordinator connector.
 No settings/profile/statusLine replacement, exporter activation, remote setup, service management or historical data changes. Claude status-line metrics require optional manual composition; the installer does not configure a status line.`;
 
 const install = Effect.gen(function*() {
@@ -56,9 +56,9 @@ const install = Effect.gen(function*() {
   if (target === "pi" || target === "omp") {
     const bundle = join(root, `dist/plugins/${target}.js`);
     yield* io(() => access(bundle, constants.R_OK));
-    json("package.json", { name: "coordinator-inspector-extension", version: "1.0.0", private: true, type: "module", ...(target === "pi" ? { pi: { extensions: [bundle] } } : { omp: { extensions: [bundle] } }) });
+    // ponytail: activate the real package; wrapper absolute entrypoints break native OMP discovery.
     if (target === "omp") json("mcp.json", { mcpServers: { coordinator: mcp } });
-    activation = `${target === "pi" ? "pi install" : "omp plugin link"} ${quote(destination)}\n${target === "pi" ? "The extension provides native coordinator_session_list and coordinator_session_inspect tools; no Pi MCP configuration or adapter is required." : `Merge ONLY the coordinator entry from ${join(destination, "mcp.json")} into ~/.omp/agent/mcp.json; preserve all existing entries.`}\nLaunch the native harness with COORDINATOR_CONNECTOR_CONFIG=${quote(configFile)}.`;
+    activation = `${target === "pi" ? "pi install" : "omp plugin link"} ${quote(root)}\n${target === "pi" ? "The extension provides native coordinator_session_list and coordinator_session_inspect tools; no Pi MCP configuration or adapter is required." : `Merge ONLY the coordinator entry from ${join(destination, "mcp.json")} into ~/.omp/agent/mcp.json; preserve all existing entries.`}\nLaunch the native harness with COORDINATOR_CONNECTOR_CONFIG=${quote(configFile)}.`;
   } else if (target === "claude" || target === "codex") {
     const events = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", ...(target === "claude" ? ["PostToolUseFailure", "PostModelSwitch", "PreCompact"] : ["Interrupt"])];
     const hooks = Object.fromEntries(events.map((event) => [event, [{ hooks: [{ type: "command", command: command(`hook ${target}`), timeout: 3 }] }]]));
