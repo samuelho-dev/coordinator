@@ -42,7 +42,7 @@ scripts/
 
 `Inspector.inspect` forwards one read request to the current connector incarnation; timeout/cancellation removes it. Bearer-authenticated `/connector/announce`, `/connector/poll`, `/connector/result` and `/connector/disconnect` are transport endpoints, not model tools. `/mcp` exposes the two tools with read-only hints. Receiver liveness is 30 seconds, discovery expiry 120 seconds, registry query deadline 10 seconds and detail callback deadline 8 seconds. HTTP/native JSON input is bounded to 64 KiB; detail is bounded to 48 KiB with explicit partial flags and retained aggregate scope. Framing/SSE output is bounded; redirects/token forwarding and unsafe Origins are rejected.
 
-`prisma/` and `migrations/` are historical rollback source assets, **not** current database dependencies or schema setup. There is no automatic historical import or deletion; see [deployment and rollback](#deployment-and-rollback).
+The old execution broker/runner stack is being retired; its unused schema and migration source have been removed. Durable rollback state, verified backups, immutable old images and private rollback evidence remain operator-owned outside this working tree, offline from the inspector. Source cleanup does not authorize deleting that material; see [deployment and rollback](#deployment-and-rollback).
 
 ### Build and entrypoints
 
