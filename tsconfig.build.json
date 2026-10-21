@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./dist",
+    "noEmit": false,
+    "noEmitOnError": true,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true
+  },
+  "include": ["src/**/*.ts", "scripts/install.ts", "scripts/smoke.ts", "scripts/deployment-smoke.ts"]
+}

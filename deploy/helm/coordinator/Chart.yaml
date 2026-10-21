@@ -1,0 +1,6 @@
+apiVersion: v2
+name: coordinator
+description: Read-only ephemeral native-session inspector with explicit legacy storage retention
+type: application
+version: 0.3.0-beta.1
+appVersion: 0.3.0-beta.1

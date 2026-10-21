@@ -1,0 +1,167 @@
+{{- $repository := required "image.repository is required" .Values.image.repository -}}
+{{- $digest := required "image.digest is required" .Values.image.digest -}}
+{{- $sha := required "sourceSha is required" .Values.sourceSha -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) }}{{ fail "image.digest must be sha256 plus 64 lowercase hexadecimal digits" }}{{ end -}}
+{{- if not (regexMatch "^[a-f0-9]{40}$" $sha) }}{{ fail "sourceSha must be the full 40-character source commit" }}{{ end -}}
+{{- if not (regexMatch "^[^@\\s]+$" $repository) }}{{ fail "image.repository must not contain a digest or whitespace" }}{{ end -}}
+{{- $settings := .Values.inspector -}}
+{{- $secret := required "inspector.existingSecret is required" $settings.existingSecret -}}
+{{- $caSecret := .Values.tls.existingCaSecret -}}
+{{- if hasKey $settings.podAnnotations "checksum/values" }}{{ fail "podAnnotations must not override checksum/values" }}{{ end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-inspector
+  {{- with $settings.deploymentAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coordinator
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: inspector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coordinator
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: inspector
+      annotations:
+        checksum/values: {{ toJson .Values | sha256sum }}
+        {{- with $settings.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: stage-config
+          image: {{ printf "%s@%s" $repository $digest | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - node
+            - --input-type=module
+            - -e
+            - |
+              import { mkdir, readFile, writeFile } from 'node:fs/promises';
+              process.umask(0o077);
+              await mkdir('/config/private', { mode: 0o700, recursive: true });
+              for (const name of ['inspector.json', 'health.token']) {
+                await writeFile(`/config/private/${name}`, await readFile(`/input/${name}`), { mode: 0o600 });
+              }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: input, mountPath: /input, readOnly: true}
+            - {name: config, mountPath: /config}
+      containers:
+        - name: inspector
+          image: {{ printf "%s@%s" $repository $digest | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [node, dist/src/main.js, inspector]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - {name: COORDINATOR_CONFIG, value: /config/private/inspector.json}
+            - {name: COORDINATOR_EXPECTED_SOURCE_SHA, value: {{ $sha | quote }}}
+            - {name: HOME, value: /tmp}
+            {{- if $caSecret }}
+            - {name: NODE_EXTRA_CA_CERTS, value: /etc/coordinator/ca/ca.crt}
+            {{- end }}
+          ports:
+            - {name: http, containerPort: {{ $settings.port }}, protocol: TCP}
+          startupProbe:
+            httpGet: {path: /livez, port: http}
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+            periodSeconds: 20
+          readinessProbe:
+            exec:
+              command:
+                - node
+                - --input-type=module
+                - -e
+                - |
+                  import { readFile } from 'node:fs/promises';
+                  const token = (await readFile('/config/private/health.token', 'utf8')).trim();
+                  if (!token || /[\r\n]/.test(token)) process.exit(1);
+                  const response = await fetch('http://127.0.0.1:{{ $settings.port }}/readyz', {
+                    headers: { authorization: `Bearer ${token}` },
+                    redirect: 'error', signal: AbortSignal.timeout(3000)
+                  });
+                  if (!response.ok || response.headers.get('x-coordinator-source-sha') !== process.env.COORDINATOR_EXPECTED_SOURCE_SHA) process.exit(1);
+            periodSeconds: 5
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml $settings.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            {{- if $caSecret }}
+            - {name: ca, mountPath: /etc/coordinator/ca, readOnly: true}
+            {{- end }}
+      volumes:
+        - name: input
+          secret:
+            secretName: {{ $secret | quote }}
+            defaultMode: 0440
+            items:
+              - {key: inspector.json, path: inspector.json}
+              - {key: health.token, path: health.token}
+        - name: config
+          emptyDir: {medium: Memory}
+        - name: tmp
+          emptyDir: {}
+        {{- if $caSecret }}
+        - name: ca
+          secret:
+            secretName: {{ $caSecret | quote }}
+            defaultMode: 0444
+            items:
+              - {key: ca.crt, path: ca.crt}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-inspector
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: coordinator
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: inspector
+  ports:
+    - {name: http, port: {{ $settings.port }}, targetPort: http, protocol: TCP}

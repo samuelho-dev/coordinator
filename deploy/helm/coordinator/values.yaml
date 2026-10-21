@@ -1,0 +1,31 @@
+image:
+  repository: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+sourceSha: ""
+imagePullSecrets: []
+nodeSelector: {}
+tolerations: []
+tls:
+  existingCaSecret: ""
+inspector:
+  # Existing Secret keys: inspector.json (InspectorConfig), health.token (bearer).
+  # Config must listen on 0.0.0.0 at this port and authorize health.token's hash.
+  existingSecret: ""
+  port: 8787
+  deploymentAnnotations: {}
+  podAnnotations: {}
+  resources: {}
+legacyStorage:
+  # REQUIRED operator decision, never inferred from a source/image update:
+  # fresh: inventory confirms this release tracks no legacy PVCs; claims stays [].
+  # retain: list EVERY previously tracked PVC with its unchanged live spec.
+  # Retained claims are protected against Helm deletion AND Argo prune/delete;
+  # none is mounted by the inspector. External DBs/journals/backups stay untouched.
+  mode: ""
+  # Each entry: {name: old-release-backups, size: 10Gi,
+  #              accessModes: [ReadWriteOnce], storageClass: null}
+  # null omits storageClassName; use "" only if live spec explicitly disables it.
+  claims: []
+# Operator-owned TLS termination and NetworkPolicies must route to <release>-inspector.
+# No ingress, public Service, database, runner, shared PVC mounts or migrations.

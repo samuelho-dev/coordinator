@@ -1,0 +1,103 @@
+# Coordinator inspector chart 0.3.0-beta.1
+
+This chart deploys the private, ephemeral native-session inspector: one Deployment and internal ClusterIP Service named `<release>-inspector`, plus only explicitly retained legacy PVC manifests. It creates no database, migrations, task queue, native agents, PVC mounts, ingress, namespace, NetworkPolicy or provider CRDs. See the [root README](../../../README.md) for configuration, native host setup, metrics and verification.
+
+## Required values
+
+Defaults are intentionally insufficient to render. Supply an operator-reviewed values file:
+
+```yaml
+image:
+  repository: ghcr.io/your-private-owner/coordinator
+  digest: "sha256:REPLACE_WITH_64_LOWERCASE_HEX_DIGEST"
+sourceSha: "REPLACE_WITH_FULL_40_LOWERCASE_HEX_COMMIT"
+inspector:
+  existingSecret: coordinator-inspector-private
+  port: 8787
+legacyStorage:
+  mode: fresh
+  claims: []
+```
+
+The placeholders are deliberately not valid release coordinates. `image.repository` must contain no digest/whitespace; `image.digest` must be `sha256:` plus 64 lowercase hex digits; `sourceSha` must be the matching full lowercase 40-hex commit. Obtain them from the same verified exact-source release, not a tag or readiness header. `inspector.existingSecret` must already exist in the release namespace. Offline Helm does not inspect its contents. Config must bind `0.0.0.0` at the same port as `inspector.port` (default 8787).
+
+Optional values are `image.pullPolicy`, native `imagePullSecrets`, `nodeSelector`, `tolerations`, `tls.existingCaSecret`, `inspector.resources`, `inspector.deploymentAnnotations`, and `inspector.podAnnotations`. These apply to the single inspector; there are no role-specific runner settings, database URLs, `connectHosts` or `extraEnv`. Native tolerations grant scheduling eligibility, not isolation/HA. Pod `checksum/values` is chart-owned and cannot be overridden. Secret contents are not part of that checksum; arrange an explicit controlled restart after Secret rotation. An annotation does not install a reload controller.
+
+The optional native Helm `global` object is accepted for umbrella-chart composition and ignored by this chart. Runtime configuration remains confined to the validated fields above.
+
+## Existing Secret and private staging
+
+| Required key | Contents |
+| --- | --- |
+| `inspector.json` | Exact [InspectorConfig](../../../src/inspection.ts) JSON: `host`, `port`, `principals`. Each principal contains `id`, `owner`, `machineId`, `tokenHash`. Unknown fields are rejected. |
+| `health.token` | Raw bearer whose trimmed exact bytes hash to an enrolled principal's lowercase SHA-256 `tokenHash`. It must be nonempty with no embedded newline; use a randomly generated 32-byte hex bearer, never a hash as the bearer. |
+
+Provision these through your private secret backend/reconciler, never in values, Git, command arguments or logs. The [configuration examples](../../../README.md#configuration) cover private token generation and distinct server/client JSON. Connectors use their own OS-local `ConnectorConfig`/`tokenFile`; that file is **not** the chart's inspector server config. Same-owner reads are allowed; writes are bound to the credential's machine. Health credentials are enrolled principals, not a separate read-only role; protect them accordingly. No model/provider/database credentials are needed.
+
+The Secret is mounted read-only at `/input` with mode0440. A same-image, **unprivileged UID/GID1000** init container copies only `inspector.json` and `health.token` to memory-backed `/config/private`, creating the parent0700 and files0600 as the runtime owner. These staged canonical regular files meet the [private reader](../../../src/native.ts) requirements: current ownership, no group/other permissions, no final symlink, canonical absolute path and parent, at most64KiB. Runtime sees `/config` read-only; it has writable `/tmp` only. Secret projection alone is not a staged-config reload.
+
+Both init and runtime use `runAsNonRoot`, UID/GID1000, `allowPrivilegeEscalation: false`, read-only root filesystem, capabilities **drop ALL**, and pod `RuntimeDefault` seccomp. Service-account token mounting is disabled. There is no root initializer, six-capability runner, migration init, native agent executable or shared historical volume. The runtime command is exactly:
+
+```sh
+node dist/src/main.js inspector
+```
+
+## Legacy storage is an explicit preservation decision
+
+`legacyStorage.mode` is required; a source/image update never authorizes deleting state:
+
+* **`fresh`**: inventory confirms this release tracks **no old PVCs**; `claims` must be empty. Rendering creates no PVC. Do not choose fresh merely because the inspector needs no storage.
+* **`retain`**: list **every** previously tracked PVC using its original exact name, requested size, access modes and storage-class specification. Empty lists and duplicate names fail. Preserve every other immutable/live spec requirement; if a claim has fields this chart cannot reproduce, resolve preservation separately before any rollout rather than applying a lossy manifest.
+
+For example only, after inspecting the actual tracked live claim:
+
+```yaml
+legacyStorage:
+  mode: retain
+  claims:
+    - name: original-release-backups
+      size: 10Gi
+      accessModes: [ReadWriteOnce]
+      storageClass: null
+```
+
+`null` omits `storageClassName`; `""` explicitly disables a provisioner. Use exactly the live specification, not the example. Every retained claim receives:
+
+```yaml
+helm.sh/resource-policy: keep
+argocd.argoproj.io/sync-options: Prune=false,Delete=false
+```
+
+None is mounted or read by the inspector. Protect the underlying PV/reclaim policy and external backups independently ([Helm resource retention](https://helm.sh/docs/howto/charts_tips_and_tricks/#tell-helm-not-to-uninstall-a-resource), [Argo prune/delete controls](https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/)). These annotations are not snapshots, ownership fences or permission to uninstall/prune an old release.
+
+Preserve **all real databases, journals, backups, PVCs and old images** and their rollback coordinates. The old execution broker/runner stack is being retired; unused schema and migration source have been removed, while durable rollback state and private rollback evidence remain operator-owned outside the working tree, offline from the inspector. New CLI commands cannot recover/import old tasks. Existing deployments require a **separately approved** actual-state inventory, drain, old-owner fencing and downstream route migration from `<release>-broker` to `<release>-inspector`. Changing chart names can otherwise prune the old workload or disconnect clients. `Recreate` alone does not fence an old broker/runner outside this new Deployment or safely finish its accepted work. Never auto-sync this product cutover based only on a new image pin.
+
+## Network, probes and independent source identity
+
+The Service is internal HTTP, not a private HTTPS endpoint. Operators own standard DNS, verified TLS termination/trust, private gateways and default-deny policy with explicit DNS, probes, gateway→inspector and native connector/client→private-route flows. External clients must use HTTPS except loopback. No custom TCP relay, host-routing override or disabled TLS verification is supported.
+
+`tls.existingCaSecret` optionally names an existing Secret with public `ca.crt` PEM trust roots, mounted read-only at `/etc/coordinator/ca/ca.crt` and supplied via `NODE_EXTRA_CA_CERTS`. No certificate/private key is generated. Preserve ordinary hostname/SNI verification; Node loads additional trust at startup, so rotation requires a controlled restart ([Node CA behavior](https://nodejs.org/docs/latest-v24.x/api/cli.html#node_extra_ca_certsfile)). This setting does not create inbound TLS termination or configure other native clients' trust.
+
+Startup and liveness use unauthenticated minimal `/livez`. Readiness executes Node, reads `/config/private/health.token`, and requests authenticated loopback `/readyz`; it refuses a failed response or source-header mismatch. `/healthz` is also authenticated. Tokens never enter probe argv. Discovery is in memory: restart loses discovery until connectors reannounce, not native work; readiness is not durable-store or model-provider acceptance.
+
+The source check is deliberately **not self-confirming**:
+
+* Trusted image build passes `COORDINATOR_IMAGE_SHA` as a Docker build argument; [Dockerfile](../../../Dockerfile) bakes it into the image and revision label. Authenticated readiness returns it as `x-coordinator-source-sha`.
+* Chart `sourceSha` sets the separate `COORDINATOR_EXPECTED_SOURCE_SHA`. The probe compares the image's response against this expected commit.
+* Never override `COORDINATOR_IMAGE_SHA` in a Pod or exact-image smoke. Setting both sides from the same deployment value defeats the check. A matched header alone still cannot prove provenance.
+
+## Preparation and approval gates
+
+The following are local review commands, not deployment authorization. Choose an operator-owned output file and real verified values; preserve private data and do not put Secret contents in the rendered file:
+
+```sh
+helm lint deploy/helm/coordinator -f "$OPERATOR_VALUES"
+helm template "$RELEASE" deploy/helm/coordinator -f "$OPERATOR_VALUES" > "$RENDERED_MANIFEST"
+helm package deploy/helm/coordinator --destination "$CHART_OUTPUT_DIRECTORY"
+```
+
+Review the actual render and inventory before any separately authorized cluster change. A render cannot validate live Secret contents, storage history, policy, DNS, TLS or native-host API support. Do not reuse old `broker.*`, `runner.*`, persistence/database/migration flags: schema validation rejects obsolete values rather than quietly retaining the old product.
+
+Before promotion require exact immutable-main normal CI, hardened exact-image runtime smoke (UID1000, cap0, read-only root/no-new-privileges), matching digest, verified expected signer/OIDC issuer, SBOM and SLSA repository/commit provenance, verified chart artifact, and an owner-reviewed GitOps PR pinning image digest plus source SHA. [CI](../../../.github/workflows/ci.yaml) prepares those gates; local checks do not prove they ran or published for this source. Do not reuse an unrelated green run or bypass admission. Source, image and chart publication/visibility remain separate owner actions; see [notices](../../../THIRD_PARTY_NOTICES.md).
+
+After an approved rollout, independently prove authenticated MCP, real private TLS/DNS, owner/machine isolation, manual native host activation and actual counters without prompts/provider work. GitOps health alone is not that acceptance. The root README covers [native host setup](../../../README.md#native-host-setup), [metrics and provenance](../../../README.md#metrics-and-provenance), and the [source/service map](../../../README.md#source).
