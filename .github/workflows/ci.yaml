@@ -31,7 +31,9 @@ jobs:
       - run: pnpm build
       - run: pnpm check
       - run: pnpm test
-      - name: Exercise ephemeral inspector and available native extensions without provider calls
+      - name: Exercise ephemeral inspector and Pi/OMP native startup without provider calls
+        env:
+          COORDINATOR_SMOKE_NATIVE: 'true'
         run: pnpm smoke
 
   npm-package:
@@ -185,7 +187,7 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          timeout --signal=TERM --kill-after=5s 180s docker run --rm --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --env HOME=/tmp --env COORDINATOR_EXPECTED_SOURCE_SHA="$SOURCE_SHA" "$IMAGE" node dist/scripts/smoke.js
+          timeout --signal=TERM --kill-after=5s 180s docker run --rm --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --env HOME=/tmp --env COORDINATOR_EXPECTED_SOURCE_SHA="$SOURCE_SHA" --env COORDINATOR_SMOKE_NATIVE=false "$IMAGE" node dist/scripts/smoke.js
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign and attest exact image source
         env:

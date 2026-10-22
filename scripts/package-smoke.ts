@@ -79,6 +79,7 @@ const program = Effect.gen(function*() {
   yield* fs.writeFileString(smoke, yield* fs.readFileString(path.join(checkout, "dist", "scripts", "smoke.js")), { flag: "wx", mode: 0o600 });
   const evidence = yield* run(host.executable, [smoke], {
     ...environment,
+    COORDINATOR_SMOKE_NATIVE: "true",
     COORDINATOR_TEST_PI_SDK: import.meta.resolve("@earendil-works/pi-coding-agent"),
     COORDINATOR_TEST_PI: path.resolve(pi),
     COORDINATOR_TEST_OMP: path.resolve(omp),

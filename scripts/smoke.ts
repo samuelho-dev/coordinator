@@ -260,7 +260,8 @@ const program = Effect.gen(function*() {
       : Effect.fail(error),
     onSuccess: () => verify.fail("Other-owner installation inspection accepted"),
   }));
-  const harnesses: ReadonlyArray<"pi" | "omp"> = ["pi", "omp"];
+  const nativeHarnesses = yield* Config.Boolean("COORDINATOR_SMOKE_NATIVE").pipe(Config.withDefault(true));
+  const harnesses: ReadonlyArray<"pi" | "omp"> = nativeHarnesses ? ["pi", "omp"] : [];
   const startupRequest = new TextEncoder().encode('{"id":"coordinator-startup","type":"get_state"}\n');
   for (const harness of harnesses) {
     const explicit = Option.getOrUndefined(yield* Config.option(Config.String(harness === "pi" ? "COORDINATOR_TEST_PI" : "COORDINATOR_TEST_OMP")));
@@ -419,7 +420,7 @@ const program = Effect.gen(function*() {
   yield* otherConnector.kill();
   yield* otherConnector.exitCode;
   yield* Console.log(JSON.stringify({ scenario: "ephemeral-inspector", status: "ok", authenticatedHttpMcp: true, outboundConnector: true,
-    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativePrograms: nativeResults }));
+    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
 });
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("120 seconds"), Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer, NodeHttpClient.layerUndici, Mcp.layer))));
