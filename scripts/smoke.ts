@@ -18,10 +18,14 @@ const verify = {
   match: (value: string, pattern: RegExp) => pattern.test(value) ? Effect.void : Effect.die("Smoke pattern mismatch"),
   fail: (message: string) => Effect.die(message),
 };
-const NativeStartupReply = Schema.fromJsonString(Schema.Struct({
-  id: Schema.Literals(["coordinator-startup"]), type: Schema.Literals(["response"]),
-  command: Schema.Literals(["get_state"]), success: Schema.Boolean,
-}));
+const NativeStartupMessage = Schema.fromJsonString(Schema.Union([
+  Schema.Struct({
+    id: Schema.Literals(["coordinator-startup"]), type: Schema.Literals(["response"]),
+    command: Schema.Literals(["get_state"]), success: Schema.Boolean,
+  }),
+  Schema.Struct({ type: Schema.Literals(["ready"]) }),
+  Schema.Struct({ type: Schema.Literals(["extension_ui_request"]), method: Schema.Literals(["notify"]), message: Schema.String }),
+]));
 
 
 const program = Effect.gen(function*() {
@@ -144,6 +148,7 @@ const program = Effect.gen(function*() {
     HOME: home, PATH: searchPath,
     XDG_CONFIG_HOME: join(home, "config"), XDG_STATE_HOME: join(home, "state"), XDG_CACHE_HOME: join(home, "cache"),
     PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
+    PI_OFFLINE: "1",
     COORDINATOR_API_URL: inspectorUrl, COORDINATOR_API_TOKEN: token,
   });
   const hermesEnv = hostEnvironment(hermesHome);
@@ -318,10 +323,20 @@ const program = Effect.gen(function*() {
       cwd: home, env: nativeEnv, extendEnv: false,
       stdin: Stream.make(startupRequest).pipe(Stream.concat(Stream.never)), forceKillAfter: "1 second",
     }));
+    let sawNativeReady = false;
+    let startupNotice = "";
     const stdout = yield* child.stdout.pipe(Stream.decodeText(), Stream.splitLines, Stream.runForEach((line) =>
-      Schema.decodeEffect(NativeStartupReply)(line).pipe(Effect.matchEffect({
+      Schema.decodeEffect(NativeStartupMessage)(line).pipe(Effect.matchEffect({
         onFailure: () => Effect.void,
-        onSuccess: (reply) => verify.ok(reply.success, `${harness} startup RPC failed`).pipe(Effect.andThen(Deferred.succeed(rpcReady, undefined))),
+        onSuccess: (message) => Effect.gen(function*() {
+          if (message.type === "ready") { sawNativeReady = true; return; }
+          if (message.type === "extension_ui_request") {
+            if (message.message.startsWith("Native inspector unavailable (")) startupNotice = message.message.slice(0, 1024);
+            return;
+          }
+          yield* verify.ok(message.success, `${harness} startup RPC failed`);
+          yield* Deferred.succeed(rpcReady, undefined);
+        }),
       }))), Effect.forkScoped);
     let nativeStderr = "";
     const stderr = yield* child.stderr.pipe(Stream.decodeText(), Stream.runForEach((chunk) => Effect.sync(() => {
@@ -330,7 +345,14 @@ const program = Effect.gen(function*() {
     yield* Effect.raceFirst(
       Effect.all([Deferred.await(startup.entered), Deferred.await(rpcReady)]),
       Fiber.join(stdout).pipe(Effect.andThen(verify.fail(`${harness} RPC output ended before startup`))),
-    ).pipe(Effect.timeout("30 seconds"));
+    ).pipe(
+      Effect.timeoutOrElse({
+        duration: "30 seconds",
+        orElse: () => Effect.gen(function*() {
+          return yield* Effect.die(`Disposable ${harness} startup timed out: announceEntered=${yield* Deferred.isDone(startup.entered)}, announceFinished=${yield* Deferred.isDone(startup.finished)}, rpcReady=${yield* Deferred.isDone(rpcReady)}, sawNativeReady=${sawNativeReady}, pid=${child.pid}, running=${yield* child.isRunning}, executable=${executable}, notice=${JSON.stringify(startupNotice.replaceAll(token, "[redacted]"))}; stderr (last 4096 characters): ${JSON.stringify(nativeStderr.replaceAll(token, "[redacted]"))}`);
+        }),
+      }),
+    );
     yield* verify.equal(yield* Deferred.isDone(startup.finished), false, `${harness} startup waited for the inspector response`);
     blockedStartup = undefined;
     yield* Deferred.succeed(startup.resume, undefined);
