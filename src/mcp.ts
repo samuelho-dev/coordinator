@@ -1,8 +1,6 @@
 import { ByteSize, Cause, Config, Context, Effect, Formatter, Layer, Option, Schema, Stream } from "effect";
 import type { Scope } from "effect";
-import { HttpBody, HttpIncomingMessage, HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { NodeHttpServer } from "@effect/platform-node";
-import { createServer } from "node:http";
+import { FetchHttpClient, HttpBody, HttpClient, HttpClientRequest, HttpIncomingMessage, HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { McpProtocol, McpSchema, McpServer } from "effect/ai";
 import { Client, StreamableHTTPClientTransport, isJSONRPCErrorResponse } from "@modelcontextprotocol/client";
 import { ConnectorAccepted, ConnectorAnnounce, ConnectorDisconnect, ConnectorPoll, ConnectorPollResult, ConnectorResult, HttpError, InspectionTools, SessionInspectInput, SessionInspection, SessionListInput, SessionListOutput } from "./inspection.ts";
@@ -18,7 +16,6 @@ const encodeToolResult = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJ
 const toolResult = (structuredContent: Schema.Json, isError = false) => new McpSchema.CallToolResult({
   isError, content: [McpSchema.TextContent.make({ type: "text", text: Formatter.formatJson(structuredContent, { space: 2 }) })], structuredContent,
 });
-export const serverLayer = (host: string, port: number) => NodeHttpServer.layerServer(() => createServer({ requestTimeout: 15000 }), { host, port, gracefulShutdownTimeout: "1 second" });
 const invalid = () => new HttpError({ status: 400, message: "Invalid inspection request or response" });
 const unavailable = () => new HttpError({ status: 502, message: "Inspection transport unavailable" });
 const boundaryFailure = <E>(cause: Cause.Cause<E>) => {
@@ -100,6 +97,7 @@ const registerTool = <I extends Schema.Top & Schema.ConstraintCodec<unknown, unk
 
 export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
   make: Effect.gen(function*() {
+    const httpClient = yield* HttpClient.HttpClient;
     const post = <I extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>, O extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>>(
       url: string, token: string, path: string, inputSchema: I, outputSchema: O, params: I["Type"], timeoutMs = 10000,
     ): Effect.Effect<O["Type"], HttpError | Cause.TimeoutError> => Effect.scoped(Effect.gen(function*(): Effect.gen.Return<O["Type"], HttpError, Scope.Scope> {
@@ -107,12 +105,13 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
       const input = yield* Schema.encodeEffect(Schema.toCodecJson(inputSchema))(params).pipe(Effect.mapError(invalid));
       const body = JSON.stringify(input);
       if (encoder.encode(body).byteLength > LIMIT) return yield* new HttpError({ status: 413, message: "Request exceeds bound" });
-      const controller = yield* Effect.acquireRelease(Effect.sync(() => new AbortController()), (controller) => Effect.sync(() => controller.abort()));
-      const response = yield* Effect.tryPromise({ try: (signal) => fetch(target, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body, redirect: "error", signal: AbortSignal.any([signal, controller.signal]) }), catch: unavailable });
-      if (!response.ok) { yield* Effect.promise(() => response.body?.cancel() ?? Promise.resolve()); return yield* new HttpError({ status: Math.min(599, Math.max(400, response.status)), message: "Inspection request rejected" }); }
-      if (!response.body) return yield* unavailable();
-      const bytes = yield* Stream.fromReadableStream({ evaluate: () => response.body!, onError: unavailable }).pipe(Stream.mapEffect(byteGate(MCP_RESPONSE_LIMIT)), Stream.runCollect);
-      const text = new TextDecoder().decode(Buffer.concat(bytes));
+      const response = yield* HttpClient.withScope(httpClient).execute(HttpClientRequest.post(target.toString()).pipe(
+        HttpClientRequest.setHeaders({ authorization: `Bearer ${token}` }),
+        HttpClientRequest.bodyText(body, "application/json"),
+      )).pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "error" }), Effect.mapError(unavailable));
+      if (response.status < 200 || response.status >= 300) return yield* new HttpError({ status: Math.min(599, Math.max(400, response.status)), message: "Inspection request rejected" });
+      if (response.status === 204 || response.status === 205) return yield* unavailable();
+      const text = yield* response.stream.pipe(Stream.mapError(unavailable), Stream.mapEffect(byteGate(MCP_RESPONSE_LIMIT)), Stream.decodeText(), Stream.mkString);
       return yield* Schema.decodeEffect(Schema.fromJsonString(Schema.toCodecJson(outputSchema)), { onExcessProperty: "error" })(text).pipe(Effect.mapError(invalid));
     })).pipe(Effect.timeout(timeoutMs));
 
@@ -123,6 +122,7 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
       if (descriptor.name !== InspectionTools.list.name && descriptor.name !== InspectionTools.inspect.name) return yield* invalid();
       let failure: HttpError | undefined;
       const controller = yield* Effect.acquireRelease(Effect.sync(() => new AbortController()), (controller) => Effect.sync(() => controller.abort()));
+      // The SDK's Web fetch callback is its foreign transport seam; it owns MCP framing.
       const sdkFetch: typeof fetch = async (input, init) => {
         if (failure) throw failure;
         const request = new Request(input, init);
@@ -215,5 +215,5 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
     return { call, post, serve, serveStdio };
   }),
 }) {
-  static readonly layer = Layer.effect(this, this.make);
+  static readonly layer = Layer.effect(this, this.make).pipe(Layer.provide(FetchHttpClient.layer));
 }

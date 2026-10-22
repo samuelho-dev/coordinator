@@ -1,9 +1,6 @@
-import { randomUUID, createHash } from "node:crypto";
-import * as fs from "node:fs/promises";
-import { constants } from "node:fs";
-import { homedir } from "node:os";
-import * as path from "node:path";
-import { Clock, Console, Data, Duration, Effect, Schedule, Schema } from "effect";
+import { Cause, Clock, Config, Console, Crypto, Data, Duration, Effect, FileSystem, Option, Path, PlatformError, Schedule, Schema, Scope } from "effect";
+import { Hex } from "effect/encoding";
+import { Host } from "./platform.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { Stream } from "effect";
 import { Mcp } from "./mcp.ts";
@@ -11,57 +8,128 @@ import { INSPECTION_LIMIT, ConnectorConfig, ConnectorAnnounce, ConnectorAccepted
 import { identifyProcess, observeResources, type ProcessIdentification } from "./resources.ts";
 
 export class NativeError extends Data.TaggedError("NativeError")<{ readonly operation: string }> {}
+export type NativeConfig = ConnectorConfig & { readonly machineId: string; readonly stateDirectory: string };
 export type NativeNotice = {
   readonly state: "unavailable" | "recovered" | "error";
   readonly operation: string;
   readonly code?: string | undefined;
   readonly status?: number | undefined;
 };
-const io = <A>(operation: string, run: () => Promise<A>) => Effect.tryPromise({ try: run, catch: () => new NativeError({ operation }) });
 const json = (text: string) => Effect.try({ try: (): unknown => JSON.parse(text), catch: () => new NativeError({ operation: "Invalid native JSON" }) });
 const decode = <S extends Schema.Top>(schema: S, value: unknown) => Schema.decodeUnknownEffect(schema)(value).pipe(Effect.mapError(() => new NativeError({ operation: "Invalid native metadata" })));
 const maximumBytes = 65536;
 const cacheLifetime = 120000;
 
-// Open without following a final symlink, validate the opened inode, and bound the read.
-export const readPrivateFile = (file: string) => io("Read private file", async () => {
-  if (!path.isAbsolute(file) || path.resolve(file) !== file) throw new Error("path");
-  const parent = path.dirname(file);
-  const directory = await fs.lstat(parent);
-  if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o077) !== 0 || directory.uid !== process.getuid?.() || await fs.realpath(parent) !== parent) throw new Error("directory");
-  const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const info = await handle.stat();
-    if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > maximumBytes) throw new Error("file");
-    const bytes = Buffer.alloc(maximumBytes + 1);
-    const result = await handle.read(bytes, 0, bytes.length, 0);
-    if (result.bytesRead > maximumBytes) throw new Error("bound");
-    return bytes.toString("utf8", 0, result.bytesRead);
-  } finally { await handle.close(); }
-});
-export const loadConnectorConfig = (file?: string) => Effect.gen(function*() {
-  const explicit = file ?? process.env.COORDINATOR_CONNECTOR_CONFIG;
-  const target = explicit ?? path.join(process.env.XDG_CONFIG_HOME ?? path.join(homedir(), ".config"), "coordinator", "inspector.json");
-  if (explicit === undefined) {
-    const exists = yield* io("Locate connector configuration", () => fs.lstat(target).then(() => true, (error: unknown) => {
-      const code = Schema.decodeUnknownOption(Schema.Struct({ code: Schema.Literal("ENOENT") }))(error);
-      if (code._tag === "Some") return false;
-      throw error;
-    }));
-    if (!exists) return undefined;
+const platformFailure = (operation: string) => () => new NativeError({ operation });
+// FileSystem finalizers close with orDie; sanitize only their platform defects.
+const sanitizeFileFinalizers = (operation: string) => <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(
+  Effect.catchCause((cause) => Effect.failCause(Cause.fromReasons<E | NativeError>(cause.reasons.map((reason) =>
+    reason._tag === "Die" && PlatformError.isPlatformError(reason.defect) && reason.defect.reason.module === "FileSystem"
+      ? Cause.makeFailReason(new NativeError({ operation }))
+      : reason)))),
+);
+const validateDirectory = (directory: string, exact = false) => Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const host = yield* Host;
+  const info = yield* fs.stat(directory);
+  if (info.type !== "Directory" || Option.getOrUndefined(info.uid) !== host.uid || host.uid === undefined || (info.mode & (exact ? 0o777 : 0o077)) !== (exact ? 0o700 : 0) || (yield* fs.realPath(directory)) !== directory) {
+    return yield* new NativeError({ operation: "Unsafe private directory" });
   }
-  return yield* Schema.decodeUnknownEffect(ConnectorConfig, { onExcessProperty: "error" })(yield* json(yield* readPrivateFile(target))).pipe(Effect.mapError(() => new NativeError({ operation: "Invalid connector configuration" })));
+});
+// Validate the opened inode, not a subsequent path lookup; reads may be partial.
+const readPrivateText = (file: string, exact = false) => Effect.scoped(Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const host = yield* Host;
+  if (!path.isAbsolute(file) || path.resolve(file) !== file) return yield* new NativeError({ operation: "Unsafe private path" });
+  yield* validateDirectory(path.dirname(file));
+  const handle = yield* fs.open(file, { flag: "r", noFollow: true });
+  const info = yield* handle.stat;
+  if (info.type !== "File" || host.uid === undefined || Option.getOrUndefined(info.uid) !== host.uid || (info.mode & (exact ? 0o777 : 0o077)) !== (exact ? 0o600 : 0) || info.size > maximumBytes) return yield* new NativeError({ operation: "Unsafe private file" });
+  const bytes = new Uint8Array(maximumBytes + 1);
+  let length = 0;
+  while (length < bytes.length) {
+    const count = yield* handle.read(bytes.subarray(length));
+    if (count === 0) break;
+    length += count;
+  }
+  if (length > maximumBytes) return yield* new NativeError({ operation: "Private file exceeds bound" });
+  return new TextDecoder().decode(bytes.subarray(0, length));
+})).pipe(sanitizeFileFinalizers("Read private file"));
+export const readPrivateFile = (file: string) => readPrivateText(file).pipe(Effect.mapError(platformFailure("Read private file")));
+export const loadConnectorConfig = (file?: string) => Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const host = yield* Host;
+  const selected = yield* Config.String("COORDINATOR_CONNECTOR_CONFIG").pipe(Config.option);
+  const xdg = yield* Config.String("XDG_CONFIG_HOME").pipe(Config.option);
+  const explicit = file ?? Option.getOrUndefined(selected);
+  const target = explicit ?? path.join(Option.getOrUndefined(xdg) ?? path.join(host.homeDirectory, ".config"), "coordinator", "inspector.json");
+  const exists = explicit !== undefined || (yield* fs.readDirectory(path.dirname(target)).pipe(
+    Effect.map((entries) => entries.includes(path.basename(target))),
+    Effect.catch((error) => error.reason._tag === "NotFound" ? Effect.succeed(false) : Effect.fail(error)),
+    Effect.mapError(platformFailure("Locate connector configuration")),
+  ));
+  const fields = yield* Schema.decodeUnknownEffect(Schema.Struct({
+    inspectorUrl: Schema.optional(Schema.Unknown), apiToken: Schema.optional(Schema.Unknown), tokenFile: Schema.optional(Schema.Unknown),
+  }), { onExcessProperty: "error" })(exists ? yield* json(yield* readPrivateFile(target)) : {}).pipe(
+    Effect.mapError(platformFailure("Invalid connector configuration")),
+  );
+  const url = yield* Config.String("COORDINATOR_API_URL").pipe(Config.option);
+  const token = yield* Config.String("COORDINATOR_API_TOKEN").pipe(Config.option);
+  const inspectorUrl = Option.getOrUndefined(url) ?? fields.inspectorUrl;
+  if (!exists && inspectorUrl === undefined) return undefined;
+  return yield* Schema.decodeUnknownEffect(ConnectorConfig, { onExcessProperty: "error" })({
+    ...fields,
+    ...(inspectorUrl === undefined ? {} : { inspectorUrl }),
+    ...(Option.isNone(token) ? {} : { apiToken: token.value }),
+  }).pipe(Effect.mapError(platformFailure("Invalid connector configuration")));
 });
 export const readConnectorToken = (config: ConnectorConfig) => Effect.gen(function*() {
+  if (config.apiToken !== undefined) return config.apiToken;
+  if (config.tokenFile === undefined) return yield* new NativeError({ operation: "Connector credential required" });
   const token = (yield* readPrivateFile(config.tokenFile)).trim();
-  if (token.length < 16 || token.length > 4096 || /\s/.test(token)) return yield* new NativeError({ operation: "Invalid connector credential" });
+  if (token.length < 16 || token.length > 4096 || !/^[A-Za-z0-9._~+\/-]+=*$/.test(token)) return yield* new NativeError({ operation: "Invalid connector credential" });
   return token;
 });
+
+export const resolveNativeConfig = (config: ConnectorConfig) => Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const crypto = yield* Crypto.Crypto;
+  const host = yield* Host;
+  const xdg = yield* Config.String("XDG_STATE_HOME").pipe(Config.option);
+  const base = Option.getOrUndefined(xdg) ?? (host.platform === "darwin" ? path.join(host.homeDirectory, "Library", "Application Support") : path.join(host.homeDirectory, ".local", "state"));
+  if (!path.isAbsolute(base) || path.resolve(base) !== base || /[\0\r\n]/.test(base)) return yield* new NativeError({ operation: "Unsafe state path" });
+  const stateDirectory = path.join(base, "coordinator");
+  yield* fs.makeDirectory(stateDirectory, { recursive: true, mode: 0o700 });
+  yield* validateDirectory(stateDirectory, true);
+  const target = path.join(stateDirectory, "machine-id");
+  const readIdentity = readPrivateText(target, true).pipe(Effect.flatMap((text) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\n$/.test(text)
+      ? Effect.succeed(text.slice(0, -1)) : Effect.fail(new NativeError({ operation: "Invalid installation identity" }))));
+  const existing = yield* readIdentity.pipe(Effect.map(Option.some), Effect.catch((error) =>
+    error._tag === "PlatformError" && error.reason._tag === "NotFound" ? Effect.succeed(Option.none<string>()) : Effect.fail(error)));
+  if (Option.isSome(existing)) return { ...config, machineId: existing.value, stateDirectory };
+  const temporary = path.join(stateDirectory, `.machine-id-${yield* crypto.randomUUIDv4()}`);
+  const machineId = yield* crypto.randomUUIDv4();
+  return yield* Effect.scoped(Effect.gen(function*() {
+    const cleanupScope = yield* Effect.scope;
+    yield* Effect.scoped(Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+      const handle = yield* fs.open(temporary, { flag: "wx", mode: 0o600 });
+      yield* Scope.addFinalizer(cleanupScope, fs.remove(temporary).pipe(Effect.orDie));
+      yield* restore(handle.writeAll(new TextEncoder().encode(machineId + "\n")));
+    })));
+    yield* fs.link(temporary, target).pipe(Effect.catch((error) =>
+      error.reason._tag === "AlreadyExists" ? Effect.void : Effect.fail(error)));
+    return yield* readIdentity;
+  })).pipe(Effect.map((identity) => ({ ...config, machineId: identity, stateDirectory })));
+}).pipe(sanitizeFileFinalizers("Resolve private native installation identity"), Effect.mapError(platformFailure("Resolve private native installation identity")));
 
 export const withProcessResources = (inspection: SessionInspection) => Effect.gen(function*() {
   const roots = inspection.presence.processes ?? [];
   if (roots.length === 0) {
-    if (Buffer.byteLength(JSON.stringify(inspection)) > INSPECTION_LIMIT - 2 * 1024) return yield* new NativeError({ operation: "Native inspection exceeds connector budget" });
+    if (new TextEncoder().encode(JSON.stringify(inspection)).length > INSPECTION_LIMIT - 2 * 1024) return yield* new NativeError({ operation: "Native inspection exceeds connector budget" });
     return inspection;
   }
   const sample = yield* observeResources(roots.map((root) => ({ pid: root.pid, startTime: root.startIdentity, ownership: root.ownership === "owned" ? "exclusive" : root.ownership })));
@@ -83,13 +151,13 @@ export const withProcessResources = (inspection: SessionInspection) => Effect.ge
   };
   // Leave normalization headroom inside the registry's observation limit.
   const result = { ...inspection, resources };
-  let bytes = Buffer.byteLength(JSON.stringify(result));
+  let bytes = new TextEncoder().encode(JSON.stringify(result)).length;
   let truncated = false;
   for (const item of sample.processes) {
     if (item.startTime === null) continue;
     const p = provenance("process", item.ownership !== "exclusive", item);
     const row: typeof inspection.resources.processes[number] = { process: { pid: item.pid, startIdentity: item.startTime, ownership: item.ownership === "exclusive" ? "owned" : item.ownership }, cpuPercent: measured("percent-one-core", item.cpuPercent, p), cpuTimeMs: measured("milliseconds", item.cpuTimeMs, p), rssBytes: measured("bytes", item.rssBytes, p) };
-    const size = Buffer.byteLength(JSON.stringify(row)) + (rows.length > 0 ? 1 : 0);
+    const size = new TextEncoder().encode(JSON.stringify(row)).length + (rows.length > 0 ? 1 : 0);
     if (bytes + size > INSPECTION_LIMIT - 2 * 1024 || rows.length >= 128) {
       truncated = true;
       break;
@@ -104,11 +172,11 @@ export const withProcessResources = (inspection: SessionInspection) => Effect.ge
       ownedProcessCount: partial(resources.ownedProcessCount), ownedCpuPercent: partial(resources.ownedCpuPercent), ownedRssBytes: partial(resources.ownedRssBytes),
     };
   }
-  if (Buffer.byteLength(JSON.stringify(result)) > INSPECTION_LIMIT - 2 * 1024) return yield* new NativeError({ operation: "Native inspection exceeds connector budget" });
+  if (new TextEncoder().encode(JSON.stringify(result)).length > INSPECTION_LIMIT - 2 * 1024) return yield* new NativeError({ operation: "Native inspection exceeds connector budget" });
   return result;
 });
 
-export const connectNative = <E extends { readonly _tag: string }, R>(config: ConnectorConfig, callbacks: {
+export const connectNative = <E extends { readonly _tag: string }, R>(config: NativeConfig, callbacks: {
   readonly presence: () => Effect.Effect<ReadonlyArray<SessionPresence>, E, R>;
   readonly inspect: (ref: SessionRef) => Effect.Effect<SessionInspection, E, R>;
   readonly report?: ((notice: NativeNotice) => Effect.Effect<void>) | undefined;
@@ -117,8 +185,9 @@ export const connectNative = <E extends { readonly _tag: string }, R>(config: Co
   const clock = yield* Clock.Clock;
   const now = () => Number(clock.monotonicTimeNanosUnsafe() / 1_000_000n);
   let token = yield* readConnectorToken(config);
-  const identity = { connectorId: randomUUID(), incarnation: randomUUID() };
-  const report = callbacks.report ?? ((notice: NativeNotice) => Console.error(JSON.stringify({ message: "Native inspector", ...notice })));
+  const crypto = yield* Crypto.Crypto;
+  const identity = { connectorId: yield* crypto.randomUUIDv4(), incarnation: yield* crypto.randomUUIDv4() };
+  const report = callbacks.report ?? ((notice: NativeNotice) => Effect.logDebug({ message: "Native inspector", state: notice.state, operation: notice.operation, code: notice.code, status: notice.status }));
   let isUnavailable = false;
   let hasReportedHealthy = false;
   let failedAt: number | undefined;
@@ -149,14 +218,14 @@ export const connectNative = <E extends { readonly _tag: string }, R>(config: Co
     mcp.post(config.inspectorUrl, token, route, input, output, value).pipe(Effect.tapError((error) => unavailable(route, error)));
   // ponytail: disconnect is advisory; registry expiry handles an unreachable receiver.
   yield* Effect.addFinalizer(() => mcp.post(config.inspectorUrl, token, "/connector/disconnect", ConnectorDisconnect, ConnectorAccepted, identity, 500).pipe(
-    Effect.catch((error) => report(failure("error", "/connector/disconnect", error))),
+    Effect.catch((error) => Effect.logDebug({ operation: "/connector/disconnect", code: error._tag, status: error._tag === "HttpError" ? error.status : undefined })),
   ));
   const announce = Effect.gen(function*() {
     const sessions = yield* callbacks.presence();
     if (sessions.length > 256) return yield* new NativeError({ operation: "Native presence exceeds bound" });
     yield* post("/connector/announce", ConnectorAnnounce, ConnectorAccepted, { ...identity, machineId: config.machineId, sessions });
   }).pipe(Effect.tapError((error) => unavailable("native presence", error)));
-  const observationFailure = (error: { readonly _tag: string; readonly status?: number | undefined }) => report(failure("error", "native detail", error)).pipe(
+  const observationFailure = (error: { readonly _tag: string; readonly status?: number | undefined }) => Effect.logDebug({ operation: "native detail", code: error._tag, status: error.status }).pipe(
     Effect.as<ObservationError>({
       code: error._tag === "TimeoutError" ? "timeout" : error._tag === "HttpError" && error.status === 404 ? "not-found" : "unavailable",
       message: "Native session observation unavailable",
@@ -210,7 +279,8 @@ const Usage = Schema.Struct({ input_tokens: optionalCount, output_tokens: option
 const ClaudeStatus = Schema.Struct({ session_id: Id, model: Schema.optional(Schema.Struct({ id: Schema.optional(Id) })), workspace: Schema.optional(Schema.Struct({ current_dir: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))) })), context_window: Schema.optional(Schema.Struct({ current_usage: Schema.optional(Schema.NullOr(Usage)), total_input_tokens: optionalCount, total_output_tokens: optionalCount, context_window_size: optionalCount, used_percentage: optionalN, remaining_percentage: Schema.optional(Schema.NullOr(Schema.Finite)) })), cost: Schema.optional(Schema.Struct({ total_cost_usd: optionalN, total_duration_ms: optionalN, total_api_duration_ms: optionalN })) });
 const cachedProvenance = (source: string, scope: MetricProvenance["scope"], at: number, description: string, estimated = false): MetricProvenance => ({ source, scope, scopeDescription: description, observedAt: at, nativeUpdatedAt: null, estimated, derived: false, shared: false, partial: false, stale: false });
 const numberMetric = <U extends MetricUnit>(unit: U, value: number | null | undefined, p: MetricProvenance) => value === undefined || value === null ? unavailableMetric(unit, "Native counter not supplied", p) : metric(unit, value, p);
-export const projectHook = (harness: "claude" | "codex", machineId: string, value: unknown, at = Date.now()) => Effect.gen(function*() {
+export const projectHook = (harness: "claude" | "codex", machineId: string, value: unknown, at?: number) => Effect.gen(function*() {
+  at ??= yield* Clock.currentTimeMillis;
   const event = yield* decode(Hook, value);
   const name = event.hook_event_name;
   const activity: NonNullable<SessionPresence["activity"]> = name === "PreCompact" || event.source === "compact" ? { state: "working", compacting: true } : name === "SessionEnd" ? { state: "stopped" } : name === "PermissionRequest" ? { state: "waiting", wait: "approval", approval: "pending", ...(event.tool_name ? { currentToolName: event.tool_name } : {}) } : name === "PreToolUse" ? { state: "working", wait: "tool", ...(event.tool_name ? { currentToolName: event.tool_name } : {}) } : name === "Stop" || name === "Interrupt" ? { state: "idle" } : name === "UserPromptSubmit" ? { state: "working", wait: "api" } : { state: "unknown" };
@@ -218,7 +288,8 @@ export const projectHook = (harness: "claude" | "codex", machineId: string, valu
   const presence: SessionPresence = { ref: { machineId, harness, nativeSessionId: event.session_id }, observedAt: at, nativeUpdatedAt: at, lastActivityAt: at, activity, ...(event.cwd ? { cwd: event.cwd } : {}), ...(model ? { model } : {}) };
   return createInspection(presence, at);
 });
-export const projectClaudeStatus = (machineId: string, value: unknown, at = Date.now()) => Effect.gen(function*() {
+export const projectClaudeStatus = (machineId: string, value: unknown, at?: number) => Effect.gen(function*() {
+  at ??= yield* Clock.currentTimeMillis;
   const data = yield* decode(ClaudeStatus, value);
   const inspection = createInspection({ ref: { machineId, harness: "claude", nativeSessionId: data.session_id }, observedAt: at, ...(data.model?.id ? { model: data.model.id } : {}), ...(data.workspace?.current_dir ? { cwd: data.workspace.current_dir } : {}) }, at);
   const p = cachedProvenance("claude-statusline", "latest-native-update", at, "Cached current-context/latest-response figures; not lifetime totals; native counter update time unknown");
@@ -235,15 +306,16 @@ export const projectClaudeStatus = (machineId: string, value: unknown, at = Date
 });
 const TokenBreakdown = Schema.Struct({ inputTokens: Count, cachedInputTokens: Count, cacheWriteInputTokens: optionalCount, outputTokens: Count, reasoningOutputTokens: Count, totalTokens: Count });
 const CodexNotification = Schema.Struct({ version: Schema.Literal(2), source: Schema.Literal("attached-app-server"), method: Schema.Literal("thread/tokenUsage/updated"), params: Schema.Struct({ threadId: Id, turnId: Id, tokenUsage: Schema.Struct({ last: TokenBreakdown, total: TokenBreakdown, modelContextWindow: Schema.NullOr(Count) }) }) });
-export const projectCodexNotification = (machineId: string, value: unknown, at = Date.now()) => Effect.gen(function*() {
+export const projectCodexNotification = (machineId: string, value: unknown, at?: number) => Effect.gen(function*() {
+  const observedAt = at ?? (yield* Clock.currentTimeMillis);
   const envelope = yield* decode(CodexNotification, value);
   const data = envelope.params;
-  const inspection = createInspection({ ref: { machineId, harness: "codex", nativeSessionId: data.threadId }, observedAt: at }, at);
+  const inspection = createInspection({ ref: { machineId, harness: "codex", nativeSessionId: data.threadId }, observedAt }, observedAt);
   const tokens = (value: typeof TokenBreakdown.Type, scope: "latest-native-update" | "native-aggregate") => {
-    const p = cachedProvenance("codex-app-server-v2", scope, at, scope === "native-aggregate" ? "Native attached-thread total; cache is subset of input, reasoning subset of output" : "Native attached-thread last token update; cache is subset of input, reasoning subset of output");
+    const p = cachedProvenance("codex-app-server-v2", scope, observedAt, scope === "native-aggregate" ? "Native attached-thread total; cache is subset of input, reasoning subset of output" : "Native attached-thread last token update; cache is subset of input, reasoning subset of output");
     return { inputTokens: numberMetric("tokens", value.inputTokens, p), outputTokens: numberMetric("tokens", value.outputTokens, p), cacheReadTokens: numberMetric("tokens", value.cachedInputTokens, p), cacheWriteTokens: numberMetric("tokens", value.cacheWriteInputTokens, p), reasoningOutputTokens: numberMetric("tokens", value.reasoningOutputTokens, p), totalTokens: numberMetric("tokens", value.totalTokens, p) };
   };
-  return { ...inspection, tokens: { latestNativeUpdate: tokens(data.tokenUsage.last, "latest-native-update"), nativeAggregate: tokens(data.tokenUsage.total, "native-aggregate") }, context: { ...inspection.context, contextWindowTokens: numberMetric("tokens", data.tokenUsage.modelContextWindow, cachedProvenance("codex-app-server-v2", "current-context", at, "Native attached-thread model context window; no input-only used basis supplied")) } };
+  return { ...inspection, tokens: { latestNativeUpdate: tokens(data.tokenUsage.last, "latest-native-update"), nativeAggregate: tokens(data.tokenUsage.total, "native-aggregate") }, context: { ...inspection.context, contextWindowTokens: numberMetric("tokens", data.tokenUsage.modelContextWindow, cachedProvenance("codex-app-server-v2", "current-context", observedAt, "Native attached-thread model context window; no input-only used basis supplied")) } };
 });
 
 const HermesUsage = Schema.Struct({ input_tokens: optionalCount, prompt_tokens: optionalCount, output_tokens: optionalCount, completion_tokens: optionalCount, total_tokens: optionalCount, cache_read_tokens: optionalCount, cache_write_tokens: optionalCount, reasoning_tokens: optionalCount });
@@ -256,26 +328,28 @@ const HermesHook = Schema.Struct({
 const Cache = Schema.Struct({ version: Schema.Literal(2), kind: Schema.Literal("inspection"), expiresAt: N, inspection: SessionInspection });
 const identifyHermesHost = (pid: number) => identifyProcess(pid).pipe(Effect.catchTag("ResourceError", (error) =>
   Console.error(JSON.stringify({ error: "Hermes hook host identity unavailable", code: error._tag })).pipe(Effect.as<ProcessIdentification>({ status: "unavailable", reason: "host-identity-unavailable" }))));
-const cacheDirectory = (config: ConnectorConfig) => path.join(config.stateDirectory, "native-observations");
-const cacheFile = (config: ConnectorConfig, ref: SessionRef) => path.join(cacheDirectory(config), (ref.harness === "hermes" ? "hermes-" : "") + createHash("sha256").update(sessionRefKey(ref)).digest("hex") + ".json");
-const prepareCache = (config: ConnectorConfig) => io("Prepare private metadata cache", async () => {
-  const directory = cacheDirectory(config);
-  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  const info = await fs.lstat(directory);
-  if (!info.isDirectory() || (info.mode & 0o077) !== 0 || info.uid !== process.getuid?.() || await fs.realpath(directory) !== directory) throw new Error("directory");
+const cacheFile = (config: NativeConfig, ref: SessionRef) => Effect.gen(function*() {
+  const path = yield* Path.Path;
+  const crypto = yield* Crypto.Crypto;
+  const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(ref)));
+  return path.join(config.stateDirectory, "native-observations", (ref.harness === "hermes" ? "hermes-" : "") + Hex.encode(digest) + ".json");
 });
-const cacheRecords = (config: ConnectorConfig, hermesIdentities = new Map<number, ProcessIdentification>()) => Effect.gen(function*() {
-  yield* prepareCache(config);
-  const entries = yield* io("List metadata cache", () => fs.readdir(cacheDirectory(config)));
+const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, ProcessIdentification>()) => Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const directory = path.join(config.stateDirectory, "native-observations");
+  yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
+  yield* validateDirectory(directory);
+  const entries = yield* fs.readDirectory(directory);
   const records = new Map<string, typeof Cache.Type>();
   for (const entry of entries) {
     if (!/^(hermes-)?[a-f0-9]{64}\.json$/.test(entry)) continue;
-    const file = path.join(cacheDirectory(config), entry);
+    const file = path.join(directory, entry);
     const parsed = yield* readPrivateFile(file).pipe(Effect.flatMap(json), Effect.map(Schema.decodeUnknownOption(Cache)), Effect.catch((error) => Console.error(JSON.stringify({ error: "Ignoring unsupported native cache", code: error._tag })).pipe(Effect.as(undefined))));
     if (parsed === undefined || parsed._tag === "None") continue;
     const record = parsed.value;
     const ref = record.inspection.presence.ref;
-    if (ref.machineId !== config.machineId || cacheFile(config, ref) !== file) continue;
+    if (ref.machineId !== config.machineId || (yield* cacheFile(config, ref)) !== file) continue;
     let liveHermesHost = false;
     if (ref.harness === "hermes" && record.inspection.presence.activity?.state !== "stopped") {
       for (const binding of record.inspection.presence.processes ?? []) {
@@ -287,16 +361,16 @@ const cacheRecords = (config: ConnectorConfig, hermesIdentities = new Map<number
         if (binding.ownership === "shared" && identity.status === "available" && identity.startTime === binding.startIdentity) liveHermesHost = true;
       }
     }
-    if ((!liveHermesHost && record.expiresAt <= Date.now()) || record.inspection.presence.activity?.state === "stopped") {
-      yield* io("Expire owned native observation", () => fs.unlink(file));
+    if ((!liveHermesHost && record.expiresAt <= (yield* Clock.currentTimeMillis)) || record.inspection.presence.activity?.state === "stopped") {
+      yield* fs.remove(file);
     } else records.set(file, record);
   }
   if (records.size > 1024) return yield* new NativeError({ operation: "Metadata cache exceeds bound" });
   return records;
-});
-export const writeNativeCache = (config: ConnectorConfig, incoming: SessionInspection) => Effect.gen(function*() {
+}).pipe(sanitizeFileFinalizers("Read private metadata cache"), Effect.catchTag("PlatformError", () => Effect.fail(new NativeError({ operation: "Read private metadata cache" }))));
+export const writeNativeCache = (config: NativeConfig, incoming: SessionInspection) => Effect.gen(function*() {
   const records = yield* cacheRecords(config);
-  const target = cacheFile(config, incoming.presence.ref);
+  const target = yield* cacheFile(config, incoming.presence.ref);
   if (records.size >= 1024 && !records.has(target)) return yield* new NativeError({ operation: "Metadata cache exceeds bound" });
   let inspection = incoming;
   const previous = records.get(target);
@@ -305,25 +379,32 @@ export const writeNativeCache = (config: ConnectorConfig, incoming: SessionInspe
     const metadataOnly = incoming.presence.nativeUpdatedAt !== undefined;
     inspection = { ...(metadataOnly ? old : incoming), presence: { ...old.presence, ...incoming.presence }, queriedAt: incoming.queriedAt, context: metadataOnly && !incoming.presence.activity?.compacting ? old.context : incoming.context };
   }
-  yield* io("Write private metadata cache", async () => {
-    // An unsupported file, even inside our namespace, is not ours to replace.
-    if (!records.has(target)) {
-      try { await fs.lstat(target); throw new Error("unsupported cache input"); }
-      catch (error) { if (Schema.decodeUnknownOption(Schema.Struct({ code: Schema.Literal("ENOENT") }))(error)._tag !== "Some") throw error; }
-    }
-    const text = JSON.stringify({ version: 2, kind: "inspection", expiresAt: incoming.presence.observedAt + cacheLifetime, inspection });
-    if (Buffer.byteLength(text) > maximumBytes) throw new Error("bound");
-    const temporary = target + "." + randomUUID();
-    await fs.writeFile(temporary, text, { flag: "wx", mode: 0o600 });
-    try { await fs.rename(temporary, target); } finally { await fs.rm(temporary, { force: true }); }
-  });
-});
-export const writeHermesHook = (config: ConnectorConfig, value: unknown, at = Date.now(), hostPid = process.ppid) => Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const crypto = yield* Crypto.Crypto;
+  // Directory entries include dangling symlinks; unsupported inputs are never replaced.
+  if (!records.has(target) && (yield* fs.readDirectory(path.dirname(target))).includes(path.basename(target))) return yield* new NativeError({ operation: "Unsupported cache input" });
+  const bytes = new TextEncoder().encode(JSON.stringify({ version: 2, kind: "inspection", expiresAt: incoming.presence.observedAt + cacheLifetime, inspection }));
+  if (bytes.length > maximumBytes) return yield* new NativeError({ operation: "Metadata cache exceeds bound" });
+  const temporary = target + "." + (yield* crypto.randomUUIDv4());
+  yield* Effect.scoped(Effect.gen(function*() {
+    const cleanupScope = yield* Effect.scope;
+    yield* Effect.scoped(Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+      const handle = yield* fs.open(temporary, { flag: "wx", mode: 0o600 });
+      yield* Scope.addFinalizer(cleanupScope, fs.remove(temporary, { force: true }).pipe(Effect.orDie));
+      yield* restore(handle.writeAll(bytes));
+    })));
+    yield* fs.rename(temporary, target);
+  }));
+}).pipe(sanitizeFileFinalizers("Write private metadata cache"), Effect.catchTag("PlatformError", () => Effect.fail(new NativeError({ operation: "Write private metadata cache" }))));
+export const writeHermesHook = (config: NativeConfig, value: unknown, at?: number, hostPid?: number) => Effect.gen(function*() {
+  at ??= yield* Clock.currentTimeMillis;
+  hostPid ??= (yield* Host).ppid;
   const event = yield* decode(HermesHook, value);
   const sessionId = event.hook_event_name === "on_session_finalize" ? event.extra.old_session_id ?? event.session_id : event.session_id;
   if (!sessionId) return yield* new NativeError({ operation: "Missing native session identity" });
   const ref: SessionRef = { machineId: config.machineId, harness: "hermes", nativeSessionId: sessionId };
-  const previous = (yield* cacheRecords(config)).get(cacheFile(config, ref))?.inspection;
+  const previous = (yield* cacheRecords(config)).get(yield* cacheFile(config, ref))?.inspection;
   if (!previous && event.hook_event_name !== "on_session_start") return;
   // Hermes shell_hooks.py directly Popen's argv (shell=False); /usr/bin/env execs Node.
   // Only this direct-exec contract attributes PPID, as a shared hook host, never a session-owned process.
@@ -347,7 +428,7 @@ export const writeHermesHook = (config: ConnectorConfig, value: unknown, at = Da
     reasoningOutputTokens: numberMetric("tokens", usage?.reasoning_tokens, p), totalTokens: numberMetric("tokens", usage?.total_tokens, p),
   } } });
 });
-export const readNativeCache = (config: ConnectorConfig) => Effect.gen(function*() {
+export const readNativeCache = (config: NativeConfig) => Effect.gen(function*() {
   const observations: SessionInspection[] = [];
   const hermesIdentities = new Map<number, ProcessIdentification>();
   for (const record of (yield* cacheRecords(config, hermesIdentities)).values()) {
@@ -358,13 +439,13 @@ export const readNativeCache = (config: ConnectorConfig) => Effect.gen(function*
       if (identity?.status === "available" && identity.startTime === binding.startIdentity) alive.push(binding);
     }
     if ((inspection.presence.processes?.length ?? 0) > 0 && alive.length === 0) continue;
-    observations.push({ ...inspection, presence: { ...inspection.presence, ...(inspection.presence.ref.harness === "hermes" && alive.length > 0 ? { observedAt: Date.now() } : {}), processes: alive } });
+    observations.push({ ...inspection, presence: { ...inspection.presence, ...(inspection.presence.ref.harness === "hermes" && alive.length > 0 ? { observedAt: yield* Clock.currentTimeMillis } : {}), processes: alive } });
   }
   return observations;
 });
 
 const ClaudeRoster = Schema.Array(Schema.Struct({ sessionId: Schema.optional(Id), id: Schema.optional(Id), pid: Schema.optional(Schema.Int), cwd: Schema.optional(Schema.String), kind: Schema.optional(Id), status: Schema.optional(Schema.Literals(["busy", "waiting", "idle"])), waitingFor: Schema.optional(Schema.String) })).check(Schema.isMaxLength(256));
-export const claudeRoster = (config: ConnectorConfig) => Effect.scoped(Effect.gen(function*() {
+export const claudeRoster = (config: NativeConfig) => Effect.scoped(Effect.gen(function*() {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const child = yield* spawner.spawn(ChildProcess.make("claude", ["agents", "--json"], { stdin: "ignore" }));
   yield* Effect.forkScoped(Stream.runDrain(child.stderr));
@@ -381,27 +462,27 @@ export const claudeRoster = (config: ConnectorConfig) => Effect.scoped(Effect.ge
     if (!id || !row.pid) continue;
     const identity = yield* identifyProcess(row.pid);
     if (identity.status !== "available") continue;
-    sessions.push({ ref: { machineId: config.machineId, harness: "claude", nativeSessionId: id }, observedAt: Date.now(), ...(row.cwd ? { cwd: row.cwd } : {}), ...(row.kind ? { kind: row.kind } : {}), processes: [{ pid: row.pid, startIdentity: identity.startTime, ownership: "owned" }], activity: { state: row.status === "busy" ? "working" : row.status === "waiting" ? "waiting" : row.status === "idle" ? "idle" : "unknown", ...(row.waitingFor === "permission prompt" ? { wait: "approval", approval: "pending" } : {}) } });
+    sessions.push({ ref: { machineId: config.machineId, harness: "claude", nativeSessionId: id }, observedAt: yield* Clock.currentTimeMillis, ...(row.cwd ? { cwd: row.cwd } : {}), ...(row.kind ? { kind: row.kind } : {}), processes: [{ pid: row.pid, startIdentity: identity.startTime, ownership: "owned" }], activity: { state: row.status === "busy" ? "working" : row.status === "waiting" ? "waiting" : row.status === "idle" ? "idle" : "unknown", ...(row.waitingFor === "permission prompt" ? { wait: "approval", approval: "pending" } : {}) } });
   }
   return sessions;
 })).pipe(Effect.timeout("5 seconds"));
-export const connectExternal = (config: ConnectorConfig) => {
+export const connectExternal = (config: NativeConfig) => {
   let latest = new Map<string, SessionInspection>();
   return connectNative(config, {
     presence: () => Effect.gen(function*() {
       const cached = yield* readNativeCache(config);
       latest = new Map(cached.map((observation) => [sessionRefKey(observation.presence.ref), observation]));
-      const roster = yield* claudeRoster(config).pipe(Effect.catch((error) => Effect.logWarning("Claude roster unavailable", error._tag).pipe(Effect.as([]))));
+      const roster = yield* claudeRoster(config).pipe(Effect.catch((error) => Effect.logDebug({ operation: "native Claude roster", code: error._tag }).pipe(Effect.as([]))));
       for (const presence of roster) {
         const old = latest.get(sessionRefKey(presence.ref));
-        latest.set(sessionRefKey(presence.ref), { ...(old ?? createInspection(presence, Date.now())), presence: { ...old?.presence, ...presence } });
+        latest.set(sessionRefKey(presence.ref), { ...(old ?? createInspection(presence, yield* Clock.currentTimeMillis)), presence: { ...old?.presence, ...presence } });
       }
       return Array.from(latest.values(), (observation) => observation.presence);
     }),
     inspect: (ref) => Effect.gen(function*() {
       const observation = latest.get(sessionRefKey(ref));
       if (!observation) return yield* new NativeError({ operation: "Native session unavailable" });
-      return yield* withProcessResources({ ...observation, queriedAt: Date.now() });
+      return yield* withProcessResources({ ...observation, queriedAt: yield* Clock.currentTimeMillis });
     }),
   });
 };

@@ -1,12 +1,12 @@
 import { NodeServices } from "@effect/platform-node";
-import { hostname, release } from "node:os";
-import { Cause, Effect, Layer, ManagedRuntime, Schema } from "effect";
+import { Cause, Clock, Config, Console, Effect, Layer, Logger, ManagedRuntime, Schema } from "effect";
 import { createInspection, HttpError, InspectionTools, metric, sessionRefKey, unavailableMetric } from "./inspection.ts";
 import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, SessionInspection, SessionListOutput, SessionPresence } from "./inspection.ts";
 import { Mcp } from "./mcp.ts";
-import { connectNative, loadConnectorConfig, NativeError, readConnectorToken, withProcessResources } from "./native.ts";
+import { connectNative, loadConnectorConfig, NativeError, readConnectorToken, resolveNativeConfig, withProcessResources } from "./native.ts";
 import type { NativeNotice } from "./native.ts";
 import { identifyProcess } from "./resources.ts";
+import { Host as PlatformHost } from "./platform.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 declare const COORDINATOR_HARNESS: "pi" | "omp";
@@ -54,17 +54,19 @@ export type NativeObserver = {
 };
 
 /** Retains only current native context and one scalar usage update; never messages or event histories. */
-export const createNativeObserver = (harness: Harness, machineId: string, processes: ReadonlyArray<ProcessIdentity> = []): NativeObserver => {
+export const createNativeObserver = (harness: Harness, machineId: string, processes: ReadonlyArray<ProcessIdentity> = []) => Effect.gen(function*() {
+  const host = yield* PlatformHost;
+  const clock = yield* Clock.Clock;
+  const rexSession = yield* Config.String("REX_SESSION").pipe(Config.withDefault(""));
+  const rexBlock = yield* Config.String("REX_BLOCK").pipe(Config.withDefault(""));
   let current: Context | undefined;
   let identity: string | undefined;
   let lastActivityAt: number | undefined;
   let latest: { usage: Usage; observedAt: number; nativeUpdatedAt: number | null } | undefined;
   const activeTools = new Map<string, string>();
-  const machineName = hostname();
-  const rexSession = process.env.REX_SESSION;
-  const rexBlock = process.env.REX_BLOCK;
-  const os: SessionPresence["os"] = process.platform === "linux" || process.platform === "darwin" ? { platform: process.platform, release: release(), architecture: process.arch } : undefined;
-  const update = (ctx: Context, event?: NativeEvent, now = Date.now()) => {
+  const machineName = host.hostname;
+  const os: SessionPresence["os"] = host.platform === "linux" || host.platform === "darwin" ? { platform: host.platform, release: host.release, architecture: host.architecture } : undefined;
+  const update = (ctx: Context, event?: NativeEvent, now = clock.currentTimeMillisUnsafe()) => {
     const key = JSON.stringify([ctx.sessionManager.getSessionId(), harness === "omp" ? ctx.agent?.id : undefined]);
     if (identity !== key) { latest = undefined; activeTools.clear(); identity = key; }
     current = ctx;
@@ -83,7 +85,7 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
       } };
     }
   };
-  const presence = (now = Date.now()): SessionPresence | undefined => {
+  const presence = (now = clock.currentTimeMillisUnsafe()): SessionPresence | undefined => {
     if (!current) return undefined;
     const currentToolName = activeTools.values().next().value;
     return {
@@ -98,7 +100,7 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
     },
     };
   };
-  const inspect = (now = Date.now()): SessionInspection | undefined => {
+  const inspect = (now = clock.currentTimeMillisUnsafe()): SessionInspection | undefined => {
     const p = presence(now);
     if (!p || !current) return undefined;
     const result = createInspection(p, now);
@@ -181,7 +183,7 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
     };
   };
   return { update, presence, inspect, clear: () => { current = undefined; identity = undefined; latest = undefined; lastActivityAt = undefined; activeTools.clear(); } };
-};
+});
 
 export const isCoordinateInput = (text: string): boolean => /^coordinate(?:\s|$)/u.test(text);
 export const transformCoordinateInput = (harness: "pi" | "omp", input: Input, snapshot: SessionListOutput): InputResult => {
@@ -199,7 +201,7 @@ export const registerCoordinateKeyword = Effect.gen(function*() {
 
 export default function plugin(host: Host): void {
   const harness = COORDINATOR_HARNESS;
-  const runtime = ManagedRuntime.make(Layer.merge(NodeServices.layer, Mcp.layer));
+  const runtime = ManagedRuntime.make(Layer.mergeAll(NodeServices.layer, PlatformHost.layer, Mcp.layer, Layer.succeed(Logger.LogToStderr, true)));
   let config: ConnectorConfig | undefined;
   let observer: NativeObserver | undefined;
   let starting: Promise<void> | undefined;
@@ -214,7 +216,7 @@ export default function plugin(host: Host): void {
         description: descriptor.description,
         parameters: { ...document.schema, type: "object", $defs: document.definitions },
         execute: (_id, params, signal) => runtime.runPromise(Effect.gen(function*() {
-          const activeConfig = config;
+          const activeConfig = config ?? (yield* loadConnectorConfig());
           if (!activeConfig) return yield* new NativeError({ operation: "Connector configuration required" });
           const input = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(params);
           const token = yield* readConnectorToken(activeConfig);
@@ -227,21 +229,19 @@ export default function plugin(host: Host): void {
     register(InspectionTools.list);
     register(InspectionTools.inspect);
   }
-  let isUnavailable = false;
-  const report = (ctx: Context) => (notice: NativeNotice) => Effect.sync(() => {
+  let lastError: NativeNotice | undefined;
+  const report = (ctx: Context) => (notice: NativeNotice) => Effect.gen(function*() {
     if (stopped) return;
-    if (notice.state === "unavailable") {
-      if (isUnavailable) return;
-      isUnavailable = true;
-    } else if (notice.state === "recovered") {
-      if (!isUnavailable) return;
-      isUnavailable = false;
+    if (notice.state !== "error") {
+      if (notice.state === "recovered") lastError = undefined;
+      yield* Effect.logDebug("Native inspector connection", { state: notice.state, operation: notice.operation, code: notice.code, status: notice.status });
+      return;
     }
-    const message = notice.state === "recovered" ? "Native inspector connection restored"
-      : `Native inspector unavailable (operation=${notice.operation}${notice.code === undefined ? "" : `, code=${notice.code}`}${notice.status === undefined ? "" : `, status=${notice.status}`})`;
-    const level = notice.state === "recovered" ? "info" : "warning";
-    if (ctx.hasUI) ctx.ui.notify(message, level);
-    else process.stderr.write(`${message}\n`);
+    if (lastError?.operation === notice.operation && lastError.code === notice.code && lastError.status === notice.status) return;
+    lastError = notice;
+    const message = `Native inspector unavailable (operation=${notice.operation}${notice.code === undefined ? "" : `, code=${notice.code}`}${notice.status === undefined ? "" : `, status=${notice.status}`})`;
+    if (ctx.hasUI) yield* Effect.sync(() => ctx.ui.notify(message, "warning"));
+    else yield* Console.error(message);
   });
   const reportCause = (ctx: Context, operation: string) => (cause: Cause.Cause<{
     readonly _tag: string; readonly operation?: string | undefined; readonly status?: number | undefined;
@@ -249,7 +249,7 @@ export default function plugin(host: Host): void {
     if (Cause.hasInterruptsOnly(cause)) return Effect.void;
     const error = Cause.findErrorOption(cause);
     return report(ctx)({
-      state: "unavailable",
+      state: "error",
       operation: error._tag === "Some" ? error.value.operation ?? operation : operation,
       code: Cause.hasDies(cause) ? "Defect" : error._tag === "Some" ? error.value._tag : "Failure",
       status: error._tag === "Some" ? error.value.status : undefined,
@@ -258,12 +258,14 @@ export default function plugin(host: Host): void {
   const start = (ctx: Context): Promise<void> => starting ??= runtime.runPromiseExit(Effect.gen(function*() {
     config = yield* loadConnectorConfig();
     if (!config || stopped) return false;
-    const processIdentity = yield* identifyProcess(process.pid);
-    observer = createNativeObserver(harness, config.machineId, processIdentity.status === "available" ? [{ pid: process.pid, startIdentity: processIdentity.startTime, ownership: harness === "omp" ? "shared" : "owned" }] : []);
+    const nativeConfig = yield* resolveNativeConfig(config);
+    const host = yield* PlatformHost;
+    const processIdentity = yield* identifyProcess(host.pid);
+    observer = yield* createNativeObserver(harness, nativeConfig.machineId, processIdentity.status === "available" ? [{ pid: host.pid, startIdentity: processIdentity.startTime, ownership: harness === "omp" ? "shared" : "owned" }] : []);
     observer.update(ctx);
     // Native TUI constructors register core keywords before session_start hooks.
     if (harness === "omp" && ctx.hasUI && ctx.mode === "tui") yield* registerCoordinateKeyword;
-    runtime.runFork(connectNative(config, {
+    runtime.runFork(connectNative(nativeConfig, {
       presence: () => Effect.sync(() => { const p = observer?.presence(); return p ? [p] : []; }),
       inspect: (ref) => Effect.gen(function*() {
         const observation = observer?.inspect();
@@ -303,10 +305,9 @@ export default function plugin(host: Host): void {
   });
   host.on("input", async (event, ctx) => {
     if (harness !== "omp" || !isCoordinateInput(event.text) || stopped) return;
-    await start(ctx);
-    const activeConfig = config;
-    if (!activeConfig) return;
     const exit = await runtime.runPromiseExit(Effect.gen(function*() {
+      const activeConfig = config ?? (yield* loadConnectorConfig());
+      if (!activeConfig) return;
       const token = yield* readConnectorToken(activeConfig);
       const mcp = yield* Mcp;
       const snapshot = yield* mcp.call(activeConfig.inspectorUrl, token, InspectionTools.list, { limit: 100 });

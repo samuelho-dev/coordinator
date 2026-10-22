@@ -1,5 +1,6 @@
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { Clock, Context, Deferred, Effect, Layer, type Scope } from "effect";
+import { Clock, Context, Crypto, Deferred, Effect, Layer, type Scope } from "effect";
+import { Hex } from "effect/encoding";
+import { equalDigests } from "./platform.ts";
 import {
   INSPECTION_LIMIT, HttpError, sessionRefKey, unavailableMetric,
   type ConnectorAccepted, type ConnectorAnnounce, type ConnectorDisconnect, type ConnectorPoll,
@@ -18,7 +19,7 @@ const MAX_PER_CONNECTOR = 32;
 const MAX_CURSORS = 1024;
 const accepted: ConnectorAccepted = { accepted: true };
 const error = (status: number, message: string) => new HttpError({ status, message });
-const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
+const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 const key = (owner: string, id: string) => JSON.stringify([owner, id]);
 const processKey = (process: ProcessIdentity) => JSON.stringify([process.pid, process.startIdentity]);
 const machineProcessKey = (machineId: string, process: ProcessIdentity) => JSON.stringify([machineId, process.pid, process.startIdentity]);
@@ -44,17 +45,19 @@ type Pending = {
 };
 type Cursor = { owner: string; machineId: string | undefined; harness: string | undefined; after: string; expires: number };
 
-const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpError, Scope.Scope> => Effect.gen(function*() {
+const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpError, Scope.Scope | Crypto.Crypto> => Effect.gen(function*() {
+  const crypto = yield* Crypto.Crypto;
+  const uuid = crypto.randomUUIDv4().pipe(Effect.mapError(() => error(500, "Inspector randomness unavailable")));
   const clock = yield* Clock.Clock;
   const principals = new Map<string, InspectorPrincipal>();
-  const credentials = new Map<string, Buffer>();
+  const credentials = new Map<string, Uint8Array>();
   const hashes = new Set<string>();
   for (const principal of config.principals) {
     if (principals.has(principal.id) || hashes.has(principal.tokenHash) || !/^[a-f0-9]{64}$/.test(principal.tokenHash)) {
       return yield* Effect.fail(error(500, "Ambiguous inspector credentials"));
     }
     principals.set(principal.id, { ...principal });
-    credentials.set(principal.id, Buffer.from(principal.tokenHash, "hex"));
+    credentials.set(principal.id, yield* Effect.fromResult(Hex.decode(principal.tokenHash)).pipe(Effect.mapError(() => error(500, "Invalid inspector credentials"))));
     hashes.add(principal.tokenHash);
   }
   const connectors = new Map<string, Connector>();
@@ -84,7 +87,7 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
   };
   const authenticated = (principal: InspectorPrincipal) => {
     const configured = principals.get(principal.id);
-    return !closed && configured !== undefined && configured.owner === principal.owner && configured.machineId === principal.machineId && configured.tokenHash === principal.tokenHash;
+    return !closed && configured !== undefined && configured.owner === principal.owner && configured.tokenHash === principal.tokenHash;
   };
   const live = (connector: Connector) => !connector.disconnected && now() - connector.seen < LIVE_MS;
   const connection = (connector: Connector): NonNullable<SessionPresence["connection"]> => ({
@@ -145,7 +148,7 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
   };
   const findConnector = (principal: InspectorPrincipal, input: ConnectorPoll) => {
     const connector = connectors.get(key(principal.owner, input.connectorId));
-    return connector && connector.principalId === principal.id && connector.machineId === principal.machineId && connector.incarnation === input.incarnation && !connector.disconnected ? connector : undefined;
+    return connector && connector.principalId === principal.id && connector.incarnation === input.incarnation && !connector.disconnected ? connector : undefined;
   };
   yield* Effect.addFinalizer(() => Effect.sync(() => {
     closed = true;
@@ -154,14 +157,14 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
   }));
 
   return {
-    authorize: (token: string): Effect.Effect<InspectorPrincipal, HttpError> => Effect.suspend(() => {
-      const digest = createHash("sha256").update(token).digest();
+    authorize: (token: string): Effect.Effect<InspectorPrincipal, HttpError> => Effect.gen(function*() {
+      const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(token)).pipe(Effect.mapError(() => error(500, "Inspector digest unavailable")));
       let match: InspectorPrincipal | undefined;
       // Compare every fixed-size digest, including after a match.
-      for (const [id, hash] of credentials) if (timingSafeEqual(digest, hash)) match = principals.get(id);
-      return match && !closed ? Effect.succeed({ ...match }) : Effect.fail(error(401, "Unauthorized"));
+      for (const [id, hash] of credentials) if (yield* equalDigests(digest, hash)) match = principals.get(id);
+      return match && !closed ? { ...match } : yield* error(401, "Unauthorized");
     }),
-    list: (principal: InspectorPrincipal, input: SessionListInput): Effect.Effect<SessionListOutput, HttpError> => Effect.suspend<SessionListOutput, HttpError, never>(() => {
+    list: (principal: InspectorPrincipal, input: SessionListInput): Effect.Effect<SessionListOutput, HttpError> => uuid.pipe(Effect.flatMap((next) => Effect.suspend<SessionListOutput, HttpError, never>(() => {
       if (!authenticated(principal)) return Effect.fail(error(401, "Unauthorized"));
       prune();
       const cursor = input.cursor === undefined ? undefined : cursors.get(input.cursor);
@@ -174,7 +177,6 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
       const page: Array<SessionPresence> = [];
       const shared = sharedProcesses(principal.owner);
       let after: string | undefined;
-      const next = randomUUID();
       for (const [id, session] of entries) {
         if (page.length >= input.limit) break;
         const presence = normalizedPresence(session, shared);
@@ -195,8 +197,8 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
         return Effect.succeed({ sessions: page, nextCursor: next });
       }
       return Effect.succeed({ sessions: page, nextCursor: null });
-    }),
-    inspect: (principal: InspectorPrincipal, input: SessionInspectInput): Effect.Effect<SessionInspection, HttpError> => Effect.uninterruptibleMask((restore) => Effect.suspend(() => {
+    }))),
+    inspect: (principal: InspectorPrincipal, input: SessionInspectInput): Effect.Effect<SessionInspection, HttpError> => uuid.pipe(Effect.flatMap((requestId) => Effect.uninterruptibleMask((restore) => Effect.suspend(() => {
       if (!authenticated(principal)) return Effect.fail(error(401, "Unauthorized"));
       prune();
       const id = key(principal.owner, sessionRefKey(input.ref));
@@ -207,7 +209,7 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
       for (const request of pending.values()) if (request.connector === session.connector) count++;
       if (pending.size >= MAX_PENDING || count >= MAX_PER_CONNECTOR) return Effect.fail(error(429, "Inspection capacity reached"));
       const request: Pending = {
-        requestId: randomUUID(), sessionKey: id, ref: session.presence.ref, connector: session.connector,
+        requestId, sessionKey: id, ref: session.presence.ref, connector: session.connector,
         incarnation: session.connector.incarnation, deadline: now() + REQUEST_MS, delivered: false,
         reply: Deferred.makeUnsafe<SessionInspection, HttpError>(),
       };
@@ -217,17 +219,17 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
       )).pipe(
         Effect.ensuring(Effect.sync(() => { pending.delete(request.requestId); })),
       );
-    })),
+    })))),
     announce: (principal: InspectorPrincipal, input: ConnectorAnnounce): Effect.Effect<ConnectorAccepted, HttpError> => Effect.suspend(() => {
       if (!authenticated(principal)) return Effect.fail(error(401, "Unauthorized"));
-      if (input.machineId !== principal.machineId || input.sessions.some((session) => session.ref.machineId !== principal.machineId)) return Effect.fail(error(403, "Machine binding mismatch"));
+      if (input.sessions.some((session) => session.ref.machineId !== input.machineId || (session.parent !== undefined && session.parent.machineId !== input.machineId))) return Effect.fail(error(403, "Machine binding mismatch"));
       prune();
       if (input.sessions.length > 256) return Effect.fail(error(413, "Native session capacity reached"));
       const ids = new Set(input.sessions.map((session) => key(principal.owner, sessionRefKey(session.ref))));
       if (ids.size !== input.sessions.length) return Effect.fail(error(409, "Duplicate native session"));
       const connectorKey = key(principal.owner, input.connectorId);
       const previous = connectors.get(connectorKey);
-      if (previous && previous.principalId !== principal.id) return Effect.fail(error(403, "Connector binding mismatch"));
+      if (previous && (previous.principalId !== principal.id || previous.machineId !== input.machineId)) return Effect.fail(error(403, "Connector binding mismatch"));
       if (previous && previous.incarnation !== input.incarnation && (live(previous) || previous.retired.has(input.incarnation) || previous.retired.size >= 16)) return Effect.fail(error(409, "Connector incarnation conflict"));
       if (previous?.disconnected && previous.incarnation === input.incarnation) return Effect.fail(error(409, "Connector incarnation retired"));
       if (!previous && connectors.size >= MAX_CONNECTORS) return Effect.fail(error(429, "Connector capacity reached"));
@@ -240,13 +242,13 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
         else if (current.connector !== previous && live(current.connector)) return Effect.fail(error(409, "Native session already has an active publisher"));
       }
       if (sessions.size + newCount - removedCount > MAX_SESSIONS) return Effect.fail(error(429, "Native session capacity reached"));
-      // Presence must itself fit a real list response; do not admit an unlistable entry.
-      for (const presence of input.sessions) if (bytes({ sessions: [{ ...presence, connection: { state: "live", receivedAt: wall(), liveUntil: wall() + LIVE_MS } }], nextCursor: randomUUID() }) > INSPECTION_LIMIT) return Effect.fail(error(413, "Native session presence exceeds response limit"));
+      // UUID cursors always occupy 36 ASCII bytes; validate presence before admitting it.
+      for (const presence of input.sessions) if (bytes({ sessions: [{ ...presence, connection: { state: "live", receivedAt: wall(), liveUntil: wall() + LIVE_MS } }], nextCursor: "0".repeat(36) }) > INSPECTION_LIMIT) return Effect.fail(error(413, "Native session presence exceeds response limit"));
       let connector = previous;
       if (!connector || connector.incarnation !== input.incarnation) {
         const retired = previous?.retired ?? new Set<string>();
         if (previous) retired.add(previous.incarnation);
-        connector = { principalId: principal.id, owner: principal.owner, machineId: principal.machineId, connectorId: input.connectorId, incarnation: input.incarnation, receivedAt: wall(), seen: now(), disconnected: false, retired };
+        connector = { principalId: principal.id, owner: principal.owner, machineId: input.machineId, connectorId: input.connectorId, incarnation: input.incarnation, receivedAt: wall(), seen: now(), disconnected: false, retired };
         if (previous) for (const [id, session] of sessions) if (session.connector === previous) removeSession(id);
         connectors.set(connectorKey, connector);
       }

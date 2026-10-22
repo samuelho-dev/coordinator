@@ -67,12 +67,18 @@ spec:
             - --input-type=module
             - -e
             - |
-              import { mkdir, readFile, writeFile } from 'node:fs/promises';
-              process.umask(0o077);
-              await mkdir('/config/private', { mode: 0o700, recursive: true });
-              for (const name of ['inspector.json', 'health.token']) {
-                await writeFile(`/config/private/${name}`, await readFile(`/input/${name}`), { mode: 0o600 });
-              }
+              import { Effect, FileSystem } from 'effect';
+              import { NodeRuntime, NodeServices } from '@effect/platform-node';
+              NodeRuntime.runMain(Effect.gen(function* () {
+                const fs = yield* FileSystem.FileSystem;
+                yield* fs.makeDirectory('/config/private', { mode: 0o700, recursive: true });
+                yield* fs.chmod('/config/private', 0o700);
+                for (const name of ['inspector.json', 'health.token']) {
+                  const destination = `/config/private/${name}`;
+                  yield* fs.writeFile(destination, yield* fs.readFile(`/input/${name}`), { mode: 0o600 });
+                  yield* fs.chmod(destination, 0o600);
+                }
+              }).pipe(Effect.provide(NodeServices.layer)));
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -114,14 +120,26 @@ spec:
                 - --input-type=module
                 - -e
                 - |
-                  import { readFile } from 'node:fs/promises';
-                  const token = (await readFile('/config/private/health.token', 'utf8')).trim();
-                  if (!token || /[\r\n]/.test(token)) process.exit(1);
-                  const response = await fetch('http://127.0.0.1:{{ $settings.port }}/readyz', {
-                    headers: { authorization: `Bearer ${token}` },
-                    redirect: 'error', signal: AbortSignal.timeout(3000)
-                  });
-                  if (!response.ok || response.headers.get('x-coordinator-source-sha') !== process.env.COORDINATOR_EXPECTED_SOURCE_SHA) process.exit(1);
+                  import { Config, Effect, FileSystem, Option } from 'effect';
+                  import { Headers, HttpClient } from 'effect/http';
+                  import { NodeHttpClient, NodeRuntime, NodeServices } from '@effect/platform-node';
+                  NodeRuntime.runMain(Effect.gen(function* () {
+                    const fs = yield* FileSystem.FileSystem;
+                    const token = (yield* fs.readFileString('/config/private/health.token')).trim();
+                    if (!token || /[\r\n]/.test(token)) return yield* Effect.fail('Invalid health token');
+                    const expectedSha = yield* Config.String('COORDINATOR_EXPECTED_SOURCE_SHA');
+                    const response = yield* HttpClient.get('http://127.0.0.1:{{ $settings.port }}/readyz', {
+                      headers: { authorization: `Bearer ${token}` }
+                    }).pipe(Effect.timeout('3 seconds'));
+                    if (response.status < 200 || response.status >= 300 ||
+                        Option.getOrUndefined(Headers.get(response.headers, 'x-coordinator-source-sha')) !== expectedSha) {
+                      return yield* Effect.fail('Readiness failed');
+                    }
+                  }).pipe(
+                    Effect.scoped,
+                    Effect.provide(NodeHttpClient.layerNodeHttp),
+                    Effect.provide(NodeServices.layer)
+                  ), { disableErrorReporting: true });
             periodSeconds: 5
             timeoutSeconds: 5
           resources:

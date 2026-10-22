@@ -1,0 +1,107 @@
+name: Publish npm beta
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full current-main source SHA from successful CI
+        required: true
+        type: string
+      ci_run_id:
+        description: Successful exact-source CI run containing the accepted npm tarball
+        required: true
+        type: string
+      version:
+        description: Exact package beta.N version (published under beta, never latest)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: coordinator-npm-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: npm-public
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - name: Require approved public exact-source producer
+        id: producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ inputs.source_sha }}
+          CI_RUN: ${{ inputs.ci_run_id }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$CI_RUN" =~ ^[0-9]+$ && "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.[1-9][0-9]*$ ]]
+          gh api "repos/$REPOSITORY" --jq '.visibility' | { read -r visibility; test "$visibility" = public; } || { echo 'Public npm provenance requires a public source repository; this workflow never changes visibility.' >&2; exit 1; }
+          test "$GITHUB_SHA" = "$SHA"
+          test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SHA"
+          gh api "repos/$REPOSITORY/actions/runs/$CI_RUN" > "$RUNNER_TEMP/ci.json"
+          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" '.repository.full_name == $repo and .head_repository.full_name == $repo and .head_sha == $sha and .head_branch == "main" and .path == ".github/workflows/ci.yaml" and (.event == "push" or .event == "workflow_dispatch") and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/ci.json"
+          ATTEMPT="$(jq -er '.run_attempt | tostring' "$RUNNER_TEMP/ci.json")"
+          gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/attempts/$ATTEMPT/jobs?per_page=100" --jq '.jobs[] | {name,conclusion}' | jq -s -e 'all(.[]; .conclusion == "success") and any(.[]; .name == "supplementary") and any(.[]; .name == "chart") and any(.[]; .name == "npm-package") and any(.[]; .name == "publish")'
+          NAME="npm-$SHA-$ATTEMPT"
+          gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/artifacts?per_page=100" --jq '.artifacts[]' | jq -s -e --arg name "$NAME" '[.[] | select(.name == $name and .expired == false)] | if length == 1 then .[0] else error("missing unique unexpired npm artifact; rerun CI") end' > "$RUNNER_TEMP/artifact.json"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "attempt=$ATTEMPT" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ steps.producer.outputs.name }}
+          run-id: ${{ inputs.ci_run_id }}
+          github-token: ${{ github.token }}
+          path: npm-evidence
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+          path: source
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Pin OIDC-capable npm CLI
+        run: npm install --global npm@11.21.0 --ignore-scripts --registry=https://registry.npmjs.org
+      - name: Verify accepted archive, metadata, and registry preconditions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ inputs.source_sha }}
+          CI_RUN: ${{ inputs.ci_run_id }}
+          ATTEMPT: ${{ steps.producer.outputs.attempt }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SHA"
+          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg attempt "$ATTEMPT" --arg version "$VERSION" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .ciRunAttempt == $attempt and .gate == "npm-package" and .packageName == "@samuelho/coordinator" and .packageVersion == $version and .acceptance == "production-only-packed-native-install" and (.archiveSha256 | test("^[0-9a-f]{64}$"))' npm-evidence/npm.json
+          test "$(sha256sum npm-evidence/package.tgz | cut -d' ' -f1)" = "$(jq -r .archiveSha256 npm-evidence/npm.json)"
+          tar -xOf npm-evidence/package.tgz package/package.json > "$RUNNER_TEMP/package.json"
+          jq -e --arg version "$VERSION" --arg url "git+https://github.com/$REPOSITORY.git" '.name == "@samuelho/coordinator" and .version == $version and .private != true and .repository.url == $url' "$RUNNER_TEMP/package.json"
+          # npm normalizes bin targets (for example ./dist -> dist); compare the public contract, not bytes.
+          jq -e --slurpfile source source/package.json 'def contract: {name,version,private:(.private // false),type,license,engines,repository,dependencies,optionalDependencies,peerDependencies,peerDependenciesMeta,exports,bin:(.bin | map_values(sub("^\\./";""))),pi,omp,files,publishConfig}; contract == ($source[0] | contract)' "$RUNNER_TEMP/package.json"
+          STATUS="$(curl --silent --show-error --output "$RUNNER_TEMP/registry-package.json" --write-out '%{http_code}' 'https://registry.npmjs.org/@samuelho%2fcoordinator')"
+          test "$STATUS" = 200 || { echo 'Trusted publishing requires an existing public package and an npmjs.com trusted publisher for npm-release.yaml / npm-public. First publication requires operator authentication and the exact verified CI tarball. See README.md#first-npm-publication.' >&2; exit 1; }
+          jq -e '.name == "@samuelho/coordinator"' "$RUNNER_TEMP/registry-package.json"
+          STATUS="$(curl --silent --show-error --output "$RUNNER_TEMP/registry-version.json" --write-out '%{http_code}' "https://registry.npmjs.org/@samuelho%2fcoordinator/$VERSION")"
+          test "$STATUS" = 404 || { echo "Refusing existing version or inconclusive registry lookup (HTTP $STATUS)." >&2; exit 1; }
+      - name: Publish only the accepted tarball with public provenance
+        working-directory: npm-evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SHA"
+          test "$(sha256sum package.tgz | cut -d' ' -f1)" = "$(jq -r .archiveSha256 npm.json)"
+          npm publish ./package.tgz --ignore-scripts --access public --tag beta --provenance --registry=https://registry.npmjs.org
+          printf 'Published `@samuelho/coordinator@%s` under `beta` from CI `%s`, source `%s`, SHA256 `%s`. No rebuild or visibility change.\n' "$VERSION" '${{ inputs.ci_run_id }}' "$SHA" "$(jq -r .archiveSha256 npm.json)" >> "$GITHUB_STEP_SUMMARY"

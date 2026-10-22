@@ -1,13 +1,18 @@
-import { Schema } from "effect";
+import { Effect, Option, Path as PlatformPath, Schema, SchemaParser } from "effect";
 
 export const INSPECTION_LIMIT = 48 * 1024;
 
 const Id = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256));
 const Label = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512));
 const Path = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096));
-const PrivatePath = Path.check(Schema.makeFilter((value) =>
-  value.startsWith("/") && !/[\0\r\n]/.test(value) ? undefined : "Absolute POSIX path without NUL, CR or LF required",
-));
+const PrivatePath = Path.pipe(Schema.middlewareDecoding<typeof Path, PlatformPath.Path>((decoded) => Effect.gen(function*() {
+  const value = yield* decoded;
+  if (Option.isNone(value)) return value;
+  const path = yield* PlatformPath.Path;
+  return Option.some(yield* SchemaParser.decodeUnknownEffect(Path.check(Schema.makeFilter((input) =>
+    path.isAbsolute(input) && path.resolve(input) === input && !/[\0\r\n]/.test(input) ? undefined : "Canonical absolute path without NUL, CR or LF required",
+  )))(value.value));
+})));
 const Nonnegative = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0));
 const Count = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
 const Timestamp = Nonnegative;
@@ -173,14 +178,18 @@ const InspectorUrl = Path.check(Schema.makeFilter((value) => {
   return url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) ? undefined : "TLS required except on loopback";
 }));
 export const InspectorPrincipal = Schema.Struct({
-  id: Id, owner: Id, tokenHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)), machineId: Id,
+  id: Id, owner: Id, tokenHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
 });
 export type InspectorPrincipal = typeof InspectorPrincipal.Type;
 export const InspectorConfig = Schema.Struct({
   host: Id, port: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 65535 })), principals: bounded(InspectorPrincipal, 256),
 });
 export type InspectorConfig = typeof InspectorConfig.Type;
-export const ConnectorConfig = Schema.Struct({ inspectorUrl: InspectorUrl, tokenFile: PrivatePath, machineId: Id, stateDirectory: PrivatePath });
+export const ConnectorConfig = Schema.Struct({
+  inspectorUrl: InspectorUrl,
+  apiToken: Schema.optional(Schema.String.check(Schema.isMinLength(16), Schema.isMaxLength(4096), Schema.isPattern(/^[A-Za-z0-9._~+\/-]+=*$/))),
+  tokenFile: Schema.optional(PrivatePath),
+});
 export type ConnectorConfig = typeof ConnectorConfig.Type;
 export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", {
   status: Schema.Int.check(Schema.isBetween({ minimum: 400, maximum: 599 })), message: Label,

@@ -1,7 +1,7 @@
-import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { it } from "@effect/vitest";
-import { Effect, Exit, Fiber, Scope } from "effect";
+import { assert, it } from "@effect/vitest";
+import { Crypto, Effect, Exit, Fiber, Scope } from "effect";
+import { Hex } from "effect/encoding";
+import { NodeServices } from "@effect/platform-node";
 import { TestClock } from "effect/testing";
 import { Inspector } from "../src/inspector.ts";
 import {
@@ -9,16 +9,20 @@ import {
   type HttpError, type MetricProvenance, type SessionInspection, type SessionListOutput, type SessionPresence,
 } from "../src/inspection.ts";
 
-const publisher: InspectorPrincipal = {
-  id: "publisher", owner: "alice", machineId: "mac", tokenHash: createHash("sha256").update("publisher-secret").digest("hex"),
-};
-const reader: InspectorPrincipal = {
-  id: "reader", owner: "alice", machineId: "linux", tokenHash: createHash("sha256").update("reader-secret").digest("hex"),
-};
-const outsider: InspectorPrincipal = {
-  id: "outsider", owner: "bob", machineId: "mac", tokenHash: createHash("sha256").update("outsider-secret").digest("hex"),
-};
-const config: InspectorConfig = { host: "127.0.0.1", port: 0, principals: [publisher, reader, outsider] };
+const { publisher, reader, outsider, config } = await Effect.runPromise(Effect.gen(function*() {
+  const crypto = yield* Crypto.Crypto;
+  const publisher: InspectorPrincipal = {
+    id: "publisher", owner: "alice", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode("publisher-secret"))),
+  };
+  const reader: InspectorPrincipal = {
+    id: "reader", owner: "alice", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode("reader-secret"))),
+  };
+  const outsider: InspectorPrincipal = {
+    id: "outsider", owner: "bob", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode("outsider-secret"))),
+  };
+  const config: InspectorConfig = { host: "127.0.0.1", port: 0, principals: [publisher, reader, outsider] };
+  return { publisher, reader, outsider, config };
+}).pipe(Effect.provide(NodeServices.layer)));
 const identity = { connectorId: "native-connector", incarnation: "first" };
 const presence: SessionPresence = {
   ref: { machineId: "mac", harness: "omp", nativeSessionId: "actual-native-session" }, observedAt: 9_999_999_999_999,
@@ -29,104 +33,157 @@ const provenance: MetricProvenance = {
   estimated: false, derived: false, shared: false, partial: false, stale: false,
 };
 
-it.effect("authenticates credentials and isolates owners and machine-bound publishers", () => Effect.scoped(Effect.gen(function*() {
-  const inspector = yield* Inspector.make(config);
-  assert.deepEqual(yield* inspector.authorize("publisher-secret"), publisher);
-  assert.equal((yield* Effect.flip(inspector.authorize("wrong-secret"))).status, 401);
-  assert.equal((yield* Effect.flip(inspector.list({ ...reader, owner: "bob" }, { limit: 10 }))).status, 401);
-  assert.equal((yield* Effect.flip(inspector.announce(reader, { ...identity, machineId: "mac", sessions: [presence] }))).status, 403);
+it.effect("authenticates owner keys across machines while isolating owners and connector principals", () => Effect.scoped(Effect.gen(function*() {
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
+  assert.deepStrictEqual(yield* inspector.authorize("publisher-secret"), publisher);
+  assert.strictEqual((yield* Effect.flip(inspector.authorize("wrong-secret"))).status, 401);
+  assert.strictEqual((yield* Effect.flip(inspector.list({ ...reader, owner: "bob" }, { limit: 10 }))).status, 401);
+  assert.strictEqual((yield* Effect.flip(inspector.list({ ...reader, tokenHash: publisher.tokenHash }, { limit: 10 }))).status, 401);
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] });
-  assert.equal((yield* inspector.list(reader, { limit: 10 })).sessions.length, 1);
-  assert.deepEqual((yield* inspector.list(outsider, { limit: 10 })).sessions, []);
-  assert.equal((yield* Effect.flip(inspector.inspect(outsider, { ref: presence.ref }))).status, 404);
-  assert.equal((yield* Effect.flip(inspector.poll(reader, identity))).status, 409);
-  const duplicateId = yield* Effect.flip(Inspector.make({ ...config, principals: [publisher, { ...reader, id: publisher.id }] }));
-  const duplicateHash = yield* Effect.flip(Inspector.make({ ...config, principals: [publisher, { ...reader, tokenHash: publisher.tokenHash }] }));
-  assert.equal(duplicateId.status, 500);
-  assert.equal(duplicateHash.status, 500);
+  const linuxIdentity = { connectorId: "linux-connector", incarnation: "first" };
+  const linux: SessionPresence = { ...presence, ref: { ...presence.ref, machineId: "linux" } };
+  yield* inspector.announce(publisher, { ...linuxIdentity, machineId: "linux", sessions: [linux] });
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions.length, 2);
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10, machineId: "linux" })).sessions.at(0)?.ref.machineId, "linux");
+  assert.deepStrictEqual((yield* inspector.list(outsider, { limit: 10 })).sessions, []);
+  assert.deepStrictEqual((yield* inspector.list(outsider, { limit: 10, machineId: "linux" })).sessions, []);
+  for (const native of [presence, linux]) {
+    assert.strictEqual((yield* Effect.flip(inspector.inspect(outsider, { ref: native.ref }))).status, 404);
+  }
+  assert.strictEqual((yield* Effect.flip(inspector.poll(reader, identity))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.poll(outsider, identity))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.disconnect(reader, identity))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.disconnect(outsider, identity))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.announce(reader, { ...identity, machineId: "mac", sessions: [presence] }))).status, 403);
+  for (const native of [presence, linux]) {
+    const connector = native.ref.machineId === "mac" ? identity : linuxIdentity;
+    const query = yield* Effect.forkChild(inspector.inspect(reader, { ref: native.ref }), { startImmediately: true });
+    const request = (yield* inspector.poll(publisher, connector)).requests.at(0);
+    if (!(request)) throw new Error("Expected truthy value");
+    const otherConnector = native.ref.machineId === "mac" ? linuxIdentity : identity;
+    assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, {
+      ...otherConnector, requestId: request.requestId, observation: createInspection(native, 0),
+    }))).status, 409);
+    assert.strictEqual((yield* Effect.flip(inspector.complete(outsider, {
+      ...connector, requestId: request.requestId, observation: createInspection(native, 0),
+    }))).status, 409);
+    yield* inspector.complete(publisher, { ...connector, requestId: request.requestId, observation: createInspection(native, 0) });
+    assert.strictEqual((yield* Fiber.join(query)).presence.ref.machineId, native.ref.machineId);
+  }
+  const duplicateId = yield* Effect.flip(Inspector.make({ ...config, principals: [publisher, { ...reader, id: publisher.id }] }).pipe(Effect.provide(NodeServices.layer)));
+  const duplicateHash = yield* Effect.flip(Inspector.make({ ...config, principals: [publisher, { ...reader, tokenHash: publisher.tokenHash }] }).pipe(Effect.provide(NodeServices.layer)));
+  assert.strictEqual(duplicateId.status, 500);
+  assert.strictEqual(duplicateHash.status, 500);
+})));
+
+it.effect("rejects mixed-machine refs and connector rebinding without changing published presence", () => Effect.scoped(Effect.gen(function*() {
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
+  const linux: SessionPresence = { ...presence, ref: { ...presence.ref, machineId: "linux" } };
+  yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] });
+  assert.strictEqual((yield* Effect.flip(inspector.announce(publisher, {
+    ...identity, connectorId: "mixed", machineId: "mac", sessions: [presence, linux],
+  }))).status, 403);
+  assert.strictEqual((yield* Effect.flip(inspector.announce(publisher, {
+    ...identity, machineId: "mac", sessions: [{ ...presence, parent: linux.ref }],
+  }))).status, 403);
+  for (const incarnation of [identity.incarnation, "second"]) {
+    assert.strictEqual((yield* Effect.flip(inspector.announce(publisher, {
+      ...identity, incarnation, machineId: "linux", sessions: [linux],
+    }))).status, 403);
+  }
+  yield* TestClock.adjust(30_001);
+  assert.strictEqual((yield* Effect.flip(inspector.announce(publisher, {
+    ...identity, incarnation: "second", machineId: "linux", sessions: [linux],
+  }))).status, 403);
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions.at(0)?.ref.machineId, "mac");
+  assert.strictEqual((yield* Effect.flip(inspector.inspect(reader, { ref: linux.ref }))).status, 404);
 })));
 
 it.effect("correlates an actual read-only query with its publisher, incarnation and native ref", () => Effect.scoped(Effect.gen(function*() {
-  const inspector = yield* Inspector.make(config);
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] });
   const query = yield* Effect.forkChild(inspector.inspect(reader, { ref: presence.ref }), { startImmediately: true });
   const request = (yield* inspector.poll(publisher, identity)).requests.at(0);
-  assert.ok(request);
-  assert.deepEqual(request.ref, presence.ref);
-  assert.deepEqual((yield* inspector.poll(publisher, identity)).requests, []);
+  if (!(request)) throw new Error("Expected truthy value");
+  assert.deepStrictEqual(request.ref, presence.ref);
+  assert.deepStrictEqual((yield* inspector.poll(publisher, identity)).requests, []);
   const observation = createInspection(presence, 123);
-  assert.equal((yield* Effect.flip(inspector.complete(publisher, { ...identity, incarnation: "forged", requestId: request.requestId, observation }))).status, 409);
-  assert.equal((yield* Effect.flip(inspector.complete(reader, { ...identity, requestId: request.requestId, observation }))).status, 409);
-  assert.equal((yield* Effect.flip(inspector.complete(publisher, {
+  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, { ...identity, incarnation: "forged", requestId: request.requestId, observation }))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.complete(reader, { ...identity, requestId: request.requestId, observation }))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, {
     ...identity, requestId: request.requestId,
     observation: { ...observation, presence: { ...presence, ref: { ...presence.ref, nativeSessionId: "another" } } },
   }))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, {
+    ...identity, requestId: request.requestId,
+    observation: { ...observation, presence: { ...presence, ref: { ...presence.ref, machineId: "linux" } } },
+  }))).status, 409);
   yield* inspector.complete(publisher, { ...identity, requestId: request.requestId, observation });
   const actual = yield* Fiber.join(query);
-  assert.notEqual(actual.presence.connection?.receivedAt, presence.connection?.receivedAt);
-  assert.notEqual(actual.queriedAt, 123);
-  assert.equal((yield* Effect.flip(inspector.complete(publisher, { ...identity, requestId: request.requestId, observation }))).status, 409);
+  assert.notStrictEqual(actual.presence.connection?.receivedAt, presence.connection?.receivedAt);
+  assert.notStrictEqual(actual.queriedAt, 123);
+  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, { ...identity, requestId: request.requestId, observation }))).status, 409);
 })));
 
 it.effect("disposes timed-out and cancelled reads and frees bounded request capacity", () => Effect.scoped(Effect.gen(function*() {
-  const inspector = yield* Inspector.make(config);
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] });
   const timed = yield* Effect.forkChild(Effect.flip(inspector.inspect(reader, { ref: presence.ref })), { startImmediately: true });
   const timedRequest = (yield* inspector.poll(publisher, identity)).requests.at(0);
-  assert.ok(timedRequest);
+  if (!(timedRequest)) throw new Error("Expected truthy value");
   yield* TestClock.adjust(10_001);
-  assert.equal((yield* Fiber.join(timed)).status, 504);
-  assert.equal((yield* Effect.flip(inspector.complete(publisher, { ...identity, requestId: timedRequest.requestId, observation: createInspection(presence, 0) }))).status, 409);
+  assert.strictEqual((yield* Fiber.join(timed)).status, 504);
+  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, { ...identity, requestId: timedRequest.requestId, observation: createInspection(presence, 0) }))).status, 409);
   const reads: Array<Fiber.Fiber<SessionInspection, HttpError>> = [];
   for (let index = 0; index < 32; index++) {
     const read = yield* Effect.forkChild(inspector.inspect(reader, { ref: presence.ref }), { startImmediately: true });
     reads.push(read);
   }
-  assert.equal((yield* Effect.flip(inspector.inspect(reader, { ref: presence.ref }))).status, 429);
+  assert.strictEqual((yield* Effect.flip(inspector.inspect(reader, { ref: presence.ref }))).status, 429);
   const cancelledRequest = (yield* inspector.poll(publisher, identity)).requests.at(0);
-  assert.ok(cancelledRequest);
+  if (!(cancelledRequest)) throw new Error("Expected truthy value");
   yield* Fiber.interruptAll(reads);
-  assert.deepEqual((yield* inspector.poll(publisher, identity)).requests, []);
-  assert.equal((yield* Effect.flip(inspector.complete(publisher, { ...identity, requestId: cancelledRequest.requestId, observation: createInspection(presence, 0) }))).status, 409);
+  assert.deepStrictEqual((yield* inspector.poll(publisher, identity)).requests, []);
+  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, { ...identity, requestId: cancelledRequest.requestId, observation: createInspection(presence, 0) }))).status, 409);
   const replacement = yield* Effect.forkChild(inspector.inspect(reader, { ref: presence.ref }), { startImmediately: true });
-  assert.equal((yield* inspector.poll(publisher, identity)).requests.length, 1);
+  assert.strictEqual((yield* inspector.poll(publisher, identity)).requests.length, 1);
   yield* Fiber.interrupt(replacement);
 })));
 
 it.effect("uses receiver freshness and fences reconnects, duplicate publishers and native session switches", () => Effect.scoped(Effect.gen(function*() {
-  const inspector = yield* Inspector.make(config);
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] });
   const listed = (yield* inspector.list(reader, { limit: 10 })).sessions.at(0);
-  assert.equal(listed?.connection?.state, "live");
-  assert.notEqual(listed?.connection?.liveUntil, presence.connection?.liveUntil);
-  assert.equal((yield* Effect.flip(inspector.announce(publisher, { ...identity, incarnation: "second", machineId: "mac", sessions: [presence] }))).status, 409);
-  assert.equal((yield* Effect.flip(inspector.announce(publisher, { ...identity, connectorId: "other", machineId: "mac", sessions: [presence] }))).status, 409);
+  assert.strictEqual(listed?.connection?.state, "live");
+  assert.notStrictEqual(listed?.connection?.liveUntil, presence.connection?.liveUntil);
+  assert.strictEqual((yield* Effect.flip(inspector.announce(publisher, { ...identity, incarnation: "second", machineId: "mac", sessions: [presence] }))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.announce(publisher, { ...identity, connectorId: "other", machineId: "mac", sessions: [presence] }))).status, 409);
   const switched = yield* Effect.forkChild(Effect.flip(inspector.inspect(reader, { ref: presence.ref })), { startImmediately: true });
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [{ ...presence, ref: { ...presence.ref, nativeSessionId: "switched-session" } }] });
-  assert.equal((yield* Fiber.join(switched)).status, 409);
-  assert.equal((yield* Effect.flip(inspector.inspect(reader, { ref: presence.ref }))).status, 404);
+  assert.strictEqual((yield* Fiber.join(switched)).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.inspect(reader, { ref: presence.ref }))).status, 404);
   yield* TestClock.adjust(30_001);
-  assert.equal((yield* inspector.list(reader, { limit: 10 })).sessions.at(0)?.connection?.state, "stale");
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions.at(0)?.connection?.state, "stale");
   yield* inspector.announce(publisher, { ...identity, incarnation: "second", machineId: "mac", sessions: [presence] });
-  assert.equal((yield* Effect.flip(inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] }))).status, 409);
+  assert.strictEqual((yield* Effect.flip(inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] }))).status, 409);
   yield* inspector.disconnect(publisher, { ...identity, incarnation: "second" });
-  assert.equal((yield* inspector.list(reader, { limit: 10 })).sessions.at(0)?.connection?.state, "stale");
-  assert.equal((yield* Effect.flip(inspector.inspect(reader, { ref: presence.ref }))).status, 409);
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions.at(0)?.connection?.state, "stale");
+  assert.strictEqual((yield* Effect.flip(inspector.inspect(reader, { ref: presence.ref }))).status, 409);
   yield* TestClock.adjust(120_001);
-  assert.deepEqual((yield* inspector.list(reader, { limit: 10 })).sessions, []);
+  assert.deepStrictEqual((yield* inspector.list(reader, { limit: 10 })).sessions, []);
 })));
 
 it.effect("marks a process shared across native sessions without charging either session owned totals", () => Effect.scoped(Effect.gen(function*() {
-  const inspector = yield* Inspector.make(config);
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
   const process = { pid: 123, startIdentity: "birth", ownership: "owned" };
   const first: SessionPresence = { ...presence, processes: [{ ...process, ownership: "owned" }] };
   const second: SessionPresence = { ...first, ref: { ...first.ref, nativeSessionId: "second-session" } };
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [first, second] });
-  assert.ok((yield* inspector.list(reader, { limit: 10 })).sessions.every((session) => session.processes?.at(0)?.ownership === "shared"));
+  if (!((yield* inspector.list(reader, { limit: 10 })).sessions.every((session) => session.processes?.at(0)?.ownership === "shared"))) throw new Error("Expected truthy value");
   for (const native of [first, second]) {
     const query = yield* Effect.forkChild(inspector.inspect(reader, { ref: native.ref }), { startImmediately: true });
     const request = (yield* inspector.poll(publisher, identity)).requests.at(0);
-    assert.ok(request);
+    if (!(request)) throw new Error("Expected truthy value");
     const empty = createInspection(native, 0);
     yield* inspector.complete(publisher, {
       ...identity, requestId: request.requestId,
@@ -136,65 +193,65 @@ it.effect("marks a process shared across native sessions without charging either
       } },
     });
     const actual = yield* Fiber.join(query);
-    assert.equal(actual.resources.processes.at(0)?.process.ownership, "shared");
-    assert.equal(actual.resources.processes.at(0)?.rssBytes.value, 1024);
-    assert.equal(actual.resources.processes.at(0)?.rssBytes.provenance.shared, true);
-    assert.equal(actual.resources.ownedRssBytes.status, "unavailable");
-    assert.equal(actual.resources.ownedCpuPercent.status, "unavailable");
-    assert.equal(actual.resources.ownedProcessCount.status, "unavailable");
+    assert.strictEqual(actual.resources.processes.at(0)?.process.ownership, "shared");
+    assert.strictEqual(actual.resources.processes.at(0)?.rssBytes.value, 1024);
+    assert.strictEqual(actual.resources.processes.at(0)?.rssBytes.provenance.shared, true);
+    assert.strictEqual(actual.resources.ownedRssBytes.status, "unavailable");
+    assert.strictEqual(actual.resources.ownedCpuPercent.status, "unavailable");
+    assert.strictEqual(actual.resources.ownedProcessCount.status, "unavailable");
   }
   const nextBirth: SessionPresence = { ...second, processes: [{ ...process, startIdentity: "new-birth", ownership: "owned" }] };
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [first, nextBirth] });
-  assert.ok((yield* inspector.list(reader, { limit: 10 })).sessions.every((session) => session.processes?.at(0)?.ownership === "owned"));
+  if (!((yield* inspector.list(reader, { limit: 10 })).sessions.every((session) => session.processes?.at(0)?.ownership === "owned"))) throw new Error("Expected truthy value");
 })));
 
 it.effect("paginates by actual response bytes using opaque owner-bound cursors", () => Effect.scoped(Effect.gen(function*() {
-  const inspector = yield* Inspector.make(config);
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
   const large = Array.from({ length: 5 }, (_, index): SessionPresence => ({
     ...presence, ref: { ...presence.ref, nativeSessionId: `session-${index}` },
     activity: { state: "idle", goals: Array.from({ length: 100 }, (_, goal): { id: string; state: "pending" } => ({ id: `${goal}`.padEnd(256, "x"), state: "pending" })) },
   }));
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: large });
   const first = yield* inspector.list(reader, { limit: 100 });
-  assert.ok(Buffer.byteLength(JSON.stringify(first), "utf8") <= 48 * 1024);
-  assert.ok(first.nextCursor);
-  assert.equal((yield* Effect.flip(inspector.list(outsider, { limit: 100, cursor: first.nextCursor }))).status, 400);
-  assert.equal((yield* Effect.flip(inspector.list(reader, { limit: 100, cursor: first.nextCursor, machineId: "other" }))).status, 400);
+  if (!(new TextEncoder().encode(JSON.stringify(first)).byteLength <= 48 * 1024)) throw new Error("Expected truthy value");
+  if (!(first.nextCursor)) throw new Error("Expected truthy value");
+  assert.strictEqual((yield* Effect.flip(inspector.list(outsider, { limit: 100, cursor: first.nextCursor }))).status, 400);
+  assert.strictEqual((yield* Effect.flip(inspector.list(reader, { limit: 100, cursor: first.nextCursor, machineId: "other" }))).status, 400);
   const found = new Set(first.sessions.map((session) => session.ref.nativeSessionId));
   let cursor: string | null = first.nextCursor;
   while (cursor !== null) {
     const page: SessionListOutput = yield* inspector.list(reader, { limit: 100, cursor });
-    assert.ok(Buffer.byteLength(JSON.stringify(page), "utf8") <= 48 * 1024);
+    if (!(new TextEncoder().encode(JSON.stringify(page)).byteLength <= 48 * 1024)) throw new Error("Expected truthy value");
     for (const session of page.sessions) {
-      assert.equal(found.has(session.ref.nativeSessionId), false);
+      assert.strictEqual(found.has(session.ref.nativeSessionId), false);
       found.add(session.ref.nativeSessionId);
     }
     cursor = page.nextCursor;
   }
-  assert.equal(found.size, large.length);
+  assert.strictEqual(found.size, large.length);
 })));
 
 it.effect("closes pending readers with the registry scope and rejects late results", () => Effect.gen(function*() {
   const scope = yield* Scope.make();
-  const inspector = yield* Inspector.make(config).pipe(Scope.provide(scope));
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer)).pipe(Scope.provide(scope));
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] });
   const read = yield* Effect.forkChild(Effect.flip(inspector.inspect(reader, { ref: presence.ref })), { startImmediately: true });
   const request = (yield* inspector.poll(publisher, identity)).requests.at(0);
-  assert.ok(request);
+  if (!(request)) throw new Error("Expected truthy value");
   yield* Scope.close(scope, Exit.void);
-  assert.equal((yield* Fiber.join(read)).status, 503);
-  assert.equal((yield* Effect.flip(inspector.complete(publisher, {
+  assert.strictEqual((yield* Fiber.join(read)).status, 503);
+  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, {
     ...identity, requestId: request.requestId, observation: createInspection(presence, 0),
   }))).status, 401);
 }));
 
 it.effect("bounds connectors and reclaims expired presence rather than retaining registrations", () => Effect.scoped(Effect.gen(function*() {
-  const inspector = yield* Inspector.make(config);
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
   for (let index = 0; index < 256; index++) {
     yield* inspector.announce(publisher, { ...identity, connectorId: `connector-${index}`, machineId: "mac", sessions: [] });
   }
-  assert.equal((yield* Effect.flip(inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [] }))).status, 429);
+  assert.strictEqual((yield* Effect.flip(inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [] }))).status, 429);
   yield* TestClock.adjust(120_001);
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [presence] });
-  assert.equal((yield* inspector.list(reader, { limit: 10 })).sessions.length, 1);
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions.length, 1);
 })));

@@ -1,14 +1,39 @@
 {
   "name": "@samuelho/coordinator",
-  "version": "0.2.0-beta.5",
-  "private": true,
+  "version": "0.3.0-beta.1",
   "type": "module",
+  "description": "Read-only native agent session inspection across self-hosted machines",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/samuelho-dev/coordinator.git"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "dist/src/*.js",
+    "dist/plugins/*.js",
+    "dist/scripts/install.js",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
+  },
   "engines": {
     "node": ">=22.19"
   },
   "packageManager": "pnpm@11.9.0",
+  "exports": {
+    "./package.json": "./package.json"
+  },
   "bin": {
-    "coordinator": "./dist/src/main.js"
+    "coordinator": "./dist/src/main.js",
+    "coordinator-install": "./dist/scripts/install.js"
   },
   "scripts": {
     "build": "effect-tsgo patch --typescript && node scripts/build.ts && tsc -p tsconfig.build.json",

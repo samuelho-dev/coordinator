@@ -1,6 +1,6 @@
-import { performance } from "node:perf_hooks";
-import { Data, Effect, FileSystem, Option, Schema, Stream } from "effect";
+import { Clock, Data, Effect, FileSystem, Option, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { Host } from "./platform.ts";
 
 export interface ResourceRoot {
   readonly pid: number;
@@ -53,7 +53,7 @@ interface Counter {
   readonly cpuTimeMs: number;
   readonly rssBytes: number;
   readonly observedAt: number;
-  readonly monotonicAt: number;
+  readonly monotonicAt: bigint;
 }
 interface Snapshot {
   readonly counters: Map<number, Counter>;
@@ -127,7 +127,7 @@ const linuxCounter = (pid: number, hz: number, pageSize: number, bootId: string)
   const system = yield* decodeInteger(fields.at(12) ?? "");
   const birth = yield* decodeInteger(fields.at(19) ?? "");
   const rss = yield* decodeInteger(fields.at(21) ?? "");
-  return { pid, ppid, startTime: `linux:${bootId}:${birth}`, cpuTimeMs: (user + system) * 1000 / hz, rssBytes: rss * pageSize, observedAt: Date.now(), monotonicAt: performance.now() };
+  return { pid, ppid, startTime: `linux:${bootId}:${birth}`, cpuTimeMs: (user + system) * 1000 / hz, rssBytes: rss * pageSize, observedAt: yield* Clock.currentTimeMillis, monotonicAt: yield* Clock.monotonicTimeNanos };
 });
 
 export const parseDarwinSnapshot = (output: { readonly text: string; readonly truncated: boolean }) => Effect.gen(function*() {
@@ -153,7 +153,7 @@ export const parseDarwinSnapshot = (output: { readonly text: string; readonly tr
     const cpuTimeMs = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000 + fraction * 10;
     // ps has no task-read validity flag: simultaneous zeroes may be uninitialized counters.
     if (cpuTimeMs === 0 && rss === 0) unavailable.set(pid, "task-counters-unreadable-or-zero");
-    counters.set(pid, { pid, ppid, startTime: `darwin:${row.at(3)?.replace(/\s+/g, " ")}`, cpuTimeMs, rssBytes: rss * 1024, observedAt: Date.now(), monotonicAt: performance.now() });
+    counters.set(pid, { pid, ppid, startTime: `darwin:${row.at(3)?.replace(/\s+/g, " ")}`, cpuTimeMs, rssBytes: rss * 1024, observedAt: yield* Clock.currentTimeMillis, monotonicAt: yield* Clock.monotonicTimeNanos });
   }
   return { counters, unavailable, truncated };
 });
@@ -163,9 +163,10 @@ export type ProcessIdentification =
   | { readonly status: "unavailable"; readonly reason: string };
 
 /** Capture native identity for presence without measuring CPU or RSS. */
-export const identifyProcess = (pid: number): Effect.Effect<ProcessIdentification, ResourceError, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner> => Effect.gen(function*() {
+export const identifyProcess = (pid: number): Effect.Effect<ProcessIdentification, ResourceError, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner | Host> => Effect.gen(function*() {
   if (!Number.isSafeInteger(pid) || pid <= 0) return yield* new ResourceError({ operation: "invalid process identity PID" });
-  if (process.platform === "linux") {
+  const host = yield* Host;
+  if (host.platform === "linux") {
     const fields = yield* linuxFields(pid);
     if (fields === null) return { status: "unavailable", reason: "process-exited-or-permission-denied" };
     const ppid = yield* decodeInteger(fields.at(1) ?? "");
@@ -173,7 +174,7 @@ export const identifyProcess = (pid: number): Effect.Effect<ProcessIdentificatio
     const bootId = yield* linuxBootId();
     return { status: "available", pid, ppid, startTime: `linux:${bootId}:${birth}` };
   }
-  if (process.platform !== "darwin") return { status: "unavailable", reason: "unsupported-platform" };
+  if (host.platform !== "darwin") return { status: "unavailable", reason: "unsupported-platform" };
   const output = yield* command("/bin/ps", ["-p", `${pid}`, "-o", "pid=,ppid=,lstart="], true);
   if (output.truncated) return { status: "unavailable", reason: "identity-output-truncated" };
   if (!output.text.trim()) return { status: "unavailable", reason: "process-exited" };
@@ -191,23 +192,24 @@ export const identifyProcess = (pid: number): Effect.Effect<ProcessIdentificatio
  * startTime is native identity: Linux boot_id + start ticks or Darwin C-locale lstart (one-second resolution).
  * No process command lines, file contents, or host resource totals are returned.
  */
-export const observeResources = (roots: ReadonlyArray<ResourceRoot>): Effect.Effect<ResourceObservation, ResourceError, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner> => Effect.gen(function*() {
+export const observeResources = (roots: ReadonlyArray<ResourceRoot>): Effect.Effect<ResourceObservation, ResourceError, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner | Host> => Effect.gen(function*() {
   if (roots.length > maxProcesses || roots.some((root) => !Number.isSafeInteger(root.pid) || root.pid <= 0)) {
     return yield* new ResourceError({ operation: "invalid resource roots" });
   }
-  const started = Date.now();
-  const empty = (reason: string | null): ResourceObservation => ({
-    processes: [], sampleStartedAt: started, sampledAt: Date.now(), windowMs: 0,
+  const host = yield* Host;
+  const started = yield* Clock.currentTimeMillis;
+  const empty = (reason: string | null, sampledAt: number): ResourceObservation => ({
+    processes: [], sampleStartedAt: started, sampledAt, windowMs: 0,
     ownedProcessCount: 0, ownedCpuPercent: null, ownedRssBytes: null,
     sharedProcessCount: 0, unknownProcessCount: 0, partial: reason !== null, truncated: false, unavailableReason: reason,
   });
-  if (process.platform !== "linux" && process.platform !== "darwin") return empty("unsupported-platform");
-  if (roots.length === 0) return empty(null);
+  if (host.platform !== "linux" && host.platform !== "darwin") return empty("unsupported-platform", yield* Clock.currentTimeMillis);
+  if (roots.length === 0) return empty(null, yield* Clock.currentTimeMillis);
   const fs = yield* FileSystem.FileSystem;
   let hz = 1;
   let pageSize = 1;
   let bootId = "";
-  if (process.platform === "linux") {
+  if (host.platform === "linux") {
     bootId = yield* linuxBootId();
     const ticks = yield* command("/usr/bin/getconf", ["CLK_TCK"]);
     const pages = yield* command("/usr/bin/getconf", ["PAGESIZE"]);
@@ -215,7 +217,7 @@ export const observeResources = (roots: ReadonlyArray<ResourceRoot>): Effect.Eff
     pageSize = yield* decodeInteger(pages.text.trim());
     if (ticks.truncated || pages.truncated || hz === 0 || pageSize === 0) return yield* new ResourceError({ operation: "read Linux native units" });
   }
-  const snapshot = (): Effect.Effect<Snapshot, ResourceError, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner> => process.platform === "darwin" ? darwinSnapshot : Effect.gen(function*() {
+  const snapshot = (): Effect.Effect<Snapshot, ResourceError, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner> => host.platform === "darwin" ? darwinSnapshot : Effect.gen(function*() {
     const names = yield* fs.readDirectory("/proc").pipe(Effect.mapError((cause) => new ResourceError({ operation: "enumerate processes", cause })));
     const pids = names.filter((name) => /^\d+$/.test(name)).map(Number);
     // Requested roots always survive the cap, even on a busy host.
@@ -231,7 +233,7 @@ export const observeResources = (roots: ReadonlyArray<ResourceRoot>): Effect.Eff
     return { counters, unavailable, truncated: unique.length > selected.length };
   });
   // Dedicated root reads bracket the entire attribution operation, not just the sleep.
-  const rootSnapshot = (): Effect.Effect<Map<number, Counter>, ResourceError, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner> => process.platform === "darwin"
+  const rootSnapshot = (): Effect.Effect<Map<number, Counter>, ResourceError, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner> => host.platform === "darwin"
     ? darwinSnapshot.pipe(Effect.map((value) => value.counters))
     : Effect.gen(function*() {
       const counters = new Map<number, Counter>();
@@ -242,13 +244,13 @@ export const observeResources = (roots: ReadonlyArray<ResourceRoot>): Effect.Eff
       return counters;
     });
   const before = yield* rootSnapshot();
-  const sampleStartedAt = Date.now();
-  const monotonicStart = performance.now();
+  const sampleStartedAt = yield* Clock.currentTimeMillis;
+  const monotonicStart = yield* Clock.monotonicTimeNanos;
   const first = yield* snapshot();
   yield* Effect.sleep("200 millis");
   const second = yield* snapshot();
-  const windowMs = performance.now() - monotonicStart;
-  const sampledAt = Date.now();
+  const windowMs = Number((yield* Clock.monotonicTimeNanos) - monotonicStart) / 1_000_000;
+  const sampledAt = yield* Clock.currentTimeMillis;
   const after = yield* rootSnapshot();
   const validRoots = new Map<number, ResourceRoot["ownership"]>();
   const invalidRoots = new Map<number, string>();
@@ -303,12 +305,12 @@ export const observeResources = (roots: ReadonlyArray<ResourceRoot>): Effect.Eff
     if (reason !== null) partial = true;
     processes.set(counter.pid, {
       pid: counter.pid, ppid: counter.ppid, startTime: counter.startTime, ownership: reason === null ? owner : "unknown",
-      cpuPercent: reason === null && start && end ? (end.cpuTimeMs - start.cpuTimeMs) / (end.monotonicAt - start.monotonicAt) * 100 : null,
+      cpuPercent: reason === null && start && end ? (end.cpuTimeMs - start.cpuTimeMs) / (Number(end.monotonicAt - start.monotonicAt) / 1_000_000) * 100 : null,
       cpuTimeMs: reason === null && end ? end.cpuTimeMs : null,
       rssBytes: reason === null && end ? end.rssBytes : null,
       sampleStartedAt: start?.observedAt ?? null,
       sampledAt: end?.observedAt ?? null,
-      windowMs: start && end ? end.monotonicAt - start.monotonicAt : null,
+      windowMs: start && end ? Number(end.monotonicAt - start.monotonicAt) / 1_000_000 : null,
       unavailableReason: reason,
     });
   }
