@@ -137,7 +137,14 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. B
 
 ## Plugin publication
 
-The npm candidate is `@samuelho/coordinator@0.3.0-beta.1`; publication requires the exact-source CI-accepted tarball and owner authorization. The [npm workflow](.github/workflows/npm-release.yaml) promotes that accepted artifact; [first-publication authentication and trust setup](#first-npm-publication) remain operator prerequisites. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The npm candidate is `@samuelho-dev/coordinator@0.3.0-beta.1`; publication requires the exact-source CI-accepted tarball and owner authorization. The [npm workflow](.github/workflows/npm-release.yaml) promotes that accepted artifact; [first-publication authentication and trust setup](#first-npm-publication) remain operator prerequisites. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+
+Once published, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
+
+```sh
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.1
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.1
+```
 
 | Host | Publication route |
 | --- | --- |
@@ -157,7 +164,7 @@ Release gaps and constraints:
 
 ### First npm publication
 
-- Authenticate with native `npm login` as an account authorized for `@samuelho`; satisfy 2FA and inspect existing package/access/version state. GitHub or AWS access does not grant npm rights. An anonymous 404 is not creation permission; stop if ownership or private-package state is ambiguous.
+- Authenticate with native `npm login` as an account authorized for `@samuelho-dev`; satisfy 2FA and inspect existing package/access/version state. GitHub or AWS access does not grant npm rights. An anonymous 404 is not creation permission; stop if ownership or private-package state is ambiguous.
 - Publish only the accepted tarball from successful current-main CI. Apply the [release workflow's](.github/workflows/npm-release.yaml) source/run/attempt, required-job, unique-unexpired-artifact, manifest/repository, normalized source-contract, SHA256 and unused-version checks. Do not rebuild, repack a dirty checkout or create a dummy bootstrap version. Explicitly publish that archive with `--ignore-scripts --access public --tag beta --registry=https://registry.npmjs.org`; an interactive first publication has no hosted npm provenance.
 - For later releases, configure [npm's trusted publisher](https://docs.npmjs.com/trusted-publishers/) for GitHub owner `samuelho-dev`, repository `coordinator`, workflow `npm-release.yaml`, environment `npm-public`, with direct publishing allowed. Protect that GitHub environment with maintainers/reviewers and main-only restrictions; naming it in YAML does not create those rules. The hosted OIDC workflow publishes the verified archive with provenance, without an npm token fallback.
 
@@ -167,7 +174,7 @@ Release gaps and constraints:
 - **Read API:** `/mcp` exposes only `session.list` and `session.inspect`. List requires `limit` 1–100, with cursor/machine/harness filters. Inspect takes the complete returned `SessionRef`: `machineId`, `harness`, `nativeSessionId`, optional `nativeAgentId`.
 - **Publishing:** native hosts initiate outbound `/connector/announce`, `/connector/poll`, `/connector/result` and `/connector/disconnect` requests. Detail queries are correlated transient read RPCs, not execution jobs.
 - **Startup:** generated integrations do not await the inspector during activation. Pi/OMP publish in the background; Claude/Codex/Hermes hooks capture locally; the local stdio bridge initializes and lists tools without a remote handshake. Explicit inspection/`coordinate` requests may await a bounded remote reply. Local configuration, filesystem and native loading still run during initialization.
-- **State/lifetime:** the owner-isolated registry is in memory; restart loses discovery until reannouncement, never native sessions. A Pi/OMP plugin owns one Effect managed runtime; presence/poll failures cancel their peer and shutdown disposes its fibers without killing the host. Failed startup/terminated connectors can restart on a later native event.
+- **State/lifetime:** the owner-isolated registry is in memory; restart loses discovery until reannouncement, never native sessions. A Pi/OMP plugin owns one Effect managed runtime; presence/poll failures cancel their peer and shutdown disposes its fibers without killing the host. Closing the stdio reader's stdin ends its scope and cancels pending HTTP reads. Failed startup/terminated connectors can restart on a later native event.
 - **Effect composition:** `NodeServices.layer` provides filesystem/path/crypto/process/stdio services; `Host.layer` provides host facts. `Mcp.layer` privately supplies its HTTP client. The CLI scope owns the inspector/server; one Pi/OMP `ManagedRuntime` owns plugin fibers/layers through shutdown. CLI-only stdin closes on completion; plugin stdin remains host-owned. Layer construction, provisioning and sharing follow the [v4 layer contract](https://effect.website/docs/v4/api/effect/Layer).
 - **Node bindings:** [`platform.ts`](src/platform.ts) confines native host facts and CLI-owned stdin alongside the server factory required by [`NodeHttpServer.layerServer`](https://effect.website/docs/v4/api/platform-node/NodeHttpServer#layerServer) and constant-time comparison absent from [`Crypto`](https://effect.website/docs/v4/api/effect/Crypto#Crypto-interface). Filesystem checks use `FileSystem`; execute permission uses Effect's scoped process service running `/bin/test -x`, never the selected runtime. Native SDK callbacks remain foreign interop boundaries.
 - **OMP shortcut:** a leading `coordinate` enriches the current input with fleet presence and an inspection cue. It does not contact other sessions with prompts.

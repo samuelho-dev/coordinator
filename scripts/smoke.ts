@@ -133,7 +133,10 @@ const program = Effect.gen(function*() {
     }));
   const observation = yield* mcp.call(inspectorUrl, siblingToken, InspectionTools.inspect, { ref: presence.ref });
   yield* verify.equal(detailRequests, 1);
-  yield* verify.equal(observation.resources.ownedProcessCount.status, "available");
+  const processCount = observation.resources.ownedProcessCount;
+  yield* verify.equal(processCount.status, "available", processCount.status === "unavailable"
+    ? `Native owned-process count unavailable: ${processCount.reason}; partial=${processCount.provenance.partial}; shared=${processCount.provenance.shared}`
+    : "Expected an available owned-process count");
   yield* verify.equal(observation.resources.ownedRssBytes.status, "available");
   yield* verify.equal(observation.resources.ownedCpuPercent.status, "available");
   if (observation.resources.ownedRssBytes.status === "available") yield* verify.ok(observation.resources.ownedRssBytes.value > 0);

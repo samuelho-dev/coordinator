@@ -55,9 +55,9 @@ const program = Effect.gen(function*() {
   }
   yield* fs.writeFileString(path.join(root, "package.json"), JSON.stringify({ private: true, type: "module" }));
   yield* run("npm", ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", tarball]);
-  const packageRoot = path.join(root, "node_modules", "@samuelho", "coordinator");
+  const packageRoot = path.join(root, "node_modules", "@samuelho-dev", "coordinator");
   const manifest = yield* Schema.decodeEffect(Schema.fromJsonString(Manifest))(yield* fs.readFileString(path.join(packageRoot, "package.json")));
-  yield* guard(manifest.name === "@samuelho/coordinator", "Unexpected installed package identity");
+  yield* guard(manifest.name === "@samuelho-dev/coordinator", "Unexpected installed package identity");
   yield* guard(manifest.scripts?.preinstall === undefined && manifest.scripts?.install === undefined && manifest.scripts?.postinstall === undefined, "Published package must not define install lifecycle scripts");
   const { "coordinator-install": installerBin } = manifest.bin;
   yield* guard(manifest.bin.coordinator.replace(/^\.\//, "") === "dist/src/main.js" && installerBin.replace(/^\.\//, "") === "dist/scripts/install.js", "Public binaries must point to built entrypoints");

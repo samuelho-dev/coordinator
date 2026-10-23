@@ -1,4 +1,4 @@
-import { ByteSize, Cause, Config, Context, Effect, Formatter, Layer, Option, Schema, Stream } from "effect";
+import { ByteSize, Cause, Config, Context, Deferred, Effect, Formatter, Layer, Option, Schema, Stdio, Stream } from "effect";
 import type { Scope } from "effect";
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientRequest, HttpIncomingMessage, HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { McpProtocol, McpSchema, McpServer } from "effect/ai";
@@ -95,7 +95,7 @@ const registerTool = <I extends Schema.Top & Schema.ConstraintCodec<unknown, unk
   });
 }));
 
-export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
+export class Mcp extends Context.Service<Mcp>()("@samuelho-dev/coordinator/Mcp", {
   make: Effect.gen(function*() {
     const httpClient = yield* HttpClient.HttpClient;
     const post = <I extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>, O extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>>(
@@ -208,10 +208,20 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho/coordinator/Mcp", {
     const serveStdio = <LE, LR, IE, IR>(reader: {
       readonly list: (input: SessionListInput) => Effect.Effect<SessionListOutput, LE, LR>;
       readonly inspect: (input: SessionInspectInput) => Effect.Effect<SessionInspection, IE, IR>;
-    }) => {
+    }) => Effect.gen(function*() {
+      const ended = yield* Deferred.make<void>();
+      const stdio = yield* Stdio.Stdio;
       const protocol = McpServer.layerStdio({ name: "coordinator-inspector", version: "1.0.0", protocols });
-      return Layer.launch(Layer.merge(protocol, Layer.merge(registerTool(InspectionTools.list, reader.list), registerTool(InspectionTools.inspect, reader.inspect)).pipe(Layer.provide(protocol))));
-    };
+      return yield* Effect.raceFirst(
+        Layer.launch(Layer.merge(protocol, Layer.merge(registerTool(InspectionTools.list, reader.list), registerTool(InspectionTools.inspect, reader.inspect)).pipe(Layer.provide(protocol)))).pipe(
+          Effect.provideService(Stdio.Stdio, {
+            ...stdio,
+            stdin: stdio.stdin.pipe(Stream.onEnd(Deferred.succeed(ended, undefined))),
+          }),
+        ),
+        Deferred.await(ended),
+      );
+    });
     return { call, post, serve, serveStdio };
   }),
 }) {

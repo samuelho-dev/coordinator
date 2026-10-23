@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { Cause, Clock, ConfigProvider, Crypto, Deferred, Effect, Fiber, FileSystem, Layer, Logger, Path, PlatformError, Random, References, Schedule, Schema, Stream } from "effect";
+import { Cause, Clock, ConfigProvider, Crypto, Deferred, Effect, Fiber, FileSystem, Layer, Logger, Path, PlatformError, Queue, Random, References, Schedule, Schema, Stream } from "effect";
 import type { Scope } from "effect";
 import { Hex } from "effect/encoding";
 import { TestClock } from "effect/testing";
@@ -14,8 +14,6 @@ import { Inspector } from "../src/inspector.ts";
 import { Mcp } from "../src/mcp.ts";
 import { Host, checkExecutable, serverLayer } from "../src/platform.ts";
 import { cli } from "../src/main.ts";
-import { Client } from "@modelcontextprotocol/client";
-import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 const fixture = <A, E>(effect: Effect.Effect<A, E, NodeServices.NodeServices | Host | Scope.Scope | HttpClient.HttpClient>) => Effect.scoped(effect.pipe(Effect.provide(FetchHttpClient.layer), Effect.provide(NodeServices.layer), Effect.provide(Host.layer)));
 const expectFailure = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.gen(function*() {
@@ -259,26 +257,56 @@ it.live("stdio startup advertises tools before inspector availability and closes
     Effect.ensuring(Deferred.succeed(disconnected, undefined)),
   ));
   const home = yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-stdio-startup-" });
-  yield* Effect.scoped(Effect.gen(function*() {
-    const client = yield* Effect.acquireRelease(
-      Effect.sync(() => new Client({ name: "startup-regression", version: "1.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } })),
-      (client) => Effect.promise(() => client.close()),
-    );
-    const transport = new StdioClientTransport({
-      command: host.executable,
-      args: ["--experimental-strip-types", yield* path.fromFileUrl(new URL("../src/main.ts", import.meta.url)), "mcp"],
-      env: {
-        HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
-        COORDINATOR_API_URL: HttpServer.formatAddress(server.address), COORDINATOR_API_TOKEN: "private-startup-credential",
-      },
-      stderr: "pipe",
-    });
-    const prematureRequest = Deferred.await(requested).pipe(Effect.andThen(Effect.die(new Error("Stdio startup awaited the inspector"))));
-    yield* Effect.raceFirst(Effect.promise(() => client.connect(transport)), prematureRequest);
-    yield* Effect.raceFirst(Effect.promise(() => client.listTools()), prematureRequest);
-    yield* Effect.promise((signal) => client.callTool({ name: "session.list", arguments: { limit: 1 } }, { signal })).pipe(Effect.exit, Effect.forkScoped);
-    yield* Deferred.await(requested);
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const input = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+  const listed = yield* Deferred.make<void>();
+  const decodeReply = Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({
+    id: Schema.optional(Schema.Number),
+    result: Schema.optional(Schema.Struct({
+      tools: Schema.optional(Schema.Array(Schema.Struct({ name: Schema.String }))),
+    })),
+    error: Schema.optional(Schema.Struct({ code: Schema.Number })),
+  })));
+  const child = yield* spawner.spawn(ChildProcess.make(host.executable, [
+    "--experimental-strip-types", yield* path.fromFileUrl(new URL("../src/main.ts", import.meta.url)), "mcp",
+  ], {
+    env: {
+      HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
+      COORDINATOR_API_URL: HttpServer.formatAddress(server.address), COORDINATOR_API_TOKEN: "private-startup-credential",
+    },
+    extendEnv: false, stdin: Stream.fromQueue(input), forceKillAfter: "1 second",
   }));
+  const output = yield* child.stdout.pipe(
+    Stream.decodeText(), Stream.splitLines,
+    Stream.runForEach((line) => Effect.gen(function*() {
+      const response = yield* decodeReply(line);
+      if (response.id === 1) {
+        assert.strictEqual(response.error, undefined);
+        assert.deepEqual(response.result?.tools?.map((tool) => tool.name).sort(), ["session.inspect", "session.list"]);
+        yield* Deferred.succeed(listed, undefined);
+      }
+    })),
+    Effect.forkScoped,
+  );
+  const stderr = yield* child.stderr.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
+  const encoder = new TextEncoder();
+  const prematureRequest = Effect.raceFirst(
+    Deferred.await(requested).pipe(Effect.andThen(Effect.die(new Error("Stdio startup awaited the inspector")))),
+    Fiber.join(output).pipe(Effect.andThen(Effect.die(new Error("Stdio closed before tool discovery")))),
+  );
+  const metadata = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientInfo": { name: "startup-regression", version: "1.0.0" },
+    "io.modelcontextprotocol/clientCapabilities": {},
+  };
+  yield* Queue.offer(input, encoder.encode(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: metadata } })}\n`));
+  yield* Effect.raceFirst(Deferred.await(listed), prematureRequest);
+  yield* Queue.offer(input, encoder.encode(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { _meta: metadata, name: "session.list", arguments: { limit: 1 } } })}\n`));
+  yield* Deferred.await(requested);
+  yield* Queue.end(input);
+  const code = yield* child.exitCode;
+  yield* Fiber.join(output);
+  assert.strictEqual(Number(code), 0, yield* Fiber.join(stderr));
   yield* Deferred.await(disconnected);
 }).pipe(Effect.provide(serverLayer("127.0.0.1", 0)), Effect.timeout("8 seconds"))), 15000);
 

@@ -75,7 +75,7 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           tar -xOf npm-evidence/package.tgz package/package.json > "$RUNNER_TEMP/packed-package.json"
-          jq -e '.name == "@samuelho/coordinator" and .private != true and (.version | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-beta\\.[1-9][0-9]*$"))' "$RUNNER_TEMP/packed-package.json"
+          jq -e '.name == "@samuelho-dev/coordinator" and .private != true and (.version | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-beta\\.[1-9][0-9]*$"))' "$RUNNER_TEMP/packed-package.json"
           HASH="$(sha256sum npm-evidence/package.tgz | cut -d' ' -f1)"
           jq -n --slurpfile package "$RUNNER_TEMP/packed-package.json" --arg repo "$REPOSITORY" --arg sha "$SOURCE_SHA" --arg run "$RUN_ID" --arg attempt "$RUN_ATTEMPT" --arg hash "$HASH" '{repository:$repo,sourceSha:$sha,ciRunId:$run,ciRunAttempt:$attempt,gate:"npm-package",packageName:$package[0].name,packageVersion:$package[0].version,archiveSha256:$hash,acceptance:"production-only-packed-native-install"}' > npm-evidence/npm.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

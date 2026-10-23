@@ -27,7 +27,7 @@ export const cli = (args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(fun
   if (mode === "--version") {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const file = yield* path.fromFileUrl(new URL(import.meta.resolve("@samuelho/coordinator/package.json")));
+    const file = yield* path.fromFileUrl(new URL(import.meta.resolve("@samuelho-dev/coordinator/package.json")));
     const manifest = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ version: Schema.String })))(yield* fs.readFileString(file));
     return yield* Console.log(manifest.version);
   }

@@ -1,5 +1,5 @@
 {
-  "name": "@samuelho/coordinator",
+  "name": "@samuelho-dev/coordinator",
   "version": "0.3.0-beta.1",
   "type": "module",
   "description": "Read-only native agent session inspection across self-hosted machines",

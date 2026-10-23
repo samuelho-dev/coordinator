@@ -81,16 +81,16 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C source rev-parse HEAD)" = "$SHA"
-          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg attempt "$ATTEMPT" --arg version "$VERSION" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .ciRunAttempt == $attempt and .gate == "npm-package" and .packageName == "@samuelho/coordinator" and .packageVersion == $version and .acceptance == "production-only-packed-native-install" and (.archiveSha256 | test("^[0-9a-f]{64}$"))' npm-evidence/npm.json
+          jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg attempt "$ATTEMPT" --arg version "$VERSION" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .ciRunAttempt == $attempt and .gate == "npm-package" and .packageName == "@samuelho-dev/coordinator" and .packageVersion == $version and .acceptance == "production-only-packed-native-install" and (.archiveSha256 | test("^[0-9a-f]{64}$"))' npm-evidence/npm.json
           test "$(sha256sum npm-evidence/package.tgz | cut -d' ' -f1)" = "$(jq -r .archiveSha256 npm-evidence/npm.json)"
           tar -xOf npm-evidence/package.tgz package/package.json > "$RUNNER_TEMP/package.json"
-          jq -e --arg version "$VERSION" --arg url "git+https://github.com/$REPOSITORY.git" '.name == "@samuelho/coordinator" and .version == $version and .private != true and .repository.url == $url' "$RUNNER_TEMP/package.json"
+          jq -e --arg version "$VERSION" --arg url "git+https://github.com/$REPOSITORY.git" '.name == "@samuelho-dev/coordinator" and .version == $version and .private != true and .repository.url == $url' "$RUNNER_TEMP/package.json"
           # npm normalizes bin targets (for example ./dist -> dist); compare the public contract, not bytes.
           jq -e --slurpfile source source/package.json 'def contract: {name,version,private:(.private // false),type,license,engines,repository,dependencies,optionalDependencies,peerDependencies,peerDependenciesMeta,exports,bin:(.bin | map_values(sub("^\\./";""))),pi,omp,files,publishConfig}; contract == ($source[0] | contract)' "$RUNNER_TEMP/package.json"
-          STATUS="$(curl --silent --show-error --output "$RUNNER_TEMP/registry-package.json" --write-out '%{http_code}' 'https://registry.npmjs.org/@samuelho%2fcoordinator')"
+          STATUS="$(curl --silent --show-error --output "$RUNNER_TEMP/registry-package.json" --write-out '%{http_code}' 'https://registry.npmjs.org/@samuelho-dev%2fcoordinator')"
           test "$STATUS" = 200 || { echo 'Trusted publishing requires an existing public package and an npmjs.com trusted publisher for npm-release.yaml / npm-public. First publication requires operator authentication and the exact verified CI tarball. See README.md#first-npm-publication.' >&2; exit 1; }
-          jq -e '.name == "@samuelho/coordinator"' "$RUNNER_TEMP/registry-package.json"
-          STATUS="$(curl --silent --show-error --output "$RUNNER_TEMP/registry-version.json" --write-out '%{http_code}' "https://registry.npmjs.org/@samuelho%2fcoordinator/$VERSION")"
+          jq -e '.name == "@samuelho-dev/coordinator"' "$RUNNER_TEMP/registry-package.json"
+          STATUS="$(curl --silent --show-error --output "$RUNNER_TEMP/registry-version.json" --write-out '%{http_code}' "https://registry.npmjs.org/@samuelho-dev%2fcoordinator/$VERSION")"
           test "$STATUS" = 404 || { echo "Refusing existing version or inconclusive registry lookup (HTTP $STATUS)." >&2; exit 1; }
       - name: Publish only the accepted tarball with public provenance
         working-directory: npm-evidence
@@ -104,4 +104,4 @@ jobs:
           test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SHA"
           test "$(sha256sum package.tgz | cut -d' ' -f1)" = "$(jq -r .archiveSha256 npm.json)"
           npm publish ./package.tgz --ignore-scripts --access public --tag beta --provenance --registry=https://registry.npmjs.org
-          printf 'Published `@samuelho/coordinator@%s` under `beta` from CI `%s`, source `%s`, SHA256 `%s`. No rebuild or visibility change.\n' "$VERSION" '${{ inputs.ci_run_id }}' "$SHA" "$(jq -r .archiveSha256 npm.json)" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Published `@samuelho-dev/coordinator@%s` under `beta` from CI `%s`, source `%s`, SHA256 `%s`. No rebuild or visibility change.\n' "$VERSION" '${{ inputs.ci_run_id }}' "$SHA" "$(jq -r .archiveSha256 npm.json)" >> "$GITHUB_STEP_SUMMARY"

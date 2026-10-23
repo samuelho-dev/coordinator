@@ -15,7 +15,7 @@ export class Host extends Context.Service<Host, {
   readonly ppid: number;
   readonly uid: number | undefined;
   readonly executable: string;
-}>()("@samuelho/coordinator/Host") {
+}>()("@samuelho-dev/coordinator/Host") {
   static readonly layer = Layer.sync(this, () => ({
     homeDirectory: homedir(), hostname: hostname(), release: release(), platform: platform(),
     architecture: arch(), pid: process.pid, ppid: process.ppid, uid: process.getuid?.(), executable: process.execPath,
