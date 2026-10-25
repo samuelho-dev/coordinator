@@ -398,7 +398,9 @@ const program = Effect.gen(function*() {
             if (result === undefined) return;
             yield* verify.ok(result.details.sessions.some((entry) => entry.ref.machineId === hermesMachineId && entry.ref.harness === harness));
             yield* verify.ok(result.details.sessions.some((entry) => entry.ref.machineId === otherMachineId));
-            yield* verify.ok(result.content.includes("Machine:") && !result.content.includes(token));
+            const content = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(CoordinatorListMessage.fields.details))(result.content);
+            yield* verify.deepEqual(content.sessions, result.details.sessions, "Displayed JSON must preserve every listed session");
+            yield* verify.ok(!result.content.includes(token));
             yield* Deferred.succeed(listVerified, undefined);
             return;
           }

@@ -1,5 +1,5 @@
 import { NodeServices } from "@effect/platform-node";
-import { Cause, Clock, Config, Console, Effect, Layer, Logger, ManagedRuntime, Schema } from "effect";
+import { Cause, Clock, Config, Console, Effect, Formatter, Layer, Logger, ManagedRuntime, Schema } from "effect";
 import { createInspection, HttpError, InspectionTools, metric, sessionRefKey, unavailableMetric } from "./inspection.ts";
 import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, ProgramStatus, SessionInspection, SessionListOutput, SessionPresence } from "./inspection.ts";
 import { Mcp } from "./mcp.ts";
@@ -8,7 +8,8 @@ import type { NativeNotice } from "./native.ts";
 import { identifyProcess } from "./resources.ts";
 import { Host as PlatformHost } from "./platform.ts";
 import { createRexReporter, readRexContext } from "./rex.ts";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { highlightCode, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 
 declare const COORDINATOR_HARNESS: "pi" | "omp";
 
@@ -45,6 +46,7 @@ export type Host = {
   readonly registerTool: (tool: ToolDefinition<ToolDefinition["parameters"], unknown, unknown>) => void;
   readonly registerCommand: ExtensionAPI["registerCommand"];
   readonly sendMessage: ExtensionAPI["sendMessage"];
+  readonly registerMessageRenderer: ExtensionAPI["registerMessageRenderer"];
 };
 
 const provenance = (source: string, scope: MetricProvenance["scope"], scopeDescription: string, observedAt: number | null, nativeUpdatedAt: number | null = null): MetricProvenance => ({
@@ -221,24 +223,6 @@ export const registerCoordinateKeyword = Effect.gen(function*() {
   setMagicKeywords([...MAGIC_KEYWORDS.filter(({ word }) => isMagicKeyword(word)), { word: "coordinate", hue: [190, 260] }]);
 });
 
-const formatSessionList = (sessions: ReadonlyArray<SessionPresence>): string => {
-  if (sessions.length === 0) return "No sessions are currently visible to this API key.";
-  const lines = [`Coordinator: ${sessions.length} sessions visible to this API key.`, "", "~~~text"];
-  for (const session of sessions) {
-    lines.push(
-      `Machine: ${JSON.stringify(session.machineName ?? "unavailable")} (${JSON.stringify(session.ref.machineId)})`,
-      `Session: ${session.ref.harness} ${JSON.stringify(session.ref.nativeSessionId)}`,
-    );
-    if (session.ref.nativeAgentId !== undefined) lines.push(`Agent ID: ${JSON.stringify(session.ref.nativeAgentId)}`);
-    for (const [field, value] of Object.entries(session)) {
-      if (field !== "ref" && field !== "machineName" && value !== undefined) lines.push(`${field}: ${JSON.stringify(value)}`);
-    }
-    lines.push("");
-  }
-  lines.push("~~~");
-  return lines.join("\n");
-};
-
 export default function plugin(host: Host): void {
   const harness = COORDINATOR_HARNESS;
   const runtime = ManagedRuntime.make(Layer.mergeAll(NodeServices.layer, PlatformHost.layer, Mcp.layer, Layer.succeed(Logger.LogToStderr, true)));
@@ -249,6 +233,10 @@ export default function plugin(host: Host): void {
   // Stock OMP owns OSC 7501 (terminal.programStatus); never duplicate or override it.
   const rexReporter = harness === "pi" ? createRexReporter((sequence) => process.stdout.write(sequence)) : undefined;
   let terminal = false;
+  host.registerMessageRenderer("coordinator-list", (message) => {
+    if (typeof message.content !== "string") return undefined;
+    return new Text(message.details === undefined ? message.content : highlightCode(message.content, "json").join("\n"), 0, 0);
+  });
   host.registerCommand("coordinator", {
     description: "List visible sessions, their machines, and native metadata",
     handler: async (args) => {
@@ -281,9 +269,10 @@ export default function plugin(host: Host): void {
         }, { triggerTurn: false });
         return;
       }
+      const result = { sessions: exit.value };
       host.sendMessage({
-        customType: "coordinator-list", content: formatSessionList(exit.value), display: true,
-        details: { sessions: exit.value },
+        customType: "coordinator-list", content: Formatter.formatJson(result, { space: 2 }), display: true,
+        details: result,
       }, { triggerTurn: false });
     },
   });

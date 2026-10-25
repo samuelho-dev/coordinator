@@ -16,7 +16,11 @@ const program = Effect.gen(function*() {
         bundle: true,
         // OMP's compatibility loader walks external runtime dependency graphs.
         packages: harness === "omp" ? "bundle" : "external",
-        external: ["@oh-my-pi/*"],
+        external: ["@oh-my-pi/*", "@earendil-works/*"],
+        alias: harness === "omp" ? {
+          "@earendil-works/pi-tui": "@oh-my-pi/pi-tui",
+          "@earendil-works/pi-coding-agent": "@oh-my-pi/pi-coding-agent",
+        } : undefined,
         platform: "node",
         format: "esm",
         target: "node22",

@@ -372,7 +372,7 @@ it("repairs startup and rotated credentials without leaking host hooks or shutdo
         }
         const handlers = new Map();
         const notices = [];
-        plugin({ on: (name, handler) => handlers.set(name, handler), registerTool: () => {}, registerCommand: () => {}, sendMessage: () => {} });
+        plugin({ on: (name, handler) => handlers.set(name, handler), registerTool: () => {}, registerCommand: () => {}, registerMessageRenderer: () => {}, sendMessage: () => {} });
         const context = { cwd: home, mode: "rpc", hasUI: scenario !== "headless",
           sessionManager: { getSessionId: () => scenario }, isIdle: () => true,
           getContextUsage: () => undefined, ui: { notify: (message, level) => notices.push({ message, level }) } };
@@ -658,13 +658,14 @@ it("lists every authorized session across pages and machines without native capt
         plugin({
           on: (name, handler) => handlers.set(name, handler), registerTool: () => {},
           registerCommand: (name, command) => commands.set(name, command),
+          registerMessageRenderer: () => {},
           sendMessage: message => messages.push(message),
         });
         yield* Effect.addFinalizer(() => Effect.promise(() => handlers.get("session_shutdown")()));
         const list = () => Effect.promise(() => commands.get("coordinator").handler("list", {}));
         yield* list();
         const message = messages.pop();
-        const sessions = message.details.sessions;
+        const sessions = JSON.parse(message.content).sessions;
         check(sessions.length === 101, "List silently stopped at the first API page");
         check(sessions.some(session => session.ref.machineId === "local-machine"), "Local machine missing");
         check(sessions.some(session => session.ref.machineId === "remote-machine"), "Remote machine missing");
@@ -679,7 +680,7 @@ it("lists every authorized session across pages and machines without native capt
         for (const credential of [${JSON.stringify(token)}, "invalid-credential"]) check(!rejected.content.includes(credential), "Command disclosed credentials");
         yield* fs.writeFileString(path.join(home, "token"), ${JSON.stringify(emptyToken)}, { mode: 0o600 });
         yield* list();
-        check(messages.pop().details.sessions.length === 0, "Empty owner did not receive an empty listing");
+        check(JSON.parse(messages.pop().content).sessions.length === 0, "Empty owner did not receive an empty JSON listing");
         check(!(yield* fs.exists(path.join(home, "state"))), "Read-only command initialized native capture");
       })).pipe(Effect.provide(NodeServices.layer)));
     `;

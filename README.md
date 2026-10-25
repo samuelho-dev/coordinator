@@ -9,7 +9,7 @@ There are two parts: **one inspector service**, plus **native integrations on ea
 The API and setup CLI require Node >=22.19. Install the version-pinned release:
 
 ```sh
-npm install --global @samuelho-dev/coordinator@0.3.0-beta.3
+npm install --global @samuelho-dev/coordinator@0.3.0-beta.4
 ```
 
 For source development only, use a reviewed checkout with `pnpm install --frozen-lockfile && pnpm build` (pnpm 11.9.0). `coordinator-install --source` deliberately activates that exact local package; never source-link a native package manager's own `node_modules` directory.
@@ -100,8 +100,8 @@ The installer validates prerequisites and creates launchers/config fragments. `-
 
 | Target | Activation | Presence publisher |
 | --- | --- | --- |
-| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.3`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
-| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.3`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
+| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.4`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
+| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.4`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
 | Claude Code | `claude --plugin-dir "$PRIVATE/claude-host"`; approve generated hooks/MCP tools; preserve existing status-line configuration. | Separate `connector.sh`. |
 | Codex CLI | Merge generated `hooks/hooks.json` and coordinator `mcp.toml`; trust only Coordinator's handlers in native `/hooks`. | Separate `connector.sh`. |
 | Hermes | Merge generated hook entries and `mcp_servers.coordinator` from `mcp.yaml` into the selected profile; no Python plugin installation. | Separate `connector.sh`. |
@@ -118,7 +118,7 @@ Hook/status-line/notification capture is local and can initialize identity/cache
 
 ### Native session commands and Rex
 
-Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and displays full native session/agent IDs, machine names/installation IDs, harness and all reported metadata: model/provider, workspace, activity, connection liveness, process identity and Rex association. Missing metadata is omitted. It reads the API directly, with no model turn, per-session resource sampling or separate MCP registration.
+Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and returns pretty JSON (`{ "sessions": [...] }`) using Effect's JSON formatter, with native JSON syntax highlighting in the terminal. Each session preserves full native session/agent IDs, machine names/installation IDs, harness and all reported metadata: model/provider, workspace, activity, connection liveness, process identity and Rex association. Missing metadata is omitted; an empty listing returns `{ "sessions": [] }`. It reads the API directly, with no model turn, per-session resource sampling or separate MCP registration.
 
 Session JSON is Coordinator's fleet model, not an OSC wire payload. `rex` preserves `REX_SERVER` as `serverAddress` and the actual full `REX_SESSION`/`REX_BLOCK` IDs; these are separate from native agent IDs. Optional `programStatus` uses [Rex Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) semantics: idle/working/done/error, or blocked with permission/question/auth kind. Agent `kind` remains separate. Tool/API waits are working; unknown outcomes are omitted, not inferred from disconnects or generic stops. API connection leases do not expire terminal status records.
 
@@ -133,13 +133,13 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. B
 
 ## Plugin publication
 
-The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.3`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.4`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
 For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.3
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.3
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.4
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.4
 ```
 
 Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
@@ -147,6 +147,8 @@ Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixe
 `0.3.0-beta.2` fixes clean-install startup failures by pinning `effect`, `@effect/platform-node` and `@effect/platform-node-shared` together at 4.0.3 in the published dependencies. Checkout-only pnpm overrides do not constrain npm/OMP consumers; leaving the shared package floating can select an incompatible release (`effect/Path` missing `make`). Keep these three pins aligned when upgrading.
 
 `0.3.0-beta.3` adds native `/coordinator list`, secure self-host bootstrap/authenticated client setup, and Rex references/status normalization without an OMP fork. Runtime dependency pins are unchanged.
+
+`0.3.0-beta.4` fixes `/coordinator list` output: Effect-formatted, indented JSON with native syntax highlighting instead of hand-built text and literal fences. Native UI imports are static and selected at build time; the renderer registers once at startup. The session wire format and runtime dependencies are unchanged, so the existing beta.3 API needs no redeployment.
 
 | Host | Publication route |
 | --- | --- |
