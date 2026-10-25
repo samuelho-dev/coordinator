@@ -6,6 +6,7 @@ import { Stream } from "effect";
 import { Mcp } from "./mcp.ts";
 import { INSPECTION_LIMIT, ConnectorConfig, ConnectorAnnounce, ConnectorAccepted, ConnectorPoll, ConnectorPollResult, ConnectorResult, ConnectorDisconnect, SessionInspection, createInspection, metric, unavailableMetric, sessionRefKey, type ObservationError, type SessionPresence, type SessionRef, type MetricProvenance, type MetricUnit } from "./inspection.ts";
 import { identifyProcess, observeResources, type ProcessIdentification } from "./resources.ts";
+import { readRexContext } from "./rex.ts";
 
 export class NativeError extends Data.TaggedError("NativeError")<{ readonly operation: string }> {}
 export type NativeConfig = ConnectorConfig & { readonly machineId: string; readonly stateDirectory: string };
@@ -285,7 +286,8 @@ export const projectHook = (harness: "claude" | "codex", machineId: string, valu
   const name = event.hook_event_name;
   const activity: NonNullable<SessionPresence["activity"]> = name === "PreCompact" || event.source === "compact" ? { state: "working", compacting: true } : name === "SessionEnd" ? { state: "stopped" } : name === "PermissionRequest" ? { state: "waiting", wait: "approval", approval: "pending", ...(event.tool_name ? { currentToolName: event.tool_name } : {}) } : name === "PreToolUse" ? { state: "working", wait: "tool", ...(event.tool_name ? { currentToolName: event.tool_name } : {}) } : name === "Stop" || name === "Interrupt" ? { state: "idle" } : name === "UserPromptSubmit" ? { state: "working", wait: "api" } : { state: "unknown" };
   const model = event.to_model ?? event.model;
-  const presence: SessionPresence = { ref: { machineId, harness, nativeSessionId: event.session_id }, observedAt: at, nativeUpdatedAt: at, lastActivityAt: at, activity, ...(event.cwd ? { cwd: event.cwd } : {}), ...(model ? { model } : {}) };
+  const programStatus: SessionPresence["programStatus"] = name === "PermissionRequest" ? { state: "blocked", kind: "permission" } : harness === "claude" && name === "Elicitation" ? { state: "blocked", kind: "question" } : name === "Interrupt" ? { state: "idle" } : harness === "claude" && name === "StopFailure" ? { state: "error" } : harness === "claude" && name === "Stop" ? { state: "done" } : activity.state === "working" || (harness === "claude" && (name === "PostToolUse" || name === "PostToolUseFailure" || name === "ElicitationResult")) ? { state: "working" } : undefined;
+  const presence: SessionPresence = { ref: { machineId, harness, nativeSessionId: event.session_id }, observedAt: at, nativeUpdatedAt: at, lastActivityAt: at, activity, ...(programStatus ? { programStatus } : {}), ...(event.cwd ? { cwd: event.cwd } : {}), ...(model ? { model } : {}) };
   return createInspection(presence, at);
 });
 export const projectClaudeStatus = (machineId: string, value: unknown, at?: number) => Effect.gen(function*() {
@@ -369,6 +371,8 @@ const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, P
   return records;
 }).pipe(sanitizeFileFinalizers("Read private metadata cache"), Effect.catchTag("PlatformError", () => Effect.fail(new NativeError({ operation: "Read private metadata cache" }))));
 export const writeNativeCache = (config: NativeConfig, incoming: SessionInspection) => Effect.gen(function*() {
+  const rex = yield* readRexContext;
+  if (rex) incoming = { ...incoming, presence: { ...incoming.presence, rex } };
   const records = yield* cacheRecords(config);
   const target = yield* cacheFile(config, incoming.presence.ref);
   if (records.size >= 1024 && !records.has(target)) return yield* new NativeError({ operation: "Metadata cache exceeds bound" });
@@ -377,7 +381,8 @@ export const writeNativeCache = (config: NativeConfig, incoming: SessionInspecti
   if (previous !== undefined) {
     const old = previous.inspection;
     const metadataOnly = incoming.presence.nativeUpdatedAt !== undefined;
-    inspection = { ...(metadataOnly ? old : incoming), presence: { ...old.presence, ...incoming.presence }, queriedAt: incoming.queriedAt, context: metadataOnly && !incoming.presence.activity?.compacting ? old.context : incoming.context };
+    const { programStatus: previousStatus, ...oldPresence } = old.presence;
+    inspection = { ...(metadataOnly ? old : incoming), presence: { ...oldPresence, ...(!incoming.presence.activity && previousStatus ? { programStatus: previousStatus } : {}), ...incoming.presence }, queriedAt: incoming.queriedAt, context: metadataOnly && !incoming.presence.activity?.compacting ? old.context : incoming.context };
   }
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -462,7 +467,8 @@ export const claudeRoster = (config: NativeConfig) => Effect.scoped(Effect.gen(f
     if (!id || !row.pid) continue;
     const identity = yield* identifyProcess(row.pid);
     if (identity.status !== "available") continue;
-    sessions.push({ ref: { machineId: config.machineId, harness: "claude", nativeSessionId: id }, observedAt: yield* Clock.currentTimeMillis, ...(row.cwd ? { cwd: row.cwd } : {}), ...(row.kind ? { kind: row.kind } : {}), processes: [{ pid: row.pid, startIdentity: identity.startTime, ownership: "owned" }], activity: { state: row.status === "busy" ? "working" : row.status === "waiting" ? "waiting" : row.status === "idle" ? "idle" : "unknown", ...(row.waitingFor === "permission prompt" ? { wait: "approval", approval: "pending" } : {}) } });
+    const programStatus: SessionPresence["programStatus"] = row.waitingFor === "permission prompt" ? { state: "blocked", kind: "permission" } : row.status === "busy" ? { state: "working" } : row.status === "idle" ? { state: "idle" } : undefined;
+    sessions.push({ ref: { machineId: config.machineId, harness: "claude", nativeSessionId: id }, observedAt: yield* Clock.currentTimeMillis, ...(row.cwd ? { cwd: row.cwd } : {}), ...(row.kind ? { kind: row.kind } : {}), ...(programStatus ? { programStatus } : {}), processes: [{ pid: row.pid, startIdentity: identity.startTime, ownership: "owned" }], activity: { state: row.status === "busy" ? "working" : row.status === "waiting" ? "waiting" : row.status === "idle" ? "idle" : "unknown", ...(row.waitingFor === "permission prompt" ? { wait: "approval", approval: "pending" } : {}) } });
   }
   return sessions;
 })).pipe(Effect.timeout("5 seconds"));

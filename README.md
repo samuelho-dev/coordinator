@@ -6,13 +6,13 @@ Read-only inspection of existing Pi, OMP, Claude Code, Codex CLI and Hermes sess
 
 There are two parts: **one inspector service**, plus **native integrations on each host**. Configuration/Helm values describe desired settings; activation and service startup are explicit commands. Building and artifact generation do not deploy, activate or hot-reload anything. CI/release workflows produce artifacts, not host installations.
 
-The API and standalone CLI use Node >=22.19; no additional runtime is required. Build a stable, reviewed package checkout using pnpm 11.9.0:
+The API and setup CLI require Node >=22.19. Install the version-pinned release:
 
 ```sh
-pnpm install --frozen-lockfile
-pnpm build
-export PACKAGE_ROOT="$PWD"
+npm install --global @samuelho-dev/coordinator@0.3.0-beta.3
 ```
+
+For source development only, use a reviewed checkout with `pnpm install --frozen-lockfile && pnpm build` (pnpm 11.9.0). `coordinator-install --source` deliberately activates that exact local package; never source-link a native package manager's own `node_modules` directory.
 
 The [esbuild build](scripts/build.ts) keeps Pi dependencies external and bundles OMP dependencies to avoid compatibility-loader traversal. Native host APIs stay external; OMP uses [Bun's native CommonJS support](https://bun.com/docs/runtime/module-resolution#module-systems), not an injected shim. Rebuild and restart OMP after source updates.
 
@@ -24,51 +24,36 @@ For Kubernetes, follow the [chart operator guide](deploy/helm/coordinator/README
 
 Provision owner-scoped bearer keys. The server stores SHA-256 hashes, not raw tokens; every principal contains only `id`, `owner` and `tokenHash`. A key authorizes reads and publishing across that owner's fleet, not one physical device. Same-owner keys can announce multiple installations; installation IDs are labels, not device authentication. Anyone holding an owner key can publish under any of that owner's machine labels. Revoking a shared key revokes every holder; there is no separate read-only or health-token role.
 
-Generate a key in a **new** private directory from the installed package checkout; this prints only its hash:
+Bootstrap a new API with one owner key:
 
 ```sh
-export PRIVATE="$HOME/.config/coordinator-inspector-private"
-(
-  set -eu
-  cd "$PACKAGE_ROOT"
-  node --input-type=module <<'JS'
-import { Config, Console, Crypto, Effect, FileSystem } from 'effect';
-import { Hex } from 'effect/encoding';
-import { NodeRuntime, NodeServices } from '@effect/platform-node';
-NodeRuntime.runMain(Effect.gen(function* () {
-  const fs = yield* FileSystem.FileSystem;
-  const crypto = yield* Crypto.Crypto;
-  const directory = yield* Config.String('PRIVATE');
-  yield* fs.makeDirectory(directory, { mode: 0o700 });
-  yield* fs.chmod(directory, 0o700);
-  const token = Hex.encode(yield* crypto.randomBytes(32));
-  const file = `${directory}/owner.token`;
-  yield* fs.writeFileString(file, token, { mode: 0o600, flag: 'wx' });
-  yield* fs.chmod(file, 0o600);
-  yield* Console.log(Hex.encode(yield* crypto.digest('SHA-256', new TextEncoder().encode(token))));
-}).pipe(Effect.provide(NodeServices.layer)));
-JS
-)
+PRIVATE="${XDG_CONFIG_HOME:-$HOME/.config}/coordinator/server"
+coordinator init --directory "$PRIVATE" --owner operator
+COORDINATOR_CONFIG="$PRIVATE/server.json" coordinator inspector
 ```
 
-Create `server.json` as **0600** in that **0700** directory, substituting the hash:
+`init` generates a random 32-byte bearer in `owner.token` and its SHA-256 principal in `server.json`, with directory0700/files0600. It prints paths and the start command, never the bearer. Existing files, unsafe ownership/permissions and symlinks are rejected; partial writes are removed. Defaults are loopback `127.0.0.1:8787`; `--listen-host` and `--port` select another bind address. No database is required.
 
-```json
-{
-  "host": "127.0.0.1", "port": 8787,
-  "principals": [{ "id": "operator-key", "owner": "operator", "tokenHash": "REPLACE_WITH_TOKEN_SHA256" }]
-}
-```
+Run the API under your normal process supervisor. Remote clients require operator-provided HTTPS with ordinary certificate verification; only loopback permits HTTP. For Kubernetes, bootstrap with `--listen-host 0.0.0.0`, provision the existing Secret from `server.json` and `owner.token` as described in the chart guide, and deploy the verified image/chart. Do not publish the token or expose an unauthenticated HTTP service.
 
-Start a local inspector in the foreground:
-
-```sh
-COORDINATOR_CONFIG="$PRIVATE/server.json" node dist/src/main.js inspector
-```
-
-`COORDINATOR_CONFIG` selects server configuration, not client credentials. Authentication is mandatory: no anonymous fallback. HTTPS with ordinary certificate verification is required except on loopback.
+`COORDINATOR_CONFIG` selects server configuration, not client credentials. Initialization does not start a service, provision TLS or replace an existing server configuration.
 
 ### Native-owner/client setup
+
+Configure a native client interactively:
+
+```sh
+coordinator connect
+```
+
+This prompts for the endpoint and a masked owner credential, performs an authenticated API read, and only then saves the private client configuration. It does not create machine identity or change native settings. For private-file provisioning:
+
+```sh
+coordinator connect --endpoint https://inspector.example.net --token-file /absolute/private/owner.token
+```
+
+`--config` chooses a new client file; otherwise the shared default location below is used. Existing files are never overwritten. `COORDINATOR_API_TOKEN` may supply the credential instead of the prompt, but credentials are never accepted as argv. Environment URL/token overrides still take precedence after setup.
+
 
 Clients need only `inspectorUrl` and `apiToken`, supplied through private JSON or `COORDINATOR_API_URL` / `COORDINATOR_API_TOKEN`. The environment overrides corresponding file fields. Have the native owner's secret manager inject the token into the environment of the native host, reader bridge and separately supervised connector; never put raw keys in Git, argv, generated native MCP configuration or logs:
 
@@ -97,8 +82,9 @@ Run as the nonroot native user with the endpoint and credentials provisioned as 
 
 ```sh
 TARGET=omp
-pnpm install:host --target "$TARGET" --destination "$PRIVATE/$TARGET-host" --dry-run
-pnpm install:host --target "$TARGET" --destination "$PRIVATE/$TARGET-host"
+PRIVATE="${XDG_CONFIG_HOME:-$HOME/.config}/coordinator"
+coordinator-install --target "$TARGET" --destination "$PRIVATE/$TARGET-host" --dry-run
+coordinator-install --target "$TARGET" --destination "$PRIVATE/$TARGET-host"
 ```
 
 `--config "$PRIVATE/inspector.json"` is optional. An explicit flag or `COORDINATOR_CONNECTOR_CONFIG` selection is retained as a literal private-file pointer, never the raw token. Without either, clients look up `$XDG_CONFIG_HOME/coordinator/inspector.json` or `~/.config/coordinator/inspector.json` at runtime; the installer does not freeze that file's current endpoint into launchers or hooks. File-backed endpoint/credential changes take effect after ordinary process restart. Keep the same configuration environment available to the native host, hooks and separately supervised connector:
@@ -114,13 +100,13 @@ The installer validates prerequisites and creates launchers/config fragments. `-
 
 | Target | Activation | Presence publisher |
 | --- | --- | --- |
-| OMP | `omp plugin link "$PACKAGE_ROOT"`; merge only the generated `mcp.json` coordinator entry into native MCP settings. | In-session extension. |
-| Pi | `pi install "$PACKAGE_ROOT"`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
+| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.3`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
+| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.3`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
 | Claude Code | `claude --plugin-dir "$PRIVATE/claude-host"`; approve generated hooks/MCP tools; preserve existing status-line configuration. | Separate `connector.sh`. |
 | Codex CLI | Merge generated `hooks/hooks.json` and coordinator `mcp.toml`; trust only Coordinator's handlers in native `/hooks`. | Separate `connector.sh`. |
 | Hermes | Merge generated hook entries and `mcp_servers.coordinator` from `mcp.yaml` into the selected profile; no Python plugin installation. | Separate `connector.sh`. |
 
-Generated directories contain configuration, not a copy of the package. Pi/OMP load `dist/plugins/{pi,omp}.js`; MCP/connector launchers reference the build's absolute paths. Keep that package available. Updates require a reviewed build/relink, deliberate native reload/new session, and restart of affected reader bridges/external connectors—not merely editing configuration. Environment or config-token changes require process reload; private token files are reread for rotation/recovery. Staged server Secret changes require a controlled inspector restart.
+Generated directories contain configuration, not a package copy. Launchers reference the installed package's absolute paths, so keep that package available. Updates use explicit native package installs, followed by deliberate native reload/new sessions and restart of affected reader bridges/external connectors. Already-open sessions retain loaded code. Updating configuration alone does not update the plugin. Private token files are reread for rotation/recovery; environment or config-token changes require process reload. Staged server Secret changes require a controlled inspector restart.
 
 `mcp.sh` is the stdio reader bridge; `connector.sh` publishes external hook metadata. The latter's equivalent foreground command is:
 
@@ -130,6 +116,16 @@ COORDINATOR_CONNECTOR_CONFIG="$PRIVATE/inspector.json" node dist/src/main.js con
 
 Hook/status-line/notification capture is local and can initialize identity/cache on first use while offline, without a token; it is not an offline delivery queue. Network publishing still needs credentials and a running publisher. Metadata cache is bounded to 1024 observations and 64 KiB per file, normally expires after 120 s, and may retain Hermes observations while the attributed host remains live. No transcripts are collected.
 
+### Native session commands and Rex
+
+Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and displays full native session/agent IDs, machine names/installation IDs, harness and all reported metadata: model/provider, workspace, activity, connection liveness, process identity and Rex association. Missing metadata is omitted. It reads the API directly, with no model turn, per-session resource sampling or separate MCP registration.
+
+Session JSON is Coordinator's fleet model, not an OSC wire payload. `rex` preserves `REX_SERVER` as `serverAddress` and the actual full `REX_SESSION`/`REX_BLOCK` IDs; these are separate from native agent IDs. Optional `programStatus` uses [Rex Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) semantics: idle/working/done/error, or blocked with permission/question/auth kind. Agent `kind` remains separate. Tool/API waits are working; unknown outcomes are omitted, not inferred from disconnects or generic stops. API connection leases do not expire terminal status records.
+
+Stock OMP 18.12.6 already owns OSC7501 through `terminal.programStatus`; Coordinator does not duplicate, override or patch that reporter. Pi's terminal-only adapter uses a private scoped record, full replacements and change-only reporting; no controls are written to RPC/JSON/print output. Pi user prompts are blocked/question; completion waits for native final settlement, not an intermediate loop end. Claude hooks supply explicit permission/question/completion/failure states; unavailable native UI-only reasons are not guessed. Prompt/error text is never copied into status reports.
+
+Deploy the matching API **before** upgrading clients. Strict schemas reject new fields on older APIs, and older readers cannot decode new presence fields. Coordinate native reloads; preserve existing credentials and installation identity.
+
 ## Coordinated migration
 
 This is a clean schema cutover, with no legacy aliases or compatibility shims. Before a separately approved rollout, coordinate the server and all native owners: provision fresh owner keys privately, replace server principals with `{ id, owner, tokenHash }`, update the chart's `health.token` to match an owner key, and replace client files with endpoint/credential fields only. Remove manual `machineId`/`stateDirectory` settings, regenerate affected installer artifacts, then deliberately restart the inspector and affected native hosts/bridges/connectors. Preserve the automatically created local identity on subsequent upgrades. Old server/client configuration is rejected; do not mix releases expecting the old machine-bound schema. These instructions do not perform a live rollout or rotate live keys.
@@ -137,16 +133,20 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. B
 
 ## Plugin publication
 
-The npm candidate is `@samuelho-dev/coordinator@0.3.0-beta.2`; publication requires the exact-source CI-accepted tarball and owner authorization. The [npm workflow](.github/workflows/npm-release.yaml) promotes that accepted artifact; [first-publication authentication and trust setup](#first-npm-publication) remain operator prerequisites. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.3`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
-Once published, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
+For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.2
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.2
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.3
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.3
 ```
 
+Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
+
 `0.3.0-beta.2` fixes clean-install startup failures by pinning `effect`, `@effect/platform-node` and `@effect/platform-node-shared` together at 4.0.3 in the published dependencies. Checkout-only pnpm overrides do not constrain npm/OMP consumers; leaving the shared package floating can select an incompatible release (`effect/Path` missing `make`). Keep these three pins aligned when upgrading.
+
+`0.3.0-beta.3` adds native `/coordinator list`, secure self-host bootstrap/authenticated client setup, and Rex references/status normalization without an OMP fork. Runtime dependency pins are unchanged.
 
 | Host | Publication route |
 | --- | --- |
@@ -178,7 +178,7 @@ Release gaps and constraints:
 - **Startup:** generated integrations do not await the inspector during activation. Pi/OMP publish in the background; Claude/Codex/Hermes hooks capture locally; the local stdio bridge initializes and lists tools without a remote handshake. Explicit inspection/`coordinate` requests may await a bounded remote reply. Local configuration, filesystem and native loading still run during initialization.
 - **State/lifetime:** the owner-isolated registry is in memory; restart loses discovery until reannouncement, never native sessions. A Pi/OMP plugin owns one Effect managed runtime; presence/poll failures cancel their peer and shutdown disposes its fibers without killing the host. Closing the stdio reader's stdin ends its scope and cancels pending HTTP reads. Failed startup/terminated connectors can restart on a later native event.
 - **Effect composition:** `NodeServices.layer` provides filesystem/path/crypto/process/stdio services; `Host.layer` provides host facts. `Mcp.layer` privately supplies its HTTP client. The CLI scope owns the inspector/server; one Pi/OMP `ManagedRuntime` owns plugin fibers/layers through shutdown. CLI-only stdin closes on completion; plugin stdin remains host-owned. Layer construction, provisioning and sharing follow the [v4 layer contract](https://effect.website/docs/v4/api/effect/Layer).
-- **Node bindings:** [`platform.ts`](src/platform.ts) confines native host facts and CLI-owned stdin alongside the server factory required by [`NodeHttpServer.layerServer`](https://effect.website/docs/v4/api/platform-node/NodeHttpServer#layerServer) and constant-time comparison absent from [`Crypto`](https://effect.website/docs/v4/api/effect/Crypto#Crypto-interface). Filesystem checks use `FileSystem`; execute permission uses Effect's scoped process service running `/bin/test -x`, never the selected runtime. Native SDK callbacks remain foreign interop boundaries.
+- **Node bindings:** [`platform.ts`](src/platform.ts) confines host facts, CLI-owned stdin, server composition and constant-time digest comparison. Runtime private readers use Effect `FileSystem`; setup's exclusive private-file transaction uses Node opened descriptors and no-follow flags. Native SDK callbacks remain foreign interop boundaries.
 - **OMP shortcut:** a leading `coordinate` enriches the current input with fleet presence and an inspection cue. It does not contact other sessions with prompts.
 
 | Timing/bound | Value |
@@ -208,6 +208,8 @@ CPU/RSS sampling runs only on inspection, over approximately 200 ms. PID plus OS
 | [mcp.ts](src/mcp.ts) | `Mcp` service: bounded HTTP/MCP transport and stdio reader. |
 | [native.ts](src/native.ts) | Private files/cache, native projections and connector policy. |
 | [plugin.ts](src/plugin.ts) | Pi/OMP hooks, observers, tools and runtime ownership. |
+| [rex.ts](src/rex.ts) | Native Rex environment association and Pi-only scoped OSC reporting. |
+| [setup.ts](src/setup.ts) | Private self-host initialization, masked client prompts and authenticated configuration creation. |
 | [resources.ts](src/resources.ts) | Linux/macOS process identity and on-demand sampling. |
 | [platform.ts](src/platform.ts) | Effect Node platform composition, scoped CLI stdin, and host/crypto/executable bindings. |
 | [main.ts](src/main.ts) | CLI entrypoints and layer composition. |

@@ -1,13 +1,14 @@
 import { NodeServices } from "@effect/platform-node";
 import { Cause, Clock, Config, Console, Effect, Layer, Logger, ManagedRuntime, Schema } from "effect";
 import { createInspection, HttpError, InspectionTools, metric, sessionRefKey, unavailableMetric } from "./inspection.ts";
-import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, SessionInspection, SessionListOutput, SessionPresence } from "./inspection.ts";
+import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, ProgramStatus, SessionInspection, SessionListOutput, SessionPresence } from "./inspection.ts";
 import { Mcp } from "./mcp.ts";
 import { connectNative, loadConnectorConfig, NativeError, readConnectorToken, resolveNativeConfig, withProcessResources } from "./native.ts";
 import type { NativeNotice } from "./native.ts";
 import { identifyProcess } from "./resources.ts";
 import { Host as PlatformHost } from "./platform.ts";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createRexReporter, readRexContext } from "./rex.ts";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 declare const COORDINATOR_HARNESS: "pi" | "omp";
 
@@ -30,16 +31,20 @@ export type Context = {
   readonly isIdle: () => boolean;
   readonly ui: { readonly notify: (text: string, level?: "info" | "warning" | "error") => void };
 };
-type NativeEvent = { readonly type?: string; readonly toolCallId?: string; readonly toolName?: string; readonly message?: { readonly role: string; readonly timestamp?: number; readonly usage?: Usage } };
+type NativeMessage = { readonly role: string; readonly timestamp?: number; readonly usage?: Usage; readonly stopReason?: string };
+type NativeEvent = { readonly type?: string; readonly toolCallId?: string; readonly toolName?: string; readonly message?: NativeMessage; readonly messages?: ReadonlyArray<NativeMessage>; readonly willContinue?: boolean; readonly outcome?: "completed" | "aborted" | "error" };
+type NativeEventName = "session_start" | "session_switch" | "session_shutdown" | "agent_start" | "agent_end" | "agent_before_settle" | "agent_settled" | "ui_prompt_start" | "ui_prompt_end" | "turn_start" | "turn_end" | "message_end" | "tool_execution_start" | "tool_execution_end";
 type Image = { readonly type: "image"; readonly data: string; readonly mimeType: string };
 type Input = { readonly text: string; readonly images?: Image[] };
 type InputResult = { readonly text: string; readonly images?: Image[] } | { readonly action: "transform"; readonly text: string; readonly images?: Image[] } | undefined;
 export type Host = {
   readonly on: {
     (name: "input", handler: (event: Input, ctx: Context) => Promise<InputResult>): unknown;
-    (name: "session_start" | "session_switch" | "session_shutdown" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_end" | "tool_execution_start" | "tool_execution_end", handler: (event: NativeEvent, ctx: Context) => Promise<void>): unknown;
+    (name: NativeEventName, handler: (event: NativeEvent, ctx: Context) => Promise<void>): unknown;
   };
   readonly registerTool: (tool: ToolDefinition<ToolDefinition["parameters"], unknown, unknown>) => void;
+  readonly registerCommand: ExtensionAPI["registerCommand"];
+  readonly sendMessage: ExtensionAPI["sendMessage"];
 };
 
 const provenance = (source: string, scope: MetricProvenance["scope"], scopeDescription: string, observedAt: number | null, nativeUpdatedAt: number | null = null): MetricProvenance => ({
@@ -57,8 +62,10 @@ export type NativeObserver = {
 export const createNativeObserver = (harness: Harness, machineId: string, processes: ReadonlyArray<ProcessIdentity> = []) => Effect.gen(function*() {
   const host = yield* PlatformHost;
   const clock = yield* Clock.Clock;
-  const rexSession = yield* Config.String("REX_SESSION").pipe(Config.withDefault(""));
-  const rexBlock = yield* Config.String("REX_BLOCK").pipe(Config.withDefault(""));
+  const rex = yield* readRexContext;
+  let programStatus: ProgramStatus | undefined;
+  let userPrompt: ProgramStatus | undefined;
+  let stopReason: string | undefined;
   let current: Context | undefined;
   let identity: string | undefined;
   let lastActivityAt: number | undefined;
@@ -68,12 +75,24 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
   const os: SessionPresence["os"] = host.platform === "linux" || host.platform === "darwin" ? { platform: host.platform, release: host.release, architecture: host.architecture } : undefined;
   const update = (ctx: Context, event?: NativeEvent, now = clock.currentTimeMillisUnsafe()) => {
     const key = JSON.stringify([ctx.sessionManager.getSessionId(), harness === "omp" ? ctx.agent?.id : undefined]);
-    if (identity !== key) { latest = undefined; activeTools.clear(); identity = key; }
+    if (identity !== key) { latest = undefined; programStatus = undefined; userPrompt = undefined; stopReason = undefined; activeTools.clear(); identity = key; }
     current = ctx;
     lastActivityAt = now;
     if (event?.type === "tool_execution_start" && event.toolCallId && event.toolName) activeTools.set(event.toolCallId, event.toolName);
     if (event?.type === "tool_execution_end" && event.toolCallId) activeTools.delete(event.toolCallId);
     if (event?.type === "agent_end") activeTools.clear();
+    if (event?.type === "agent_start") { programStatus = { state: "working" }; stopReason = undefined; }
+    if (event?.type === "turn_start") { programStatus = { state: "working" }; stopReason = undefined; }
+    if (event?.type === "tool_execution_start") programStatus = { state: "working" };
+    if (event?.message?.role === "assistant" && event.message.stopReason) stopReason = event.message.stopReason;
+    if (event?.type === "agent_end") stopReason = event.messages?.findLast((message) => message.role === "assistant")?.stopReason ?? stopReason;
+    if (harness === "pi" && event?.type === "agent_before_settle") stopReason = event.outcome === "completed" ? "stop" : event.outcome;
+    if (event?.type === "agent_settled" || (harness !== "pi" && event?.type === "agent_end")) {
+      programStatus = event.willContinue ? { state: "working" } : stopReason === "aborted" ? { state: "idle" } : stopReason === "error" ? { state: "error" } : stopReason === "stop" || stopReason === "length" ? { state: "done" } : undefined;
+    } else if (event?.type === "agent_end") programStatus = { state: "working" };
+    if (harness === "pi" && event?.type === "ui_prompt_start") userPrompt = { state: "blocked", kind: "question" };
+    if (harness === "pi" && event?.type === "ui_prompt_end") userPrompt = undefined;
+    if ((event === undefined || event.type === "session_start" || event.type === "session_switch") && programStatus === undefined) programStatus = { state: ctx.isIdle() ? "idle" : "working" };
     const message = event?.message;
     if (message?.role === "assistant" && message.usage) {
       const u = message.usage;
@@ -88,15 +107,18 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
   const presence = (now = clock.currentTimeMillisUnsafe()): SessionPresence | undefined => {
     if (!current) return undefined;
     const currentToolName = activeTools.values().next().value;
+    const status = userPrompt ?? programStatus;
     return {
     ref: { machineId, harness, nativeSessionId: current.sessionManager.getSessionId(), ...(harness === "omp" && current.agent?.id ? { nativeAgentId: current.agent.id } : {}) },
     observedAt: now, ...(lastActivityAt === undefined ? {} : { lastActivityAt }), cwd: current.cwd, processes,
     machineName, ...(os ? { os } : {}),
-    ...(rexSession || rexBlock ? { rex: { ...(rexSession ? { sessionId: rexSession } : {}), ...(rexBlock ? { blockId: rexBlock } : {}) } } : {}),
+    ...(rex ? { rex } : {}),
+    ...(status ? { programStatus: status } : {}),
     ...(current.model ? { provider: current.model.provider, model: current.model.id } : {}),
     ...(current.agent ? { kind: current.agent.kind, ...(current.agent.name ? { agent: current.agent.name } : {}) } : {}),
-    activity: { state: current.isIdle() ? "idle" : "working", streaming: !current.isIdle(),
-      ...(currentToolName === undefined ? {} : { currentToolName, wait: "tool" }),
+    activity: { state: userPrompt ? "waiting" : current.isIdle() ? "idle" : "working", streaming: !current.isIdle(),
+      ...(currentToolName === undefined ? {} : { currentToolName }),
+      ...(userPrompt ? { wait: "user" } : currentToolName === undefined ? {} : { wait: "tool" }),
     },
     };
   };
@@ -182,7 +204,7 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
       },
     };
   };
-  return { update, presence, inspect, clear: () => { current = undefined; identity = undefined; latest = undefined; lastActivityAt = undefined; activeTools.clear(); } };
+  return { update, presence, inspect, clear: () => { current = undefined; identity = undefined; latest = undefined; programStatus = undefined; userPrompt = undefined; stopReason = undefined; lastActivityAt = undefined; activeTools.clear(); } };
 });
 
 export const isCoordinateInput = (text: string): boolean => /^coordinate(?:\s|$)/u.test(text);
@@ -199,6 +221,24 @@ export const registerCoordinateKeyword = Effect.gen(function*() {
   setMagicKeywords([...MAGIC_KEYWORDS.filter(({ word }) => isMagicKeyword(word)), { word: "coordinate", hue: [190, 260] }]);
 });
 
+const formatSessionList = (sessions: ReadonlyArray<SessionPresence>): string => {
+  if (sessions.length === 0) return "No sessions are currently visible to this API key.";
+  const lines = [`Coordinator: ${sessions.length} sessions visible to this API key.`, "", "~~~text"];
+  for (const session of sessions) {
+    lines.push(
+      `Machine: ${JSON.stringify(session.machineName ?? "unavailable")} (${JSON.stringify(session.ref.machineId)})`,
+      `Session: ${session.ref.harness} ${JSON.stringify(session.ref.nativeSessionId)}`,
+    );
+    if (session.ref.nativeAgentId !== undefined) lines.push(`Agent ID: ${JSON.stringify(session.ref.nativeAgentId)}`);
+    for (const [field, value] of Object.entries(session)) {
+      if (field !== "ref" && field !== "machineName" && value !== undefined) lines.push(`${field}: ${JSON.stringify(value)}`);
+    }
+    lines.push("");
+  }
+  lines.push("~~~");
+  return lines.join("\n");
+};
+
 export default function plugin(host: Host): void {
   const harness = COORDINATOR_HARNESS;
   const runtime = ManagedRuntime.make(Layer.mergeAll(NodeServices.layer, PlatformHost.layer, Mcp.layer, Layer.succeed(Logger.LogToStderr, true)));
@@ -206,6 +246,47 @@ export default function plugin(host: Host): void {
   let observer: NativeObserver | undefined;
   let starting: Promise<void> | undefined;
   let stopped = false;
+  // Stock OMP owns OSC 7501 (terminal.programStatus); never duplicate or override it.
+  const rexReporter = harness === "pi" ? createRexReporter((sequence) => process.stdout.write(sequence)) : undefined;
+  let terminal = false;
+  host.registerCommand("coordinator", {
+    description: "List visible sessions, their machines, and native metadata",
+    handler: async (args) => {
+      if (args.trim() !== "list") {
+        host.sendMessage({ customType: "coordinator-list", content: "Usage: /coordinator list", display: true }, { triggerTurn: false });
+        return;
+      }
+      const exit = await runtime.runPromiseExit(Effect.gen(function*() {
+        const activeConfig = config ?? (yield* loadConnectorConfig());
+        if (!activeConfig) return yield* new NativeError({ operation: "Connector configuration required" });
+        const token = yield* readConnectorToken(activeConfig);
+        const mcp = yield* Mcp;
+        const sessions: SessionPresence[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = yield* mcp.call(activeConfig.inspectorUrl, token, InspectionTools.list, { limit: 100, ...(cursor === undefined ? {} : { cursor }) });
+          for (const session of page.sessions) sessions.push(session);
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor !== undefined);
+        return sessions;
+      }));
+      if (stopped) return;
+      if (exit._tag === "Failure") {
+        const error = Cause.findErrorOption(exit.cause);
+        const reason = error._tag === "Some" ? error.value._tag === "HttpError" ? `HTTP ${error.value.status}` : error.value._tag : "unexpected failure";
+        host.sendMessage({
+          customType: "coordinator-list",
+          content: `Coordinator list unavailable (${reason}). Check inspectorUrl, your access token, and API reachability.`,
+          display: true,
+        }, { triggerTurn: false });
+        return;
+      }
+      host.sendMessage({
+        customType: "coordinator-list", content: formatSessionList(exit.value), display: true,
+        details: { sessions: exit.value },
+      }, { triggerTurn: false });
+    },
+  });
   if (harness === "pi") {
     const register = <I extends Schema.Top & Schema.ConstraintCodec<unknown, Schema.JsonObject>, O extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>>(
       descriptor: { readonly name: string; readonly description: string; readonly input: I; readonly output: O },
@@ -263,6 +344,8 @@ export default function plugin(host: Host): void {
     const processIdentity = yield* identifyProcess(host.pid);
     observer = yield* createNativeObserver(harness, nativeConfig.machineId, processIdentity.status === "available" ? [{ pid: host.pid, startIdentity: processIdentity.startTime, ownership: harness === "omp" ? "shared" : "owned" }] : []);
     observer.update(ctx);
+    terminal = ctx.mode === "tui" && ctx.hasUI && process.stdout.isTTY === true;
+    rexReporter?.update(observer.presence()?.programStatus, terminal);
     // Native TUI constructors register core keywords before session_start hooks.
     if (harness === "omp" && ctx.hasUI && ctx.mode === "tui") yield* registerCoordinateKeyword;
     runtime.runFork(connectNative(nativeConfig, {
@@ -289,17 +372,24 @@ export default function plugin(host: Host): void {
       config = undefined;
     }
   });
-  const events: Array<"session_start" | "session_switch" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_end" | "tool_execution_start" | "tool_execution_end"> = ["session_start", "session_switch", "agent_start", "agent_end", "turn_start", "turn_end", "message_end", "tool_execution_start", "tool_execution_end"];
+  const events: Array<NativeEventName> = ["session_start", "session_switch", "agent_start", "agent_end", "turn_start", "turn_end", "message_end", "tool_execution_start", "tool_execution_end"];
+  if (harness === "pi") events.push("agent_before_settle", "agent_settled", "ui_prompt_start", "ui_prompt_end");
   for (const name of events) {
     host.on(name, async (event, ctx) => {
       if (stopped) return;
       await start(ctx);
       if (stopped || !observer) return;
-      await runtime.runPromiseExit(Effect.sync(() => observer?.update(ctx, event)).pipe(Effect.tapCause(reportCause(ctx, "native update"))));
+      await runtime.runPromiseExit(Effect.sync(() => {
+        if (name === "session_switch") rexReporter?.update(undefined, terminal);
+        observer?.update(ctx, event);
+        terminal = ctx.mode === "tui" && ctx.hasUI && process.stdout.isTTY === true;
+        rexReporter?.update(observer?.presence()?.programStatus, terminal);
+      }).pipe(Effect.tapCause(reportCause(ctx, "native update"))));
     });
   }
   host.on("session_shutdown", async () => {
     stopped = true;
+    rexReporter?.close(terminal);
     try { await runtime.dispose(); }
     finally { observer?.clear(); observer = undefined; config = undefined; }
   });

@@ -36,6 +36,14 @@ export const ProcessIdentity = Schema.Struct({
 });
 export type ProcessIdentity = typeof ProcessIdentity.Type;
 const NativeWorkState = Schema.Struct({ id: Id, state: Schema.Literals(["pending", "active", "completed", "cancelled", "unknown"]) });
+const RexText = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096), Schema.makeFilter((value) =>
+  /[\u0000-\u001f\u007f-\u009f]/u.test(value) ? "Control characters are forbidden" : undefined,
+));
+export const ProgramStatus = Schema.Union([
+  Schema.Struct({ state: Schema.Literals(["idle", "working", "done", "error"]) }),
+  Schema.Struct({ state: Schema.Literal("blocked"), kind: Schema.Literals(["permission", "question", "auth"]) }),
+]);
+export type ProgramStatus = typeof ProgramStatus.Type;
 export const SessionPresence = Schema.Struct({
   ref: SessionRef,
   observedAt: Timestamp,
@@ -50,7 +58,8 @@ export const SessionPresence = Schema.Struct({
   label: Schema.optional(Label), kind: Schema.optional(Id),
   provider: Schema.optional(Id), model: Schema.optional(Id), profile: Schema.optional(Id), agent: Schema.optional(Id),
   cwd: Schema.optional(Path), repository: Schema.optional(Path),
-  rex: Schema.optional(Schema.Struct({ serverId: Schema.optional(Id), blockId: Schema.optional(Id), sessionId: Schema.optional(Id), windowId: Schema.optional(Id), paneId: Schema.optional(Id), terminalId: Schema.optional(Id) })),
+  rex: Schema.optional(Schema.Struct({ serverAddress: Schema.optional(RexText), blockId: Schema.optional(RexText), sessionId: Schema.optional(RexText) })),
+  programStatus: Schema.optional(ProgramStatus),
   processes: Schema.optional(bounded(ProcessIdentity, 128)),
   activity: Schema.optional(Schema.Struct({
     state: Schema.Literals(["idle", "working", "waiting", "stopped", "unknown"]),

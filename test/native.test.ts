@@ -315,10 +315,26 @@ it.live("projects Claude metadata without prompt, transcript, result or invented
   const observation = (yield* (projectHook("claude", "machine", { session_id: "session", hook_event_name: "PermissionRequest", cwd: "/workspace", tool_name: "Bash", prompt: "secret-prompt", transcript_path: "/secret/transcript", tool_input: { command: "secret-command" }, tool_response: "secret-result", pid: 123, ppid: 456 }, 100)));
   (yield* (decodeSessionInspection(observation)));
   assert.strictEqual(observation.presence.activity?.approval, "pending");
+  assert.deepStrictEqual(observation.presence.programStatus, { state: "blocked", kind: "permission" });
   assert.strictEqual(observation.presence.processes, undefined);
   assert.strictEqual(observation.tokens.nativeAggregate.totalTokens.status, "unavailable");
   assert.strictEqual(JSON.stringify(observation).includes("secret"), false);
   assert.strictEqual(((yield* (withProcessResources(observation).pipe(Effect.provide(NodeServices.layer))))).resources.ownedProcessCount.status, "unavailable");
+})));
+
+it.live("normalizes only proven external hook outcomes and user waits", () => fixture(Effect.gen(function*() {
+  for (const [hook_event_name, expected] of [
+    ["UserPromptSubmit", { state: "working" }], ["PreToolUse", { state: "working" }],
+    ["PostToolUseFailure", { state: "working" }], ["Elicitation", { state: "blocked", kind: "question" }],
+    ["ElicitationResult", { state: "working" }], ["Stop", { state: "done" }],
+    ["StopFailure", { state: "error" }], ["Interrupt", { state: "idle" }], ["SessionEnd", undefined],
+  ] as const) {
+    const observation = yield* projectHook("claude", "machine", { session_id: "session", hook_event_name }, 100);
+    yield* decodeSessionInspection(observation);
+    assert.deepStrictEqual(observation.presence.programStatus, expected);
+  }
+  const unknown = yield* projectHook("codex", "machine", { session_id: "session", hook_event_name: "Stop" }, 100);
+  assert.strictEqual(unknown.presence.programStatus, undefined);
 })));
 
 it.live("keeps Claude current context input-only, cached and distinct from aggregate spend", () => fixture(Effect.gen(function*() {

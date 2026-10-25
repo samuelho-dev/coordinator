@@ -9,12 +9,12 @@ class InstallError extends Schema.TaggedError<InstallError>()("InstallError", { 
 const installationFailure = () => new InstallError({ message: "Installation failed; check owner, private paths, installed package and destination permissions. Existing native configuration was not changed." });
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const packageRoot = new URL("../../", import.meta.url);
-const help = `Usage: coordinator-install --target pi|omp|claude|codex|hermes --destination /absolute/new-directory [--config /absolute/private/inspector.json] [--runtime /absolute/node] [--dry-run]
+const help = `Usage: coordinator-install --target pi|omp|claude|codex|hermes --destination /absolute/new-directory [--config /absolute/private/inspector.json] [--runtime /absolute/node] [--source] [--dry-run]
 
 Run as the native session owner. --destination must be a NEW directory under an existing private owner directory; no existing native files are overwritten.
 --config selects an existing private connector config; otherwise use COORDINATOR_CONNECTOR_CONFIG, the default private file, or COORDINATOR_API_URL/COORDINATOR_API_TOKEN. --runtime defaults to this Node executable.
 --dry-run validates prerequisites and prints activation instructions without writing.
-Printed native install/link commands activate this exact installed package. Generated include artifacts require separate explicit activation; supervise the external coordinator connector separately. API tokens must be inherited from the native owner's environment/secret manager or read from the private config; they are never embedded in artifacts.
+Printed native install commands pin the published package version. --source instead activates this exact local package (for intentional checkout/tarball development, never a managed native node_modules directory). Generated include artifacts require separate explicit activation; supervise the external coordinator connector separately. API tokens must be inherited from the native owner's environment/secret manager or read from the private config; they are never embedded in artifacts.
 No settings/profile/statusLine replacement, exporter activation, remote setup, service management or historical data changes. Claude status-line metrics require optional manual composition; the installer does not configure a status line.`;
 
 const install = (version: string) => Command.make("coordinator-install", {
@@ -22,6 +22,7 @@ const install = (version: string) => Command.make("coordinator-install", {
   destination: Flag.String("destination").pipe(Flag.optional),
   config: Flag.String("config").pipe(Flag.optional),
   runtime: Flag.String("runtime").pipe(Flag.optional),
+  source: Flag.Boolean("source").pipe(Flag.withDefault(false)),
   dryRun: Flag.Boolean("dry-run").pipe(Flag.withDefault(false)),
 }, (flags) => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
@@ -81,11 +82,14 @@ const install = (version: string) => Command.make("coordinator-install", {
   if (target === "pi" || target === "omp") {
     const bundle = join(root, `dist/plugins/${target}.js`);
     yield* fs.access(bundle, { readable: true }).pipe(Effect.mapError(installationFailure));
-    // ponytail: activate the real package; wrapper absolute entrypoints break native OMP discovery.
+    // Published activation must not self-link a native package manager's node_modules tree.
     if (target === "omp") json("mcp.json", { mcpServers: { coordinator: mcp } });
-    activation = `${target === "pi" ? "pi install" : "omp plugin link"} ${quote(root)}\n${target === "pi" ? "The extension provides native coordinator_session_list and coordinator_session_inspect tools; no Pi MCP configuration or adapter is required." : `Merge ONLY the coordinator entry from ${join(destination, "mcp.json")} into ~/.omp/agent/mcp.json; preserve all existing entries.`}\nLaunch the native harness with the same configuration environment${environment ? ` and ${environment}` : ""}.`;
+    const activationCommand = flags.source
+      ? `${target === "pi" ? "pi install" : "omp plugin link"} ${quote(root)}`
+      : `${target === "pi" ? "pi install" : "omp plugin install"} ${quote(`${target === "pi" ? "npm:" : ""}@samuelho-dev/coordinator@${version}`)}`;
+    activation = `${activationCommand}\n${target === "pi" ? "The extension provides native coordinator_session_list and coordinator_session_inspect tools; no Pi MCP configuration or adapter is required." : `Merge ONLY the coordinator entry from ${join(destination, "mcp.json")} into ~/.omp/agent/mcp.json; preserve all existing entries.`}\nLaunch the native harness with the same configuration environment${environment ? ` and ${environment}` : ""}.`;
   } else if (target === "claude" || target === "codex") {
-    const events = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", ...(target === "claude" ? ["PostToolUseFailure", "PostModelSwitch", "PreCompact"] : ["Interrupt"])];
+    const events = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop", ...(target === "claude" ? ["PostToolUseFailure", "PostModelSwitch", "PreCompact", "StopFailure", "Elicitation", "ElicitationResult"] : ["Interrupt"])];
     const hooks = Object.fromEntries(events.map((event) => [event, [{ hooks: [{ type: "command", command: command(`hook ${target}`), timeout: 3 }] }]]));
     json("hooks/hooks.json", { hooks });
     if (target === "claude") {

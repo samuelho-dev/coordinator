@@ -5,7 +5,7 @@ import { Host, serverLayer } from "../src/platform.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { NodeHttpClient, NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Inspector } from "../src/inspector.ts";
-import { ConnectorAccepted, ConnectorAnnounce, InspectionTools, createInspection, type SessionPresence } from "../src/inspection.ts";
+import { ConnectorAccepted, ConnectorAnnounce, InspectionTools, InspectorConfig, SessionPresence, createInspection } from "../src/inspection.ts";
 import { Mcp } from "../src/mcp.ts";
 import { connectNative, withProcessResources } from "../src/native.ts";
 import { identifyProcess } from "../src/resources.ts";
@@ -18,13 +18,21 @@ const verify = {
   match: (value: string, pattern: RegExp) => pattern.test(value) ? Effect.void : Effect.die("Smoke pattern mismatch"),
   fail: (message: string) => Effect.die(message),
 };
+const CoordinatorListMessage = Schema.Struct({
+  role: Schema.Literal("custom"), customType: Schema.Literal("coordinator-list"), content: Schema.String,
+  details: Schema.Struct({ sessions: Schema.Array(SessionPresence) }),
+});
 const NativeStartupMessage = Schema.fromJsonString(Schema.Union([
+  Schema.Struct({ id: Schema.Literal("coordinator-startup"), type: Schema.Literal("response"), command: Schema.Literal("get_state"), success: Schema.Boolean }),
+  Schema.Struct({ id: Schema.Literal("coordinator-list"), type: Schema.Literal("response"), success: Schema.Boolean }),
+  Schema.Struct({ id: Schema.Literal("coordinator-list"), type: Schema.Literal("prompt_result"), status: Schema.String, agentInvoked: Schema.Boolean }),
   Schema.Struct({
-    id: Schema.Literals(["coordinator-startup"]), type: Schema.Literals(["response"]),
-    command: Schema.Literals(["get_state"]), success: Schema.Boolean,
+    id: Schema.Literal("coordinator-list-messages"), type: Schema.Literal("response"), success: Schema.Boolean,
+    data: Schema.Struct({ messages: Schema.Array(Schema.Unknown) }),
   }),
-  Schema.Struct({ type: Schema.Literals(["ready"]) }),
-  Schema.Struct({ type: Schema.Literals(["extension_ui_request"]), method: Schema.Literals(["notify"]), message: Schema.String }),
+  Schema.Struct({ type: Schema.Literal("agent_start") }),
+  Schema.Struct({ type: Schema.Literal("ready") }),
+  Schema.Struct({ type: Schema.Literal("extension_ui_request"), method: Schema.Literal("notify"), message: Schema.String }),
 ]));
 
 
@@ -147,16 +155,41 @@ const program = Effect.gen(function*() {
   // Synthetic native envelopes exercise the built CLI, not a live Hermes provider request.
   const hermesHome = join(root, "hermes space's");
   yield* fs.makeDirectory(hermesHome, { mode: 0o700 });
+  // Synthetic Rex references verify native metadata transport, not a live Rex server.
+  const rex = { serverAddress: "unix:/tmp/coordinator-smoke-rex.sock", sessionId: `session:${yield* crypto.randomUUIDv4()}`, blockId: `block:${yield* crypto.randomUUIDv4()}` };
   const hostEnvironment = (home: string) => ({
     HOME: home, PATH: searchPath,
     XDG_CONFIG_HOME: join(home, "config"), XDG_STATE_HOME: join(home, "state"), XDG_CACHE_HOME: join(home, "cache"),
     PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
     PI_OFFLINE: "1",
     COORDINATOR_API_URL: inspectorUrl, COORDINATOR_API_TOKEN: token,
+    REX_SERVER: rex.serverAddress, REX_SESSION: rex.sessionId, REX_BLOCK: rex.blockId,
   });
   const hermesEnv = hostEnvironment(hermesHome);
   const compiledMain = resolve(scriptDirectory, "../src/main.js");
   const main = (yield* fs.exists(compiledMain)) ? compiledMain : resolve(scriptDirectory, "../dist/src/main.js");
+  const setup = (args: ReadonlyArray<string>) => Effect.gen(function*() {
+    const child = yield* spawner.spawn(ChildProcess.make(host.executable, [main, ...args], {
+      cwd: hermesHome, env: hostEnvironment(hermesHome), extendEnv: false, stdin: Stream.empty, forceKillAfter: "1 second",
+    }));
+    const output = yield* child.stdout.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
+    const errors = yield* child.stderr.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
+    yield* verify.equal(yield* child.exitCode, 0, yield* Fiber.join(errors));
+    return yield* Fiber.join(output);
+  });
+  const serverDirectory = join(root, "self-hosted");
+  const initialized = yield* setup(["init", "--directory", serverDirectory, "--owner", "smoke"]);
+  const ownerToken = (yield* fs.readFileString(join(serverDirectory, "owner.token"))).trim();
+  const initializedConfig = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(InspectorConfig))(yield* fs.readFileString(join(serverDirectory, "server.json")));
+  yield* verify.equal(initializedConfig.principals[0]?.tokenHash, Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(ownerToken))));
+  yield* verify.ok(!initialized.includes(ownerToken), "Bootstrap must print a credential path, never its value");
+  yield* verify.equal((yield* fs.stat(serverDirectory)).mode & 0o777, 0o700);
+  yield* verify.equal((yield* fs.stat(join(serverDirectory, "owner.token"))).mode & 0o777, 0o600);
+  const connected = yield* setup(["connect", "--endpoint", inspectorUrl, "--token-file", tokenFile]);
+  const clientFile = join(hermesHome, "config", "coordinator", "inspector.json");
+  yield* verify.deepEqual(JSON.parse(yield* fs.readFileString(clientFile)), { inspectorUrl, tokenFile });
+  yield* verify.ok(!connected.includes(token), "Connection setup cannot print credentials");
+  yield* verify.equal((yield* fs.stat(clientFile)).mode & 0o777, 0o600);
   const hermesId = `synthetic-hermes-${yield* crypto.randomUUIDv4()}`;
   const sensitive = `ignored-sensitive-${yield* crypto.randomUUIDv4()}`;
   const hermesHook = (event: string, extra: object = {}, sessionId = hermesId, home = hermesHome) => Effect.gen(function*() {
@@ -292,11 +325,12 @@ const program = Effect.gen(function*() {
         },
       }), { mode: 0o600 });
       modelArgs.push("--provider", "inspector-smoke", "--model", "inspector-smoke");
+      modelArgs.push("--no-tools", "--no-rules", "--no-skills", "--no-lsp", "--no-ui");
     }
     const nativeEnv = hostEnvironment(home);
     // Both CLIs honor this override; their native settings must stay separate.
     if (harness === "omp") nativeEnv.PI_CODING_AGENT_DIR = join(home, ".omp", "agent");
-    const install = yield* spawner.spawn(ChildProcess.make(host.executable, [resolve(dirname(main), "../scripts/install.js"), "--target", harness, "--destination", join(home, `${harness}-native-host`)], {
+    const install = yield* spawner.spawn(ChildProcess.make(host.executable, [resolve(dirname(main), "../scripts/install.js"), "--target", harness, "--destination", join(home, `${harness}-native-host`), "--source"], {
       cwd: home, env: nativeEnv, extendEnv: false,
     }));
     const instructions = yield* install.stdout.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
@@ -322,25 +356,56 @@ const program = Effect.gen(function*() {
     const startup = { machineId: hermesMachineId, entered: yield* Deferred.make<void>(), resume: yield* Deferred.make<void>(), finished: yield* Deferred.make<void>() };
     blockedStartup = startup;
     const rpcReady = yield* Deferred.make<void>();
+    const runList = yield* Deferred.make<void>();
+    const listHandled = yield* Deferred.make<void>();
+    const listVerified = yield* Deferred.make<void>();
+    const listRequest = new TextEncoder().encode('{"id":"coordinator-list","type":"prompt","message":"/coordinator list"}\n');
+    const messagesRequest = new TextEncoder().encode('{"id":"coordinator-list-messages","type":"get_messages"}\n');
     const child = yield* spawner.spawn(ChildProcess.make(executable, ["--mode", "rpc", "--session-dir", home, ...modelArgs], {
       cwd: home, env: nativeEnv, extendEnv: false,
-      stdin: Stream.make(startupRequest).pipe(Stream.concat(Stream.never)), forceKillAfter: "1 second",
+      stdin: Stream.make(startupRequest).pipe(
+        Stream.concat(Stream.fromEffect(Deferred.await(runList).pipe(Effect.as(listRequest)))),
+        Stream.concat(Stream.fromEffect(Deferred.await(listHandled).pipe(Effect.as(messagesRequest)))),
+        Stream.concat(Stream.never),
+      ), forceKillAfter: "1 second",
     }));
     let sawNativeReady = false;
     let startupNotice = "";
-    const stdout = yield* child.stdout.pipe(Stream.decodeText(), Stream.splitLines, Stream.runForEach((line) =>
-      Schema.decodeEffect(NativeStartupMessage)(line).pipe(Effect.matchEffect({
+    const stdout = yield* child.stdout.pipe(Stream.decodeText(), Stream.splitLines, Stream.runForEach((line) => Effect.gen(function*() {
+      yield* verify.ok(!line.includes("\u001b]7501"), "Rex OSC reports must never corrupt native RPC stdout");
+      yield* Schema.decodeEffect(NativeStartupMessage)(line).pipe(Effect.matchEffect({
         onFailure: () => Effect.void,
         onSuccess: (message) => Effect.gen(function*() {
           if (message.type === "ready") { sawNativeReady = true; return; }
+          if (message.type === "agent_start") return yield* verify.fail("The native list command must not start a model turn");
           if (message.type === "extension_ui_request") {
             if (message.message.startsWith("Native inspector unavailable (")) startupNotice = message.message.slice(0, 1024);
             return;
           }
-          yield* verify.ok(message.success, `${harness} startup RPC failed`);
+          if (message.type === "prompt_result") {
+            yield* verify.equal(message.status, "completed");
+            yield* verify.equal(message.agentInvoked, false);
+            return yield* Deferred.succeed(listHandled, undefined);
+          }
+          yield* verify.ok(message.success, `${harness} native RPC command failed`);
+          if (message.id === "coordinator-list") {
+            if (harness === "pi") yield* Deferred.succeed(listHandled, undefined);
+            return;
+          }
+          if (message.id === "coordinator-list-messages") {
+            const result = message.data.messages.find(Schema.is(CoordinatorListMessage));
+            yield* verify.ok(result !== undefined, "Native history must contain the displayed Coordinator list");
+            if (result === undefined) return;
+            yield* verify.ok(result.details.sessions.some((entry) => entry.ref.machineId === hermesMachineId && entry.ref.harness === harness));
+            yield* verify.ok(result.details.sessions.some((entry) => entry.ref.machineId === otherMachineId));
+            yield* verify.ok(result.content.includes("Machine:") && !result.content.includes(token));
+            yield* Deferred.succeed(listVerified, undefined);
+            return;
+          }
           yield* Deferred.succeed(rpcReady, undefined);
         }),
-      }))), Effect.forkScoped);
+      }));
+    })), Effect.forkScoped);
     let nativeStderr = "";
     const stderr = yield* child.stderr.pipe(Stream.decodeText(), Stream.runForEach((chunk) => Effect.sync(() => {
       nativeStderr = (nativeStderr + chunk).slice(-4096);
@@ -364,6 +429,14 @@ const program = Effect.gen(function*() {
       yield* Fiber.join(stderr);
       return yield* Effect.die(`Disposable ${harness} exited ${code} before presence; stderr (last 4096 characters): ${JSON.stringify(nativeStderr)}`);
     }));
+    yield* verify.equal(native.rex?.serverAddress, rex.serverAddress);
+    yield* verify.equal(native.rex?.sessionId, rex.sessionId);
+    yield* verify.equal(native.rex?.blockId, rex.blockId);
+    yield* verify.deepEqual(native.programStatus, { state: "idle" }, "Native startup has a known idle status");
+    const beforeList = detailRequests;
+    yield* Deferred.succeed(runList, undefined);
+    yield* Effect.raceFirst(Deferred.await(listVerified), Fiber.join(stdout).pipe(Effect.andThen(verify.fail("Native RPC ended before list verification")))).pipe(Effect.timeout("30 seconds"));
+    yield* verify.equal(detailRequests, beforeList, "The list command must not sample per-session details");
     const inspected = yield* mcp.call(inspectorUrl, token, InspectionTools.inspect, { ref: native.ref });
     yield* verify.equal(inspected.presence.ref.harness, harness);
     yield* verify.equal(native.ref.machineId, hermesMachineId, "Pi, OMP and hooks share one local installation identity");
@@ -440,12 +513,12 @@ const program = Effect.gen(function*() {
     }));
     yield* child.kill();
     yield* child.exitCode;
-    nativeResults.push({ harness, status: "actual disposable CLI; native get_state startup completed while the first announce response was held; generated shared installation identity and authenticated inspection; no model prompt sent" });
+    nativeResults.push({ harness, status: "actual disposable CLI; startup is nonblocking; /coordinator list displays same-owner machines without a model turn or detail sampling; Rex references/status round-trip and no OSC on RPC" });
   }
   yield* otherConnector.kill();
   yield* otherConnector.exitCode;
   yield* Console.log(JSON.stringify({ scenario: "ephemeral-inspector", status: "ok", authenticatedHttpMcp: true, outboundConnector: true,
-    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
+    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
 });
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("120 seconds"), Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer, NodeHttpClient.layerUndici, Mcp.layer))));

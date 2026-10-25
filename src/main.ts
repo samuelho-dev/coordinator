@@ -7,6 +7,7 @@ import { Mcp } from "./mcp.ts";
 import { Host, cliStdioLayer, serverLayer } from "./platform.ts";
 import { InspectorConfig, InspectionTools, SessionInspectInput } from "./inspection.ts";
 import { NativeError, connectExternal, loadConnectorConfig, resolveNativeConfig, readConnectorToken, readPrivateFile, projectHook, projectClaudeStatus, projectCodexNotification, writeNativeCache, writeHermesHook } from "./native.ts";
+import { runSetup } from "./setup.ts";
 
 const readInput = Effect.gen(function*() {
   const stdio = yield* Stdio.Stdio;
@@ -32,8 +33,9 @@ export const cli = (args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(fun
     return yield* Console.log(manifest.version);
   }
   if (mode === "help" || mode === "--help") {
-    return yield* Console.log(JSON.stringify({ commands: ["inspector", "connector", "mcp", "hook claude|codex|hermes", "claude-statusline", "codex-notification", "list", "inspect"], inspectorConfiguration: "COORDINATOR_CONFIG: private inspector server configuration", configuration: "COORDINATOR_API_URL / COORDINATOR_API_TOKEN override COORDINATOR_CONNECTOR_CONFIG or XDG_CONFIG_HOME/coordinator/inspector.json; credentials may also use tokenFile", statusline: "Optional manual composition only; consumes stdin without producing display output", codexNotification: "Version 2 envelope, source attached-app-server, thread/tokenUsage/updated only; does not observe other TUIs" }));
+    return yield* Console.log(JSON.stringify({ commands: ["init [--directory PATH] [--owner ID] [--listen-host IP] [--port 8787]", "connect [--endpoint URL] [--token-file PATH] [--config PATH]", "inspector", "connector", "mcp", "hook claude|codex|hermes", "claude-statusline", "codex-notification", "list", "inspect"], inspectorConfiguration: "COORDINATOR_CONFIG: private inspector server configuration", configuration: "COORDINATOR_API_URL / COORDINATOR_API_TOKEN override COORDINATOR_CONNECTOR_CONFIG or XDG_CONFIG_HOME/coordinator/inspector.json; credentials may also use tokenFile", setup: "Run coordinator init --help or coordinator connect --help. Credentials are accepted only by masked prompt, private file, or environment.", statusline: "Optional manual composition only; consumes stdin without producing display output", codexNotification: "Version 2 envelope, source attached-app-server, thread/tokenUsage/updated only; does not observe other TUIs" }));
   }
+  if (mode === "init" || mode === "connect") return yield* runSetup(args);
   if (mode === "inspector") {
     const file = yield* Config.String("COORDINATOR_CONFIG").pipe(Config.withDefault(""));
     if (!file) return yield* new NativeError({ operation: "Inspector private configuration required" });

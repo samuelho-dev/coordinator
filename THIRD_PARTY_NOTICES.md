@@ -17,9 +17,11 @@ The implemented inspector cutover changes the shipped runtime, not the completen
 
 The current Dockerfile does **not** download/copy standalone OMP or collect OMP notices into `/usr/local/share/coordinator/third-party/`; it adds no PostgreSQL client/backup tooling or application database. `tsx`, `undici` and `ws` are no longer direct runtime dependencies. Their absence from the direct manifest is not proof of absence from every transitive package or base-image byte. No Pi/OMP/native binary closure is asserted to be shipped by the current inspector image.
 
-## npm plugin bundle notices — candidate 0.3.0-beta.2
+## npm plugin bundle notices — candidate 0.3.0-beta.3
 
 The OMP extension embeds runtime dependencies to support its native compatibility loader; Pi keeps those dependencies external. Native Pi/OMP SDK implementations are not part of this inventory. The entries below were traced in the existing emitted OMP artifact and matching package distributions. Reconcile them against the newly built, accepted tarball before publication; this source review is not a completed image, history, or legal certification.
+
+`0.3.0-beta.3` keeps the `0.3.0-beta.2` runtime dependency pins; bootstrap uses Node built-ins and the already-declared Effect CLI. No native host binary or SDK implementation is added to the published package.
 
 | Embedded component | Version | Matching notice source |
 | --- | --- | --- |

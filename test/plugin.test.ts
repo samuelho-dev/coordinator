@@ -1,6 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
-import { ConfigProvider, Context as EffectContext, Effect, FileSystem, Layer, Path, Stream } from "effect";
+import { ConfigProvider, Context as EffectContext, Crypto, Effect, FileSystem, Layer, Path, Stream } from "effect";
 import { ChildProcess } from "effect/process";
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Host, serverLayer } from "../src/platform.ts";
@@ -8,6 +8,10 @@ import { createNativeObserver, isCoordinateInput, transformCoordinateInput } fro
 import type { Context } from "../src/plugin.ts";
 import type { SessionListOutput } from "../src/inspection.ts";
 import { decodeConnectorResult } from "../src/inspection.ts";
+import { Hex } from "effect/encoding";
+import { Inspector } from "../src/inspector.ts";
+import { Mcp } from "../src/mcp.ts";
+import { createRexReporter, rexSequence } from "../src/rex.ts";
 
 const context = (id = "surrounding-session"): Context => ({
   cwd: "/workspace", mode: "rpc", hasUI: false,
@@ -18,18 +22,76 @@ const context = (id = "surrounding-session"): Context => ({
 });
 const usage = { input: 10, output: 3, cacheRead: 5, cacheWrite: 2, totalTokens: 20, cost: { input: 0.1, output: 0.2, cacheRead: 0.01, cacheWrite: 0.02, total: 0.33 } };
 
-it("captures host and REX metadata through injected Effect services", async () => {
-  const observer = await Effect.runPromise(createNativeObserver("omp", "machine").pipe(
-    Effect.provideService(Host, {
-      homeDirectory: "/isolated", hostname: "native-host", release: "native-release", platform: "darwin",
-      architecture: "arm64", pid: 42, ppid: 1, uid: 1000, executable: "/native/runtime",
-    }),
-    Effect.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ REX_SESSION: "rex-session", REX_BLOCK: "rex-block" }))),
-  ));
-  observer.update(context(), undefined, 1);
-  assert.strictEqual(observer.presence(2)?.machineName, "native-host");
-  assert.deepStrictEqual(observer.presence(2)?.os, { platform: "darwin", release: "native-release", architecture: "arm64" });
-  assert.deepStrictEqual(observer.presence(2)?.rex, { sessionId: "rex-session", blockId: "rex-block" });
+
+it("projects native lifecycle outcomes without treating tools, retries or unknown stops as failures", async () => {
+  for (const harness of ["omp", "pi"] as const) {
+    const observer = await Effect.runPromise(createNativeObserver(harness, "machine").pipe(Effect.provide(Host.layer)));
+    const ctx = { ...context(), isIdle: () => false, agent: { kind: "main" as const } };
+    observer.update(ctx, { type: "agent_start" });
+    assert.deepStrictEqual(observer.presence()?.programStatus, { state: "working" });
+    observer.update(ctx, { type: "tool_execution_start", toolCallId: "a", toolName: "read" });
+    assert.deepStrictEqual(observer.presence()?.programStatus, { state: "working" });
+    assert.strictEqual(observer.presence()?.activity?.wait, "tool");
+    assert.strictEqual(observer.presence()?.kind, "main");
+    observer.update(ctx, { type: "tool_execution_end", toolCallId: "a" });
+    if (harness === "pi") {
+      observer.update(ctx, { type: "ui_prompt_start" });
+      observer.update(ctx, { type: "tool_execution_start", toolCallId: "b", toolName: "read" });
+      assert.deepStrictEqual(observer.presence()?.programStatus, { state: "blocked", kind: "question" });
+      assert.strictEqual(observer.presence()?.activity?.wait, "user");
+      observer.update(ctx, { type: "ui_prompt_end" });
+      assert.deepStrictEqual(observer.presence()?.programStatus, { state: "working" });
+    }
+    for (const [stopReason, state] of [["stop", "done"], ["error", "error"], ["aborted", "idle"]] as const) {
+      observer.update(ctx, { type: "agent_start" });
+      observer.update(ctx, { type: "message_end", message: { role: "assistant", stopReason } });
+      observer.update(ctx, { type: "agent_end" });
+      if (harness === "pi") {
+        assert.deepStrictEqual(observer.presence()?.programStatus, { state: "working" }, "A loop end is not final settlement");
+        observer.update(ctx, { type: "agent_before_settle", outcome: stopReason === "stop" ? "completed" : stopReason });
+        observer.update(ctx, { type: "agent_settled" });
+      }
+      assert.deepStrictEqual(observer.presence()?.programStatus, { state });
+    }
+    observer.update(ctx, { type: "agent_end", willContinue: true });
+    assert.deepStrictEqual(observer.presence()?.programStatus, { state: "working" });
+    observer.update(ctx, { type: "agent_start" });
+    observer.update(ctx, { type: "agent_end" });
+    if (harness === "pi") observer.update(ctx, { type: "agent_settled" });
+    assert.strictEqual(observer.presence()?.programStatus, undefined);
+    observer.clear();
+    assert.strictEqual(observer.presence(), undefined);
+  }
+});
+
+it("emits complete scoped Rex records only on terminal status changes", () => {
+  const output: string[] = [];
+  const reporter = createRexReporter((sequence) => output.push(sequence));
+  reporter.update({ state: "working" }, false);
+  reporter.update({ state: "done" }, false);
+  assert.deepStrictEqual(output, []);
+  reporter.update({ state: "working" }, true);
+  reporter.update({ state: "working" }, true);
+  reporter.update({ state: "blocked", kind: "permission" }, true);
+  reporter.update({ state: "working" }, true);
+  assert.strictEqual(output.length, 3);
+  const id = /id=([^:]+)/u.exec(output[0]!)?.[1];
+  assert.match(id!, /^coordinator\/[a-f0-9]{32}$/u);
+  for (const sequence of output) {
+    assert.match(sequence, /^\u001b\]7501;id=coordinator\/[a-f0-9]{32}:state=/u);
+    assert.match(sequence, /:app=coordinator:title=Q29vcmRpbmF0b3I=/u);
+    assert.ok(Buffer.byteLength(sequence) < 4096);
+  }
+  assert.ok(!output[2]!.includes(":kind="));
+  reporter.close(true);
+  assert.ok(output.at(-1)!.includes(":state=clear:"));
+  assert.strictEqual(rexSequence("550e8400-e29b-41d4-a716-446655440000", { state: "idle" }), "");
+  assert.strictEqual(rexSequence("bad\u001b", { state: "idle" }), "");
+  const completed: string[] = [];
+  const done = createRexReporter((sequence) => completed.push(sequence));
+  done.update({ state: "done" }, true);
+  done.close(true);
+  assert.strictEqual(completed.length, 1);
 });
 
 it("publishes surrounding native identity and clears cached counters only on real switches", async () => {
@@ -310,7 +372,7 @@ it("repairs startup and rotated credentials without leaking host hooks or shutdo
         }
         const handlers = new Map();
         const notices = [];
-        plugin({ on: (name, handler) => handlers.set(name, handler), registerTool: () => {} });
+        plugin({ on: (name, handler) => handlers.set(name, handler), registerTool: () => {}, registerCommand: () => {}, sendMessage: () => {} });
         const context = { cwd: home, mode: "rpc", hasUI: scenario !== "headless",
           sessionManager: { getSessionId: () => scenario }, isIdle: () => true,
           getContextUsage: () => undefined, ui: { notify: (message, level) => notices.push({ message, level }) } };
@@ -543,3 +605,91 @@ it("authenticates the OMP stdio reader from the native environment without creat
     assert.isAbove(requests, 0, "The actual native stdio child must receive the owner's token");
   })).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer))));
 }, 25000);
+
+it("lists every authorized session across pages and machines without native capture or credential leakage", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const crypto = yield* Crypto.Crypto;
+    const home = yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-command-" });
+    yield* fs.chmod(home, 0o700);
+    const token = "private-list-credential", outsiderToken = "private-outsider-credential", emptyToken = "private-empty-credential";
+    const principal = (id: string, owner: string, credential: string) => crypto.digest("SHA-256", new TextEncoder().encode(credential)).pipe(
+      Effect.map((hash) => ({ id, owner, tokenHash: Hex.encode(hash) })),
+    );
+    const reader = yield* principal("reader", "reader-owner", token);
+    const outsider = yield* principal("outsider", "outsider-owner", outsiderToken);
+    const empty = yield* principal("empty", "empty-owner", emptyToken);
+    const inspector = yield* Inspector.make({ host: "127.0.0.1", port: 0, principals: [reader, outsider, empty] });
+    for (let batch = 0; batch < 4; batch++) {
+      const machineId = batch === 3 ? "remote-machine" : "local-machine";
+      const sessions = Array.from({ length: batch === 3 ? 5 : 32 }, (_, index) => ({
+        ref: { machineId, harness: "omp" as const, nativeSessionId: `native-${batch * 32 + index}`, nativeAgentId: `agent-${batch * 32 + index}` },
+        observedAt: 10, lastActivityAt: 0, machineName: "same-hostname",
+        provider: "test-provider", model: "test-model", cwd: `/workspace/${batch * 32 + index}`,
+        os: { platform: "linux" as const, architecture: "x64" }, activity: { state: "idle" as const },
+      }));
+      yield* inspector.announce(reader, { connectorId: `connector-${batch}`, incarnation: `incarnation-${batch}`, machineId, sessions });
+      if (batch === 3) yield* inspector.disconnect(reader, { connectorId: `connector-${batch}`, incarnation: `incarnation-${batch}` });
+    }
+    yield* inspector.announce(outsider, {
+      connectorId: "hidden-connector", incarnation: "hidden-incarnation", machineId: "hidden-machine",
+      sessions: [{ ref: { machineId: "hidden-machine", harness: "pi", nativeSessionId: "hidden-session" }, observedAt: 10 }],
+    });
+    const serverContext = yield* Layer.build(serverLayer("127.0.0.1", 0));
+    const server = EffectContext.get(serverContext, HttpServer.HttpServer);
+    if (server.address._tag === "UnixPathAddress") return yield* Effect.die("Expected TCP fixture server");
+    yield* (yield* Mcp).serve(server, inspector);
+    const tokenFile = path.join(home, "token");
+    const configFile = path.join(home, "inspector.json");
+    yield* fs.writeFileString(tokenFile, token, { mode: 0o600 });
+    yield* fs.writeFileString(configFile, JSON.stringify({ inspectorUrl: `http://127.0.0.1:${server.address.port}`, tokenFile }), { mode: 0o600 });
+    const script = `
+      import { NodeRuntime, NodeServices } from "@effect/platform-node";
+      import { Config, Effect, FileSystem, Path } from "effect";
+      import plugin from "./src/plugin.ts";
+      globalThis.COORDINATOR_HARNESS = process.env.FIXTURE_HARNESS;
+      const check = (condition, message) => { if (!condition) throw new Error(message); };
+      NodeRuntime.runMain(Effect.scoped(Effect.gen(function*() {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const home = yield* Config.String("HOME");
+        const handlers = new Map(), commands = new Map(), messages = [];
+        plugin({
+          on: (name, handler) => handlers.set(name, handler), registerTool: () => {},
+          registerCommand: (name, command) => commands.set(name, command),
+          sendMessage: message => messages.push(message),
+        });
+        yield* Effect.addFinalizer(() => Effect.promise(() => handlers.get("session_shutdown")()));
+        const list = () => Effect.promise(() => commands.get("coordinator").handler("list", {}));
+        yield* list();
+        const message = messages.pop();
+        const sessions = message.details.sessions;
+        check(sessions.length === 101, "List silently stopped at the first API page");
+        check(sessions.some(session => session.ref.machineId === "local-machine"), "Local machine missing");
+        check(sessions.some(session => session.ref.machineId === "remote-machine"), "Remote machine missing");
+        check(!message.content.includes("hidden-session") && !message.content.includes("hidden-machine"), "List exposed another owner's sessions");
+        for (const value of ["local-machine", "remote-machine", "native-100", "agent-100", "test-provider", "test-model", "/workspace/100", "stale", "live"]) {
+          check(message.content.includes(value), "Visible session metadata missing: " + value);
+        }
+        yield* fs.writeFileString(path.join(home, "token"), "invalid-credential", { mode: 0o600 });
+        yield* list();
+        const rejected = messages.pop();
+        check(rejected.details === undefined && rejected.content.includes("401"), "Rejected credentials produced a session list");
+        for (const credential of [${JSON.stringify(token)}, "invalid-credential"]) check(!rejected.content.includes(credential), "Command disclosed credentials");
+        yield* fs.writeFileString(path.join(home, "token"), ${JSON.stringify(emptyToken)}, { mode: 0o600 });
+        yield* list();
+        check(messages.pop().details.sessions.length === 0, "Empty owner did not receive an empty listing");
+        check(!(yield* fs.exists(path.join(home, "state"))), "Read-only command initialized native capture");
+      })).pipe(Effect.provide(NodeServices.layer)));
+    `;
+    for (const harness of ["pi", "omp"]) {
+      yield* runScript("bun", ["--eval", script], { extendEnv: true, env: {
+        HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
+        COORDINATOR_CONNECTOR_CONFIG: configFile, COORDINATOR_API_URL: undefined, COORDINATOR_API_TOKEN: undefined,
+        FIXTURE_HARNESS: harness,
+      } });
+      yield* fs.writeFileString(tokenFile, token, { mode: 0o600 });
+    }
+  })).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer, Mcp.layer))));
+}, 30000);
