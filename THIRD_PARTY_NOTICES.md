@@ -8,7 +8,7 @@ The implemented inspector cutover changes the shipped runtime, not the completen
 
 | Component | Current declared input / ownership | Notice obligation / boundary |
 | --- | --- | --- |
-| Effect | Production dependencies `effect` and `@effect/platform-node` 4.0.3 | Retain matching upstream MIT license/copyright notices, including transitive dependencies; metadata alone is not sufficient. |
+| Effect | Production dependencies `effect`, `@effect/platform-node` and `@effect/platform-node-shared` 4.0.3 | Retain matching upstream MIT license/copyright notices, including transitive dependencies; metadata alone is not sufficient. |
 | MCP client | Production dependency `@modelcontextprotocol/client` 2.3.1 | The previously inspected LICENSE describes a mixed-license transition: new code/specification and consented contributions Apache-2.0, unconsented legacy contributions MIT, non-specification documentation CC-BY-4.0. Preserve the complete applicable LICENSE/NOTICE/attributions; Apache-2.0 metadata is not a homogeneous-license certification. |
 | Node / operating system | Final image `node:24.21.0-bookworm-slim`, Node 24.21.0 / Debian bookworm | Preserve base-image notices and applicable `/usr/share/doc/*/copyright`; system packages have individual licenses, including copyleft terms. Versioned inputs do not establish bit-for-bit reproducibility. |
 | Build/development tools | pnpm 11.9.0 in build/dependency stages; TypeScript, esbuild, Effect tooling, Vitest and native SDKs are development inputs | Final assembly copies compiled `dist`, the manifest/notices and production-installed `node_modules`, not `integrations` assets; assess actual emitted/bundled code and transitive/image contents before redistribution, not just dependency labels. |
@@ -17,7 +17,7 @@ The implemented inspector cutover changes the shipped runtime, not the completen
 
 The current Dockerfile does **not** download/copy standalone OMP or collect OMP notices into `/usr/local/share/coordinator/third-party/`; it adds no PostgreSQL client/backup tooling or application database. `tsx`, `undici` and `ws` are no longer direct runtime dependencies. Their absence from the direct manifest is not proof of absence from every transitive package or base-image byte. No Pi/OMP/native binary closure is asserted to be shipped by the current inspector image.
 
-## npm plugin bundle notices — candidate 0.3.0-beta.1
+## npm plugin bundle notices — candidate 0.3.0-beta.2
 
 The OMP extension embeds runtime dependencies to support its native compatibility loader; Pi keeps those dependencies external. Native Pi/OMP SDK implementations are not part of this inventory. The entries below were traced in the existing emitted OMP artifact and matching package distributions. Reconcile them against the newly built, accepted tarball before publication; this source review is not a completed image, history, or legal certification.
 

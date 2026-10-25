@@ -137,14 +137,16 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. B
 
 ## Plugin publication
 
-The npm candidate is `@samuelho-dev/coordinator@0.3.0-beta.1`; publication requires the exact-source CI-accepted tarball and owner authorization. The [npm workflow](.github/workflows/npm-release.yaml) promotes that accepted artifact; [first-publication authentication and trust setup](#first-npm-publication) remain operator prerequisites. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The npm candidate is `@samuelho-dev/coordinator@0.3.0-beta.2`; publication requires the exact-source CI-accepted tarball and owner authorization. The [npm workflow](.github/workflows/npm-release.yaml) promotes that accepted artifact; [first-publication authentication and trust setup](#first-npm-publication) remain operator prerequisites. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
 Once published, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.1
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.1
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.2
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.2
 ```
+
+`0.3.0-beta.2` fixes clean-install startup failures by pinning `effect`, `@effect/platform-node` and `@effect/platform-node-shared` together at 4.0.3 in the published dependencies. Checkout-only pnpm overrides do not constrain npm/OMP consumers; leaving the shared package floating can select an incompatible release (`effect/Path` missing `make`). Keep these three pins aligned when upgrading.
 
 | Host | Publication route |
 | --- | --- |
