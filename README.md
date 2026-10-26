@@ -9,14 +9,16 @@ There are two parts: **one inspector service**, plus **native integrations on ea
 The API and setup CLI require Node >=22.19. Install the version-pinned release:
 
 ```sh
-npm install --global @samuelho-dev/coordinator@0.3.0-beta.5
+npm install --global @samuelho-dev/coordinator@0.3.0-beta.6
 ```
 
 For source development only, use a reviewed checkout with `pnpm install --frozen-lockfile && pnpm build` (pnpm 11.9.0). `coordinator-install --source` deliberately activates that exact local package; never source-link a native package manager's own `node_modules` directory.
 
 The [esbuild build](scripts/build.ts) keeps Pi dependencies external and bundles OMP dependencies to avoid compatibility-loader traversal. Native host APIs stay external; OMP uses [Bun's native CommonJS support](https://bun.com/docs/runtime/module-resolution#module-systems), not an injected shim. Rebuild and restart OMP after source updates.
 
-`0.3.0-beta.5` introduces the grouped metadata/workspace contract described below. It is a breaking cutover from beta.4 and earlier APIs, publishers and readers; deploy the matching API before upgrading clients.
+Client and server code stays in [`src/mcp.ts`](src/mcp.ts). The `Mcp` layer contains only client calls; separate HTTP/stdio exports let native bundles discard server-only protocol and tool initialization.
+
+The grouped metadata/workspace contract introduced in `0.3.0-beta.5` is a breaking cutover from beta.4 and earlier APIs, publishers and readers. `0.3.0-beta.6` retains that contract and works with the existing beta.5 API; no API rollout is required.
 
 For Kubernetes, follow the [chart operator guide](deploy/helm/coordinator/README.md): provide an existing Secret, verified image digest and matching source SHA. The chart creates an inspector Deployment/internal Service, not native plugins, TLS routing, a database or runners. Operators own rollout and supervision. Existing broker state requires the guide's preservation/migration procedure; the plugin does not migrate or delete it.
 
@@ -107,8 +109,8 @@ The installer validates prerequisites and creates launchers/config fragments. `-
 
 | Target | Activation | Presence publisher |
 | --- | --- | --- |
-| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.5`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
-| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.5`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
+| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.6`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
+| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.6`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
 | Claude Code | `claude --plugin-dir "$PRIVATE/claude-host"`; approve generated hooks/MCP tools; preserve existing status-line configuration. | Separate `connector.sh`. |
 | Codex CLI | Merge generated `hooks/hooks.json` and coordinator `mcp.toml`; trust only Coordinator's handlers in native `/hooks`. | Separate `connector.sh`. |
 | Hermes | Merge generated hook entries and `mcp_servers.coordinator` from `mcp.yaml` into the selected profile; no Python plugin installation. | Separate `connector.sh`. |
@@ -161,13 +163,13 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. E
 
 ## Plugin publication
 
-The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.5`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.6`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
 For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.5
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.5
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.6
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.6
 ```
 
 Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
@@ -179,6 +181,8 @@ Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixe
 `0.3.0-beta.4` fixes `/coordinator list` output: Effect-formatted, indented JSON with native syntax highlighting instead of hand-built text and literal fences. Native UI imports are static and selected at build time; the renderer registers once at startup. The session wire format and runtime dependencies are unchanged, so the existing beta.3 API needs no redeployment.
 
 `0.3.0-beta.5` groups machine, agent, model and workspace metadata; adds cached Git worktree/common-directory/branch/HEAD observations and native or explicitly configured project association; and migrates every harness and private metadata cache. This requires matching API, publishers and readers, but no credential rotation, new runtime dependencies or OMP fork.
+
+`0.3.0-beta.6` removes server-only MCP protocol/tool initialization from native client bundles while keeping the implementation in `src/mcp.ts`. The wire contract, runtime dependencies, heartbeat timing and readiness probe are unchanged; the beta.5 API remains compatible.
 
 | Host | Publication route |
 | --- | --- |

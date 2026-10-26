@@ -7,7 +7,7 @@ import { HttpServer } from "effect/http";
 import { NodeServices } from "@effect/platform-node";
 import { InspectorConfig } from "../src/inspection.ts";
 import { Inspector } from "../src/inspector.ts";
-import { Mcp } from "../src/mcp.ts";
+import { Mcp, serve } from "../src/mcp.ts";
 import { Host, serverLayer } from "../src/platform.ts";
 import { loadConnectorConfig, readConnectorToken } from "../src/native.ts";
 import { connectClient, initializeServer } from "../src/setup.ts";
@@ -34,7 +34,7 @@ it("bootstraps and authenticates real clients without credential disclosure, ide
       make: Effect.gen(function*() {
         const inspector = yield* Inspector.make(config);
         const http = yield* HttpServer.HttpServer;
-        yield* (yield* Mcp).serve(http, inspector);
+        yield* serve(http, inspector);
         return HttpServer.formatAddress(http.address);
       }),
     }) {}

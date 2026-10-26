@@ -9,23 +9,10 @@ import type { Inspector } from "./inspector.ts";
 export const LIMIT = 64 * 1024;
 export const MCP_RESPONSE_LIMIT = 3 * LIMIT;
 export const MCP_RESULT_LIMIT = MCP_RESPONSE_LIMIT - 1024;
-const protocols: readonly [McpProtocol.ProtocolAdapter, ...McpProtocol.ProtocolAdapter[]] = [McpProtocol.v2026_07_28, McpProtocol.v2025_11_25, McpProtocol.v2025_06_18, McpProtocol.v2025_03_26, McpProtocol.v2024_11_05];
 const encoder = new TextEncoder();
 const ToolFailure = Schema.Struct({ error: HttpError });
-const encodeToolResult = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(McpSchema.CallToolResult)));
-const toolResult = (structuredContent: Schema.Json, isError = false) => new McpSchema.CallToolResult({
-  isError, content: [McpSchema.TextContent.make({ type: "text", text: Formatter.formatJson(structuredContent, { space: 2 }) })], structuredContent,
-});
 const invalid = () => new HttpError({ status: 400, message: "Invalid inspection request or response" });
 const unavailable = () => new HttpError({ status: 502, message: "Inspection transport unavailable" });
-const boundaryFailure = <E>(cause: Cause.Cause<E>) => {
-  const error = Cause.findErrorOption(cause);
-  if (Option.isSome(error)) {
-    const decoded = Schema.decodeUnknownOption(HttpError)(error.value);
-    if (Option.isSome(decoded)) return new HttpError({ status: decoded.value.status, message: "Inspection request unavailable" });
-  }
-  return invalid();
-};
 const endpoint = (url: string, path: string, token: string) => Effect.try({
   try: () => {
     const base = new URL(url);
@@ -58,42 +45,6 @@ const byteGate = (limit: number) => {
   return (chunk: Uint8Array) => (size += chunk.byteLength) > limit
     ? Effect.fail(new HttpError({ status: 413, message: "Response exceeds bound" })) : Effect.succeed(chunk);
 };
-const boundedResponse = Effect.fnUntraced(function*(response: HttpServerResponse.HttpServerResponse, limit: number) {
-  const body = response.body;
-  if (body._tag === "Empty") return response;
-  const sse = response.headers["content-type"]?.split(";")[0]?.trim() === "text/event-stream";
-  const gate = sse ? eventByteGate(limit) : byteGate(limit);
-  if (body._tag === "Uint8Array") { yield* gate(body.body); return response; }
-  if (body._tag !== "Stream") return yield* unavailable();
-  return HttpServerResponse.setBody(response, HttpBody.stream(body.stream.pipe(Stream.mapEffect(gate)), body.contentType));
-});
-const resultResponse = <O extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>>(schema: O, value: O["Type"]) => Effect.gen(function*() {
-  const encoded = yield* Schema.encodeEffect(Schema.toCodecJson(schema))(value).pipe(Effect.mapError(invalid));
-  if (encoder.encode(JSON.stringify(encoded)).byteLength > LIMIT - 1024) return yield* new HttpError({ status: 413, message: "Inspection result exceeds bound" });
-  const response = toolResult({ result: encoded });
-  if (encoder.encode(encodeToolResult(response)).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Inspection result exceeds bound" });
-  return response;
-});
-const registerTool = <I extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>, O extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>, E, R>(
-  descriptor: { readonly name: string; readonly description: string; readonly input: I; readonly output: O },
-  handle: (input: I["Type"]) => Effect.Effect<O["Type"], E, R>,
-) => Layer.effectDiscard(Effect.gen(function*() {
-  const services = yield* Effect.context<R>();
-  const registry = yield* McpServer.McpServer;
-  const input = Schema.toJsonSchemaDocument(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" });
-  const output = Schema.toJsonSchemaDocument(Schema.toCodecJson(Schema.Struct({ result: descriptor.output })));
-  const inputSchema = yield* Schema.decodeUnknownEffect(McpSchema.ToolJson)({ ...input.schema, type: "object", $defs: input.definitions });
-  const outputSchema = yield* Schema.decodeUnknownEffect(McpSchema.ToolOutputJson)({ ...output.schema, $defs: output.definitions });
-  yield* registry.addTool({
-    tool: new McpSchema.Tool({ name: descriptor.name, description: descriptor.description, inputSchema, outputSchema,
-      annotations: McpSchema.ToolAnnotations.make({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }) }),
-    annotations: Context.empty(),
-    handle: (payload: unknown) => Effect.gen(function*() {
-      const decoded = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(payload).pipe(Effect.mapError(invalid));
-      return yield* resultResponse(descriptor.output, yield* handle(decoded).pipe(Effect.provideContext(services)));
-    }).pipe(Effect.catchCause((cause) => Effect.succeed(toolResult(Schema.encodeSync(Schema.toCodecJson(ToolFailure))({ error: boundaryFailure(cause) }), true)))),
-  });
-}));
 
 export class Mcp extends Context.Service<Mcp>()("@samuelho-dev/coordinator/Mcp", {
   make: Effect.gen(function*() {
@@ -168,62 +119,112 @@ export class Mcp extends Context.Service<Mcp>()("@samuelho-dev/coordinator/Mcp",
       return yield* Schema.decodeUnknownEffect(Schema.toCodecJson(descriptor.output), { onExcessProperty: "error" })(output.result).pipe(Effect.mapError(invalid));
     })).pipe(Effect.timeout(timeoutMs));
 
-    const serve = (server: HttpServer.HttpServer["Service"], inspector: Inspector["Service"]) => Effect.gen(function*() {
-      const sha = yield* Config.option(Config.String("COORDINATOR_IMAGE_SHA"));
-      const readinessHeaders = { "cache-control": "no-store", ...(Option.isSome(sha) ? { "x-coordinator-source-sha": sha.value } : {}) };
-      const authorize = Effect.gen(function*() {
-        const current = yield* Effect.serviceOption(HttpServerRequest.HttpServerRequest);
-        if (Option.isNone(current)) return yield* new HttpError({ status: 401, message: "Request context required" });
-        const request = current.value;
-        if (request.headers.origin !== undefined) return yield* new HttpError({ status: 403, message: "Origin prohibited" });
-        const auth = request.headers.authorization;
-        if (!auth?.startsWith("Bearer ") || auth.length > 512) return yield* new HttpError({ status: 401, message: "Credential required" });
-        return yield* inspector.authorize(auth.slice(7));
-      });
-      const protocol = McpServer.layerHttp({ name: "coordinator-inspector", version: "1.0.0", path: "/mcp", protocols, allowedOrigins: [] });
-      const tools = Layer.merge(registerTool(InspectionTools.list, (input) => authorize.pipe(Effect.flatMap((principal) => inspector.list(principal, input)))), registerTool(InspectionTools.inspect, (input) => authorize.pipe(Effect.flatMap((principal) => inspector.inspect(principal, input))))).pipe(Layer.provide(protocol));
-      const app = yield* HttpRouter.toHttpEffect(Layer.merge(protocol, tools));
-      yield* server.serve(Effect.gen(function*() {
-        const request = yield* HttpServerRequest.HttpServerRequest;
-        if (request.method === "GET" && request.url === "/livez") return HttpServerResponse.jsonUnsafe({ status: "ok" }, { headers: { "cache-control": "no-store" } });
-        const principal = yield* authorize;
-        if (request.method === "GET" && (request.url === "/readyz" || request.url === "/healthz")) return HttpServerResponse.jsonUnsafe({ status: "ok" }, { headers: readinessHeaders });
-        if (Number(request.headers["content-length"] ?? 0) > LIMIT) return yield* new HttpError({ status: 413, message: "Request exceeds bound" });
-        const body: unknown = request.method === "POST" ? yield* request.json.pipe(Effect.interruptible, Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT)), Effect.mapError(invalid)) : undefined;
-        const decode = <S extends Schema.Top>(schema: S) => Schema.decodeUnknownEffect(schema, { onExcessProperty: "error" })(body).pipe(Effect.mapError(invalid));
-        if (request.method === "POST") {
-          switch (request.url) {
-            case "/connector/announce": return yield* HttpServerResponse.schemaJson(ConnectorAccepted)(yield* inspector.announce(principal, yield* decode(ConnectorAnnounce)));
-            case "/connector/poll": return yield* HttpServerResponse.schemaJson(ConnectorPollResult)(yield* inspector.poll(principal, yield* decode(ConnectorPoll)));
-            case "/connector/result": return yield* HttpServerResponse.schemaJson(ConnectorAccepted)(yield* inspector.complete(principal, yield* decode(ConnectorResult)));
-            case "/connector/disconnect": return yield* HttpServerResponse.schemaJson(ConnectorAccepted)(yield* inspector.disconnect(principal, yield* decode(ConnectorDisconnect)));
-          }
-        }
-        return yield* app;
-      }).pipe(Effect.flatMap((response) => boundedResponse(response, 512 * 1024)), Effect.catchCause((cause) => {
-        const error = boundaryFailure(cause);
-        return Effect.succeed(HttpServerResponse.jsonUnsafe({ error: error.message }, { status: error.status, headers: readinessHeaders }));
-      })));
-    });
-    const serveStdio = <LE, LR, IE, IR>(reader: {
-      readonly list: (input: SessionListInput) => Effect.Effect<SessionListOutput, LE, LR>;
-      readonly inspect: (input: SessionInspectInput) => Effect.Effect<SessionInspection, IE, IR>;
-    }) => Effect.gen(function*() {
-      const ended = yield* Deferred.make<void>();
-      const stdio = yield* Stdio.Stdio;
-      const protocol = McpServer.layerStdio({ name: "coordinator-inspector", version: "1.0.0", protocols });
-      return yield* Effect.raceFirst(
-        Layer.launch(Layer.merge(protocol, Layer.merge(registerTool(InspectionTools.list, reader.list), registerTool(InspectionTools.inspect, reader.inspect)).pipe(Layer.provide(protocol)))).pipe(
-          Effect.provideService(Stdio.Stdio, {
-            ...stdio,
-            stdin: stdio.stdin.pipe(Stream.onEnd(Deferred.succeed(ended, undefined))),
-          }),
-        ),
-        Deferred.await(ended),
-      );
-    });
-    return { call, post, serve, serveStdio };
+    return { call, post };
   }),
 }) {
   static readonly layer = Layer.effect(this, this.make).pipe(Layer.provide(FetchHttpClient.layer));
 }
+// Pure server initializers can be pruned from client-only native bundles.
+const protocols: readonly [McpProtocol.ProtocolAdapter, ...McpProtocol.ProtocolAdapter[]] = /* @__PURE__ */ (() => [McpProtocol.v2026_07_28, McpProtocol.v2025_11_25, McpProtocol.v2025_06_18, McpProtocol.v2025_03_26, McpProtocol.v2024_11_05])();
+const encodeToolResult = /* @__PURE__ */ (() => Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(McpSchema.CallToolResult))))();
+const toolResult = (structuredContent: Schema.Json, isError = false) => new McpSchema.CallToolResult({
+  isError, content: [McpSchema.TextContent.make({ type: "text", text: Formatter.formatJson(structuredContent, { space: 2 }) })], structuredContent,
+});
+const boundaryFailure = <E>(cause: Cause.Cause<E>) => {
+  const error = Cause.findErrorOption(cause);
+  if (Option.isSome(error)) {
+    const decoded = Schema.decodeUnknownOption(HttpError)(error.value);
+    if (Option.isSome(decoded)) return new HttpError({ status: decoded.value.status, message: "Inspection request unavailable" });
+  }
+  return invalid();
+};
+const boundedResponse = /* @__PURE__ */ Effect.fnUntraced(function*(response: HttpServerResponse.HttpServerResponse, limit: number) {
+  const body = response.body;
+  if (body._tag === "Empty") return response;
+  const sse = response.headers["content-type"]?.split(";")[0]?.trim() === "text/event-stream";
+  const gate = sse ? eventByteGate(limit) : byteGate(limit);
+  if (body._tag === "Uint8Array") { yield* gate(body.body); return response; }
+  if (body._tag !== "Stream") return yield* unavailable();
+  return HttpServerResponse.setBody(response, HttpBody.stream(body.stream.pipe(Stream.mapEffect(gate)), body.contentType));
+});
+const resultResponse = <O extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>>(schema: O, value: O["Type"]) => Effect.gen(function*() {
+  const encoded = yield* Schema.encodeEffect(Schema.toCodecJson(schema))(value).pipe(Effect.mapError(invalid));
+  if (encoder.encode(JSON.stringify(encoded)).byteLength > LIMIT - 1024) return yield* new HttpError({ status: 413, message: "Inspection result exceeds bound" });
+  const response = toolResult({ result: encoded });
+  if (encoder.encode(encodeToolResult(response)).byteLength > MCP_RESULT_LIMIT) return yield* new HttpError({ status: 413, message: "Inspection result exceeds bound" });
+  return response;
+});
+const registerTool = <I extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>, O extends Schema.Top & Schema.ConstraintCodec<unknown, unknown>, E, R>(
+  descriptor: { readonly name: string; readonly description: string; readonly input: I; readonly output: O },
+  handle: (input: I["Type"]) => Effect.Effect<O["Type"], E, R>,
+) => Layer.effectDiscard(Effect.gen(function*() {
+  const services = yield* Effect.context<R>();
+  const registry = yield* McpServer.McpServer;
+  const input = Schema.toJsonSchemaDocument(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" });
+  const output = Schema.toJsonSchemaDocument(Schema.toCodecJson(Schema.Struct({ result: descriptor.output })));
+  const inputSchema = yield* Schema.decodeUnknownEffect(McpSchema.ToolJson)({ ...input.schema, type: "object", $defs: input.definitions });
+  const outputSchema = yield* Schema.decodeUnknownEffect(McpSchema.ToolOutputJson)({ ...output.schema, $defs: output.definitions });
+  yield* registry.addTool({
+    tool: new McpSchema.Tool({ name: descriptor.name, description: descriptor.description, inputSchema, outputSchema,
+      annotations: McpSchema.ToolAnnotations.make({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }) }),
+    annotations: Context.empty(),
+    handle: (payload: unknown) => Effect.gen(function*() {
+      const decoded = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(descriptor.input), { onExcessProperty: "error" })(payload).pipe(Effect.mapError(invalid));
+      return yield* resultResponse(descriptor.output, yield* handle(decoded).pipe(Effect.provideContext(services)));
+    }).pipe(Effect.catchCause((cause) => Effect.succeed(toolResult(Schema.encodeSync(Schema.toCodecJson(ToolFailure))({ error: boundaryFailure(cause) }), true)))),
+  });
+}));
+export const serve = (server: HttpServer.HttpServer["Service"], inspector: Inspector["Service"]) => Effect.gen(function*() {
+  const sha = yield* Config.option(Config.String("COORDINATOR_IMAGE_SHA"));
+  const readinessHeaders = { "cache-control": "no-store", ...(Option.isSome(sha) ? { "x-coordinator-source-sha": sha.value } : {}) };
+  const authorize = Effect.gen(function*() {
+    const current = yield* Effect.serviceOption(HttpServerRequest.HttpServerRequest);
+    if (Option.isNone(current)) return yield* new HttpError({ status: 401, message: "Request context required" });
+    const request = current.value;
+    if (request.headers.origin !== undefined) return yield* new HttpError({ status: 403, message: "Origin prohibited" });
+    const auth = request.headers.authorization;
+    if (!auth?.startsWith("Bearer ") || auth.length > 512) return yield* new HttpError({ status: 401, message: "Credential required" });
+    return yield* inspector.authorize(auth.slice(7));
+  });
+  const protocol = McpServer.layerHttp({ name: "coordinator-inspector", version: "1.0.0", path: "/mcp", protocols, allowedOrigins: [] });
+  const tools = Layer.merge(registerTool(InspectionTools.list, (input) => authorize.pipe(Effect.flatMap((principal) => inspector.list(principal, input)))), registerTool(InspectionTools.inspect, (input) => authorize.pipe(Effect.flatMap((principal) => inspector.inspect(principal, input))))).pipe(Layer.provide(protocol));
+  const app = yield* HttpRouter.toHttpEffect(Layer.merge(protocol, tools));
+  yield* server.serve(Effect.gen(function*() {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    if (request.method === "GET" && request.url === "/livez") return HttpServerResponse.jsonUnsafe({ status: "ok" }, { headers: { "cache-control": "no-store" } });
+    const principal = yield* authorize;
+    if (request.method === "GET" && (request.url === "/readyz" || request.url === "/healthz")) return HttpServerResponse.jsonUnsafe({ status: "ok" }, { headers: readinessHeaders });
+    if (Number(request.headers["content-length"] ?? 0) > LIMIT) return yield* new HttpError({ status: 413, message: "Request exceeds bound" });
+    const body: unknown = request.method === "POST" ? yield* request.json.pipe(Effect.interruptible, Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(LIMIT)), Effect.mapError(invalid)) : undefined;
+    const decode = <S extends Schema.Top>(schema: S) => Schema.decodeUnknownEffect(schema, { onExcessProperty: "error" })(body).pipe(Effect.mapError(invalid));
+    if (request.method === "POST") {
+      switch (request.url) {
+        case "/connector/announce": return yield* HttpServerResponse.schemaJson(ConnectorAccepted)(yield* inspector.announce(principal, yield* decode(ConnectorAnnounce)));
+        case "/connector/poll": return yield* HttpServerResponse.schemaJson(ConnectorPollResult)(yield* inspector.poll(principal, yield* decode(ConnectorPoll)));
+        case "/connector/result": return yield* HttpServerResponse.schemaJson(ConnectorAccepted)(yield* inspector.complete(principal, yield* decode(ConnectorResult)));
+        case "/connector/disconnect": return yield* HttpServerResponse.schemaJson(ConnectorAccepted)(yield* inspector.disconnect(principal, yield* decode(ConnectorDisconnect)));
+      }
+    }
+    return yield* app;
+  }).pipe(Effect.flatMap((response) => boundedResponse(response, 512 * 1024)), Effect.catchCause((cause) => {
+    const error = boundaryFailure(cause);
+    return Effect.succeed(HttpServerResponse.jsonUnsafe({ error: error.message }, { status: error.status, headers: readinessHeaders }));
+  })));
+});
+export const serveStdio = <LE, LR, IE, IR>(reader: {
+  readonly list: (input: SessionListInput) => Effect.Effect<SessionListOutput, LE, LR>;
+  readonly inspect: (input: SessionInspectInput) => Effect.Effect<SessionInspection, IE, IR>;
+}) => Effect.gen(function*() {
+  const ended = yield* Deferred.make<void>();
+  const stdio = yield* Stdio.Stdio;
+  const protocol = McpServer.layerStdio({ name: "coordinator-inspector", version: "1.0.0", protocols });
+  return yield* Effect.raceFirst(
+    Layer.launch(Layer.merge(protocol, Layer.merge(registerTool(InspectionTools.list, reader.list), registerTool(InspectionTools.inspect, reader.inspect)).pipe(Layer.provide(protocol)))).pipe(
+      Effect.provideService(Stdio.Stdio, {
+        ...stdio,
+        stdin: stdio.stdin.pipe(Stream.onEnd(Deferred.succeed(ended, undefined))),
+      }),
+    ),
+    Deferred.await(ended),
+  );
+});

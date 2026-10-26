@@ -3,7 +3,7 @@ import { Cause, Config, Console, Context, Effect, FileSystem, Layer, Logger, Pat
 import { HttpServer } from "effect/http";
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Inspector } from "./inspector.ts";
-import { Mcp } from "./mcp.ts";
+import { Mcp, serve, serveStdio } from "./mcp.ts";
 import { Host, cliStdioLayer, serverLayer } from "./platform.ts";
 import { InspectorConfig, InspectionTools, SessionInspectInput } from "./inspection.ts";
 import { NativeError, connectExternal, loadConnectorConfig, resolveNativeConfig, readConnectorToken, readPrivateFile, projectHook, projectClaudeStatus, projectCodexNotification, writeNativeCache, writeHermesHook } from "./native.ts";
@@ -42,8 +42,7 @@ export const cli = (args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(fun
     const config = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(InspectorConfig), { onExcessProperty: "error" })(yield* readPrivateFile(file));
     const inspector = yield* Inspector.make(config);
     const context = yield* Layer.build(serverLayer(config.host, config.port));
-    const mcp = yield* Mcp;
-    yield* mcp.serve(Context.get(context, HttpServer.HttpServer), inspector);
+    yield* serve(Context.get(context, HttpServer.HttpServer), inspector);
     return yield* Effect.never;
   }
   const config = yield* loadConnectorConfig();
@@ -64,7 +63,7 @@ export const cli = (args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(fun
     list: (input: typeof InspectionTools.list.input.Type) => mcp.call(config.inspectorUrl, token, InspectionTools.list, input),
     inspect: (input: typeof SessionInspectInput.Type) => mcp.call(config.inspectorUrl, token, InspectionTools.inspect, input),
   };
-  if (mode === "mcp") return yield* mcp.serveStdio(reader);
+  if (mode === "mcp") return yield* serveStdio(reader);
   if (mode === "list") return yield* Console.log(JSON.stringify(yield* reader.list({ limit: 100 })));
   if (mode === "inspect") {
     const input = yield* Schema.decodeUnknownEffect(SessionInspectInput)(yield* readInput);

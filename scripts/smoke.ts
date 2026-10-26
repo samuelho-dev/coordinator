@@ -6,7 +6,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { NodeHttpClient, NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Inspector } from "../src/inspector.ts";
 import { ConnectorAccepted, ConnectorAnnounce, InspectionTools, InspectorConfig, SessionPresence, createInspection } from "../src/inspection.ts";
-import { Mcp } from "../src/mcp.ts";
+import { Mcp, serve } from "../src/mcp.ts";
 import { connectNative, withProcessResources } from "../src/native.ts";
 import { identifyProcess } from "../src/resources.ts";
 
@@ -63,7 +63,7 @@ const program = Effect.gen(function*() {
     readonly resume: Deferred.Deferred<void>;
     readonly finished: Deferred.Deferred<void>;
   } | undefined;
-  yield* mcp.serve(server, {
+  yield* serve(server, {
     ...inspector,
     announce: (principal, input) => {
       const gate = blockedStartup;

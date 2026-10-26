@@ -7,7 +7,7 @@ import { serverLayer } from "../src/platform.ts";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { ConnectorAccepted, ConnectorAnnounce, ConnectorPoll, ConnectorPollResult, ConnectorResult, createInspection, HttpError, InspectionTools, type SessionInspection, type SessionListOutput, type SessionPresence } from "../src/inspection.ts";
 import { Inspector } from "../src/inspector.ts";
-import { LIMIT, MCP_RESPONSE_LIMIT, Mcp } from "../src/mcp.ts";
+import { LIMIT, MCP_RESPONSE_LIMIT, Mcp, serve } from "../src/mcp.ts";
 
 const token = "private-inspector-test-token";
 const outsiderToken = "private-outsider-test-token";
@@ -31,7 +31,7 @@ class Endpoint extends Context.Service<Endpoint>()("test/InspectorHttp", {
       { id: "outsider", owner: "other-owner", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(outsiderToken))) },
     ] });
     const server = yield* HttpServer.HttpServer;
-    yield* mcp.serve(server, inspector);
+    yield* serve(server, inspector);
     return { mcp, url: HttpServer.formatAddress(server.address) };
   }),
 }) {}

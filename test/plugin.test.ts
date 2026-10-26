@@ -10,7 +10,7 @@ import type { SessionListOutput } from "../src/inspection.ts";
 import { decodeConnectorResult } from "../src/inspection.ts";
 import { Hex } from "effect/encoding";
 import { Inspector } from "../src/inspector.ts";
-import { Mcp } from "../src/mcp.ts";
+import { Mcp, serve } from "../src/mcp.ts";
 import { createRexReporter, rexSequence } from "../src/rex.ts";
 
 const context = (id = "surrounding-session"): Context => ({
@@ -727,7 +727,7 @@ it("lists every authorized session across pages and machines without native capt
     const serverContext = yield* Layer.build(serverLayer("127.0.0.1", 0));
     const server = EffectContext.get(serverContext, HttpServer.HttpServer);
     if (server.address._tag === "UnixPathAddress") return yield* Effect.die("Expected TCP fixture server");
-    yield* (yield* Mcp).serve(server, inspector);
+    yield* serve(server, inspector);
     const tokenFile = path.join(home, "token");
     const configFile = path.join(home, "inspector.json");
     yield* fs.writeFileString(tokenFile, token, { mode: 0o600 });
