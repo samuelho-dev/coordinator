@@ -1,6 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
-import { ConfigProvider, Context as EffectContext, Crypto, Effect, FileSystem, Layer, Path, Stream } from "effect";
+import { ConfigProvider, Context as EffectContext, Crypto, Deferred, Effect, Fiber, FileSystem, Layer, Path, Stream } from "effect";
 import { ChildProcess } from "effect/process";
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Host, serverLayer } from "../src/platform.ts";
@@ -32,7 +32,7 @@ it("projects native lifecycle outcomes without treating tools, retries or unknow
     observer.update(ctx, { type: "tool_execution_start", toolCallId: "a", toolName: "read" });
     assert.deepStrictEqual(observer.presence()?.programStatus, { state: "working" });
     assert.strictEqual(observer.presence()?.activity?.wait, "tool");
-    assert.strictEqual(observer.presence()?.kind, "main");
+    assert.strictEqual(observer.presence()?.agent?.kind, "main");
     observer.update(ctx, { type: "tool_execution_end", toolCallId: "a" });
     if (harness === "pi") {
       observer.update(ctx, { type: "ui_prompt_start" });
@@ -99,6 +99,11 @@ it("publishes surrounding native identity and clears cached counters only on rea
   const native: Context = { ...context(), agent: { kind: "main", id: "Main", name: "main" } };
   observer.update(native, { message: { role: "assistant", timestamp: 12, usage } }, 20);
   assert.deepStrictEqual(observer.presence(21)?.ref, { machineId: "machine", harness: "omp", nativeSessionId: "surrounding-session", nativeAgentId: "Main" });
+  assert.deepStrictEqual(observer.presence(21)?.model, { provider: "native-provider", id: "native-model" });
+  assert.deepStrictEqual(observer.presence(21)?.agent, { kind: "main", name: "main" });
+  assert.deepStrictEqual(observer.presence(21)?.workspace, { cwd: "/workspace" });
+  assert.isString(observer.presence(21)?.machine?.name);
+  for (const key of ["machineName", "os", "kind", "provider", "profile", "cwd", "repository"]) assert.notProperty(observer.presence(21), key);
   observer.update(native, undefined, 22);
   assert.strictEqual(observer.inspect(30)?.tokens.latestNativeUpdate.inputTokens.value, 10);
   assert.strictEqual(observer.inspect(30)?.tokens.latestNativeUpdate.inputTokens.provenance.observedAt, 20);
@@ -109,6 +114,88 @@ it("publishes surrounding native identity and clears cached counters only on rea
   assert.strictEqual(observer.presence(34)?.ref.nativeSessionId, "next-session");
   observer.clear();
   assert.strictEqual(observer.inspect(35), undefined);
+});
+
+it("retains linked-worktree metadata through native list and inspect and clears associations on switches", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const crypto = yield* Crypto.Crypto;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-plugin-worktree-" });
+    const repository = path.join(directory, "repository"), linked = path.join(directory, "linked tree"), cwd = path.join(linked, "subdir");
+    for (const args of [
+      ["init", "-q", repository],
+      ["-C", repository, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "initial"],
+      ["-C", repository, "worktree", "add", "-qb", "native-worktree", linked],
+    ]) {
+      const child = yield* ChildProcess.make("git", args, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+      assert.strictEqual(yield* child.exitCode, 0);
+    }
+    yield* fs.makeDirectory(cwd);
+    const observer = yield* createNativeObserver("omp", "machine");
+    observer.update({ ...context(), cwd });
+    assert.deepStrictEqual(observer.presence()?.workspace, { cwd });
+    const project = { root: linked, source: "configured" as const, id: "explicit-project", name: "Explicit project" };
+    yield* observer.refreshWorkspace(project);
+    const observation = observer.inspect();
+    if (!observation) return yield* Effect.die("Missing native observation");
+    const workspace = observation.presence.workspace;
+    assert.deepStrictEqual(workspace?.project, project);
+    assert.strictEqual(workspace?.git?.state, "available");
+    if (workspace?.git?.state !== "available") return yield* Effect.die("Missing worktree observation");
+    assert.strictEqual(workspace.git.worktreeRoot, yield* fs.realPath(linked));
+    assert.strictEqual(workspace.git.commonDir, yield* fs.realPath(path.join(repository, ".git")));
+    assert.strictEqual(workspace.git.branch, "native-worktree");
+    yield* observer.refreshWorkspace(project);
+    assert.deepStrictEqual(observer.presence()?.workspace?.git, workspace.git, "Same-cwd refresh must reuse the Git observation");
+    const principal = { id: "native", owner: "owner", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode("native-worktree-secret"))) };
+    const inspector = yield* Inspector.make({ host: "127.0.0.1", port: 0, principals: [principal] });
+    const identity = { connectorId: "native", incarnation: "first" };
+    yield* inspector.announce(principal, { ...identity, machineId: "machine", sessions: [observation.presence] });
+    assert.deepStrictEqual((yield* inspector.list(principal, { limit: 10 })).sessions.at(0)?.workspace, workspace);
+    const query = yield* Effect.forkChild(inspector.inspect(principal, { ref: observation.presence.ref }), { startImmediately: true });
+    const request = (yield* inspector.poll(principal, identity)).requests.at(0);
+    if (!request) return yield* Effect.die("Missing native inspect request");
+    yield* inspector.complete(principal, { ...identity, requestId: request.requestId, observation });
+    assert.deepStrictEqual((yield* Fiber.join(query)).presence.workspace, workspace);
+    observer.update({ ...context(), cwd: repository });
+    assert.deepStrictEqual(observer.presence()?.workspace, { cwd: repository });
+    yield* observer.refreshWorkspace(project);
+    assert.strictEqual(observer.presence()?.workspace?.project, undefined);
+    observer.update({ ...context("new-session"), cwd: repository, model: undefined });
+    assert.deepStrictEqual(observer.presence()?.workspace, { cwd: repository });
+    assert.strictEqual(observer.presence()?.model, undefined);
+  })).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer))));
+});
+
+it("discards pending workspace discovery after cwd changes, session switches and clear", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-plugin-refresh-" });
+    const next = path.join(cwd, "next");
+    yield* fs.makeDirectory(next);
+    for (const change of ["cwd", "session", "clear"] as const) {
+      const observer = yield* createNativeObserver("omp", "machine");
+      observer.update({ ...context(), cwd });
+      const started = yield* Deferred.make<void>(), release = yield* Deferred.make<void>();
+      const injected = { ...fs, realPath: (file: string) => file === cwd
+        ? Effect.andThen(Deferred.succeed(started, undefined), Effect.andThen(Deferred.await(release), fs.realPath(file)))
+        : fs.realPath(file) };
+      const refresh = yield* observer.refreshWorkspace({ root: cwd, source: "configured" }).pipe(
+        Effect.provideService(FileSystem.FileSystem, injected), Effect.forkChild,
+      );
+      yield* Deferred.await(started);
+      observer.update({ ...context(), cwd }, { type: "turn_start" });
+      assert.deepStrictEqual(observer.presence()?.workspace, { cwd });
+      assert.deepStrictEqual(observer.inspect()?.presence.workspace, { cwd });
+      if (change === "clear") { observer.clear(); observer.update({ ...context(), cwd }); }
+      else observer.update({ ...context(change === "session" ? "next-session" : undefined), cwd: change === "cwd" ? next : cwd });
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(refresh);
+      assert.deepStrictEqual(observer.presence()?.workspace, { cwd: change === "cwd" ? next : cwd });
+    }
+  })).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer))));
 });
 
 it("queries context only on demand, preserving unknown and over-limit native estimates", async () => {
@@ -365,7 +452,7 @@ it("repairs startup and rotated credentials without leaking host hooks or shutdo
         const scenario = yield* Config.String("FIXTURE_CASE");
         const url = yield* Config.String("FIXTURE_URL");
         const configFile = path.join(home, "inspector.json");
-        const config = { inspectorUrl: url, tokenFile: path.join(home, "inspector.token") };
+        const config = { inspectorUrl: url, tokenFile: path.join(home, "inspector.token"), project: { root: home, id: "configured-native-project" } };
         if (scenario !== "ambient") {
           yield* fs.writeFileString(configFile, scenario === "main" ? "{invalid" : JSON.stringify(config), { mode: 0o600 });
           if (scenario !== "missing") yield* fs.writeFileString(config.tokenFile, ${JSON.stringify(tokenA)}, { mode: 0o600 });
@@ -625,9 +712,10 @@ it("lists every authorized session across pages and machines without native capt
       const machineId = batch === 3 ? "remote-machine" : "local-machine";
       const sessions = Array.from({ length: batch === 3 ? 5 : 32 }, (_, index) => ({
         ref: { machineId, harness: "omp" as const, nativeSessionId: `native-${batch * 32 + index}`, nativeAgentId: `agent-${batch * 32 + index}` },
-        observedAt: 10, lastActivityAt: 0, machineName: "same-hostname",
-        provider: "test-provider", model: "test-model", cwd: `/workspace/${batch * 32 + index}`,
-        os: { platform: "linux" as const, architecture: "x64" }, activity: { state: "idle" as const },
+        observedAt: 10, lastActivityAt: 0,
+        machine: { name: "same-hostname", os: { platform: "linux" as const, architecture: "x64" } },
+        ...(batch === 0 && index === 0 ? {} : { model: { provider: "test-provider", id: "test-model" } }), workspace: { cwd: `/workspace/${batch * 32 + index}` },
+        activity: { state: "idle" as const },
       }));
       yield* inspector.announce(reader, { connectorId: `connector-${batch}`, incarnation: `incarnation-${batch}`, machineId, sessions });
       if (batch === 3) yield* inspector.disconnect(reader, { connectorId: `connector-${batch}`, incarnation: `incarnation-${batch}` });
@@ -669,6 +757,9 @@ it("lists every authorized session across pages and machines without native capt
         check(sessions.length === 101, "List silently stopped at the first API page");
         check(sessions.some(session => session.ref.machineId === "local-machine"), "Local machine missing");
         check(sessions.some(session => session.ref.machineId === "remote-machine"), "Remote machine missing");
+        check(sessions.every(session => session.machine.name === "same-hostname" && (!session.model || session.model.id === "test-model") && session.workspace.cwd.startsWith("/workspace/")), "Grouped metadata missing");
+        check(sessions.find(session => session.ref.nativeSessionId === "native-0").model === undefined, "No-model session gained a model");
+        check(sessions.every(session => !["machineName", "os", "kind", "provider", "profile", "cwd", "repository"].some(key => key in session)), "Flat metadata leaked");
         check(!message.content.includes("hidden-session") && !message.content.includes("hidden-machine"), "List exposed another owner's sessions");
         for (const value of ["local-machine", "remote-machine", "native-100", "agent-100", "test-provider", "test-model", "/workspace/100", "stale", "live"]) {
           check(message.content.includes(value), "Visible session metadata missing: " + value);

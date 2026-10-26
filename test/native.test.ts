@@ -6,10 +6,10 @@ import { TestClock } from "effect/testing";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { FetchHttpClient, HttpClient, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { NodeServices } from "@effect/platform-node";
-import { connectNative, projectHook, projectClaudeStatus, projectCodexNotification, writeNativeCache, writeHermesHook, readNativeCache, readPrivateFile, loadConnectorConfig, readConnectorToken, resolveNativeConfig, withProcessResources } from "../src/native.ts";
+import { claudeRoster, connectExternal, connectNative, projectHook, projectClaudeStatus, projectCodexNotification, writeNativeCache, writeHermesHook, readNativeCache, readPrivateFile, loadConnectorConfig, readConnectorToken, resolveNativeConfig, withProcessResources } from "../src/native.ts";
 import type { NativeConfig, NativeNotice } from "../src/native.ts";
-import type { ConnectorConfig, InspectorPrincipal } from "../src/inspection.ts";
-import { INSPECTION_LIMIT, HttpError, decodeConnectorResult, decodeSessionInspection, sessionRefKey } from "../src/inspection.ts";
+import type { ConnectorConfig, InspectorPrincipal, SessionPresence } from "../src/inspection.ts";
+import { ConnectorAnnounce, ConnectorResult, INSPECTION_LIMIT, HttpError, decodeConnectorResult, decodeSessionInspection, sessionRefKey } from "../src/inspection.ts";
 import { Inspector } from "../src/inspector.ts";
 import { Mcp } from "../src/mcp.ts";
 import { Host, checkExecutable, serverLayer } from "../src/platform.ts";
@@ -66,17 +66,19 @@ it.live("merges environment over private config, keeps file selection explicit a
     const tokenFile = path.join(directory, "token");
     (yield* fs.writeFileString(tokenFile, "file-credential-first\n", { mode: 0o600 }));
     const file = path.join(directory, "client.json");
-    (yield* fs.writeFileString(file, JSON.stringify({ inspectorUrl: "https://file.example", apiToken: "configured-credential", tokenFile }), { mode: 0o600 }));
+    const project = { root: directory, id: "explicit-project", name: "Explicit project" };
+    (yield* fs.writeFileString(file, JSON.stringify({ inspectorUrl: "https://file.example", apiToken: "configured-credential", tokenFile, project }), { mode: 0o600 }));
     const other = path.join(directory, "other.json");
     (yield* fs.writeFileString(other, JSON.stringify({ inspectorUrl: "https://other.example", tokenFile }), { mode: 0o600 }));
     settings.COORDINATOR_CONNECTOR_CONFIG = other;
-    assert.deepStrictEqual((yield* (loadConnectorConfig(file).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(settings))))), { ...environment, tokenFile });
+    assert.deepStrictEqual((yield* (loadConnectorConfig(file).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(settings))))), { ...environment, tokenFile, project });
     settings.COORDINATOR_API_URL = undefined;
     settings.COORDINATOR_API_TOKEN = undefined;
     assert.deepStrictEqual((yield* (loadConnectorConfig().pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(settings))))), { inspectorUrl: "https://other.example", tokenFile });
     const configured = (yield* (loadConnectorConfig(file).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(settings)))));
     if (!configured) return yield* Effect.die("Missing expected fixture result");
     assert.strictEqual((yield* (readConnectorToken(configured))), "configured-credential");
+    assert.deepStrictEqual(configured.project, project);
     const rotating: ConnectorConfig = { inspectorUrl: configured.inspectorUrl, tokenFile };
     assert.strictEqual((yield* (readConnectorToken(rotating))), "file-credential-first");
     const replacement = path.join(directory, "replacement");
@@ -87,6 +89,8 @@ it.live("merges environment over private config, keeps file selection explicit a
     (yield* expectFailure((loadConnectorConfig(path.join(directory, "missing")).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(settings))))));
     (yield* fs.writeFileString(file, JSON.stringify({ inspectorUrl: "https://file.example", machineId: "obsolete" }), { mode: 0o600 }));
     (yield* expectFailure((loadConnectorConfig(file).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(settings))))));
+    (yield* fs.writeFileString(file, JSON.stringify({ inspectorUrl: "https://file.example", project: { root: "../relative" } }), { mode: 0o600 }));
+    (yield* expectFailure(loadConnectorConfig(file).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(settings)))));
     (yield* expectFailure(fs.stat(path.join(directory, "untouched"))));
 })));
 
@@ -108,6 +112,9 @@ it.live("publishes one complete installation UUID across processes and preserves
     assert.strictEqual(((yield* fs.stat(root))).mode & 0o777, 0o700);
     assert.strictEqual(((yield* fs.stat(path.join(root, "machine-id")))).mode & 0o777, 0o600);
     assert.deepStrictEqual((yield* fs.readDirectory(root)), ["machine-id"]);
+    const project = { root: directory, id: "project" };
+    const config = yield* resolveNativeConfig({ inspectorUrl: "https://first.example", project }).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(environment)));
+    assert.deepStrictEqual(config.project, project);
 })), 30000);
 
 it.live("cleans acquired identity temporaries on write or close failure without removing failed exclusive acquisitions", () => fixture(Effect.gen(function*() {
@@ -316,6 +323,7 @@ it.live("projects Claude metadata without prompt, transcript, result or invented
   (yield* (decodeSessionInspection(observation)));
   assert.strictEqual(observation.presence.activity?.approval, "pending");
   assert.deepStrictEqual(observation.presence.programStatus, { state: "blocked", kind: "permission" });
+  assert.deepStrictEqual(observation.presence.workspace, { cwd: "/workspace" });
   assert.strictEqual(observation.presence.processes, undefined);
   assert.strictEqual(observation.tokens.nativeAggregate.totalTokens.status, "unavailable");
   assert.strictEqual(JSON.stringify(observation).includes("secret"), false);
@@ -411,6 +419,243 @@ it.live("keeps private cached usage aged across metadata updates and expires sto
     (yield* expectFailure((readPrivateFile(link))));
 })));
 
+it.live("projects Claude roster groups while reusing the previous local workspace observation", () => fixture(Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const host = yield* Host;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const directory = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-roster-" }));
+  const cwd = path.join(directory, "subdirectory");
+  yield* fs.makeDirectory(cwd);
+  const config: NativeConfig = { inspectorUrl: "https://unused.example", machineId: "machine", stateDirectory: directory, project: { root: directory, id: "configured" } };
+  const rows = [{ sessionId: "session", pid: host.pid, cwd, kind: "native-agent", status: "busy", provider: "unsupported-provider", project: "unsupported-project" }];
+  let gitCalls = 0;
+  const nativeSpawner: typeof spawner = { ...spawner, spawn: (command) => {
+    if (ChildProcess.isStandardCommand(command) && command.command === "claude") {
+      return spawner.spawn(ChildProcess.make(host.executable, ["-e", `console.log(${JSON.stringify(JSON.stringify(rows))})`], { stdin: "ignore" }));
+    }
+    gitCalls++;
+    return spawner.spawn(command);
+  } };
+  const first = (yield* claudeRoster(config).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner))).at(0);
+  if (!first) return yield* Effect.die("Missing roster session");
+  assert.deepStrictEqual(first.agent, { kind: "native-agent" });
+  assert.deepStrictEqual(first.workspace?.project, { root: directory, id: "configured", source: "configured" });
+  assert.strictEqual(first.workspace?.cwd, cwd);
+  assert.strictEqual(first.machine?.name, host.hostname);
+  assert.strictEqual(first.model, undefined);
+  assert.ok(gitCalls > 0);
+  const initialGitCalls = gitCalls;
+  const inspection = yield* projectClaudeStatus("machine", { session_id: "session" });
+  const previous = new Map([[sessionRefKey(first.ref), { ...inspection, presence: first }]]);
+  const second = (yield* claudeRoster(config, previous).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner))).at(0);
+  assert.deepStrictEqual(second?.workspace, first.workspace);
+  assert.strictEqual(gitCalls, initialGitCalls);
+})));
+
+it.effect("refreshes idle cached publishers without hooks and recomputes projects independently of Git TTL", () => fixture(Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const host = yield* Host;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const directory = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-cached-publisher-" }));
+  const root = path.join(directory, "repository");
+  yield* fs.makeDirectory(root);
+  const git = (...args: string[]) => Effect.scoped(Effect.gen(function*() {
+    const child = yield* spawner.spawn(ChildProcess.make("git", ["-C", root, ...args], { stdin: "ignore", stdout: "ignore", stderr: "ignore" }));
+    assert.strictEqual(Number(yield* child.exitCode), 0);
+  }));
+  yield* git("init", "--initial-branch=before");
+  let project: ConnectorConfig["project"];
+  const server = yield* HttpServer.HttpServer;
+  const config: NativeConfig = {
+    inspectorUrl: HttpServer.formatAddress(server.address), apiToken: "cached-publisher-credential",
+    machineId: "machine", stateDirectory: path.join(directory, "metadata"),
+    get project() { return project; },
+  };
+  const at = yield* Clock.currentTimeMillis;
+  for (const session of ["native-project", "configured-only"]) {
+    const observation = yield* projectClaudeStatus("machine", {
+      session_id: session, workspace: { current_dir: root, ...(session === "native-project" ? { project_dir: root } : {}) },
+      context_window: { total_input_tokens: 123 },
+    }, at);
+    yield* writeNativeCache(config, { ...observation, presence: { ...observation.presence, activity: { state: "idle" }, lastActivityAt: at } });
+  }
+  const namespace = path.join(config.stateDirectory, "native-observations");
+  const files = yield* fs.readDirectory(namespace);
+  const original = yield* Effect.forEach(files, (file) => fs.readFileString(path.join(namespace, file)));
+  const announcements = yield* Queue.unbounded<ReadonlyArray<SessionPresence>>();
+  const details = yield* Queue.unbounded<typeof ConnectorResult.Type>();
+  const requests = yield* Queue.unbounded<ReadonlyArray<SessionPresence["ref"]>>();
+  yield* server.serve(Effect.gen(function*() {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    if (request.url === "/connector/announce") {
+      const announcement = yield* Schema.decodeUnknownEffect(ConnectorAnnounce)(yield* request.json);
+      const ref = announcement.sessions.at(0)?.ref;
+      if (ref) yield* Queue.offer(requests, [ref]);
+      yield* Queue.offer(announcements, announcement.sessions);
+    } else if (request.url === "/connector/poll") {
+      const refs = yield* Queue.take(requests);
+      return HttpServerResponse.jsonUnsafe({ requests: refs.map((ref) => ({ requestId: ref.nativeSessionId, ref })) });
+    } else if (request.url === "/connector/result") {
+      yield* Queue.offer(details, yield* Schema.decodeUnknownEffect(ConnectorResult)(yield* request.json));
+    }
+    return HttpServerResponse.jsonUnsafe({ accepted: true });
+  }));
+  let gitCalls = 0;
+  const nativeSpawner: typeof spawner = { ...spawner, spawn: (command) => {
+    if (ChildProcess.isStandardCommand(command) && command.command === "claude") {
+      return spawner.spawn(ChildProcess.make(host.executable, ["-e", "console.log('[]')"], { stdin: "ignore" }));
+    }
+    if (ChildProcess.isStandardCommand(command) && command.command === "git") gitCalls++;
+    return spawner.spawn(command);
+  } };
+  const refreshing = yield* Deferred.make<void>();
+  const resume = yield* Deferred.make<void>();
+  let pauseRefresh = false;
+  const publisherFs: typeof fs = { ...fs, realPath: (file) => Effect.gen(function*() {
+    if (pauseRefresh && file === directory) {
+      yield* Deferred.succeed(refreshing, undefined);
+      yield* Deferred.await(resume);
+    }
+    return yield* fs.realPath(file);
+  }) };
+  const connector = yield* connectExternal(config).pipe(
+    Effect.scoped,
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner),
+    Effect.provideService(FileSystem.FileSystem, publisherFs),
+    Effect.provide(Mcp.layer),
+    Effect.forkChild,
+  );
+  const first = yield* Queue.take(announcements);
+  const checkDetail = Effect.gen(function*() {
+    const result = yield* Queue.take(details);
+    assert.ok("presence" in result.observation);
+    if (!("presence" in result.observation)) return;
+    assert.strictEqual(result.requestId, result.observation.presence.ref.nativeSessionId);
+    assert.strictEqual(result.observation.tokens.latestNativeUpdate.inputTokens.value, 123);
+    assert.strictEqual(result.observation.tokens.latestNativeUpdate.inputTokens.provenance.observedAt, at);
+    assert.strictEqual(result.observation.presence.observedAt, at);
+    assert.strictEqual(result.observation.presence.lastActivityAt, at);
+    assert.strictEqual(result.observation.presence.activity?.state, "idle");
+    return result.observation;
+  });
+  yield* checkDetail;
+  assert.strictEqual(gitCalls, 0);
+  yield* git("symbolic-ref", "HEAD", "refs/heads/after");
+  project = { root: directory, id: "configured-first" };
+  const next = Effect.gen(function*() {
+    yield* TestClock.adjust("10 seconds");
+    const sessions = yield* Queue.take(announcements);
+    yield* checkDetail;
+    return sessions;
+  });
+  pauseRefresh = true;
+  yield* TestClock.adjust("10 seconds");
+  yield* Deferred.await(refreshing);
+  yield* Queue.offer(requests, first.map((presence) => presence.ref));
+  for (const presence of first) {
+    const inspection = yield* checkDetail;
+    assert.deepStrictEqual(inspection?.presence, presence);
+  }
+  pauseRefresh = false;
+  yield* Deferred.succeed(resume, undefined);
+  const second = yield* Queue.take(announcements);
+  yield* TestClock.adjust("1 second");
+  yield* checkDetail;
+  for (const presence of second) {
+    assert.deepStrictEqual(presence.workspace?.project, { ...project, source: "configured" });
+    assert.deepStrictEqual(presence.workspace?.git, first.find((item) => sessionRefKey(item.ref) === sessionRefKey(presence.ref))?.workspace?.git);
+  }
+  assert.strictEqual(gitCalls, 0);
+  project = { root: directory, id: "configured-changed" };
+  for (const presence of yield* next) assert.strictEqual(presence.workspace?.project?.id, "configured-changed");
+  assert.strictEqual(gitCalls, 0);
+  project = { root: path.join(directory, "unrelated"), id: "outside" };
+  yield* fs.makeDirectory(project.root);
+  const refreshed = yield* next;
+  assert.ok(gitCalls > 0);
+  for (const presence of refreshed) {
+    assert.strictEqual(presence.workspace?.git?.state, "available");
+    if (presence.workspace?.git?.state === "available") assert.strictEqual(presence.workspace.git.branch, "after");
+    assert.deepStrictEqual(presence.workspace?.project, presence.ref.nativeSessionId === "native-project" ? { root, source: "native" } : undefined);
+  }
+  const refreshedCalls = gitCalls;
+  project = { root: directory, id: "configured-restored" };
+  for (const presence of yield* next) assert.strictEqual(presence.workspace?.project?.id, "configured-restored");
+  assert.strictEqual(gitCalls, refreshedCalls);
+  project = undefined;
+  const removed = yield* next;
+  assert.strictEqual(gitCalls, refreshedCalls, "Refreshed in-memory Git must beat the older hook file cache");
+  for (const presence of removed) assert.deepStrictEqual(presence.workspace?.project, presence.ref.nativeSessionId === "native-project" ? { root, source: "native" } : undefined);
+  assert.deepStrictEqual(yield* Effect.forEach(files, (file) => fs.readFileString(path.join(namespace, file))), original);
+  yield* Fiber.interrupt(connector);
+}).pipe(Effect.provide(serverLayer("127.0.0.1", 0)))));
+
+it.live("associates native and scoped configured projects locally, caching Git without leaking changed metadata", () => fixture(Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const host = yield* Host;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const directory = yield* fs.realPath(yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-workspace-cache-" }));
+  yield* fs.chmod(directory, 0o700);
+  const root = path.join(directory, "project");
+  const cwd = path.join(root, "subdirectory");
+  const unrelated = path.join(directory, "project-other");
+  yield* fs.makeDirectory(cwd, { recursive: true });
+  yield* fs.makeDirectory(unrelated);
+  const git = yield* spawner.spawn(ChildProcess.make("git", ["init", "-q", root], { stdin: "ignore", stdout: "ignore", stderr: "ignore" }));
+  assert.strictEqual(Number(yield* git.exitCode), 0);
+  const config: NativeConfig = { inspectorUrl: "https://unused.example", apiToken: "private-credential", machineId: "machine", stateDirectory: directory };
+  const initial = yield* projectClaudeStatus("machine", { session_id: "session", model: { id: "old-model" }, workspace: { current_dir: cwd, project_dir: root } });
+  yield* writeNativeCache(config, { ...initial, presence: { ...initial.presence, model: { id: "old-model", provider: "old-provider" } } });
+  let presence = (yield* readNativeCache(config)).at(0)?.presence;
+  assert.deepStrictEqual(presence?.workspace?.project, { root, source: "native" });
+  assert.strictEqual(presence?.workspace?.git?.state, "available");
+  assert.strictEqual(presence?.machine?.name, host.hostname);
+  const observedAt = presence?.workspace?.git?.observedAt;
+  const hook = yield* projectHook("claude", "machine", { session_id: "session", hook_event_name: "UserPromptSubmit", model: "new-model" });
+  yield* writeNativeCache(config, hook);
+  presence = (yield* readNativeCache(config)).at(0)?.presence;
+  assert.deepStrictEqual(presence?.model, { id: "new-model" });
+  assert.strictEqual(presence?.workspace?.git?.observedAt, observedAt);
+  assert.deepStrictEqual(presence?.workspace?.project, { root, source: "native" });
+  yield* writeNativeCache({ ...config, project: { root: unrelated } }, initial);
+  assert.deepStrictEqual((yield* readNativeCache(config)).at(0)?.presence.workspace?.project, { root, source: "native" });
+  const configured = { ...config, project: { root: directory, id: "configured-id", name: "Configured" } };
+  yield* writeNativeCache(configured, initial);
+  presence = (yield* readNativeCache(config)).at(0)?.presence;
+  assert.deepStrictEqual(presence?.workspace?.project, { ...configured.project, source: "configured" });
+  yield* writeNativeCache(config, hook);
+  assert.strictEqual((yield* readNativeCache(config)).at(0)?.presence.workspace?.project, undefined);
+  yield* writeNativeCache({ ...config, project: { root } }, yield* projectHook("claude", "machine", { session_id: "session", hook_event_name: "Stop", cwd: unrelated }));
+  presence = (yield* readNativeCache(config)).at(0)?.presence;
+  assert.strictEqual(presence?.workspace?.cwd, unrelated);
+  assert.strictEqual(presence?.workspace?.project, undefined);
+  assert.strictEqual(presence?.workspace?.git?.state, "not-repository");
+  yield* writeNativeCache(config, { ...hook, presence: { ...hook.presence, model: { provider: "replacement-provider" } } });
+  assert.deepStrictEqual((yield* readNativeCache(config)).at(0)?.presence.model, { provider: "replacement-provider" });
+  const namespace = path.join(directory, "native-observations");
+  const files = yield* fs.readDirectory(namespace);
+  assert.strictEqual(files.length, 1);
+  assert.ok(files.every((file) => /^v3-[a-f0-9]{64}\.json$/.test(file)));
+  const file = files.at(0);
+  if (!file) return yield* Effect.die("Missing cache file");
+  const legacy = path.join(namespace, file.slice(3));
+  const original = JSON.stringify({ version: 2, kind: "inspection", expiresAt: 1, inspection: initial });
+  yield* fs.writeFileString(legacy, original, { mode: 0o600 });
+  yield* writeNativeCache(config, hook);
+  assert.strictEqual((yield* readNativeCache(config)).length, 1);
+  assert.strictEqual(yield* fs.readFileString(legacy), original);
+  const sentinel = path.join(directory, "sentinel");
+  yield* fs.writeFileString(sentinel, "untouched", { mode: 0o600 });
+  yield* fs.remove(path.join(namespace, file));
+  yield* fs.symlink(sentinel, path.join(namespace, file));
+  yield* expectFailure(writeNativeCache(config, hook));
+  assert.strictEqual(yield* fs.readFileString(sentinel), "untouched");
+  assert.strictEqual((yield* readNativeCache(config)).length, 0);
+})));
+
 it.live("isolates native observations from legacy journals and reclaims only expired owned typed files", () => fixture(Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -431,8 +676,8 @@ it.live("isolates native observations from legacy journals and reclaims only exp
     const old = (yield* (projectHook("codex", "machine", { session_id: "expired", hook_event_name: "Stop" }, 1)));
     (yield* Effect.forEach(Array.from({ length: 1024 }, (_, index) => index), (index) => Effect.gen(function*() {
       const ref = { ...old.presence.ref, nativeSessionId: `expired-${index}` };
-      const file = Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(ref)))) + ".json";
-      (yield* fs.writeFileString(path.join(namespace, file), JSON.stringify({ version: 2, kind: "inspection", expiresAt: 2, inspection: { ...old, presence: { ...old.presence, ref } } }), { mode: 0o600 }));
+      const file = "v3-" + Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(ref)))) + ".json";
+      (yield* fs.writeFileString(path.join(namespace, file), JSON.stringify({ version: 3, kind: "inspection", expiresAt: 2, inspection: { ...old, presence: { ...old.presence, ref } } }), { mode: 0o600 }));
     }), { concurrency: "unbounded" }));
     const current = (yield* (projectHook("codex", "machine", { session_id: "new", hook_event_name: "Stop" })));
     (yield* (writeNativeCache(config, current)));
@@ -464,10 +709,10 @@ it.live("keeps native Hermes idle presence tied to the shared host without refre
     const observation = cached.at(0);
     if (!observation) return yield* Effect.die("Missing expected fixture result");
     (yield* (decodeSessionInspection(observation)));
-    assert.strictEqual(observation.presence.profile, "native-profile");
-    assert.strictEqual(observation.presence.model, "native-model");
-    assert.strictEqual(observation.presence.provider, "native-provider");
-    assert.strictEqual(observation.presence.cwd, "/workspace");
+    assert.strictEqual(observation.presence.agent?.profile, "native-profile");
+    assert.deepStrictEqual(observation.presence.model, { id: "native-model", provider: "native-provider" });
+    assert.strictEqual(observation.presence.workspace?.cwd, "/workspace");
+    assert.strictEqual(observation.presence.machine?.name, host.hostname);
     assert.strictEqual(observation.presence.activity?.state, "idle");
     assert.strictEqual(observation.presence.lastActivityAt, at + 2);
     assert.ok(observation.presence.observedAt > at + 120000);
@@ -555,9 +800,14 @@ it.live("does not promote a dead, reused or unavailable Hermes host to live or o
     (yield* (writeHermesHook(config, { session_id: "expired-missing", hook_event_name: "on_session_start", extra: {} }, (yield* Clock.currentTimeMillis) - 240000, child.pid)));
     assert.strictEqual(((yield* (readNativeCache(config)))).some((item) => item.presence.ref.nativeSessionId === "expired-missing"), false);
     const reused = (yield* (projectHook("claude", "machine", { session_id: "reused", hook_event_name: "Stop" })));
-    (yield* (writeNativeCache(config, { ...reused, presence: { ...reused.presence, ref: { ...reused.presence.ref, harness: "hermes" }, processes: [{ pid: host.pid, startIdentity: "different-birth", ownership: "shared" }] } })));
+    const reusedRef = { ...reused.presence.ref, harness: "hermes" as const };
+    (yield* (writeNativeCache(config, { ...reused, presence: { ...reused.presence, ref: reusedRef, workspace: { cwd: directory, project: { root: directory, source: "native" } }, agent: { profile: "original-profile" }, model: { id: "original-model", provider: "original-provider" }, processes: [{ pid: host.pid, startIdentity: "different-birth", ownership: "shared" }] } })));
+    const crypto = yield* Crypto.Crypto;
+    const file = path.join(directory, "native-observations", "v3-hermes-" + Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(reusedRef)))) + ".json");
+    const original = yield* fs.readFileString(file);
     assert.strictEqual(((yield* (readNativeCache(config)))).some((item) => item.presence.ref.nativeSessionId === "reused"), false);
-    (yield* (writeHermesHook(config, { session_id: "reused", hook_event_name: "on_session_end", extra: {} }, (yield* Clock.currentTimeMillis), host.pid)));
+    (yield* (writeHermesHook(config, { session_id: "reused", hook_event_name: "on_session_end", cwd: path.dirname(directory), profile: "replacement-profile", extra: { model: "replacement-model", provider: "replacement-provider" } }, (yield* Clock.currentTimeMillis), host.pid)));
+    assert.strictEqual(yield* fs.readFileString(file), original);
     assert.strictEqual(((yield* (readNativeCache(config)))).some((item) => item.presence.ref.nativeSessionId === "reused"), false);
 })));
 

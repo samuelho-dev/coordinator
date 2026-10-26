@@ -63,6 +63,10 @@ it("bootstraps and authenticates real clients without credential disclosure, ide
       assert.deepStrictEqual((await readdir(join(root, "client"))).sort(), ["inspector.json", "inspector.token"]);
       await runtime.runPromise(connectClient({ endpoint, token, configFile }).pipe(Effect.flip));
       assert.strictEqual(await runtime.runPromise(readConnectorToken(client)), token);
+      const project = { root, id: "explicit-project", name: "Explicit project scope" };
+      await writeFile(configFile, JSON.stringify({ ...client, project }), { mode: 0o600 });
+      assert.deepStrictEqual(await runtime.runPromise(loadConnectorConfig(configFile)), { ...client, project });
+      assert.strictEqual((await readFile(configFile, "utf8")).includes(token), false);
       const source = join(root, "source.token");
       await writeFile(source, token, { mode: 0o600 });
       const pointer = join(root, "pointer", "inspector.json");

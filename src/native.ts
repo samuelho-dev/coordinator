@@ -7,6 +7,7 @@ import { Mcp } from "./mcp.ts";
 import { INSPECTION_LIMIT, ConnectorConfig, ConnectorAnnounce, ConnectorAccepted, ConnectorPoll, ConnectorPollResult, ConnectorResult, ConnectorDisconnect, SessionInspection, createInspection, metric, unavailableMetric, sessionRefKey, type ObservationError, type SessionPresence, type SessionRef, type MetricProvenance, type MetricUnit } from "./inspection.ts";
 import { identifyProcess, observeResources, type ProcessIdentification } from "./resources.ts";
 import { readRexContext } from "./rex.ts";
+import { readWorkspace } from "./workspace.ts";
 
 export class NativeError extends Data.TaggedError("NativeError")<{ readonly operation: string }> {}
 export type NativeConfig = ConnectorConfig & { readonly machineId: string; readonly stateDirectory: string };
@@ -72,7 +73,7 @@ export const loadConnectorConfig = (file?: string) => Effect.gen(function*() {
     Effect.mapError(platformFailure("Locate connector configuration")),
   ));
   const fields = yield* Schema.decodeUnknownEffect(Schema.Struct({
-    inspectorUrl: Schema.optional(Schema.Unknown), apiToken: Schema.optional(Schema.Unknown), tokenFile: Schema.optional(Schema.Unknown),
+    inspectorUrl: Schema.optional(Schema.Unknown), apiToken: Schema.optional(Schema.Unknown), tokenFile: Schema.optional(Schema.Unknown), project: Schema.optional(Schema.Unknown),
   }), { onExcessProperty: "error" })(exists ? yield* json(yield* readPrivateFile(target)) : {}).pipe(
     Effect.mapError(platformFailure("Invalid connector configuration")),
   );
@@ -277,7 +278,9 @@ const Count = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MA
 const optionalCount = Schema.optional(Schema.NullOr(Count));
 const Hook = Schema.Struct({ session_id: Id, hook_event_name: Id, source: Schema.optional(Id), cwd: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))), model: Schema.optional(Id), tool_name: Schema.optional(Id), to_model: Schema.optional(Id) });
 const Usage = Schema.Struct({ input_tokens: optionalCount, output_tokens: optionalCount, cache_creation_input_tokens: optionalCount, cache_read_input_tokens: optionalCount });
-const ClaudeStatus = Schema.Struct({ session_id: Id, model: Schema.optional(Schema.Struct({ id: Schema.optional(Id) })), workspace: Schema.optional(Schema.Struct({ current_dir: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))) })), context_window: Schema.optional(Schema.Struct({ current_usage: Schema.optional(Schema.NullOr(Usage)), total_input_tokens: optionalCount, total_output_tokens: optionalCount, context_window_size: optionalCount, used_percentage: optionalN, remaining_percentage: Schema.optional(Schema.NullOr(Schema.Finite)) })), cost: Schema.optional(Schema.Struct({ total_cost_usd: optionalN, total_duration_ms: optionalN, total_api_duration_ms: optionalN })) });
+// Official statusline input: https://code.claude.com/docs/en/statusline#available-data
+// project_dir is the launch directory, not a repository-derived project identity.
+const ClaudeStatus = Schema.Struct({ session_id: Id, model: Schema.optional(Schema.Struct({ id: Schema.optional(Id) })), workspace: Schema.optional(Schema.Struct({ current_dir: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))), project_dir: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))) })), context_window: Schema.optional(Schema.Struct({ current_usage: Schema.optional(Schema.NullOr(Usage)), total_input_tokens: optionalCount, total_output_tokens: optionalCount, context_window_size: optionalCount, used_percentage: optionalN, remaining_percentage: Schema.optional(Schema.NullOr(Schema.Finite)) })), cost: Schema.optional(Schema.Struct({ total_cost_usd: optionalN, total_duration_ms: optionalN, total_api_duration_ms: optionalN })) });
 const cachedProvenance = (source: string, scope: MetricProvenance["scope"], at: number, description: string, estimated = false): MetricProvenance => ({ source, scope, scopeDescription: description, observedAt: at, nativeUpdatedAt: null, estimated, derived: false, shared: false, partial: false, stale: false });
 const numberMetric = <U extends MetricUnit>(unit: U, value: number | null | undefined, p: MetricProvenance) => value === undefined || value === null ? unavailableMetric(unit, "Native counter not supplied", p) : metric(unit, value, p);
 export const projectHook = (harness: "claude" | "codex", machineId: string, value: unknown, at?: number) => Effect.gen(function*() {
@@ -287,13 +290,13 @@ export const projectHook = (harness: "claude" | "codex", machineId: string, valu
   const activity: NonNullable<SessionPresence["activity"]> = name === "PreCompact" || event.source === "compact" ? { state: "working", compacting: true } : name === "SessionEnd" ? { state: "stopped" } : name === "PermissionRequest" ? { state: "waiting", wait: "approval", approval: "pending", ...(event.tool_name ? { currentToolName: event.tool_name } : {}) } : name === "PreToolUse" ? { state: "working", wait: "tool", ...(event.tool_name ? { currentToolName: event.tool_name } : {}) } : name === "Stop" || name === "Interrupt" ? { state: "idle" } : name === "UserPromptSubmit" ? { state: "working", wait: "api" } : { state: "unknown" };
   const model = event.to_model ?? event.model;
   const programStatus: SessionPresence["programStatus"] = name === "PermissionRequest" ? { state: "blocked", kind: "permission" } : harness === "claude" && name === "Elicitation" ? { state: "blocked", kind: "question" } : name === "Interrupt" ? { state: "idle" } : harness === "claude" && name === "StopFailure" ? { state: "error" } : harness === "claude" && name === "Stop" ? { state: "done" } : activity.state === "working" || (harness === "claude" && (name === "PostToolUse" || name === "PostToolUseFailure" || name === "ElicitationResult")) ? { state: "working" } : undefined;
-  const presence: SessionPresence = { ref: { machineId, harness, nativeSessionId: event.session_id }, observedAt: at, nativeUpdatedAt: at, lastActivityAt: at, activity, ...(programStatus ? { programStatus } : {}), ...(event.cwd ? { cwd: event.cwd } : {}), ...(model ? { model } : {}) };
+  const presence: SessionPresence = { ref: { machineId, harness, nativeSessionId: event.session_id }, observedAt: at, nativeUpdatedAt: at, lastActivityAt: at, activity, ...(programStatus ? { programStatus } : {}), ...(event.cwd ? { workspace: { cwd: event.cwd } } : {}), ...(model ? { model: { id: model } } : {}) };
   return createInspection(presence, at);
 });
 export const projectClaudeStatus = (machineId: string, value: unknown, at?: number) => Effect.gen(function*() {
   at ??= yield* Clock.currentTimeMillis;
   const data = yield* decode(ClaudeStatus, value);
-  const inspection = createInspection({ ref: { machineId, harness: "claude", nativeSessionId: data.session_id }, observedAt: at, ...(data.model?.id ? { model: data.model.id } : {}), ...(data.workspace?.current_dir ? { cwd: data.workspace.current_dir } : {}) }, at);
+  const inspection = createInspection({ ref: { machineId, harness: "claude", nativeSessionId: data.session_id }, observedAt: at, ...(data.model?.id ? { model: { id: data.model.id } } : {}), ...(data.workspace?.current_dir ? { workspace: { cwd: data.workspace.current_dir, ...(data.workspace.project_dir ? { project: { root: data.workspace.project_dir, source: "native" as const } } : {}) } } : {}) }, at);
   const p = cachedProvenance("claude-statusline", "latest-native-update", at, "Cached current-context/latest-response figures; not lifetime totals; native counter update time unknown");
   const cp: MetricProvenance = { ...p, scope: "current-context", scopeDescription: "Native input-only context basis including cache read and creation; output excluded" };
   const current = data.context_window?.current_usage;
@@ -327,14 +330,14 @@ const HermesHook = Schema.Struct({
   cwd: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))), profile: Schema.optional(Id),
   extra: Schema.Struct({ old_session_id: Schema.optional(Id), model: Schema.optional(Id), provider: Schema.optional(Id), usage: Schema.optional(Schema.NullOr(HermesUsage)) }),
 });
-const Cache = Schema.Struct({ version: Schema.Literal(2), kind: Schema.Literal("inspection"), expiresAt: N, inspection: SessionInspection });
+const Cache = Schema.Struct({ version: Schema.Literal(3), kind: Schema.Literal("inspection"), expiresAt: N, inspection: SessionInspection });
 const identifyHermesHost = (pid: number) => identifyProcess(pid).pipe(Effect.catchTag("ResourceError", (error) =>
   Console.error(JSON.stringify({ error: "Hermes hook host identity unavailable", code: error._tag })).pipe(Effect.as<ProcessIdentification>({ status: "unavailable", reason: "host-identity-unavailable" }))));
 const cacheFile = (config: NativeConfig, ref: SessionRef) => Effect.gen(function*() {
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
   const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(ref)));
-  return path.join(config.stateDirectory, "native-observations", (ref.harness === "hermes" ? "hermes-" : "") + Hex.encode(digest) + ".json");
+  return path.join(config.stateDirectory, "native-observations", "v3-" + (ref.harness === "hermes" ? "hermes-" : "") + Hex.encode(digest) + ".json");
 });
 const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, ProcessIdentification>()) => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
@@ -345,7 +348,7 @@ const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, P
   const entries = yield* fs.readDirectory(directory);
   const records = new Map<string, typeof Cache.Type>();
   for (const entry of entries) {
-    if (!/^(hermes-)?[a-f0-9]{64}\.json$/.test(entry)) continue;
+    if (!/^v3-(hermes-)?[a-f0-9]{64}\.json$/.test(entry)) continue;
     const file = path.join(directory, entry);
     const parsed = yield* readPrivateFile(file).pipe(Effect.flatMap(json), Effect.map(Schema.decodeUnknownOption(Cache)), Effect.catch((error) => Console.error(JSON.stringify({ error: "Ignoring unsupported native cache", code: error._tag })).pipe(Effect.as(undefined))));
     if (parsed === undefined || parsed._tag === "None") continue;
@@ -370,6 +373,28 @@ const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, P
   if (records.size > 1024) return yield* new NativeError({ operation: "Metadata cache exceeds bound" });
   return records;
 }).pipe(sanitizeFileFinalizers("Read private metadata cache"), Effect.catchTag("PlatformError", () => Effect.fail(new NativeError({ operation: "Read private metadata cache" }))));
+const localMachine = Effect.gen(function*() {
+  const host = yield* Host;
+  return { name: host.hostname, ...(host.platform === "linux" || host.platform === "darwin" ? { os: { platform: host.platform, release: host.release, architecture: host.architecture } } : {}) } satisfies NonNullable<SessionPresence["machine"]>;
+});
+const mergePresence = (old: SessionPresence, incoming: SessionPresence): SessionPresence => {
+  if (old.processes?.length && incoming.processes?.length && !incoming.processes.some((current) => old.processes?.some((prior) => current.pid === prior.pid && current.startIdentity === prior.startIdentity))) return incoming;
+  const modelChanged = incoming.model !== undefined && (
+    (incoming.model.id !== undefined && incoming.model.id !== old.model?.id) ||
+    (incoming.model.provider !== undefined && incoming.model.provider !== old.model?.provider));
+  const sameCwd = incoming.workspace === undefined || incoming.workspace.cwd === old.workspace?.cwd;
+  return {
+    ...old, ...incoming,
+    ...(incoming.agent ? { agent: { ...old.agent, ...incoming.agent } } : {}),
+    ...(incoming.model ? { model: { ...(modelChanged ? {} : old.model), ...incoming.model } } : {}),
+    ...(incoming.workspace ? { workspace: { ...(sameCwd ? old.workspace : {}), ...incoming.workspace } } : {}),
+  };
+};
+const refreshWorkspace = (config: NativeConfig, workspace: NonNullable<SessionPresence["workspace"]>, previous?: SessionPresence["workspace"]) => Effect.gen(function*() {
+  const native = workspace.project?.source === "native" ? workspace.project : undefined;
+  const observed = yield* readWorkspace(workspace.cwd, previous, config.project ? { ...config.project, source: "configured" } : native);
+  return config.project && !observed.project && native ? yield* readWorkspace(workspace.cwd, observed, native) : observed;
+});
 export const writeNativeCache = (config: NativeConfig, incoming: SessionInspection) => Effect.gen(function*() {
   const rex = yield* readRexContext;
   if (rex) incoming = { ...incoming, presence: { ...incoming.presence, rex } };
@@ -382,14 +407,18 @@ export const writeNativeCache = (config: NativeConfig, incoming: SessionInspecti
     const old = previous.inspection;
     const metadataOnly = incoming.presence.nativeUpdatedAt !== undefined;
     const { programStatus: previousStatus, ...oldPresence } = old.presence;
-    inspection = { ...(metadataOnly ? old : incoming), presence: { ...oldPresence, ...(!incoming.presence.activity && previousStatus ? { programStatus: previousStatus } : {}), ...incoming.presence }, queriedAt: incoming.queriedAt, context: metadataOnly && !incoming.presence.activity?.compacting ? old.context : incoming.context };
+    const presence = mergePresence({ ...oldPresence, ...(!incoming.presence.activity && previousStatus ? { programStatus: previousStatus } : {}) }, incoming.presence);
+    const retainCounters = metadataOnly && presence !== incoming.presence;
+    inspection = { ...(retainCounters ? old : incoming), presence, queriedAt: incoming.queriedAt, context: retainCounters && !incoming.presence.activity?.compacting ? old.context : incoming.context };
   }
+  const workspace = inspection.presence.workspace;
+  inspection = { ...inspection, presence: { ...inspection.presence, machine: yield* localMachine, ...(workspace ? { workspace: yield* refreshWorkspace(config, workspace, previous?.inspection.presence.workspace) } : {}) } };
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
   // Directory entries include dangling symlinks; unsupported inputs are never replaced.
   if (!records.has(target) && (yield* fs.readDirectory(path.dirname(target))).includes(path.basename(target))) return yield* new NativeError({ operation: "Unsupported cache input" });
-  const bytes = new TextEncoder().encode(JSON.stringify({ version: 2, kind: "inspection", expiresAt: incoming.presence.observedAt + cacheLifetime, inspection }));
+  const bytes = new TextEncoder().encode(JSON.stringify({ version: 3, kind: "inspection", expiresAt: incoming.presence.observedAt + cacheLifetime, inspection }));
   if (bytes.length > maximumBytes) return yield* new NativeError({ operation: "Metadata cache exceeds bound" });
   const temporary = target + "." + (yield* crypto.randomUUIDv4());
   yield* Effect.scoped(Effect.gen(function*() {
@@ -420,8 +449,8 @@ export const writeHermesHook = (config: NativeConfig, value: unknown, at?: numbe
     ref, observedAt: at, lastActivityAt: at,
     ...(event.hook_event_name !== "post_api_request" ? { nativeUpdatedAt: at } : {}),
     activity: { state: event.hook_event_name === "on_session_finalize" ? "stopped" : event.hook_event_name === "on_session_end" ? "idle" : "unknown" },
-    ...(event.cwd ? { cwd: event.cwd } : {}), ...(event.profile ? { profile: event.profile } : {}),
-    ...(event.extra.model ? { model: event.extra.model } : {}), ...(event.extra.provider ? { provider: event.extra.provider } : {}),
+    ...(event.cwd ? { workspace: { cwd: event.cwd } } : {}), ...(event.profile ? { agent: { profile: event.profile } } : {}),
+    ...(event.extra.model || event.extra.provider ? { model: { ...(event.extra.model ? { id: event.extra.model } : {}), ...(event.extra.provider ? { provider: event.extra.provider } : {}) } } : {}),
     ...(!previous && identity.status === "available" ? { processes: [{ pid: hostPid, startIdentity: identity.startTime, ownership: "shared" }] } : {}),
   };
   const inspection = createInspection(presence, at);
@@ -450,7 +479,7 @@ export const readNativeCache = (config: NativeConfig) => Effect.gen(function*() 
 });
 
 const ClaudeRoster = Schema.Array(Schema.Struct({ sessionId: Schema.optional(Id), id: Schema.optional(Id), pid: Schema.optional(Schema.Int), cwd: Schema.optional(Schema.String), kind: Schema.optional(Id), status: Schema.optional(Schema.Literals(["busy", "waiting", "idle"])), waitingFor: Schema.optional(Schema.String) })).check(Schema.isMaxLength(256));
-export const claudeRoster = (config: NativeConfig) => Effect.scoped(Effect.gen(function*() {
+export const claudeRoster = (config: NativeConfig, previous = new Map<string, SessionInspection>()) => Effect.scoped(Effect.gen(function*() {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const child = yield* spawner.spawn(ChildProcess.make("claude", ["agents", "--json"], { stdin: "ignore" }));
   yield* Effect.forkScoped(Stream.runDrain(child.stderr));
@@ -468,7 +497,12 @@ export const claudeRoster = (config: NativeConfig) => Effect.scoped(Effect.gen(f
     const identity = yield* identifyProcess(row.pid);
     if (identity.status !== "available") continue;
     const programStatus: SessionPresence["programStatus"] = row.waitingFor === "permission prompt" ? { state: "blocked", kind: "permission" } : row.status === "busy" ? { state: "working" } : row.status === "idle" ? { state: "idle" } : undefined;
-    sessions.push({ ref: { machineId: config.machineId, harness: "claude", nativeSessionId: id }, observedAt: yield* Clock.currentTimeMillis, ...(row.cwd ? { cwd: row.cwd } : {}), ...(row.kind ? { kind: row.kind } : {}), ...(programStatus ? { programStatus } : {}), processes: [{ pid: row.pid, startIdentity: identity.startTime, ownership: "owned" }], activity: { state: row.status === "busy" ? "working" : row.status === "waiting" ? "waiting" : row.status === "idle" ? "idle" : "unknown", ...(row.waitingFor === "permission prompt" ? { wait: "approval", approval: "pending" } : {}) } });
+    const ref: SessionRef = { machineId: config.machineId, harness: "claude", nativeSessionId: id };
+    const old = previous.get(sessionRefKey(ref));
+    const sameHost = !old?.presence.processes?.length || old.presence.processes.some((binding) => binding.pid === row.pid && binding.startIdentity === identity.startTime);
+    const previousWorkspace = sameHost ? old?.presence.workspace : undefined;
+    const workspace = row.cwd ? yield* refreshWorkspace(config, { cwd: row.cwd, ...(previousWorkspace?.cwd === row.cwd && previousWorkspace.project ? { project: previousWorkspace.project } : {}) }, previousWorkspace) : undefined;
+    sessions.push({ ref, machine: yield* localMachine, observedAt: yield* Clock.currentTimeMillis, ...(workspace ? { workspace } : {}), ...(row.kind ? { agent: { kind: row.kind } } : {}), ...(programStatus ? { programStatus } : {}), processes: [{ pid: row.pid, startIdentity: identity.startTime, ownership: "owned" }], activity: { state: row.status === "busy" ? "working" : row.status === "waiting" ? "waiting" : row.status === "idle" ? "idle" : "unknown", ...(row.waitingFor === "permission prompt" ? { wait: "approval", approval: "pending" } : {}) } });
   }
   return sessions;
 })).pipe(Effect.timeout("5 seconds"));
@@ -476,14 +510,30 @@ export const connectExternal = (config: NativeConfig) => {
   let latest = new Map<string, SessionInspection>();
   return connectNative(config, {
     presence: () => Effect.gen(function*() {
+      const previous = latest;
       const cached = yield* readNativeCache(config);
-      latest = new Map(cached.map((observation) => [sessionRefKey(observation.presence.ref), observation]));
-      const roster = yield* claudeRoster(config).pipe(Effect.catch((error) => Effect.logDebug({ operation: "native Claude roster", code: error._tag }).pipe(Effect.as([]))));
-      for (const presence of roster) {
-        const old = latest.get(sessionRefKey(presence.ref));
-        latest.set(sessionRefKey(presence.ref), { ...(old ?? createInspection(presence, yield* Clock.currentTimeMillis)), presence: { ...old?.presence, ...presence } });
+      const next = new Map<string, SessionInspection>();
+      const rosterPrevious = new Map(previous);
+      const now = yield* Clock.currentTimeMillis;
+      for (const observation of cached) {
+        const key = sessionRefKey(observation.presence.ref);
+        const old = previous.get(key);
+        const presence = old ? mergePresence(old.presence, observation.presence) : observation.presence;
+        const oldWorkspace = presence !== observation.presence ? old?.presence.workspace : undefined;
+        const workspace = observation.presence.workspace;
+        const previousWorkspace = workspace && oldWorkspace?.cwd === workspace.cwd && oldWorkspace.git !== undefined && oldWorkspace.git.observedAt <= now && oldWorkspace.git.observedAt > (workspace.git?.observedAt ?? -1) ? oldWorkspace : workspace;
+        const refreshed = { ...observation, presence: { ...observation.presence, ...(workspace ? { workspace: yield* refreshWorkspace(config, workspace, previousWorkspace) } : {}) } };
+        next.set(key, refreshed);
+        rosterPrevious.set(key, refreshed);
       }
-      return Array.from(latest.values(), (observation) => observation.presence);
+      const roster = yield* claudeRoster(config, rosterPrevious).pipe(Effect.catch((error) => Effect.logDebug({ operation: "native Claude roster", code: error._tag }).pipe(Effect.as([]))));
+      for (const presence of roster) {
+        const old = next.get(sessionRefKey(presence.ref));
+        const merged = old ? mergePresence(old.presence, presence) : presence;
+        next.set(sessionRefKey(presence.ref), { ...(old && merged !== presence ? old : createInspection(presence, yield* Clock.currentTimeMillis)), presence: { ...merged, ...(presence.workspace ? { workspace: presence.workspace } : {}) } });
+      }
+      latest = next;
+      return Array.from(next.values(), (observation) => observation.presence);
     }),
     inspect: (ref) => Effect.gen(function*() {
       const observation = latest.get(sessionRefKey(ref));

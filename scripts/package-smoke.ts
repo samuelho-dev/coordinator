@@ -50,7 +50,7 @@ const program = Effect.gen(function*() {
   for (const entry of entries) {
     yield* guard(payload.test(entry) || ["package/", "package/dist/", "package/dist/src/", "package/dist/plugins/", "package/dist/scripts/"].includes(entry), `Unexpected public tarball entry: ${entry}`);
   }
-  for (const required of ["package.json", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "dist/src/main.js", "dist/src/inspection.js", "dist/scripts/install.js", "dist/plugins/pi.js", "dist/plugins/omp.js"]) {
+  for (const required of ["package.json", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "dist/src/main.js", "dist/src/inspection.js", "dist/src/workspace.js", "dist/scripts/install.js", "dist/plugins/pi.js", "dist/plugins/omp.js"]) {
     yield* guard(entries.includes(`package/${required}`), `Missing public tarball entry: ${required}`);
   }
   yield* fs.writeFileString(path.join(root, "package.json"), JSON.stringify({ private: true, type: "module" }));
@@ -84,10 +84,16 @@ const program = Effect.gen(function*() {
     COORDINATOR_TEST_PI: path.resolve(pi),
     COORDINATOR_TEST_OMP: path.resolve(omp),
   });
+  yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({
+    scenario: Schema.Literal("ephemeral-inspector"), status: Schema.Literal("ok"),
+    groupedMetadata: Schema.Literal(true), realGitWorktree: Schema.Literal(true), explicitProjectScope: Schema.Literal(true),
+    ownerIsolation: Schema.Literal(true), sameInstallationNativeIdentity: Schema.Literal(true), nativeHarnesses: Schema.Literal(true),
+  })))(evidence.trim().split("\n").at(-1) ?? "");
   yield* Console.log(evidence.trim());
   yield* Console.log(JSON.stringify({ scenario: "npm-package-acceptance", status: "ok", package: manifest.name, version: manifest.version,
     payloadEntries: entries.length, productionOnly: true, lifecycleScripts: false, isolatedInstall: true,
-    installedBins: ["coordinator", "coordinator-install"], installedNativeEntrypoints: ["pi", "omp"], hostOwnedSdkReaders: true }));
+    installedBins: ["coordinator", "coordinator-install"], installedNativeEntrypoints: ["pi", "omp"], hostOwnedSdkReaders: true,
+    groupedMetadata: true, realGitWorktree: true, explicitProjectScope: true }));
 });
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("5 minutes"), Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer))));

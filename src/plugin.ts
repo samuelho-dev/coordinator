@@ -1,13 +1,16 @@
 import { NodeServices } from "@effect/platform-node";
 import { Cause, Clock, Config, Console, Effect, Formatter, Layer, Logger, ManagedRuntime, Schema } from "effect";
+import type { FileSystem, Path, Scope } from "effect";
+import type { ChildProcessSpawner } from "effect/process";
 import { createInspection, HttpError, InspectionTools, metric, sessionRefKey, unavailableMetric } from "./inspection.ts";
-import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, ProgramStatus, SessionInspection, SessionListOutput, SessionPresence } from "./inspection.ts";
+import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, ProgramStatus, SessionInspection, SessionListOutput, SessionPresence, SessionProject, SessionWorkspace } from "./inspection.ts";
 import { Mcp } from "./mcp.ts";
 import { connectNative, loadConnectorConfig, NativeError, readConnectorToken, resolveNativeConfig, withProcessResources } from "./native.ts";
 import type { NativeNotice } from "./native.ts";
 import { identifyProcess } from "./resources.ts";
 import { Host as PlatformHost } from "./platform.ts";
 import { createRexReporter, readRexContext } from "./rex.ts";
+import { readWorkspace } from "./workspace.ts";
 import { highlightCode, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
@@ -57,6 +60,7 @@ export type NativeObserver = {
   readonly update: (ctx: Context, event?: NativeEvent, now?: number) => void;
   readonly presence: (now?: number) => SessionPresence | undefined;
   readonly inspect: (now?: number) => SessionInspection | undefined;
+  readonly refreshWorkspace: (project?: SessionProject) => Effect.Effect<void, never, FileSystem.FileSystem | Path.Path | ChildProcessSpawner.ChildProcessSpawner | Scope.Scope>;
   readonly clear: () => void;
 };
 
@@ -70,13 +74,16 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
   let stopReason: string | undefined;
   let current: Context | undefined;
   let identity: string | undefined;
+  let workspace: SessionWorkspace | undefined;
+  let workspaceRevision = 0;
   let lastActivityAt: number | undefined;
   let latest: { usage: Usage; observedAt: number; nativeUpdatedAt: number | null } | undefined;
   const activeTools = new Map<string, string>();
   const machineName = host.hostname;
-  const os: SessionPresence["os"] = host.platform === "linux" || host.platform === "darwin" ? { platform: host.platform, release: host.release, architecture: host.architecture } : undefined;
+  const os: NonNullable<SessionPresence["machine"]>["os"] = host.platform === "linux" || host.platform === "darwin" ? { platform: host.platform, release: host.release, architecture: host.architecture } : undefined;
   const update = (ctx: Context, event?: NativeEvent, now = clock.currentTimeMillisUnsafe()) => {
     const key = JSON.stringify([ctx.sessionManager.getSessionId(), harness === "omp" ? ctx.agent?.id : undefined]);
+    if (identity !== key || workspace?.cwd !== ctx.cwd) { workspace = { cwd: ctx.cwd }; workspaceRevision++; }
     if (identity !== key) { latest = undefined; programStatus = undefined; userPrompt = undefined; stopReason = undefined; activeTools.clear(); identity = key; }
     current = ctx;
     lastActivityAt = now;
@@ -106,18 +113,24 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
       } };
     }
   };
+  const refreshWorkspace = (project?: SessionProject) => Effect.gen(function*() {
+    if (!current) return;
+    const revision = ++workspaceRevision;
+    const refreshed = yield* readWorkspace(current.cwd, workspace, project);
+    if (workspaceRevision === revision) workspace = refreshed;
+  });
   const presence = (now = clock.currentTimeMillisUnsafe()): SessionPresence | undefined => {
     if (!current) return undefined;
     const currentToolName = activeTools.values().next().value;
     const status = userPrompt ?? programStatus;
     return {
     ref: { machineId, harness, nativeSessionId: current.sessionManager.getSessionId(), ...(harness === "omp" && current.agent?.id ? { nativeAgentId: current.agent.id } : {}) },
-    observedAt: now, ...(lastActivityAt === undefined ? {} : { lastActivityAt }), cwd: current.cwd, processes,
-    machineName, ...(os ? { os } : {}),
+    observedAt: now, ...(lastActivityAt === undefined ? {} : { lastActivityAt }), workspace: workspace ?? { cwd: current.cwd }, processes,
+    machine: { name: machineName, ...(os ? { os } : {}) },
     ...(rex ? { rex } : {}),
     ...(status ? { programStatus: status } : {}),
-    ...(current.model ? { provider: current.model.provider, model: current.model.id } : {}),
-    ...(current.agent ? { kind: current.agent.kind, ...(current.agent.name ? { agent: current.agent.name } : {}) } : {}),
+    ...(current.model ? { model: { provider: current.model.provider, id: current.model.id } } : {}),
+    ...(current.agent ? { agent: { kind: current.agent.kind, ...(current.agent.name ? { name: current.agent.name } : {}) } } : {}),
     activity: { state: userPrompt ? "waiting" : current.isIdle() ? "idle" : "working", streaming: !current.isIdle(),
       ...(currentToolName === undefined ? {} : { currentToolName }),
       ...(userPrompt ? { wait: "user" } : currentToolName === undefined ? {} : { wait: "tool" }),
@@ -206,7 +219,7 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
       },
     };
   };
-  return { update, presence, inspect, clear: () => { current = undefined; identity = undefined; latest = undefined; programStatus = undefined; userPrompt = undefined; stopReason = undefined; lastActivityAt = undefined; activeTools.clear(); } };
+  return { update, presence, inspect, refreshWorkspace, clear: () => { current = undefined; workspace = undefined; workspaceRevision++; identity = undefined; latest = undefined; programStatus = undefined; userPrompt = undefined; stopReason = undefined; lastActivityAt = undefined; activeTools.clear(); } };
 });
 
 export const isCoordinateInput = (text: string): boolean => /^coordinate(?:\s|$)/u.test(text);
@@ -338,8 +351,13 @@ export default function plugin(host: Host): void {
     // Native TUI constructors register core keywords before session_start hooks.
     if (harness === "omp" && ctx.hasUI && ctx.mode === "tui") yield* registerCoordinateKeyword;
     runtime.runFork(connectNative(nativeConfig, {
-      presence: () => Effect.sync(() => { const p = observer?.presence(); return p ? [p] : []; }),
+      presence: () => Effect.gen(function*() {
+        yield* observer?.refreshWorkspace(config?.project ? { ...config.project, source: "configured" } : undefined) ?? Effect.void;
+        const p = observer?.presence();
+        return p ? [p] : [];
+      }),
       inspect: (ref) => Effect.gen(function*() {
+        yield* observer?.refreshWorkspace(config?.project ? { ...config.project, source: "configured" } : undefined) ?? Effect.void;
         const observation = observer?.inspect();
         if (!observation || sessionRefKey(ref) !== sessionRefKey(observation.presence.ref)) {
           return yield* new HttpError({ status: 404, message: "Native session unavailable" });

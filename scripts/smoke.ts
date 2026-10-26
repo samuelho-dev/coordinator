@@ -155,6 +155,39 @@ const program = Effect.gen(function*() {
   // Synthetic native envelopes exercise the built CLI, not a live Hermes provider request.
   const hermesHome = join(root, "hermes space's");
   yield* fs.makeDirectory(hermesHome, { mode: 0o700 });
+  const repositoryRoot = join(hermesHome, "repository");
+  const worktreeRoot = join(hermesHome, "linked workspace");
+  yield* fs.makeDirectory(repositoryRoot, { mode: 0o700 });
+  const git = (args: ReadonlyArray<string>) => Effect.gen(function*() {
+    const child = yield* spawner.spawn(ChildProcess.make("git", args, {
+      cwd: repositoryRoot, env: { HOME: hermesHome, PATH: searchPath, GIT_CONFIG_NOSYSTEM: "1" },
+      extendEnv: false, stdin: Stream.empty, forceKillAfter: "1 second",
+    }));
+    const output = yield* child.stdout.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
+    const errors = yield* child.stderr.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
+    yield* verify.equal(yield* child.exitCode, 0, yield* Fiber.join(errors));
+    return (yield* Fiber.join(output)).trim();
+  });
+  yield* git(["init", "--initial-branch=main"]);
+  yield* git(["-c", "user.name=Smoke", "-c", "user.email=smoke@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "local smoke fixture"]);
+  const gitHead = yield* git(["rev-parse", "HEAD"]);
+  yield* git(["worktree", "add", "-b", "smoke-linked", worktreeRoot]);
+  const project = { root: hermesHome, source: "configured", id: "smoke-project", name: "Explicit smoke scope" } as const;
+  const verifyWorkspace = (session: SessionPresence, cwd = worktreeRoot, branch = "smoke-linked") => Effect.gen(function*() {
+    yield* verify.equal(session.workspace?.cwd, cwd, "Native cwd must survive workspace grouping");
+    yield* verify.deepEqual(session.workspace?.project, project, "Private configured project must survive list/inspect");
+    const association = session.workspace?.git;
+    yield* verify.equal(association?.state, "available", "Actual local Git association must be available");
+    if (association?.state !== "available") return;
+    yield* verify.equal(association.worktreeRoot, cwd);
+    yield* verify.equal(association.commonDir, join(repositoryRoot, ".git"), "Linked worktrees must share the actual common Git directory");
+    yield* verify.equal(association.branch, branch);
+    yield* verify.equal(association.head, gitHead);
+    yield* verify.ok(association.observedAt > 0 && association.observedAt <= (yield* Clock.currentTimeMillis));
+    for (const key of ["machineName", "os", "kind", "provider", "profile", "cwd", "repository"]) {
+      yield* verify.ok(!Object.hasOwn(session, key), `Legacy flat metadata must be absent: ${key}`);
+    }
+  });
   // Synthetic Rex references verify native metadata transport, not a live Rex server.
   const rex = { serverAddress: "unix:/tmp/coordinator-smoke-rex.sock", sessionId: `session:${yield* crypto.randomUUIDv4()}`, blockId: `block:${yield* crypto.randomUUIDv4()}` };
   const hostEnvironment = (home: string) => ({
@@ -190,13 +223,16 @@ const program = Effect.gen(function*() {
   yield* verify.deepEqual(JSON.parse(yield* fs.readFileString(clientFile)), { inspectorUrl, tokenFile });
   yield* verify.ok(!connected.includes(token), "Connection setup cannot print credentials");
   yield* verify.equal((yield* fs.stat(clientFile)).mode & 0o777, 0o600);
+  yield* fs.writeFileString(clientFile, JSON.stringify({
+    inspectorUrl, tokenFile, project: { root: project.root, id: project.id, name: project.name },
+  }), { mode: 0o600 });
   const hermesId = `synthetic-hermes-${yield* crypto.randomUUIDv4()}`;
   const sensitive = `ignored-sensitive-${yield* crypto.randomUUIDv4()}`;
-  const hermesHook = (event: string, extra: object = {}, sessionId = hermesId, home = hermesHome) => Effect.gen(function*() {
+  const hermesHook = (event: string, extra: object = {}, sessionId = hermesId, home = hermesHome, cwd = home === hermesHome ? repositoryRoot : home) => Effect.gen(function*() {
     // Synthetic shell=False envelope; only the local built hook program executes.
     const child = yield* spawner.spawn(ChildProcess.make(host.executable, [main, "hook", "hermes"], {
-      cwd: home, env: hostEnvironment(home), extendEnv: false,
-      stdin: Stream.make(new TextEncoder().encode(JSON.stringify({ hook_event_name: event, session_id: sessionId, cwd: home, profile: "synthetic-profile", extra }))),
+      cwd, env: hostEnvironment(home), extendEnv: false,
+      stdin: Stream.make(new TextEncoder().encode(JSON.stringify({ hook_event_name: event, session_id: sessionId, cwd, profile: "synthetic-profile", extra }))),
       forceKillAfter: "1 second",
     }));
     const stdout = yield* child.stdout.pipe(Stream.decodeText(), Stream.runFold(() => "", (text, chunk) => text + chunk), Effect.forkScoped);
@@ -226,10 +262,12 @@ const program = Effect.gen(function*() {
   })), Effect.forkScoped);
   const hermes = yield* waitForSession("hermes", hermesId, hermesMachineId);
   yield* verify.equal(hermes.activity?.state, "idle", "Turn end retains Hermes identity as idle");
+  yield* verifyWorkspace(hermes, repositoryRoot, "main");
   const hermesUsage = yield* mcp.call(inspectorUrl, token, InspectionTools.inspect, { ref: hermes.ref });
-  yield* verify.equal(hermesUsage.presence.profile, "synthetic-profile");
-  yield* verify.equal(hermesUsage.presence.provider, "synthetic-provider");
-  yield* verify.equal(hermesUsage.presence.model, "synthetic-model");
+  yield* verify.equal(hermesUsage.presence.agent?.profile, "synthetic-profile");
+  yield* verify.equal(hermesUsage.presence.model?.provider, "synthetic-provider");
+  yield* verify.equal(hermesUsage.presence.model?.id, "synthetic-model");
+  yield* verifyWorkspace(hermesUsage.presence, repositoryRoot, "main");
   yield* verify.deepEqual(hermesUsage.presence.processes, [{ pid: host.pid, startIdentity: identity.startTime, ownership: "shared" }]);
   yield* verify.equal(hermesUsage.resources.processes[0]?.process.pid, host.pid);
   yield* verify.equal(hermesUsage.resources.processes[0]?.rssBytes.status, "available");
@@ -258,10 +296,12 @@ const program = Effect.gen(function*() {
   const hermesIdle = yield* mcp.call(inspectorUrl, token, InspectionTools.inspect, { ref: hermes.ref });
   yield* verify.deepEqual(hermesIdle.tokens.latestNativeUpdate, hermesUsage.tokens.latestNativeUpdate, "Idle presence cannot rewrite native counter age");
   yield* verify.deepEqual(hermesIdle.presence.processes, hermesUsage.presence.processes);
+  yield* verify.equal(hermesIdle.presence.workspace?.git?.observedAt, hermesUsage.presence.workspace?.git?.observedAt, "Hook heartbeats reuse the 30-second Git observation");
   const cacheDirectory = join(hermesHome, "state", "coordinator", "native-observations");
   const cacheEntries = yield* fs.readDirectory(cacheDirectory);
   for (const entry of cacheEntries) {
     const file = join(cacheDirectory, entry);
+    yield* verify.ok(entry.startsWith("v3-"), "Ephemeral native cache must use the incompatible v3 namespace");
     const text = yield* fs.readFileString(file);
     yield* verify.ok(!text.includes(sensitive) && !text.includes(token), "Sensitive wire extras and credentials must not enter cache");
     yield* verify.equal((yield* fs.stat(file)).mode & 0o077, 0, "Cache must remain private");
@@ -276,6 +316,15 @@ const program = Effect.gen(function*() {
     yield* verify.ok(attempt < 299, "Finalized Hermes identity must disappear and late callbacks cannot resurrect it");
     yield* Effect.sleep(100);
   }
+  const outsideRoot = join(root, "unrelated workspace");
+  yield* fs.makeDirectory(outsideRoot, { mode: 0o700 });
+  const outsideSessionId = `synthetic-outside-${yield* crypto.randomUUIDv4()}`;
+  yield* hermesHook("on_session_start", {}, outsideSessionId, hermesHome, outsideRoot);
+  const outsideSession = yield* waitForSession("hermes", outsideSessionId, hermesMachineId);
+  yield* verify.equal(outsideSession.workspace?.cwd, outsideRoot);
+  yield* verify.equal(outsideSession.workspace?.project, undefined, "Configured project must not attach outside its root on the same installation");
+  yield* verify.equal(outsideSession.workspace?.git?.state, "not-repository", "Changing cwd cannot retain a stale repository");
+  yield* hermesHook("on_session_finalize", { old_session_id: outsideSessionId }, "", hermesHome, outsideRoot);
   yield* hermesConnector.kill();
   yield* hermesConnector.exitCode;
   yield* Fiber.join(connectorStdout);
@@ -294,6 +343,9 @@ const program = Effect.gen(function*() {
   yield* otherConnector.stdout.pipe(Stream.runDrain, Effect.forkScoped);
   yield* otherConnector.stderr.pipe(Stream.runDrain, Effect.forkScoped);
   const otherSession = yield* waitForSession("hermes", otherSessionId, otherMachineId);
+  yield* verify.equal(otherSession.workspace?.cwd, otherHome);
+  yield* verify.equal(otherSession.workspace?.project, undefined, "Configured project cannot leak to another installation");
+  yield* verify.equal(otherSession.workspace?.git?.state, "not-repository");
   yield* verify.equal((yield* mcp.call(inspectorUrl, outsiderToken, InspectionTools.list, { limit: 100 })).sessions.length, 0);
   yield* mcp.call(inspectorUrl, outsiderToken, InspectionTools.inspect, { ref: otherSession.ref }).pipe(Effect.matchEffect({
     onFailure: (error) => error._tag === "HttpError"
@@ -362,7 +414,7 @@ const program = Effect.gen(function*() {
     const listRequest = new TextEncoder().encode('{"id":"coordinator-list","type":"prompt","message":"/coordinator list"}\n');
     const messagesRequest = new TextEncoder().encode('{"id":"coordinator-list-messages","type":"get_messages"}\n');
     const child = yield* spawner.spawn(ChildProcess.make(executable, ["--mode", "rpc", "--session-dir", home, ...modelArgs], {
-      cwd: home, env: nativeEnv, extendEnv: false,
+      cwd: worktreeRoot, env: nativeEnv, extendEnv: false,
       stdin: Stream.make(startupRequest).pipe(
         Stream.concat(Stream.fromEffect(Deferred.await(runList).pipe(Effect.as(listRequest)))),
         Stream.concat(Stream.fromEffect(Deferred.await(listHandled).pipe(Effect.as(messagesRequest)))),
@@ -400,6 +452,9 @@ const program = Effect.gen(function*() {
             yield* verify.ok(result.details.sessions.some((entry) => entry.ref.machineId === otherMachineId));
             const content = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(CoordinatorListMessage.fields.details))(result.content);
             yield* verify.deepEqual(content.sessions, result.details.sessions, "Displayed JSON must preserve every listed session");
+            const displayedNative = content.sessions.find((entry) => entry.ref.machineId === hermesMachineId && entry.ref.harness === harness);
+            if (displayedNative === undefined) return yield* verify.fail("Displayed native session missing");
+            yield* verifyWorkspace(displayedNative);
             yield* verify.ok(!result.content.includes(token));
             yield* Deferred.succeed(listVerified, undefined);
             return;
@@ -435,12 +490,16 @@ const program = Effect.gen(function*() {
     yield* verify.equal(native.rex?.sessionId, rex.sessionId);
     yield* verify.equal(native.rex?.blockId, rex.blockId);
     yield* verify.deepEqual(native.programStatus, { state: "idle" }, "Native startup has a known idle status");
+    yield* verifyWorkspace(native);
+    yield* verify.ok(native.machine?.name !== undefined && native.machine.os?.platform !== undefined, "Native machine facts must use the grouped shape");
+    if (harness === "omp") yield* verify.deepEqual(native.model, { provider: "inspector-smoke", id: "inspector-smoke" });
     const beforeList = detailRequests;
     yield* Deferred.succeed(runList, undefined);
     yield* Effect.raceFirst(Deferred.await(listVerified), Fiber.join(stdout).pipe(Effect.andThen(verify.fail("Native RPC ended before list verification")))).pipe(Effect.timeout("30 seconds"));
     yield* verify.equal(detailRequests, beforeList, "The list command must not sample per-session details");
     const inspected = yield* mcp.call(inspectorUrl, token, InspectionTools.inspect, { ref: native.ref });
     yield* verify.equal(inspected.presence.ref.harness, harness);
+    yield* verifyWorkspace(inspected.presence);
     yield* verify.equal(native.ref.machineId, hermesMachineId, "Pi, OMP and hooks share one local installation identity");
     yield* verify.equal((yield* fs.readFileString(join(home, "state", "coordinator", "machine-id"))).trim(), hermesMachineId);
     const discovered = yield* mcp.call(inspectorUrl, token, InspectionTools.list, { limit: 100 });
@@ -484,11 +543,21 @@ const program = Effect.gen(function*() {
           if (list === undefined || inspect === undefined) return yield* Effect.die("Activated built package must register native readers");
           const listed = yield* Effect.promise(() => list.execute("native-smoke-list", { limit: 100 }));
           const listing = yield* Schema.decodeUnknownEffect(InspectionTools.list.output)(listed.details);
+          const rawListing = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(InspectionTools.list.output))(listed.content.find((entry) => entry.type === "text")?.text);
+          yield* guard(JSON.stringify(rawListing) === JSON.stringify(listing), "Raw native list JSON must preserve complete structured details");
           yield* guard(listing.sessions.some((entry) => entry.ref.machineId === ref.machineId && entry.ref.harness === "pi" && entry.ref.nativeSessionId === ref.nativeSessionId), "Native reader must discover the independent disposable Pi CLI");
+          const listedNative = listing.sessions.find((entry) => entry.ref.nativeSessionId === ref.nativeSessionId && entry.ref.machineId === ref.machineId && entry.ref.harness === ref.harness);
+          yield* guard(listedNative?.workspace?.cwd === ${JSON.stringify(worktreeRoot)} && listedNative.workspace.git?.state === "available" && listedNative.workspace.git.worktreeRoot === ${JSON.stringify(worktreeRoot)} && listedNative.workspace.git.head === ${JSON.stringify(gitHead)}, "Native list JSON must retain real linked-worktree association");
+          yield* guard(listedNative?.workspace?.project?.root === ${JSON.stringify(project.root)} && listedNative.workspace.project.id === "smoke-project", "Native list JSON must retain explicit project scope");
           yield* guard(listing.sessions.some((entry) => entry.ref.machineId === otherMachineId), "Native owner-key reader must discover separate installation");
           const inspected = yield* Effect.promise(() => inspect.execute("native-smoke-inspect", { ref }));
           const detail = yield* Schema.decodeUnknownEffect(InspectionTools.inspect.output)(inspected.details);
+          const rawDetail = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(InspectionTools.inspect.output))(inspected.content.find((entry) => entry.type === "text")?.text);
+          yield* guard(JSON.stringify(rawDetail) === JSON.stringify(detail), "Raw native inspect JSON must preserve complete grouped details");
           yield* guard(JSON.stringify(detail.presence.ref) === JSON.stringify(ref), "Native detail must match independent CLI");
+          yield* guard(detail.presence.workspace?.git?.state === "available", "Native inspect JSON must retain actual Git metadata");
+          yield* guard(detail.presence.workspace?.project?.id === "smoke-project" && detail.presence.workspace.project.source === "configured", "Native inspect JSON must retain explicit project");
+          yield* guard(detail.presence.workspace?.git?.state === "available" && detail.presence.workspace.git.commonDir === ${JSON.stringify(join(repositoryRoot, ".git"))}, "Native inspect must retain shared Git identity");
           const rootProcess = detail.resources.processes.find((entry) => entry.process.pid === cliPid);
           if (rootProcess === undefined) return yield* Effect.die("Independent CLI process missing");
           yield* guard(rootProcess.rssBytes.status === "available" && rootProcess.rssBytes.value > 0, "Native reader must measure independent CLI, not SDK process");
@@ -520,7 +589,7 @@ const program = Effect.gen(function*() {
   yield* otherConnector.kill();
   yield* otherConnector.exitCode;
   yield* Console.log(JSON.stringify({ scenario: "ephemeral-inspector", status: "ok", authenticatedHttpMcp: true, outboundConnector: true,
-    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
+    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, groupedMetadata: true, realGitWorktree: true, explicitProjectScope: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
 });
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("120 seconds"), Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer, NodeHttpClient.layerUndici, Mcp.layer))));

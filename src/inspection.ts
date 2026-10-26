@@ -44,20 +44,48 @@ export const ProgramStatus = Schema.Union([
   Schema.Struct({ state: Schema.Literal("blocked"), kind: Schema.Literals(["permission", "question", "auth"]) }),
 ]);
 export type ProgramStatus = typeof ProgramStatus.Type;
+
+export const SessionMachine = Schema.Struct({
+  name: Schema.optional(Label),
+  os: Schema.optional(Schema.Struct({ platform: Schema.Literals(["linux", "darwin"]), release: Schema.optional(Id), architecture: Schema.optional(Id) })),
+});
+export type SessionMachine = typeof SessionMachine.Type;
+export const SessionAgent = Schema.Struct({
+  kind: Schema.optional(Id), name: Schema.optional(Id), profile: Schema.optional(Id),
+});
+export type SessionAgent = typeof SessionAgent.Type;
+export const SessionModel = Schema.Struct({ provider: Schema.optional(Id), id: Schema.optional(Id) });
+export type SessionModel = typeof SessionModel.Type;
+export const SessionProject = Schema.Struct({
+  root: Path, source: Schema.Literals(["native", "configured"]), id: Schema.optional(Id), name: Schema.optional(Label),
+});
+export type SessionProject = typeof SessionProject.Type;
+export const SessionGit = Schema.Union([
+  Schema.Struct({
+    state: Schema.Literal("available"), observedAt: Timestamp, worktreeRoot: Path, commonDir: Path,
+    branch: Schema.NullOr(Id), head: Schema.NullOr(Schema.String.check(Schema.isPattern(/^(?:[a-f0-9]{40}|[a-f0-9]{64})(?![\s\S])/))),
+  }),
+  Schema.Struct({ state: Schema.Literal("not-repository"), observedAt: Timestamp }),
+  Schema.Struct({ state: Schema.Literal("unavailable"), observedAt: Timestamp }),
+]);
+export type SessionGit = typeof SessionGit.Type;
+export const SessionWorkspace = Schema.Struct({
+  cwd: Path, git: Schema.optional(SessionGit), project: Schema.optional(SessionProject),
+});
+export type SessionWorkspace = typeof SessionWorkspace.Type;
 export const SessionPresence = Schema.Struct({
   ref: SessionRef,
   observedAt: Timestamp,
-  harnessVersion: Schema.optional(Id), machineName: Schema.optional(Label),
-  os: Schema.optional(Schema.Struct({ platform: Schema.Literals(["linux", "darwin"]), release: Schema.optional(Id), architecture: Schema.optional(Id) })),
+  harnessVersion: Schema.optional(Id),
+  machine: Schema.optional(SessionMachine), agent: Schema.optional(SessionAgent),
+  model: Schema.optional(SessionModel), workspace: Schema.optional(SessionWorkspace),
   // Source-host observedAt does not determine receiver-clock connection liveness.
   connection: Schema.optional(Schema.Struct({ state: Schema.Literals(["live", "stale"]), receivedAt: Timestamp, liveUntil: Timestamp })),
   nativeUpdatedAt: Schema.optional(Schema.NullOr(Timestamp)),
   startedAt: Schema.optional(Schema.NullOr(Timestamp)),
   lastActivityAt: Schema.optional(Schema.NullOr(Timestamp)),
   parent: Schema.optional(SessionRef),
-  label: Schema.optional(Label), kind: Schema.optional(Id),
-  provider: Schema.optional(Id), model: Schema.optional(Id), profile: Schema.optional(Id), agent: Schema.optional(Id),
-  cwd: Schema.optional(Path), repository: Schema.optional(Path),
+  label: Schema.optional(Label),
   rex: Schema.optional(Schema.Struct({ serverAddress: Schema.optional(RexText), blockId: Schema.optional(RexText), sessionId: Schema.optional(RexText) })),
   programStatus: Schema.optional(ProgramStatus),
   processes: Schema.optional(bounded(ProcessIdentity, 128)),
@@ -198,6 +226,7 @@ export const ConnectorConfig = Schema.Struct({
   inspectorUrl: InspectorUrl,
   apiToken: Schema.optional(Schema.String.check(Schema.isMinLength(16), Schema.isMaxLength(4096), Schema.isPattern(/^[A-Za-z0-9._~+\/-]+=*$/))),
   tokenFile: Schema.optional(PrivatePath),
+  project: Schema.optional(Schema.Struct({ root: PrivatePath, id: Schema.optional(Id), name: Schema.optional(Label) })),
 });
 export type ConnectorConfig = typeof ConnectorConfig.Type;
 export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", {

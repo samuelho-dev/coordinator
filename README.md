@@ -9,12 +9,14 @@ There are two parts: **one inspector service**, plus **native integrations on ea
 The API and setup CLI require Node >=22.19. Install the version-pinned release:
 
 ```sh
-npm install --global @samuelho-dev/coordinator@0.3.0-beta.4
+npm install --global @samuelho-dev/coordinator@0.3.0-beta.5
 ```
 
 For source development only, use a reviewed checkout with `pnpm install --frozen-lockfile && pnpm build` (pnpm 11.9.0). `coordinator-install --source` deliberately activates that exact local package; never source-link a native package manager's own `node_modules` directory.
 
 The [esbuild build](scripts/build.ts) keeps Pi dependencies external and bundles OMP dependencies to avoid compatibility-loader traversal. Native host APIs stay external; OMP uses [Bun's native CommonJS support](https://bun.com/docs/runtime/module-resolution#module-systems), not an injected shim. Rebuild and restart OMP after source updates.
+
+`0.3.0-beta.5` introduces the grouped metadata/workspace contract described below. It is a breaking cutover from beta.4 and earlier APIs, publishers and readers; deploy the matching API before upgrading clients.
 
 For Kubernetes, follow the [chart operator guide](deploy/helm/coordinator/README.md): provide an existing Secret, verified image digest and matching source SHA. The chart creates an inspector Deployment/internal Service, not native plugins, TLS routing, a database or runners. Operators own rollout and supervision. Existing broker state requires the guide's preservation/migration procedure; the plugin does not migrate or delete it.
 
@@ -68,7 +70,12 @@ Alternatively, use a private client file (`inspector.json`), with either `apiTok
 ```json
 {
   "inspectorUrl": "https://inspector.example.net",
-  "tokenFile": "/home/operator/.config/coordinator-inspector-private/owner.token"
+  "tokenFile": "/home/operator/.config/coordinator-inspector-private/owner.token",
+  "project": {
+    "root": "/home/operator/projects/product",
+    "id": "product",
+    "name": "Product workspace"
+  }
 }
 ```
 
@@ -100,8 +107,8 @@ The installer validates prerequisites and creates launchers/config fragments. `-
 
 | Target | Activation | Presence publisher |
 | --- | --- | --- |
-| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.4`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
-| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.4`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
+| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.5`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
+| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.5`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
 | Claude Code | `claude --plugin-dir "$PRIVATE/claude-host"`; approve generated hooks/MCP tools; preserve existing status-line configuration. | Separate `connector.sh`. |
 | Codex CLI | Merge generated `hooks/hooks.json` and coordinator `mcp.toml`; trust only Coordinator's handlers in native `/hooks`. | Separate `connector.sh`. |
 | Hermes | Merge generated hook entries and `mcp_servers.coordinator` from `mcp.yaml` into the selected profile; no Python plugin installation. | Separate `connector.sh`. |
@@ -114,32 +121,53 @@ Generated directories contain configuration, not a package copy. Launchers refer
 COORDINATOR_CONNECTOR_CONFIG="$PRIVATE/inspector.json" node dist/src/main.js connector
 ```
 
-Hook/status-line/notification capture is local and can initialize identity/cache on first use while offline, without a token; it is not an offline delivery queue. Network publishing still needs credentials and a running publisher. Metadata cache is bounded to 1024 observations and 64 KiB per file, normally expires after 120 s, and may retain Hermes observations while the attributed host remains live. No transcripts are collected.
+Hook/status-line/notification capture is local and can initialize identity/cache on first use while offline, without a token; it is not an offline delivery queue. Network publishing still needs credentials and a running publisher. Metadata cache is bounded to 1024 observations and 64 KiB per file, normally expires after 120 s, and may retain Hermes observations while the attributed host remains live. The grouped contract uses cache version 3 and versioned filenames; old version 2 records are ignored, not decoded or overwritten. No transcripts are collected.
 
 ### Native session commands and Rex
 
 Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and returns pretty JSON (`{ "sessions": [...] }`) using Effect's JSON formatter, with native JSON syntax highlighting in the terminal. Each session preserves full native session/agent IDs, machine names/installation IDs, harness and all reported metadata: model/provider, workspace, activity, connection liveness, process identity and Rex association. Missing metadata is omitted; an empty listing returns `{ "sessions": [] }`. It reads the API directly, with no model turn, per-session resource sampling or separate MCP registration.
 
+Unreleased presence groups optional metadata under `machine`, `agent`, `model` and `workspace`; absent facts/groups are omitted, with no old flat aliases:
+
+```json
+{
+  "ref": { "machineId": "installation-uuid", "harness": "omp", "nativeSessionId": "native-session-id" },
+  "observedAt": 1792886400000,
+  "machine": { "name": "workstation", "os": { "platform": "linux", "architecture": "x64" } },
+  "agent": { "kind": "coding", "name": "native-agent", "profile": "work" },
+  "model": { "provider": "provider-id", "id": "model-id" },
+  "workspace": {
+    "cwd": "/home/operator/projects/product/worktree/src",
+    "project": { "root": "/home/operator/projects/product", "source": "configured", "id": "product", "name": "Product workspace" },
+    "git": { "state": "available", "observedAt": 1792886400000, "worktreeRoot": "/home/operator/projects/product/worktree", "commonDir": "/home/operator/projects/product/main/.git", "branch": "feature", "head": "0123456789abcdef0123456789abcdef01234567" }
+  }
+}
+```
+
+Git discovery is read-only and local to the session machine, bounded to two seconds without network, hooks, remote URLs or working-tree scans. `available` reports the actual worktree root and shared absolute Git common directory (including linked worktrees); `branch: null` means detached HEAD, `head: null` an unborn branch. `not-repository` means genuinely outside Git; `unavailable` means discovery failed, was denied, timed out or Git was missing. All three outcomes include `observedAt` and are cached for 30 seconds at unchanged cwd; future timestamps force refresh. Changing cwd clears stale associations. Native startup does not await discovery.
+
+Projects are explicit scope, independent of Git: Claude's documented status-line [`workspace.project_dir`](https://code.claude.com/docs/en/statusline) supplies its launch directory as `source: "native"`, not a guessed Git repository or application identity. The optional private configuration `project` above uses `source: "configured"` and wins only for cwd inside its root; outside that root, a valid native association can remain. Association respects directory/symlink boundaries and is recomputed independently of the Git cache. No project ID/name is inferred from a directory, repository or branch.
+
 Session JSON is Coordinator's fleet model, not an OSC wire payload. `rex` preserves `REX_SERVER` as `serverAddress` and the actual full `REX_SESSION`/`REX_BLOCK` IDs; these are separate from native agent IDs. Optional `programStatus` uses [Rex Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) semantics: idle/working/done/error, or blocked with permission/question/auth kind. Agent `kind` remains separate. Tool/API waits are working; unknown outcomes are omitted, not inferred from disconnects or generic stops. API connection leases do not expire terminal status records.
 
 Stock OMP 18.12.6 already owns OSC7501 through `terminal.programStatus`; Coordinator does not duplicate, override or patch that reporter. Pi's terminal-only adapter uses a private scoped record, full replacements and change-only reporting; no controls are written to RPC/JSON/print output. Pi user prompts are blocked/question; completion waits for native final settlement, not an intermediate loop end. Claude hooks supply explicit permission/question/completion/failure states; unavailable native UI-only reasons are not guessed. Prompt/error text is never copied into status reports.
 
-Deploy the matching API **before** upgrading clients. Strict schemas reject new fields on older APIs, and older readers cannot decode new presence fields. Coordinate native reloads; preserve existing credentials and installation identity.
+For beta.5, coordinate a breaking cutover across the API, every publisher and every reader; beta.4 and earlier are incompatible. Deploy the matching API **before** upgrading clients, then deliberately reload native hosts, reader bridges and connectors together. Strict schemas reject new fields on older APIs, and older readers cannot decode the grouped presence. Preserve existing credentials and installation identity; there are no flat-field compatibility aliases.
 
 ## Coordinated migration
 
-This is a clean schema cutover, with no legacy aliases or compatibility shims. Before a separately approved rollout, coordinate the server and all native owners: provision fresh owner keys privately, replace server principals with `{ id, owner, tokenHash }`, update the chart's `health.token` to match an owner key, and replace client files with endpoint/credential fields only. Remove manual `machineId`/`stateDirectory` settings, regenerate affected installer artifacts, then deliberately restart the inspector and affected native hosts/bridges/connectors. Preserve the automatically created local identity on subsequent upgrades. Old server/client configuration is rejected; do not mix releases expecting the old machine-bound schema. These instructions do not perform a live rollout or rotate live keys.
+This is a clean schema cutover, with no legacy aliases or compatibility shims. Existing owner-scoped credentials and installation identity remain valid for grouped metadata; do not rotate them merely for this change. For installations still using the older machine-bound configuration, a separately approved migration must provision owner keys privately, use server principals `{ id, owner, tokenHash }` and matching chart `health.token`, and replace manual client `machineId`/`stateDirectory` with endpoint/credential configuration (plus optional explicit `project`). Regenerate affected installer artifacts and deliberately restart the inspector and affected native hosts/bridges/connectors. These instructions do not perform a live rollout or rotate live keys.
 
 
 ## Plugin publication
 
-The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.4`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.5`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
 For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.4
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.4
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.5
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.5
 ```
 
 Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
@@ -149,6 +177,8 @@ Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixe
 `0.3.0-beta.3` adds native `/coordinator list`, secure self-host bootstrap/authenticated client setup, and Rex references/status normalization without an OMP fork. Runtime dependency pins are unchanged.
 
 `0.3.0-beta.4` fixes `/coordinator list` output: Effect-formatted, indented JSON with native syntax highlighting instead of hand-built text and literal fences. Native UI imports are static and selected at build time; the renderer registers once at startup. The session wire format and runtime dependencies are unchanged, so the existing beta.3 API needs no redeployment.
+
+`0.3.0-beta.5` groups machine, agent, model and workspace metadata; adds cached Git worktree/common-directory/branch/HEAD observations and native or explicitly configured project association; and migrates every harness and private metadata cache. This requires matching API, publishers and readers, but no credential rotation, new runtime dependencies or OMP fork.
 
 | Host | Publication route |
 | --- | --- |

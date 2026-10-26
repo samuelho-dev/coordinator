@@ -6,7 +6,7 @@ import { TestClock } from "effect/testing";
 import { Inspector } from "../src/inspector.ts";
 import {
   createInspection, metric, type InspectorConfig, type InspectorPrincipal,
-  type HttpError, type MetricProvenance, type SessionInspection, type SessionListOutput, type SessionPresence,
+  type HttpError, type MetricProvenance, type SessionInspection, type SessionListOutput, type SessionPresence, type SessionRef,
 } from "../src/inspection.ts";
 
 const { publisher, reader, outsider, config } = await Effect.runPromise(Effect.gen(function*() {
@@ -27,6 +27,14 @@ const identity = { connectorId: "native-connector", incarnation: "first" };
 const presence: SessionPresence = {
   ref: { machineId: "mac", harness: "omp", nativeSessionId: "actual-native-session" }, observedAt: 9_999_999_999_999,
   connection: { state: "live", receivedAt: 9_999_999_999_999, liveUntil: 9_999_999_999_999 },
+  machine: { name: "Mac", os: { platform: "darwin", architecture: "arm64" } },
+  agent: { kind: "primary", name: "reviewer", profile: "careful" },
+  model: { provider: "provider", id: "model" },
+  workspace: {
+    cwd: "/work/linked/subdir",
+    project: { root: "/work/linked", source: "configured", id: "project" },
+    git: { state: "available", observedAt: 5, worktreeRoot: "/work/linked", commonDir: "/work/main/.git", branch: null, head: "a".repeat(64) },
+  },
 };
 const provenance: MetricProvenance = {
   source: "native", scope: "process", scopeDescription: "Native process sample", observedAt: 5, nativeUpdatedAt: 4,
@@ -110,18 +118,25 @@ it.effect("correlates an actual read-only query with its publisher, incarnation 
   const observation = createInspection(presence, 123);
   assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, { ...identity, incarnation: "forged", requestId: request.requestId, observation }))).status, 409);
   assert.strictEqual((yield* Effect.flip(inspector.complete(reader, { ...identity, requestId: request.requestId, observation }))).status, 409);
-  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, {
-    ...identity, requestId: request.requestId,
-    observation: { ...observation, presence: { ...presence, ref: { ...presence.ref, nativeSessionId: "another" } } },
-  }))).status, 409);
-  assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, {
-    ...identity, requestId: request.requestId,
-    observation: { ...observation, presence: { ...presence, ref: { ...presence.ref, machineId: "linux" } } },
-  }))).status, 409);
+  for (const ref of [
+    { ...presence.ref, nativeSessionId: "another" },
+    { ...presence.ref, machineId: "linux" },
+    { ...presence.ref, harness: "pi" },
+    { ...presence.ref, nativeAgentId: "child" },
+  ] satisfies ReadonlyArray<SessionRef>) {
+    assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, {
+      ...identity, requestId: request.requestId,
+      observation: { ...observation, presence: { ...presence, ref } },
+    }))).status, 409);
+  }
   yield* inspector.complete(publisher, { ...identity, requestId: request.requestId, observation });
   const actual = yield* Fiber.join(query);
   assert.notStrictEqual(actual.presence.connection?.receivedAt, presence.connection?.receivedAt);
   assert.notStrictEqual(actual.queriedAt, 123);
+  assert.deepStrictEqual(actual.presence.machine, presence.machine);
+  assert.deepStrictEqual(actual.presence.agent, presence.agent);
+  assert.deepStrictEqual(actual.presence.model, presence.model);
+  assert.deepStrictEqual(actual.presence.workspace, presence.workspace);
   assert.strictEqual((yield* Effect.flip(inspector.complete(publisher, { ...identity, requestId: request.requestId, observation }))).status, 409);
 })));
 

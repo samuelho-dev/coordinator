@@ -1,17 +1,27 @@
 import { assert, expectTypeOf, it } from "@effect/vitest";
-import { Cause, Context, Crypto, Effect, Layer, ManagedRuntime, Stream } from "effect";
+import { Cause, Context, Crypto, Effect, Fiber, Layer, ManagedRuntime, Stream } from "effect";
 import { HttpClient, HttpClientRequest, HttpServer, HttpServerResponse } from "effect/http";
 import { NodeHttpClient, NodeServices } from "@effect/platform-node";
 import { Hex } from "effect/encoding";
 import { serverLayer } from "../src/platform.ts";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { ConnectorAccepted, ConnectorAnnounce, HttpError, InspectionTools, type SessionInspection, type SessionListOutput, type SessionPresence } from "../src/inspection.ts";
+import { ConnectorAccepted, ConnectorAnnounce, ConnectorPoll, ConnectorPollResult, ConnectorResult, createInspection, HttpError, InspectionTools, type SessionInspection, type SessionListOutput, type SessionPresence } from "../src/inspection.ts";
 import { Inspector } from "../src/inspector.ts";
 import { LIMIT, MCP_RESPONSE_LIMIT, Mcp } from "../src/mcp.ts";
 
 const token = "private-inspector-test-token";
 const outsiderToken = "private-outsider-test-token";
-const presence: SessionPresence = { ref: { machineId: "machine-a", harness: "pi", nativeSessionId: "native-😀" }, observedAt: 1, label: "readable-😀-\"\\\n" };
+const presence: SessionPresence = {
+  ref: { machineId: "machine-a", harness: "pi", nativeSessionId: "native-😀" }, observedAt: 1, label: "readable-😀-\"\\\n",
+  machine: { name: "Machine A", os: { platform: "linux", release: "6", architecture: "x64" } },
+  agent: { kind: "primary", name: "reviewer", profile: "careful" },
+  model: { provider: "provider", id: "model" },
+  workspace: {
+    cwd: "/work/linked/subdir",
+    project: { root: "/work/linked", source: "configured", id: "project", name: "Project" },
+    git: { state: "available", observedAt: 1, worktreeRoot: "/work/linked", commonDir: "/work/main/.git", branch: "feature", head: "a".repeat(40) },
+  },
+};
 class Endpoint extends Context.Service<Endpoint>()("test/InspectorHttp", {
   make: Effect.gen(function*() {
     const mcp = yield* Mcp;
@@ -50,8 +60,29 @@ it("native MCP exposes only read-only tools and escapes or rejects private param
     assert.strictEqual(listed.sessions.length, 1);
     assert.deepStrictEqual(listed.sessions[0]?.ref, presence.ref);
     assert.strictEqual(listed.sessions[0]?.label, presence.label);
+    assert.deepStrictEqual(listed.sessions[0]?.machine, presence.machine);
+    assert.deepStrictEqual(listed.sessions[0]?.agent, presence.agent);
+    assert.deepStrictEqual(listed.sessions[0]?.model, presence.model);
+    assert.deepStrictEqual(listed.sessions[0]?.workspace, presence.workspace);
     const inspection = mcp.call(url, token, InspectionTools.inspect, { ref: presence.ref });
     expectTypeOf(inspection).toEqualTypeOf<Effect.Effect<SessionInspection, HttpError | Cause.TimeoutError>>();
+    const inspected = await app.runPromise(Effect.gen(function*() {
+      const pending = yield* Effect.forkChild(inspection, { startImmediately: true });
+      let requests = (yield* mcp.post(url, token, "/connector/poll", ConnectorPoll, ConnectorPollResult, connector)).requests;
+      for (let attempt = 0; requests.length === 0 && attempt < 100; attempt++) {
+        yield* Effect.sleep("10 millis");
+        requests = (yield* mcp.post(url, token, "/connector/poll", ConnectorPoll, ConnectorPollResult, connector)).requests;
+      }
+      const request = requests.at(0);
+      if (!request) return yield* Effect.die("Missing inspection request");
+      assert.deepStrictEqual(request.ref, presence.ref);
+      yield* mcp.post(url, token, "/connector/result", ConnectorResult, ConnectorAccepted, {
+        ...connector, requestId: request.requestId, observation: createInspection(presence, 2),
+      });
+      return yield* Fiber.join(pending);
+    }));
+    assert.deepStrictEqual(inspected.presence.workspace, presence.workspace);
+    assert.deepStrictEqual(inspected.presence.model, presence.model);
     const readable = await client.callTool({ name: "session.list", arguments: { limit: 10 } });
     const text = readable.content.find((content) => content.type === "text");
     if (text?.type !== "text") return assert.fail("Missing MCP text result");
@@ -141,9 +172,22 @@ it("HTTP probes, credentials, origin, oversize and private connector fields stay
     const oversized = await request(`${url}/connector/announce`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ privatePrompt: "x".repeat(LIMIT) }) });
     assert.strictEqual(oversized.status, 413);
     const secret = "private-transcript-secret";
-    const privateInput = await request(`${url}/connector/announce`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ ...connector, machineId: "machine-a", sessions: [{ ...presence, transcript: secret }] }) });
-    assert.strictEqual(privateInput.status, 400);
-    assert.strictEqual(privateInput.body.includes(secret), false);
+    for (const invalid of [
+      { ...presence, transcript: secret },
+      { ...presence, machineName: secret },
+      { ...presence, cwd: "/obsolete" },
+      { ...presence, repository: "/obsolete" },
+      { ...presence, agent: secret },
+      { ...presence, model: secret },
+      { ...presence, machine: { name: "Machine A", transcript: secret } },
+      { ...presence, model: { id: "model", prompt: secret } },
+      { ...presence, workspace: { cwd: "/work", project: { root: "/work", source: "native", transcript: secret } } },
+      { ...presence, workspace: { cwd: "/work", git: { state: "unavailable", observedAt: 1, stderr: secret } } },
+    ]) {
+      const privateInput = await request(`${url}/connector/announce`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ ...connector, machineId: "machine-a", sessions: [invalid] }) });
+      assert.strictEqual(privateInput.status, 400);
+      assert.strictEqual(privateInput.body.includes(secret), false);
+    }
     assert.strictEqual((await app.runPromise(mcp.call(url, token, InspectionTools.list, { limit: 1 }))).sessions.length, 0);
     await app.runPromise(mcp.call(url, "wrong-private-token", InspectionTools.list, { limit: 1 }).pipe(Effect.match({ onSuccess: () => assert.fail("unauthorized call"), onFailure: (error) => { assert.strictEqual(error._tag, "HttpError"); if (error._tag === "HttpError") assert.strictEqual(error.status, 401); } })));
   } finally { await app.dispose(); }

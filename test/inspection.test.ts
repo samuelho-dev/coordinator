@@ -3,9 +3,9 @@ import type { Path } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import { assert, expect, it } from "@effect/vitest";
 import {
-  createInspection, decodeConnectorConfig, decodeInspectorConfig, decodeSessionInspection, decodeSessionListInput,
-  decodeSessionPresence, metric, sessionRefKey,
-  type MetricProvenance, type SessionPresence,
+  createInspection, decodeConnectorAnnounce, decodeConnectorConfig, decodeConnectorResult, decodeInspectorConfig,
+  decodeSessionInspection, decodeSessionListInput, decodeSessionListOutput, decodeSessionPresence, metric, sessionRefKey,
+  type MetricProvenance, type SessionGit, type SessionPresence,
 } from "../src/inspection.ts";
 
 const run = <A, E>(effect: Effect.Effect<A, E, Path.Path>) => Effect.runPromise(effect.pipe(Effect.provide(NodeServices.layer)));
@@ -13,6 +13,79 @@ const run = <A, E>(effect: Effect.Effect<A, E, Path.Path>) => Effect.runPromise(
 const presence: SessionPresence = {
   ref: { machineId: "mac", harness: "claude", nativeSessionId: "native-session" }, observedAt: 200,
 };
+const grouped: SessionPresence = {
+  ...presence,
+  machine: { name: "Mac", os: { platform: "darwin", release: "25", architecture: "arm64" } },
+  agent: { kind: "primary", name: "reviewer", profile: "careful" },
+  model: { provider: "provider", id: "model" },
+  workspace: {
+    cwd: "/work/project/subdir",
+    project: { root: "/work/project", source: "configured", id: "project-id", name: "Project" },
+    git: { state: "available", observedAt: 190, worktreeRoot: "/work/project", commonDir: "/work/main/.git", branch: "feature", head: "a".repeat(40) },
+  },
+};
+
+it("round trips grouped metadata through public list, inspection and connector boundaries", async () => {
+  const copy = JSON.parse(JSON.stringify(grouped));
+  assert.deepStrictEqual(await run(decodeSessionPresence(copy)), grouped);
+  const list = { sessions: [copy], nextCursor: null };
+  assert.deepStrictEqual(await run(decodeSessionListOutput(list)), list);
+  const observation = createInspection(copy, 300);
+  assert.deepStrictEqual(await run(decodeSessionInspection(observation)), observation);
+  const connector = { connectorId: "connector", incarnation: "incarnation" };
+  const announce = { ...connector, machineId: grouped.ref.machineId, sessions: [copy] };
+  assert.deepStrictEqual(await run(decodeConnectorAnnounce(announce)), announce);
+  const result = { ...connector, requestId: "request", observation };
+  assert.deepStrictEqual(await run(decodeConnectorResult(result)), result);
+});
+
+it("accepts SHA-1, SHA-256, detached, unborn and explicit negative Git observations", async () => {
+  const available = { state: "available", observedAt: 190, worktreeRoot: "/work/project", commonDir: "/work/main/.git" } satisfies Omit<Extract<SessionGit, { state: "available" }>, "branch" | "head">;
+  for (const git of [
+    ...["a".repeat(40), "0123456789abcdef".repeat(4), null].map((head) => ({ ...available, branch: "main", head })),
+    { ...available, branch: null, head: "b".repeat(40) },
+    { state: "not-repository", observedAt: 190 },
+    { state: "unavailable", observedAt: 190 },
+  ] satisfies SessionGit[]) {
+    const value = { ...presence, workspace: { cwd: "/work/project", git } };
+    assert.deepStrictEqual(await run(decodeSessionPresence(value)), value);
+  }
+  for (const head of ["", "A".repeat(40), "g".repeat(40), "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), `${"a".repeat(40)}\n`, `${"a".repeat(64)}\r\n`]) {
+    await expect(run(decodeSessionPresence({ ...presence, workspace: { cwd: "/work/project", git: { ...available, branch: "main", head } } }))).rejects.toThrow();
+  }
+  for (const git of [
+    { ...available, head: null },
+    { ...available, branch: null },
+    { state: "not-repository", observedAt: 190, worktreeRoot: "/work/project" },
+    { state: "unavailable", observedAt: -1 },
+  ]) {
+    await expect(run(decodeSessionPresence({ ...presence, workspace: { cwd: "/work/project", git } }))).rejects.toThrow();
+  }
+});
+
+it("rejects obsolete flat metadata and unknown or private fields within every metadata group", async () => {
+  for (const obsolete of [
+    { machineName: "Mac" }, { os: { platform: "darwin" } }, { kind: "primary" }, { provider: "provider" },
+    { model: "model" }, { profile: "careful" }, { agent: "reviewer" }, { cwd: "/work/project" }, { repository: "/work/project" },
+  ]) {
+    await expect(run(decodeSessionPresence({ ...presence, ...obsolete }))).rejects.toThrow();
+  }
+  for (const extra of [
+    { machine: { name: "Mac", transcript: "private" } },
+    { machine: { os: { platform: "darwin", prompt: "private" } } },
+    { agent: { name: "reviewer", instructions: "private" } },
+    { model: { id: "model", messages: ["private"] } },
+    { workspace: { cwd: "/work/project", transcript: "private" } },
+    { workspace: { cwd: "/work/project", project: { root: "/work/project", source: "native", prompt: "private" } } },
+    { workspace: { cwd: "/work/project", git: { state: "unavailable", observedAt: 190, stderr: "private" } } },
+    { workspace: { project: { root: "/work/project", source: "native" } } },
+    { workspace: { cwd: "/work/project", project: { root: "/work/project", source: "inferred" } } },
+  ]) {
+    const invalid = { ...presence, ...extra };
+    await expect(run(decodeSessionPresence(invalid))).rejects.toThrow();
+    await expect(run(decodeSessionInspection({ ...createInspection(presence, 300), presence: invalid }))).rejects.toThrow();
+  }
+});
 const provenance: MetricProvenance = {
   source: "claude.statusline", scope: "latest-native-update", scopeDescription: "Latest response input, not lifetime session usage",
   observedAt: 150, nativeUpdatedAt: 100, estimated: false, derived: false, shared: false, partial: true, stale: true,
@@ -76,8 +149,22 @@ it("requires canonical private token paths without restricting native metadata",
   for (const tokenFile of ["private/token", "", "/private/\0token", "/private/token\r", "/private/token\n", "/private/../token", "/private//token", "/private/./token", "/private/token/"]) {
     await expect(run(decodeConnectorConfig({ ...config, tokenFile }))).rejects.toThrow();
   }
-  const metadata = { ...presence, cwd: "relative/native", repository: "native\nmetadata" };
+  const metadata: SessionPresence = { ...presence, workspace: { cwd: "relative/native", project: { root: "native\nmetadata", source: "native" } } };
   assert.deepStrictEqual(await run(decodeSessionPresence(metadata)), metadata);
+});
+
+it("validates explicitly configured project roots with private path rules and bounded labels", async () => {
+  const config = { inspectorUrl: "https://inspector.example", project: { root: "/work/project", id: "stable-project", name: "Project" } };
+  assert.deepStrictEqual(await run(decodeConnectorConfig(config)), config);
+  for (const root of ["work/project", "", "/work/\0project", "/work/project\r", "/work/project\n", "/work/../project", "/work//project", "/work/./project", "/work/project/"]) {
+    await expect(run(decodeConnectorConfig({ ...config, project: { ...config.project, root } }))).rejects.toThrow();
+  }
+  for (const project of [
+    { root: "/work/project", id: "" }, { root: "/work/project", id: "x".repeat(257) },
+    { root: "/work/project", name: "" }, { root: "/work/project", name: "x".repeat(513) },
+    { root: "/work/project", source: "configured" }, { root: "/work/project", transcript: "private" },
+    { id: "missing-root" },
+  ]) await expect(run(decodeConnectorConfig({ ...config, project }))).rejects.toThrow();
 });
 
 it("allows local capture without credentials but rejects invalid credentials and obsolete client settings", async () => {
