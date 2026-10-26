@@ -151,6 +151,7 @@ const program = Effect.gen(function*() {
   yield* verify.equal(observation.context.contextUsedTokens.status, "unavailable");
   yield* verify.equal(observation.tokens.nativeAggregate.totalTokens.status, "unavailable");
   yield* verify.equal(observation.cost.nativeAggregate.totalCostUsd.status, "unavailable");
+  const nativeHarnesses = yield* Config.Boolean("COORDINATOR_SMOKE_NATIVE").pipe(Config.withDefault(true));
   const nativeResults: Array<{ harness: string; status: string }> = [];
   // Synthetic native envelopes exercise the built CLI, not a live Hermes provider request.
   const hermesHome = join(root, "hermes space's");
@@ -168,22 +169,32 @@ const program = Effect.gen(function*() {
     yield* verify.equal(yield* child.exitCode, 0, yield* Fiber.join(errors));
     return (yield* Fiber.join(output)).trim();
   });
-  yield* git(["init", "--initial-branch=main"]);
-  yield* git(["-c", "user.name=Smoke", "-c", "user.email=smoke@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "local smoke fixture"]);
-  const gitHead = yield* git(["rev-parse", "HEAD"]);
-  yield* git(["worktree", "add", "-b", "smoke-linked", worktreeRoot]);
+  let gitHead: string | undefined;
+  if (nativeHarnesses) {
+    yield* git(["init", "--initial-branch=main"]);
+    yield* git(["-c", "user.name=Smoke", "-c", "user.email=smoke@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "local smoke fixture"]);
+    gitHead = yield* git(["rev-parse", "HEAD"]);
+    yield* git(["worktree", "add", "-b", "smoke-linked", worktreeRoot]);
+  } else {
+    // The API-only production image intentionally has no Git executable.
+    yield* fs.makeDirectory(worktreeRoot, { mode: 0o700 });
+  }
   const project = { root: hermesHome, source: "configured", id: "smoke-project", name: "Explicit smoke scope" } as const;
   const verifyWorkspace = (session: SessionPresence, cwd = worktreeRoot, branch = "smoke-linked") => Effect.gen(function*() {
     yield* verify.equal(session.workspace?.cwd, cwd, "Native cwd must survive workspace grouping");
     yield* verify.deepEqual(session.workspace?.project, project, "Private configured project must survive list/inspect");
     const association = session.workspace?.git;
-    yield* verify.equal(association?.state, "available", "Actual local Git association must be available");
-    if (association?.state !== "available") return;
-    yield* verify.equal(association.worktreeRoot, cwd);
-    yield* verify.equal(association.commonDir, join(repositoryRoot, ".git"), "Linked worktrees must share the actual common Git directory");
-    yield* verify.equal(association.branch, branch);
-    yield* verify.equal(association.head, gitHead);
-    yield* verify.ok(association.observedAt > 0 && association.observedAt <= (yield* Clock.currentTimeMillis));
+    yield* verify.ok(association !== undefined && association.observedAt > 0 && association.observedAt <= (yield* Clock.currentTimeMillis));
+    if (nativeHarnesses) {
+      yield* verify.equal(association?.state, "available", "Actual local Git association must be available");
+      if (association?.state !== "available") return;
+      yield* verify.equal(association.worktreeRoot, cwd);
+      yield* verify.equal(association.commonDir, join(repositoryRoot, ".git"), "Linked worktrees must share the actual common Git directory");
+      yield* verify.equal(association.branch, branch);
+      yield* verify.equal(association.head, gitHead);
+    } else {
+      yield* verify.ok(association?.state === "not-repository" || association?.state === "unavailable", "API-image metadata must report an honest negative Git observation");
+    }
     for (const key of ["machineName", "os", "kind", "provider", "profile", "cwd", "repository"]) {
       yield* verify.ok(!Object.hasOwn(session, key), `Legacy flat metadata must be absent: ${key}`);
     }
@@ -323,7 +334,8 @@ const program = Effect.gen(function*() {
   const outsideSession = yield* waitForSession("hermes", outsideSessionId, hermesMachineId);
   yield* verify.equal(outsideSession.workspace?.cwd, outsideRoot);
   yield* verify.equal(outsideSession.workspace?.project, undefined, "Configured project must not attach outside its root on the same installation");
-  yield* verify.equal(outsideSession.workspace?.git?.state, "not-repository", "Changing cwd cannot retain a stale repository");
+  const outsideGitState = outsideSession.workspace?.git?.state;
+  yield* verify.ok(outsideGitState === "not-repository" || (!nativeHarnesses && outsideGitState === "unavailable"), "Changing cwd cannot retain a stale repository");
   yield* hermesHook("on_session_finalize", { old_session_id: outsideSessionId }, "", hermesHome, outsideRoot);
   yield* hermesConnector.kill();
   yield* hermesConnector.exitCode;
@@ -353,7 +365,6 @@ const program = Effect.gen(function*() {
       : Effect.fail(error),
     onSuccess: () => verify.fail("Other-owner installation inspection accepted"),
   }));
-  const nativeHarnesses = yield* Config.Boolean("COORDINATOR_SMOKE_NATIVE").pipe(Config.withDefault(true));
   const harnesses: ReadonlyArray<"pi" | "omp"> = nativeHarnesses ? ["pi", "omp"] : [];
   const startupRequest = new TextEncoder().encode('{"id":"coordinator-startup","type":"get_state"}\n');
   for (const harness of harnesses) {
@@ -589,7 +600,7 @@ const program = Effect.gen(function*() {
   yield* otherConnector.kill();
   yield* otherConnector.exitCode;
   yield* Console.log(JSON.stringify({ scenario: "ephemeral-inspector", status: "ok", authenticatedHttpMcp: true, outboundConnector: true,
-    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, groupedMetadata: true, realGitWorktree: true, explicitProjectScope: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
+    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, groupedMetadata: true, realGitWorktree: nativeHarnesses, explicitProjectScope: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
 });
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("120 seconds"), Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer, NodeHttpClient.layerUndici, Mcp.layer))));
