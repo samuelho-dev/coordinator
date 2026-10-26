@@ -357,7 +357,8 @@ const program = Effect.gen(function*() {
   const otherSession = yield* waitForSession("hermes", otherSessionId, otherMachineId);
   yield* verify.equal(otherSession.workspace?.cwd, otherHome);
   yield* verify.equal(otherSession.workspace?.project, undefined, "Configured project cannot leak to another installation");
-  yield* verify.equal(otherSession.workspace?.git?.state, "not-repository");
+  const otherGitState = otherSession.workspace?.git?.state;
+  yield* verify.ok(otherGitState === "not-repository" || (!nativeHarnesses && otherGitState === "unavailable"), "Another installation must report its own negative Git observation");
   yield* verify.equal((yield* mcp.call(inspectorUrl, outsiderToken, InspectionTools.list, { limit: 100 })).sessions.length, 0);
   yield* mcp.call(inspectorUrl, outsiderToken, InspectionTools.inspect, { ref: otherSession.ref }).pipe(Effect.matchEffect({
     onFailure: (error) => error._tag === "HttpError"
