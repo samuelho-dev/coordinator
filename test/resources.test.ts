@@ -1,7 +1,8 @@
 import { NodeServices } from "@effect/platform-node";
-import { Effect, FileSystem, PlatformError } from "effect";
+import { Effect, Exit, FileSystem, PlatformError } from "effect";
 import { assert, it } from "@effect/vitest";
-import { identifyProcess, observeResources, parseDarwinSnapshot, type ResourceRoot } from "../src/resources.ts";
+import { identifyProcess, observeResources, observeSessionResources, projectSessionResources, parseDarwinSnapshot, type ResourceRoot, type ResourceProcess, type ResourceObservation, type SessionResourceTarget } from "../src/resources.ts";
+import { metric, unavailableMetric, type MachineResources, type MetricProvenance, type SessionPresence } from "../src/inspection.ts";
 import { Host } from "../src/platform.ts";
 
 const linuxHost = {
@@ -215,4 +216,179 @@ it.effect("marks ambiguous Darwin task zeroes unavailable without rejecting idle
   assert.strictEqual(snapshot.counters.get(12)?.cpuTimeMs, 1250);
   assert.strictEqual(snapshot.counters.get(12)?.rssBytes, 128 * 1024);
   assert.strictEqual(snapshot.truncated, false);
+}));
+
+const provenance: MetricProvenance = {
+  source: "fixture", scope: "cgroup", scopeDescription: "Fixture container",
+  observedAt: 1000, nativeUpdatedAt: null, estimated: false, derived: false, shared: true, partial: false, stale: false,
+};
+const capacity: MachineResources = {
+  scope: "cgroup", scopeId: "machine:fixture", source: "fixture", observedAt: 1000,
+  cpu: { capacityCores: metric("cores", 2, provenance), usagePercent: unavailableMetric("percent-one-core"), usedPercent: unavailableMetric("percent") },
+  memory: { capacityBytes: metric("bytes", 1000, provenance), usedBytes: unavailableMetric("bytes"), availableBytes: unavailableMetric("bytes"), usedPercent: unavailableMetric("percent") },
+};
+const session = (id: string, pid: number, ownership: "owned" | "shared" | "unknown" = "owned"): SessionPresence => ({
+  ref: { machineId: "fixture", harness: "omp", nativeSessionId: id }, observedAt: 1000,
+  machine: { resources: capacity }, processes: [{ pid, startIdentity: `birth:${pid}`, ownership }],
+});
+const processRow = (pid: number, ppid: number, cpuPercent: number | null, rssBytes: number | null): ResourceProcess => ({
+  pid, ppid, startTime: `birth:${pid}`, ownership: "exclusive", cpuPercent, rssBytes, cpuTimeMs: 500,
+  sampleStartedAt: 1000, sampledAt: 1200, windowMs: 200, unavailableReason: null,
+});
+const observation = (processes: readonly ResourceProcess[], partial = false): ResourceObservation => ({
+  processes, sampleStartedAt: 1000, sampledAt: 1200, windowMs: 200, ownedProcessCount: processes.length,
+  ownedCpuPercent: null, ownedRssBytes: null, sharedProcessCount: 0, unknownProcessCount: 0,
+  partial, truncated: false, unavailableReason: partial ? "incomplete" : null,
+});
+const target = (pid: number, before = capacity, after = before): SessionResourceTarget => ({
+  pid, startIdentity: `birth:${pid}`, before, after,
+});
+
+it.effect("normalizes actual session work and partitions separately identified child trees without duplicate charging", () => Effect.sync(() => {
+  const sessions = [session("parent", 10), session("child", 11)];
+  const rows = [processRow(10, 0, 150, 200), processRow(11, 10, 50, 100), processRow(12, 11, 25, 50)];
+  const result = projectSessionResources(sessions, observation(rows), [target(10), target(11)], 1200);
+  assert.strictEqual(result[0]?.resources?.cpuPercent.value, 150);
+  assert.strictEqual(result[0]?.resources?.cpuCapacityPercent.value, 75);
+  assert.strictEqual(result[0]?.resources?.rssCapacityPercent.value, 20);
+  assert.strictEqual(result[1]?.resources?.cpuPercent.value, 75);
+  assert.strictEqual(result[1]?.resources?.cpuCapacityPercent.value, 37.5);
+  assert.strictEqual(result[1]?.resources?.rssCapacityPercent.value, 15);
+  assert.deepStrictEqual(result[1]?.resources?.cpuPercent.provenance.sampleWindow, { startedAt: 1000, endedAt: 1200 });
+  const unclamped = projectSessionResources([session("parent", 10)], observation([processRow(10, 0, 500, 2000)]), [target(10)], 1200);
+  assert.strictEqual(unclamped[0]?.resources?.cpuCapacityPercent.value, 250);
+  assert.strictEqual(unclamped[0]?.resources?.rssCapacityPercent.value, 200);
+}));
+
+it.effect("reports shared measurements without splitting and restores exclusive attribution after a claimant retires", () => Effect.sync(() => {
+  const sample = observation([processRow(10, 0, 120, 300)]);
+  const shared = projectSessionResources([session("a", 10), session("b", 10)], sample, [target(10)], 1200);
+  for (const presence of shared) {
+    assert.strictEqual(presence.resources?.attribution, "shared");
+    assert.strictEqual(presence.resources?.cpuCapacityPercent.value, 60);
+    assert.strictEqual(presence.resources?.rssCapacityPercent.value, 30);
+    assert.strictEqual(presence.resources?.cpuPercent.provenance.shared, true);
+    assert.strictEqual(presence.resources?.rssCapacityPercent.provenance.shared, true);
+  }
+  const refreshed = { ...shared[0], ...session("a", 10) };
+  const remaining = projectSessionResources([refreshed], sample, [target(10)], 1200)[0]?.resources;
+  assert.strictEqual(remaining?.attribution, "owned");
+  assert.strictEqual(remaining?.cpuCapacityPercent.provenance.shared, false);
+  const explicit = projectSessionResources([session("explicit", 10, "shared")], sample, [target(10)], 1200)[0]?.resources;
+  assert.strictEqual(explicit?.attribution, "shared");
+  assert.strictEqual(explicit?.cpuCapacityPercent.provenance.scope, "process");
+  assert.strictEqual(projectSessionResources([session("unknown", 10, "unknown")], sample, [target(10)], 1200)[0]?.resources?.attribution, "unknown");
+}));
+
+it.effect("rejects missing stale nonpositive and changed denominators independently without hiding process use", () => Effect.sync(() => {
+  const sample = observation([processRow(10, 0, 100, 200)]);
+  const badCpu: MachineResources[] = [
+    { ...capacity, cpu: { ...capacity.cpu, capacityCores: unavailableMetric("cores") } },
+    { ...capacity, cpu: { ...capacity.cpu, capacityCores: metric("cores", 0, provenance) } },
+    { ...capacity, cpu: { ...capacity.cpu, capacityCores: metric("cores", 2, { ...provenance, stale: true }) } },
+    { ...capacity, cpu: { ...capacity.cpu, capacityCores: metric("cores", 4, provenance) } },
+  ];
+  for (const after of badCpu) {
+    const resources = projectSessionResources([session("a", 10)], sample, [target(10, capacity, after)], 1200)[0]?.resources;
+    assert.strictEqual(resources?.cpuPercent.value, 100);
+    assert.strictEqual(resources?.cpuCapacityPercent.status, "unavailable");
+    assert.strictEqual(resources?.rssCapacityPercent.value, 20);
+  }
+  const memoryMissing = { ...capacity, memory: { ...capacity.memory, capacityBytes: unavailableMetric("bytes") } };
+  const resources = projectSessionResources([session("a", 10)], sample, [target(10, capacity, memoryMissing)], 1200)[0]?.resources;
+  assert.strictEqual(resources?.cpuCapacityPercent.value, 50);
+  assert.strictEqual(resources?.rssCapacityPercent.status, "unavailable");
+  const staleSource = { ...session("a", 10), machine: { resources: { ...capacity, cpu: { ...capacity.cpu, capacityCores: metric("cores", 2, { ...provenance, stale: true }) } } } };
+  assert.strictEqual(projectSessionResources([staleSource], sample, [target(10)], 1200)[0]?.resources?.cpuCapacityPercent.status, "unavailable");
+}));
+
+it.effect("never substitutes unrelated scope or changed birth and preserves inaccessible source summaries stale", () => Effect.sync(() => {
+  const presence = session("a", 10);
+  const sample = observation([processRow(10, 0, 100, 200)]);
+  const captured = projectSessionResources([presence], sample, [target(10)], 1200)[0];
+  if (!captured) assert.fail("Source summary missing");
+  for (const scopeId of [null, "machine:other"]) {
+    const other = { ...capacity, scopeId };
+    const inaccessible = projectSessionResources([captured], sample, [target(10, other)], 5000)[0]?.resources;
+    assert.strictEqual(inaccessible?.observedAt, 1200);
+    assert.strictEqual(inaccessible?.cpuCapacityPercent.value, 50);
+    assert.strictEqual(inaccessible?.cpuCapacityPercent.provenance.stale, true);
+    const changed = projectSessionResources([presence], sample, [target(10, capacity, other)], 1200)[0]?.resources;
+    assert.strictEqual(changed?.cpuCapacityPercent.status, "unavailable");
+    assert.strictEqual(changed?.rssCapacityPercent.status, "unavailable");
+  }
+  for (const startTime of [null, "birth:reused"]) {
+    const changed = projectSessionResources([presence], observation([{ ...processRow(10, 0, 100, 200), startTime }]), [target(10)], 1200)[0]?.resources;
+    assert.strictEqual(changed?.cpuPercent.status, "unavailable");
+    assert.strictEqual(changed?.rssBytes.status, "unavailable");
+  }
+  assert.strictEqual(projectSessionResources([presence], sample, [], 1200)[0]?.resources?.cpuPercent.status, "unavailable");
+}));
+
+it.effect("retains partial CPU or RSS honestly and marks unavailable sessions explicitly", () => Effect.sync(() => {
+  for (const [cpu, rss] of [[null, 200], [100, null]] as const) {
+    const resources = projectSessionResources([session("a", 10)], observation([processRow(10, 0, cpu, rss)], true), [target(10)], 1200)[0]?.resources;
+    assert.strictEqual(resources?.cpuPercent.value, cpu);
+    assert.strictEqual(resources?.rssBytes.value, rss);
+    assert.strictEqual(resources?.cpuCapacityPercent.value, cpu === null ? null : 50);
+    assert.strictEqual(resources?.rssCapacityPercent.value, rss === null ? null : 20);
+    assert.strictEqual(resources?.cpuPercent.provenance.partial, true);
+  }
+  const unbound = { ...session("a", 10), processes: [] };
+  const resources = projectSessionResources([unbound], null, [], 1200)[0]?.resources;
+  assert.strictEqual(resources?.attribution, "unknown");
+  assert.strictEqual(resources?.cpuPercent.status, "unavailable");
+  assert.strictEqual(resources?.rssBytes.status, "unavailable");
+}));
+
+it.effect("publishes unavailable unsupported observations without requiring a process scan", () => Effect.gen(function*() {
+  const result = yield* observeSessionResources([session("a", 10)]).pipe(
+    Effect.provide(NodeServices.layer), Effect.provideService(Host, { ...linuxHost, platform: "unsupported" }),
+  );
+  assert.strictEqual(result.sample, null);
+  assert.strictEqual(result.sessions[0]?.resources?.cpuCapacityPercent.status, "unavailable");
+  assert.strictEqual(result.sessions[0]?.resources?.rssCapacityPercent.status, "unavailable");
+}));
+
+it.live("reuses a single raw batch for bound sessions without machine denominators and preserves operational failures", () => Effect.gen(function*() {
+  let scans = 0;
+  const fs = FileSystem.makeNoop({
+    readDirectory: () => Effect.sync(() => { scans += 1; return ["10", "11", "12"]; }),
+    readFileString: (path) => Effect.sync(() => {
+      if (path === "/proc/sys/kernel/random/boot_id") return bootId;
+      if (!path.endsWith("/stat")) return "";
+      const pid = Number(path.split("/").at(2));
+      const fields = Array.from({ length: 22 }, (_, index) =>
+        index === 1 ? `${pid === 10 ? 0 : pid - 1}` : index === 19 ? `${pid}` : index === 11 ? `${scans * pid}` : index === 21 ? "3" : "0");
+      return `${pid} (fixture) ${fields.join(" ")}`;
+    }),
+  });
+  const presences: SessionPresence[] = [10, 11].map((pid) => ({
+    ref: { machineId: "fixture", harness: "omp", nativeSessionId: `${pid}` }, observedAt: 1000,
+    processes: [{ pid, startIdentity: `linux:${bootId}:${pid}`, ownership: "owned" }],
+  }));
+  const result = yield* observeSessionResources(presences).pipe(
+    Effect.provideService(FileSystem.FileSystem, fs), Effect.provide(NodeServices.layer), Effect.provideService(Host, linuxHost),
+  );
+  assert.strictEqual(scans, 2);
+  assert.strictEqual(result.sample?.processes.length, 3);
+  assert.strictEqual(result.sample?.ownedProcessCount, 3);
+  assert.strictEqual(result.sessions[0]?.resources?.cpuCapacityPercent.status, "unavailable");
+  assert.strictEqual(result.sessions[1]?.resources?.rssCapacityPercent.status, "unavailable");
+  const denied = PlatformError.systemError({ _tag: "PermissionDenied", module: "FileSystem", method: "readFile" });
+  const unavailable = yield* observeSessionResources(presences).pipe(
+    Effect.provideService(FileSystem.FileSystem, FileSystem.makeNoop({ readFileString: () => Effect.fail(denied) })),
+    Effect.provide(NodeServices.layer), Effect.provideService(Host, linuxHost),
+  );
+  assert.strictEqual(unavailable.sample, null);
+  assert.strictEqual(unavailable.sessions[0]?.resources?.cpuPercent.status, "unavailable");
+}));
+
+it.effect("does not swallow resource sampler defects", () => Effect.gen(function*() {
+  const defect = new Error("fixture implementation defect");
+  const exit = yield* observeSessionResources([session("a", 10)]).pipe(
+    Effect.provideService(FileSystem.FileSystem, FileSystem.makeNoop({ readFileString: () => Effect.die(defect) })),
+    Effect.provide(NodeServices.layer), Effect.provideService(Host, linuxHost), Effect.exit,
+  );
+  assert.deepStrictEqual(exit, Exit.die(defect));
 }));

@@ -1,6 +1,6 @@
 # Coordinator
 
-Read-only inspection of existing Pi, OMP, Claude Code, Codex CLI and Hermes sessions on Linux/macOS. Presence, native counters and on-demand CPU/RSS only: no conversations, prompt forwarding, task execution or agent control.
+Read-only inspection of existing Pi, OMP, Claude Code, Codex CLI and Hermes sessions on Linux/macOS. Presence, native counters, local machine/container CPU and memory, and per-session process CPU/RSS capacity: no conversations, prompt forwarding, task execution or agent control.
 
 ## Deployment and rollback
 
@@ -9,7 +9,7 @@ There are two parts: **one inspector service**, plus **native integrations on ea
 The API and setup CLI require Node >=22.19. Install the version-pinned release:
 
 ```sh
-npm install --global @samuelho-dev/coordinator@0.3.0-beta.6
+npm install --global @samuelho-dev/coordinator@0.3.0-beta.7
 ```
 
 For source development only, use a reviewed checkout with `pnpm install --frozen-lockfile && pnpm build` (pnpm 11.9.0). `coordinator-install --source` deliberately activates that exact local package; never source-link a native package manager's own `node_modules` directory.
@@ -18,7 +18,7 @@ The [esbuild build](scripts/build.ts) keeps Pi dependencies external and bundles
 
 Client and server code stays in [`src/mcp.ts`](src/mcp.ts). The `Mcp` layer contains only client calls; separate HTTP/stdio exports let native bundles discard server-only protocol and tool initialization.
 
-The grouped metadata/workspace contract introduced in `0.3.0-beta.5` is a breaking cutover from beta.4 and earlier APIs, publishers and readers. `0.3.0-beta.6` retains that contract and works with the existing beta.5 API; no API rollout is required.
+The grouped metadata/workspace contract introduced in `0.3.0-beta.5` is a breaking cutover from beta.4 and earlier APIs, publishers and readers. `0.3.0-beta.6` retains that contract and works with the beta.5 API. `0.3.0-beta.7` adds machine/session resource telemetry and requires matching API, native publisher and reader upgrades; deploy the API first.
 
 For Kubernetes, follow the [chart operator guide](deploy/helm/coordinator/README.md): provide an existing Secret, verified image digest and matching source SHA. The chart creates an inspector Deployment/internal Service, not native plugins, TLS routing, a database or runners. Operators own rollout and supervision. Existing broker state requires the guide's preservation/migration procedure; the plugin does not migrate or delete it.
 
@@ -109,8 +109,8 @@ The installer validates prerequisites and creates launchers/config fragments. `-
 
 | Target | Activation | Presence publisher |
 | --- | --- | --- |
-| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.6`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
-| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.6`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
+| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.7`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
+| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.7`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
 | Claude Code | `claude --plugin-dir "$PRIVATE/claude-host"`; approve generated hooks/MCP tools; preserve existing status-line configuration. | Separate `connector.sh`. |
 | Codex CLI | Merge generated `hooks/hooks.json` and coordinator `mcp.toml`; trust only Coordinator's handlers in native `/hooks`. | Separate `connector.sh`. |
 | Hermes | Merge generated hook entries and `mcp_servers.coordinator` from `mcp.yaml` into the selected profile; no Python plugin installation. | Separate `connector.sh`. |
@@ -127,9 +127,9 @@ Hook/status-line/notification capture is local and can initialize identity/cache
 
 ### Native session commands and Rex
 
-Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and returns pretty JSON (`{ "sessions": [...] }`) using Effect's JSON formatter, with native JSON syntax highlighting in the terminal. Each session preserves full native session/agent IDs, machine names/installation IDs, harness and all reported metadata: model/provider, workspace, activity, connection liveness, process identity and Rex association. Missing metadata is omitted; an empty listing returns `{ "sessions": [] }`. It reads the API directly, with no model turn, per-session resource sampling or separate MCP registration.
+Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and returns pretty JSON (`{ "sessions": [...] }`) using Effect's JSON formatter, with native JSON syntax highlighting in the terminal. Each session preserves full native session/agent IDs, machine names/installation IDs, harness and all reported metadata: model/provider, workspace, activity, connection liveness, process identity, resource usage and Rex association. Missing metadata is omitted; an empty listing returns `{ "sessions": [] }`. It reads published snapshots directly, with no model turn, on-demand per-session sampling or separate MCP registration.
 
-Unreleased presence groups optional metadata under `machine`, `agent`, `model` and `workspace`; absent facts/groups are omitted, with no old flat aliases:
+Presence groups optional metadata under `machine`, `agent`, `model` and `workspace`; absent facts/groups are omitted, with no old flat aliases:
 
 ```json
 {
@@ -156,6 +156,8 @@ Stock OMP 18.12.6 already owns OSC7501 through `terminal.programStatus`; Coordin
 
 For beta.5, coordinate a breaking cutover across the API, every publisher and every reader; beta.4 and earlier are incompatible. Deploy the matching API **before** upgrading clients, then deliberately reload native hosts, reader bridges and connectors together. Strict schemas reject new fields on older APIs, and older readers cannot decode the grouped presence. Preserve existing credentials and installation identity; there are no flat-field compatibility aliases.
 
+The beta.7 machine and session resource extensions require the same API-first cutover across matching native publishers and readers; older strict schemas reject the new fields.
+
 ## Coordinated migration
 
 This is a clean schema cutover, with no legacy aliases or compatibility shims. Existing owner-scoped credentials and installation identity remain valid for grouped metadata; do not rotate them merely for this change. For installations still using the older machine-bound configuration, a separately approved migration must provision owner keys privately, use server principals `{ id, owner, tokenHash }` and matching chart `health.token`, and replace manual client `machineId`/`stateDirectory` with endpoint/credential configuration (plus optional explicit `project`). Regenerate affected installer artifacts and deliberately restart the inspector and affected native hosts/bridges/connectors. These instructions do not perform a live rollout or rotate live keys.
@@ -163,13 +165,13 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. E
 
 ## Plugin publication
 
-The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.6`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.7`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
 For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.6
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.6
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.7
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.7
 ```
 
 Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
@@ -183,6 +185,8 @@ Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixe
 `0.3.0-beta.5` groups machine, agent, model and workspace metadata; adds cached Git worktree/common-directory/branch/HEAD observations and native or explicitly configured project association; and migrates every harness and private metadata cache. This requires matching API, publishers and readers, but no credential rotation, new runtime dependencies or OMP fork.
 
 `0.3.0-beta.6` removes server-only MCP protocol/tool initialization from native client bundles while keeping the implementation in `src/mcp.ts`. The wire contract, runtime dependencies, heartbeat timing and readiness probe are unchanged; the beta.5 API remains compatible.
+
+`0.3.0-beta.7` adds portable Linux host/cgroup and macOS CPU/RAM telemetry plus per-session CPU/RSS capacity percentages in list and inspect. Sampling uses the existing native publishing cadence and pinned Effect platform services, with explicit shared-process attribution, target-scope/PID birth checks, stale/unavailable readings, and complete list pagination. No new runtime dependency or monitoring backend is required. Deploy the matching API before updating and deliberately reloading native publishers/readers; existing credentials and installation identities remain valid.
 
 | Host | Publication route |
 | --- | --- |
@@ -233,7 +237,15 @@ Connector timeouts and HTTP 409/429/5xx retry and reannounce. HTTP 401/403 retry
 
 Only exposed native metadata/getters are observed; no transcript/screen scraping or retained prompt/tool contents. Pi/OMP use context/usage updates. Claude optionally adds status-line counters/native PID roster; Codex token counters require an already-attached app-server's v2 notifications. The `claude-statusline` / `codex-notification` stdin adapters do not attach to or launch agents. Hermes uses start, post-API, turn-end and finalize hooks: end means idle, finalize removes the record, and late callbacks cannot recreate it.
 
-CPU/RSS sampling runs only on inspection, over approximately 200 ms. PID plus OS birth identity protects attribution. OMP/Hermes host processes are shared, not exclusive session usage; CPU 100% means one core and RSS is not unique physical memory. Missing/unsupported fields are `unavailable`, never fabricated zeroes. Latest updates and aggregates stay separate, with cached ages and provenance flags retained. Exact fields/units live in [inspection.ts](src/inspection.ts), rather than a duplicate metric catalog here.
+Session process CPU/RSS is sampled over approximately 200 ms when publishing and inspecting; list reads the published snapshot rather than issuing one inspection per row. Optional presence `resources` reports `cpuPercent` (100% = one core), `cpuCapacityPercent`, `rssBytes`, `rssCapacityPercent`, `attribution`, `machineScopeId` and source observation time. CPU capacity share is `cpuPercent / capacityCores`; RSS capacity share is `100 * rssBytes / memoryCapacityBytes`, not unique physical RAM or memory pressure. Source/target scope and PID birth identity are checked before/after measurement. Invalid, stale or changing denominators are unavailable, never fabricated zeroes or a percentage of the inspector's machine.
+
+Publishers batch process roots into one interval; separately identified child-session roots in that batch are excluded from the parent's tree. Duplicate roots become explicit shared bindings, including later detail refreshes. OMP/Hermes host processes can serve multiple logical sessions: `attribution: "shared"` reports the measured shared group, not an exclusive charge or equal split. Do not sum overlapping/shared groups or RSS as unique physical memory. Missing ownership remains `unknown`. Detailed process rows remain available on inspection. Exact fields/units live in [inspection.ts](src/inspection.ts).
+
+Local environment telemetry is published as optional `machine.resources`, reusing the existing 10-second presence cadence; external native hooks also capture readings at source. It describes the agent's local machine/VM or identified Linux cgroup, never the inspector's machine. Linux cgroup v2, v1/hybrid and native macOS use direct local counters; no monitoring backend, cluster access, privileged mounts or additional daemon is required. Inaccessible target counters remain unavailable, and a connector in another scope cannot replace them with its own usage.
+
+CPU exposes one-core consumption, visible capacity in cores, and percentage of that capacity. Quota/cpuset/visible ancestor bounds are not reserved CPU; bursts are not clamped. The first sample, counter reset or scope change requires a new interval before CPU usage is available. Memory is cgroup-accounted usage on Linux cgroups, `MemTotal - MemAvailable` on ungrouped Linux, and `(active + inactive + wired + compressor-occupied pages) × actual page size` on macOS. The macOS value includes inactive cache, not Activity Monitor memory pressure; compressed pages are physical occupied pages, not their uncompressed size. Cgroups and macOS do not fabricate `availableBytes` from limit headroom or free pages.
+
+Each observation retains source, scope identity, timestamp, units, sample window and unavailable/stale provenance. Repeated session rows with the same `scopeId` share environment totals: never sum them. Session rows identify native agent sessions, not OS threads. Shutdown or expired observations remain explicitly stale; collection ends with the native runtime.
 
 ## Source
 
@@ -246,7 +258,8 @@ CPU/RSS sampling runs only on inspection, over approximately 200 ms. PID plus OS
 | [plugin.ts](src/plugin.ts) | Pi/OMP hooks, observers, tools and runtime ownership. |
 | [rex.ts](src/rex.ts) | Native Rex environment association and Pi-only scoped OSC reporting. |
 | [setup.ts](src/setup.ts) | Private self-host initialization, masked client prompts and authenticated configuration creation. |
-| [resources.ts](src/resources.ts) | Linux/macOS process identity and on-demand sampling. |
+| [resources.ts](src/resources.ts) | Linux/macOS process identity, batched session CPU/RSS capacity and detailed process sampling. |
+| [machine.ts](src/machine.ts) | Local Linux host/cgroup and macOS CPU/memory sampling, scope identity and shared interval state. |
 | [platform.ts](src/platform.ts) | Effect Node platform composition, scoped CLI stdin, and host/crypto/executable bindings. |
 | [main.ts](src/main.ts) | CLI entrypoints and layer composition. |
 

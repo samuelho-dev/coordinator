@@ -2,11 +2,11 @@ import { Clock, Context, Crypto, Deferred, Effect, Layer, type Scope } from "eff
 import { Hex } from "effect/encoding";
 import { equalDigests } from "./platform.ts";
 import {
-  INSPECTION_LIMIT, HttpError, sessionRefKey, unavailableMetric,
+  INSPECTION_LIMIT, HttpError, sessionRefKey, unavailableMetric, staleMachineResources, staleSessionResources,
   type ConnectorAccepted, type ConnectorAnnounce, type ConnectorDisconnect, type ConnectorPoll,
   type ConnectorPollResult, type ConnectorResult, type InspectorConfig, type InspectorPrincipal,
   type ProcessIdentity, type ProcessObservation, type SessionInspection, type SessionInspectInput, type SessionListInput,
-  type SessionListOutput, type SessionPresence, type SessionRef,
+  type SessionListOutput, type SessionPresence, type SessionRef, type Metric,
 } from "./inspection.ts";
 
 const LIVE_MS = 30_000;
@@ -109,12 +109,26 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
   };
   const sharedProcess = (session: Session, process: ProcessIdentity, shared: Set<string>) =>
     shared.has(machineProcessKey(session.presence.ref.machineId, process));
-  const normalizedPresence = (session: Session, shared: Set<string>, presence = session.presence): SessionPresence => ({
-    ...presence, connection: connection(session.connector),
-    ...(presence.processes === undefined ? {} : {
-      processes: presence.processes.map((process): ProcessIdentity => sharedProcess(session, process, shared) ? { ...process, ownership: "shared" } : process),
-    }),
-  });
+  const normalizedPresence = (session: Session, shared: Set<string>, presence = session.presence): SessionPresence => {
+    let resources = presence.resources;
+    if (resources && (resources.attribution === "shared" || presence.processes?.some((process) => process.ownership === "shared" || sharedProcess(session, process, shared)))) {
+      const markShared = <M extends Metric>(value: M): M => ({ ...value, provenance: { ...value.provenance, shared: true } });
+      resources = { ...resources, attribution: "shared", cpuPercent: markShared(resources.cpuPercent),
+        cpuCapacityPercent: markShared(resources.cpuCapacityPercent), rssBytes: markShared(resources.rssBytes),
+        rssCapacityPercent: markShared(resources.rssCapacityPercent) };
+    }
+    if (resources && (!live(session.connector) || wall() - resources.observedAt >= LIVE_MS)) resources = staleSessionResources(resources);
+    return {
+      ...presence, connection: connection(session.connector),
+      ...(presence.machine?.resources && (!live(session.connector) || wall() - presence.machine.resources.observedAt >= LIVE_MS) ? {
+        machine: { ...presence.machine, resources: staleMachineResources(presence.machine.resources) },
+      } : {}),
+      ...(resources ? { resources } : {}),
+      ...(presence.processes === undefined ? {} : {
+        processes: presence.processes.map((process): ProcessIdentity => sharedProcess(session, process, shared) ? { ...process, ownership: "shared" } : process),
+      }),
+    };
+  };
   const normalizedInspection = (session: Session, observation: SessionInspection): SessionInspection => {
     const shared = sharedProcesses(session.connector.owner);
     const seen = new Set<string>();

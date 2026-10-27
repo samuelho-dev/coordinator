@@ -5,7 +5,7 @@ import { assert, expect, it } from "@effect/vitest";
 import {
   createInspection, decodeConnectorAnnounce, decodeConnectorConfig, decodeConnectorResult, decodeInspectorConfig,
   decodeSessionInspection, decodeSessionListInput, decodeSessionListOutput, decodeSessionPresence, metric, sessionRefKey,
-  type MetricProvenance, type SessionGit, type SessionPresence,
+  type MachineResources, type MetricProvenance, type SessionGit, type SessionPresence,
 } from "../src/inspection.ts";
 
 const run = <A, E>(effect: Effect.Effect<A, E, Path.Path>) => Effect.runPromise(effect.pipe(Effect.provide(NodeServices.layer)));
@@ -24,6 +24,45 @@ const grouped: SessionPresence = {
     git: { state: "available", observedAt: 190, worktreeRoot: "/work/project", commonDir: "/work/main/.git", branch: "feature", head: "a".repeat(40) },
   },
 };
+
+const machineProvenance: MetricProvenance = { source: "linux-cgroup-v2", scope: "cgroup", scopeDescription: "Shared cgroup boundary", observedAt: 100, nativeUpdatedAt: null, estimated: false, derived: false, shared: true, partial: false, stale: false };
+const machineResources: MachineResources = {
+  scope: "cgroup", scopeId: "boot-boundary", source: "linux-cgroup-v2", observedAt: 100,
+  cpu: { usagePercent: metric("percent-one-core", 75, machineProvenance), capacityCores: metric("cores", 0.5, machineProvenance), usedPercent: metric("percent", 150, machineProvenance) },
+  memory: { usedBytes: metric("bytes", 10, machineProvenance), capacityBytes: metric("bytes", 100, machineProvenance), availableBytes: { status: "unavailable", value: null, unit: "bytes", reason: "No MemAvailable measurement", provenance: machineProvenance }, usedPercent: metric("percent", 10, machineProvenance) },
+};
+
+it("round trips fractional CPU capacity and quota bursts while rejecting malformed machine telemetry", async () => {
+  const value = { ...grouped, machine: { ...grouped.machine, resources: machineResources } };
+  assert.deepStrictEqual(await run(decodeSessionPresence(value)), value);
+  assert.deepStrictEqual((await run(decodeSessionInspection(createInspection(value, 200)))).presence, value);
+  for (const resources of [
+    { ...machineResources, scopeId: "" },
+    { ...machineResources, observedAt: -1 },
+    { ...machineResources, privatePath: "/sys/fs/cgroup/private" },
+    { ...machineResources, cpu: { ...machineResources.cpu, capacityCores: metric("cores", -1, machineProvenance) } },
+    { ...machineResources, cpu: { ...machineResources.cpu, capacityCores: metric("count", 1, machineProvenance) } },
+    { ...machineResources, memory: { ...machineResources.memory, usedBytes: metric("bytes", 0.5, machineProvenance) } },
+  ]) await expect(run(decodeSessionPresence({ ...value, machine: { resources } }))).rejects.toThrow();
+});
+
+it("validates per-session capacity units, fractional quotas and nonexclusive RSS fractions", async () => {
+  const resources: NonNullable<SessionPresence["resources"]> = {
+    observedAt: 100, machineScopeId: "boot-boundary", attribution: "shared",
+    cpuPercent: metric("percent-one-core", 75, machineProvenance), cpuCapacityPercent: metric("percent", 150, machineProvenance),
+    rssBytes: metric("bytes", 110, machineProvenance), rssCapacityPercent: metric("percent", 110, machineProvenance),
+  };
+  const value = { ...grouped, resources };
+  assert.deepStrictEqual((await run(decodeSessionPresence(value))).resources, resources);
+  for (const invalid of [
+    { ...resources, attribution: "proportional" },
+    { ...resources, cpuCapacityPercent: metric("percent-one-core", 50, machineProvenance) },
+    { ...resources, rssCapacityPercent: metric("percent", -1, machineProvenance) },
+    { ...resources, cpuCapacityPercent: metric("percent", Infinity, machineProvenance) },
+    { ...resources, rssBytes: metric("bytes", 0.5, machineProvenance) },
+    { ...resources, privatePath: "/proc/private" },
+  ]) await expect(run(decodeSessionPresence({ ...value, resources: invalid }))).rejects.toThrow();
+});
 
 it("round trips grouped metadata through public list, inspection and connector boundaries", async () => {
   const copy = JSON.parse(JSON.stringify(grouped));

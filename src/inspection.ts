@@ -45,8 +45,72 @@ export const ProgramStatus = Schema.Union([
 ]);
 export type ProgramStatus = typeof ProgramStatus.Type;
 
+export const MetricUnit = Schema.Literals(["count", "tokens", "bytes", "cores", "milliseconds", "percent", "percent-one-core", "usd", "premium-requests", "provider-defined"]);
+export type MetricUnit = typeof MetricUnit.Type;
+export const MetricProvenance = Schema.Struct({
+  source: Label,
+  scope: Schema.Literals(["host", "cgroup", "process", "owned-processes", "current-context", "latest-native-update", "native-aggregate", "sample-window", "unknown"]),
+  scopeDescription: Label,
+  observedAt: Schema.NullOr(Timestamp), nativeUpdatedAt: Schema.NullOr(Timestamp),
+  estimated: Schema.Boolean, derived: Schema.Boolean, shared: Schema.Boolean, partial: Schema.Boolean, stale: Schema.Boolean,
+  sampleWindow: Schema.optional(Schema.Struct({ startedAt: Timestamp, endedAt: Timestamp }).check(
+    Schema.makeFilter((window) => window.endedAt >= window.startedAt ? undefined : "Sample window must end after its start"),
+  )),
+});
+export type MetricProvenance = typeof MetricProvenance.Type;
+const metricSchema = <U extends MetricUnit, S extends Schema.Constraint>(unit: U, value: S) => Schema.Union([
+  Schema.Struct({ status: Schema.Literal("available"), value, unit: Schema.Literal(unit), provenance: MetricProvenance }),
+  Schema.Struct({ status: Schema.Literal("unavailable"), value: Schema.Null, reason: Label, unit: Schema.Literal(unit), provenance: MetricProvenance }),
+]);
+export const Metric = Schema.Union([
+  metricSchema("count", Count), metricSchema("tokens", Count), metricSchema("bytes", Count),
+  metricSchema("milliseconds", Nonnegative), metricSchema("percent", Percent), metricSchema("percent-one-core", Nonnegative),
+  metricSchema("cores", Nonnegative),
+  metricSchema("usd", Nonnegative), metricSchema("premium-requests", Nonnegative), metricSchema("provider-defined", Nonnegative),
+]);
+export type Metric = typeof Metric.Type;
+export const metric = <U extends MetricUnit>(unit: U, value: number, provenance: MetricProvenance): {
+  readonly status: "available"; readonly value: number; readonly unit: U; readonly provenance: MetricProvenance;
+} => ({ status: "available", value, unit, provenance });
+export const unavailableMetric = <U extends MetricUnit>(unit: U, reason = "Not provided by the native session", provenance: MetricProvenance = {
+  source: "unavailable", scope: "unknown", scopeDescription: "No native measurement available",
+  observedAt: null, nativeUpdatedAt: null, estimated: false, derived: false, shared: false, partial: false, stale: false,
+}): { readonly status: "unavailable"; readonly value: null; readonly reason: string; readonly unit: U; readonly provenance: MetricProvenance } => ({
+  status: "unavailable", value: null, reason, unit, provenance,
+});
+export const MachineResources = Schema.Struct({
+  scope: Schema.Literals(["host", "cgroup", "unknown"]), scopeId: Schema.NullOr(Id), source: Label, observedAt: Timestamp,
+  cpu: Schema.Struct({
+    usagePercent: metricSchema("percent-one-core", Nonnegative),
+    capacityCores: metricSchema("cores", Nonnegative), usedPercent: metricSchema("percent", Nonnegative),
+  }),
+  memory: Schema.Struct({
+    usedBytes: metricSchema("bytes", Count), capacityBytes: metricSchema("bytes", Count),
+    availableBytes: metricSchema("bytes", Count), usedPercent: metricSchema("percent", Nonnegative),
+  }),
+});
+export type MachineResources = typeof MachineResources.Type;
+export const staleMachineResources = (resources: MachineResources): MachineResources => {
+  const stale = <M extends Metric>(value: M): M => ({ ...value, provenance: { ...value.provenance, stale: true } });
+  return { ...resources,
+    cpu: { usagePercent: stale(resources.cpu.usagePercent), capacityCores: stale(resources.cpu.capacityCores), usedPercent: stale(resources.cpu.usedPercent) },
+    memory: { usedBytes: stale(resources.memory.usedBytes), capacityBytes: stale(resources.memory.capacityBytes), availableBytes: stale(resources.memory.availableBytes), usedPercent: stale(resources.memory.usedPercent) },
+  };
+};
+export const SessionResources = Schema.Struct({
+  observedAt: Timestamp, machineScopeId: Schema.NullOr(Id), attribution: Schema.Literals(["owned", "shared", "unknown"]),
+  cpuPercent: metricSchema("percent-one-core", Nonnegative), cpuCapacityPercent: metricSchema("percent", Nonnegative),
+  rssBytes: metricSchema("bytes", Count), rssCapacityPercent: metricSchema("percent", Nonnegative),
+});
+export type SessionResources = typeof SessionResources.Type;
+export const staleSessionResources = (resources: SessionResources): SessionResources => {
+  const stale = <M extends Metric>(value: M): M => ({ ...value, provenance: { ...value.provenance, stale: true } });
+  return { ...resources, cpuPercent: stale(resources.cpuPercent), cpuCapacityPercent: stale(resources.cpuCapacityPercent),
+    rssBytes: stale(resources.rssBytes), rssCapacityPercent: stale(resources.rssCapacityPercent) };
+};
 export const SessionMachine = Schema.Struct({
   name: Schema.optional(Label),
+  resources: Schema.optional(MachineResources),
   os: Schema.optional(Schema.Struct({ platform: Schema.Literals(["linux", "darwin"]), release: Schema.optional(Id), architecture: Schema.optional(Id) })),
 });
 export type SessionMachine = typeof SessionMachine.Type;
@@ -89,6 +153,7 @@ export const SessionPresence = Schema.Struct({
   rex: Schema.optional(Schema.Struct({ serverAddress: Schema.optional(RexText), blockId: Schema.optional(RexText), sessionId: Schema.optional(RexText) })),
   programStatus: Schema.optional(ProgramStatus),
   processes: Schema.optional(bounded(ProcessIdentity, 128)),
+  resources: Schema.optional(SessionResources),
   activity: Schema.optional(Schema.Struct({
     state: Schema.Literals(["idle", "working", "waiting", "stopped", "unknown"]),
     wait: Schema.optional(Schema.Literals(["api", "tool", "user", "approval", "unknown"])),
@@ -100,38 +165,6 @@ export const SessionPresence = Schema.Struct({
 });
 export type SessionPresence = typeof SessionPresence.Type;
 
-export const MetricUnit = Schema.Literals(["count", "tokens", "bytes", "milliseconds", "percent", "percent-one-core", "usd", "premium-requests", "provider-defined"]);
-export type MetricUnit = typeof MetricUnit.Type;
-export const MetricProvenance = Schema.Struct({
-  source: Label,
-  scope: Schema.Literals(["process", "owned-processes", "current-context", "latest-native-update", "native-aggregate", "sample-window", "unknown"]),
-  scopeDescription: Label,
-  observedAt: Schema.NullOr(Timestamp), nativeUpdatedAt: Schema.NullOr(Timestamp),
-  estimated: Schema.Boolean, derived: Schema.Boolean, shared: Schema.Boolean, partial: Schema.Boolean, stale: Schema.Boolean,
-  sampleWindow: Schema.optional(Schema.Struct({ startedAt: Timestamp, endedAt: Timestamp }).check(
-    Schema.makeFilter((window) => window.endedAt >= window.startedAt ? undefined : "Sample window must end after its start"),
-  )),
-});
-export type MetricProvenance = typeof MetricProvenance.Type;
-const metricSchema = <U extends MetricUnit, S extends Schema.Constraint>(unit: U, value: S) => Schema.Union([
-  Schema.Struct({ status: Schema.Literal("available"), value, unit: Schema.Literal(unit), provenance: MetricProvenance }),
-  Schema.Struct({ status: Schema.Literal("unavailable"), value: Schema.Null, reason: Label, unit: Schema.Literal(unit), provenance: MetricProvenance }),
-]);
-export const Metric = Schema.Union([
-  metricSchema("count", Count), metricSchema("tokens", Count), metricSchema("bytes", Count),
-  metricSchema("milliseconds", Nonnegative), metricSchema("percent", Percent), metricSchema("percent-one-core", Nonnegative),
-  metricSchema("usd", Nonnegative), metricSchema("premium-requests", Nonnegative), metricSchema("provider-defined", Nonnegative),
-]);
-export type Metric = typeof Metric.Type;
-export const metric = <U extends MetricUnit>(unit: U, value: number, provenance: MetricProvenance): {
-  readonly status: "available"; readonly value: number; readonly unit: U; readonly provenance: MetricProvenance;
-} => ({ status: "available", value, unit, provenance });
-export const unavailableMetric = <U extends MetricUnit>(unit: U, reason = "Not provided by the native session", provenance: MetricProvenance = {
-  source: "unavailable", scope: "unknown", scopeDescription: "No native measurement available",
-  observedAt: null, nativeUpdatedAt: null, estimated: false, derived: false, shared: false, partial: false, stale: false,
-}): { readonly status: "unavailable"; readonly value: null; readonly reason: string; readonly unit: U; readonly provenance: MetricProvenance } => ({
-  status: "unavailable", value: null, reason, unit, provenance,
-});
 const TokenMetric = metricSchema("tokens", Count);
 const CountMetric = metricSchema("count", Count);
 const TimeMetric = metricSchema("milliseconds", Nonnegative);

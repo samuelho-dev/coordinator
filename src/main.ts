@@ -8,6 +8,7 @@ import { Host, cliStdioLayer, serverLayer } from "./platform.ts";
 import { InspectorConfig, InspectionTools, SessionInspectInput } from "./inspection.ts";
 import { NativeError, connectExternal, loadConnectorConfig, resolveNativeConfig, readConnectorToken, readPrivateFile, projectHook, projectClaudeStatus, projectCodexNotification, writeNativeCache, writeHermesHook } from "./native.ts";
 import { runSetup } from "./setup.ts";
+import type { SessionPresence } from "./inspection.ts";
 
 const readInput = Effect.gen(function*() {
   const stdio = yield* Stdio.Stdio;
@@ -64,7 +65,16 @@ export const cli = (args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(fun
     inspect: (input: typeof SessionInspectInput.Type) => mcp.call(config.inspectorUrl, token, InspectionTools.inspect, input),
   };
   if (mode === "mcp") return yield* serveStdio(reader);
-  if (mode === "list") return yield* Console.log(JSON.stringify(yield* reader.list({ limit: 100 })));
+  if (mode === "list") {
+    const sessions: SessionPresence[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = yield* reader.list({ limit: 100, ...(cursor === undefined ? {} : { cursor }) });
+      sessions.push(...page.sessions);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor !== undefined);
+    return yield* Console.log(JSON.stringify({ sessions, nextCursor: null }));
+  }
   if (mode === "inspect") {
     const input = yield* Schema.decodeUnknownEffect(SessionInspectInput)(yield* readInput);
     return yield* Console.log(JSON.stringify(yield* reader.inspect(input)));

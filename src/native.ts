@@ -5,9 +5,12 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { Stream } from "effect";
 import { Mcp } from "./mcp.ts";
 import { INSPECTION_LIMIT, ConnectorConfig, ConnectorAnnounce, ConnectorAccepted, ConnectorPoll, ConnectorPollResult, ConnectorResult, ConnectorDisconnect, SessionInspection, createInspection, metric, unavailableMetric, sessionRefKey, type ObservationError, type SessionPresence, type SessionRef, type MetricProvenance, type MetricUnit } from "./inspection.ts";
-import { identifyProcess, observeResources, type ProcessIdentification } from "./resources.ts";
+import { identifyProcess, observeSessionResources, type ProcessIdentification } from "./resources.ts";
 import { readRexContext } from "./rex.ts";
 import { readWorkspace } from "./workspace.ts";
+import { makeMachineSampler } from "./machine.ts";
+import { staleMachineResources } from "./inspection.ts";
+import type { MachineResources } from "./inspection.ts";
 
 export class NativeError extends Data.TaggedError("NativeError")<{ readonly operation: string }> {}
 export type NativeConfig = ConnectorConfig & { readonly machineId: string; readonly stateDirectory: string };
@@ -129,12 +132,13 @@ export const resolveNativeConfig = (config: ConnectorConfig) => Effect.gen(funct
 }).pipe(sanitizeFileFinalizers("Resolve private native installation identity"), Effect.mapError(platformFailure("Resolve private native installation identity")));
 
 export const withProcessResources = (inspection: SessionInspection) => Effect.gen(function*() {
-  const roots = inspection.presence.processes ?? [];
-  if (roots.length === 0) {
+  const observed = yield* observeSessionResources([inspection.presence]);
+  inspection = { ...inspection, presence: observed.sessions[0] ?? inspection.presence };
+  const sample = observed.sample;
+  if (sample === null) {
     if (new TextEncoder().encode(JSON.stringify(inspection)).length > INSPECTION_LIMIT - 2 * 1024) return yield* new NativeError({ operation: "Native inspection exceeds connector budget" });
     return inspection;
   }
-  const sample = yield* observeResources(roots.map((root) => ({ pid: root.pid, startTime: root.startIdentity, ownership: root.ownership === "owned" ? "exclusive" : root.ownership })));
   const provenance = (scope: "process" | "owned-processes", shared: boolean, item?: typeof sample.processes[number]): MetricProvenance => ({
     source: "native-os", scope,
     scopeDescription: scope === "process" ? `Identified OS process; 100 percent is one core; RSS is not unique physical RAM; CPU monotonic sample interval ${item?.windowMs ?? "unknown"} milliseconds` : "Unique exclusively attributable process tree; overall sampling span; RSS sum is not unique physical RAM",
@@ -339,7 +343,9 @@ const cacheFile = (config: NativeConfig, ref: SessionRef) => Effect.gen(function
   const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(ref)));
   return path.join(config.stateDirectory, "native-observations", "v3-" + (ref.harness === "hermes" ? "hermes-" : "") + Hex.encode(digest) + ".json");
 });
-const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, ProcessIdentification>()) => Effect.gen(function*() {
+const matchingScope = (source: MachineResources | undefined, local: MachineResources) =>
+  source?.scopeId != null && source.scope === local.scope && source.scopeId === local.scopeId;
+const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, ProcessIdentification>(), localResources?: MachineResources) => Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const directory = path.join(config.stateDirectory, "native-observations");
@@ -350,13 +356,13 @@ const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, P
   for (const entry of entries) {
     if (!/^v3-(hermes-)?[a-f0-9]{64}\.json$/.test(entry)) continue;
     const file = path.join(directory, entry);
-    const parsed = yield* readPrivateFile(file).pipe(Effect.flatMap(json), Effect.map(Schema.decodeUnknownOption(Cache)), Effect.catch((error) => Console.error(JSON.stringify({ error: "Ignoring unsupported native cache", code: error._tag })).pipe(Effect.as(undefined))));
+    const parsed = yield* readPrivateFile(file).pipe(Effect.flatMap(json), Effect.map(Schema.decodeUnknownOption(Cache, { onExcessProperty: "error" })), Effect.catch((error) => Console.error(JSON.stringify({ error: "Ignoring unsupported native cache", code: error._tag })).pipe(Effect.as(undefined))));
     if (parsed === undefined || parsed._tag === "None") continue;
     const record = parsed.value;
     const ref = record.inspection.presence.ref;
     if (ref.machineId !== config.machineId || (yield* cacheFile(config, ref)) !== file) continue;
     let liveHermesHost = false;
-    if (ref.harness === "hermes" && record.inspection.presence.activity?.state !== "stopped") {
+    if (ref.harness === "hermes" && record.inspection.presence.activity?.state !== "stopped" && (!localResources || matchingScope(record.inspection.presence.machine?.resources, localResources))) {
       for (const binding of record.inspection.presence.processes ?? []) {
         let identity = hermesIdentities.get(binding.pid);
         if (identity === undefined) {
@@ -411,8 +417,15 @@ export const writeNativeCache = (config: NativeConfig, incoming: SessionInspecti
     const retainCounters = metadataOnly && presence !== incoming.presence;
     inspection = { ...(retainCounters ? old : incoming), presence, queriedAt: incoming.queriedAt, context: retainCounters && !incoming.presence.activity?.compacting ? old.context : incoming.context };
   }
+  const sampler = yield* makeMachineSampler(inspection.presence.processes?.[0]?.pid);
+  const resources = yield* sampler.read;
   const workspace = inspection.presence.workspace;
-  inspection = { ...inspection, presence: { ...inspection.presence, machine: yield* localMachine, ...(workspace ? { workspace: yield* refreshWorkspace(config, workspace, previous?.inspection.presence.workspace) } : {}) } };
+  inspection = { ...inspection, presence: { ...inspection.presence, machine: { ...(yield* localMachine), resources }, ...(workspace ? { workspace: yield* refreshWorkspace(config, workspace, previous?.inspection.presence.workspace) } : {}) } };
+  const observed = yield* observeSessionResources([
+    ...Array.from(records.entries()).filter(([file]) => file !== target).map(([, record]) => record.inspection.presence),
+    inspection.presence,
+  ]);
+  inspection = { ...inspection, presence: observed.sessions[observed.sessions.length - 1] ?? inspection.presence };
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
@@ -462,11 +475,15 @@ export const writeHermesHook = (config: NativeConfig, value: unknown, at?: numbe
     reasoningOutputTokens: numberMetric("tokens", usage?.reasoning_tokens, p), totalTokens: numberMetric("tokens", usage?.total_tokens, p),
   } } });
 });
-export const readNativeCache = (config: NativeConfig) => Effect.gen(function*() {
+export const readNativeCache = (config: NativeConfig, localResources?: MachineResources) => Effect.gen(function*() {
   const observations: SessionInspection[] = [];
   const hermesIdentities = new Map<number, ProcessIdentification>();
-  for (const record of (yield* cacheRecords(config, hermesIdentities)).values()) {
+  for (const record of (yield* cacheRecords(config, hermesIdentities, localResources)).values()) {
     const inspection = record.inspection;
+    if (localResources && !matchingScope(inspection.presence.machine?.resources, localResources)) {
+      observations.push(inspection);
+      continue;
+    }
     const alive = [];
     for (const binding of inspection.presence.processes ?? []) {
       const identity = inspection.presence.ref.harness === "hermes" ? hermesIdentities.get(binding.pid) : yield* identifyProcess(binding.pid);
@@ -479,7 +496,7 @@ export const readNativeCache = (config: NativeConfig) => Effect.gen(function*() 
 });
 
 const ClaudeRoster = Schema.Array(Schema.Struct({ sessionId: Schema.optional(Id), id: Schema.optional(Id), pid: Schema.optional(Schema.Int), cwd: Schema.optional(Schema.String), kind: Schema.optional(Id), status: Schema.optional(Schema.Literals(["busy", "waiting", "idle"])), waitingFor: Schema.optional(Schema.String) })).check(Schema.isMaxLength(256));
-export const claudeRoster = (config: NativeConfig, previous = new Map<string, SessionInspection>()) => Effect.scoped(Effect.gen(function*() {
+export const claudeRoster = (config: NativeConfig, previous = new Map<string, SessionInspection>(), targetReads = new Map<string, Effect.Effect<MachineResources>>()) => Effect.scoped(Effect.gen(function*() {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const child = yield* spawner.spawn(ChildProcess.make("claude", ["agents", "--json"], { stdin: "ignore" }));
   yield* Effect.forkScoped(Stream.runDrain(child.stderr));
@@ -491,6 +508,7 @@ export const claudeRoster = (config: NativeConfig, previous = new Map<string, Se
   if ((yield* child.exitCode) !== 0) return yield* new NativeError({ operation: "Native Claude roster unavailable" });
   const roster = yield* decode(ClaudeRoster, yield* json(text));
   const sessions: SessionPresence[] = [];
+  const activeTargets = new Set<string>();
   for (const row of roster) {
     const id = row.sessionId ?? row.id;
     if (!id || !row.pid) continue;
@@ -499,19 +517,36 @@ export const claudeRoster = (config: NativeConfig, previous = new Map<string, Se
     const programStatus: SessionPresence["programStatus"] = row.waitingFor === "permission prompt" ? { state: "blocked", kind: "permission" } : row.status === "busy" ? { state: "working" } : row.status === "idle" ? { state: "idle" } : undefined;
     const ref: SessionRef = { machineId: config.machineId, harness: "claude", nativeSessionId: id };
     const old = previous.get(sessionRefKey(ref));
-    const sameHost = !old?.presence.processes?.length || old.presence.processes.some((binding) => binding.pid === row.pid && binding.startIdentity === identity.startTime);
+    const targetKey = JSON.stringify([row.pid, identity.startTime]);
+    activeTargets.add(targetKey);
+    let read = targetReads.get(targetKey);
+    if (!read) {
+      read = (yield* makeMachineSampler(row.pid)).read;
+      if (targetReads.size >= 256) targetReads.clear();
+      targetReads.set(targetKey, read);
+    }
+    const resources = yield* read;
+    const boundHost = old?.presence.processes?.some((binding) => binding.pid === row.pid && binding.startIdentity === identity.startTime) === true;
+    if (old?.presence.machine?.resources && !matchingScope(old.presence.machine.resources, resources) && !boundHost) continue;
+    const sameHost = !old?.presence.processes?.length || boundHost;
     const previousWorkspace = sameHost ? old?.presence.workspace : undefined;
     const workspace = row.cwd ? yield* refreshWorkspace(config, { cwd: row.cwd, ...(previousWorkspace?.cwd === row.cwd && previousWorkspace.project ? { project: previousWorkspace.project } : {}) }, previousWorkspace) : undefined;
-    sessions.push({ ref, machine: yield* localMachine, observedAt: yield* Clock.currentTimeMillis, ...(workspace ? { workspace } : {}), ...(row.kind ? { agent: { kind: row.kind } } : {}), ...(programStatus ? { programStatus } : {}), processes: [{ pid: row.pid, startIdentity: identity.startTime, ownership: "owned" }], activity: { state: row.status === "busy" ? "working" : row.status === "waiting" ? "waiting" : row.status === "idle" ? "idle" : "unknown", ...(row.waitingFor === "permission prompt" ? { wait: "approval", approval: "pending" } : {}) } });
+    const currentIdentity = yield* identifyProcess(row.pid);
+    if (currentIdentity.status !== "available" || currentIdentity.startTime !== identity.startTime) continue;
+    sessions.push({ ref, machine: { ...(yield* localMachine), resources }, observedAt: yield* Clock.currentTimeMillis, ...(workspace ? { workspace } : {}), ...(row.kind ? { agent: { kind: row.kind } } : {}), ...(programStatus ? { programStatus } : {}), processes: [{ pid: row.pid, startIdentity: identity.startTime, ownership: "owned" }], activity: { state: row.status === "busy" ? "working" : row.status === "waiting" ? "waiting" : row.status === "idle" ? "idle" : "unknown", ...(row.waitingFor === "permission prompt" ? { wait: "approval", approval: "pending" } : {}) } });
   }
+  for (const key of targetReads.keys()) if (!activeTargets.has(key)) targetReads.delete(key);
   return sessions;
 })).pipe(Effect.timeout("5 seconds"));
-export const connectExternal = (config: NativeConfig) => {
+export const connectExternal = (config: NativeConfig) => Effect.gen(function*() {
+  const sampler = yield* makeMachineSampler();
   let latest = new Map<string, SessionInspection>();
-  return connectNative(config, {
+  const targetReads = new Map<string, Effect.Effect<MachineResources>>();
+  return yield* connectNative(config, {
     presence: () => Effect.gen(function*() {
+      const localResources = yield* sampler.read;
       const previous = latest;
-      const cached = yield* readNativeCache(config);
+      const cached = yield* readNativeCache(config, localResources);
       const next = new Map<string, SessionInspection>();
       const rosterPrevious = new Map(previous);
       const now = yield* Clock.currentTimeMillis;
@@ -522,23 +557,38 @@ export const connectExternal = (config: NativeConfig) => {
         const oldWorkspace = presence !== observation.presence ? old?.presence.workspace : undefined;
         const workspace = observation.presence.workspace;
         const previousWorkspace = workspace && oldWorkspace?.cwd === workspace.cwd && oldWorkspace.git !== undefined && oldWorkspace.git.observedAt <= now && oldWorkspace.git.observedAt > (workspace.git?.observedAt ?? -1) ? oldWorkspace : workspace;
-        const refreshed = { ...observation, presence: { ...observation.presence, ...(workspace ? { workspace: yield* refreshWorkspace(config, workspace, previousWorkspace) } : {}) } };
+        const sourceResources = observation.presence.machine?.resources;
+        const sameScope = matchingScope(sourceResources, localResources);
+        const refreshed = { ...observation, presence: { ...observation.presence,
+          ...(sourceResources ? { machine: { ...observation.presence.machine, resources: sameScope ? localResources : staleMachineResources(sourceResources) } } : {}),
+          ...(workspace && sameScope ? { workspace: yield* refreshWorkspace(config, workspace, previousWorkspace) } : {}),
+        } };
         next.set(key, refreshed);
         rosterPrevious.set(key, refreshed);
       }
-      const roster = yield* claudeRoster(config, rosterPrevious).pipe(Effect.catch((error) => Effect.logDebug({ operation: "native Claude roster", code: error._tag }).pipe(Effect.as([]))));
+      const roster = yield* claudeRoster(config, rosterPrevious, targetReads).pipe(Effect.catch((error) => Effect.logDebug({ operation: "native Claude roster", code: error._tag }).pipe(Effect.as([]))));
       for (const presence of roster) {
         const old = next.get(sessionRefKey(presence.ref));
         const merged = old ? mergePresence(old.presence, presence) : presence;
         next.set(sessionRefKey(presence.ref), { ...(old && merged !== presence ? old : createInspection(presence, yield* Clock.currentTimeMillis)), presence: { ...merged, ...(presence.workspace ? { workspace: presence.workspace } : {}) } });
       }
+      const observed = yield* observeSessionResources(Array.from(next.values(), (observation) => observation.presence));
+      for (const presence of observed.sessions) {
+        const key = sessionRefKey(presence.ref);
+        const observation = next.get(key);
+        if (observation) next.set(key, { ...observation, presence });
+      }
       latest = next;
-      return Array.from(next.values(), (observation) => observation.presence);
+      return observed.sessions;
     }),
     inspect: (ref) => Effect.gen(function*() {
       const observation = latest.get(sessionRefKey(ref));
       if (!observation) return yield* new NativeError({ operation: "Native session unavailable" });
-      return yield* withProcessResources({ ...observation, queriedAt: yield* Clock.currentTimeMillis });
+      const source = observation.presence.machine?.resources;
+      if (!source || source.scopeId === null || source.cpu.capacityCores.provenance.stale) return { ...observation, queriedAt: yield* Clock.currentTimeMillis };
+      const detailed = yield* withProcessResources({ ...observation, queriedAt: yield* Clock.currentTimeMillis });
+      latest.set(sessionRefKey(ref), detailed);
+      return detailed;
     }),
   });
-};
+});

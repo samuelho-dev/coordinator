@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { Crypto, Effect, Exit, Fiber, Scope } from "effect";
+import { Clock, Crypto, Effect, Exit, Fiber, Scope } from "effect";
 import { Hex } from "effect/encoding";
 import { NodeServices } from "@effect/platform-node";
 import { TestClock } from "effect/testing";
@@ -40,6 +40,80 @@ const provenance: MetricProvenance = {
   source: "native", scope: "process", scopeDescription: "Native process sample", observedAt: 5, nativeUpdatedAt: 4,
   estimated: false, derived: false, shared: false, partial: false, stale: false,
 };
+
+it.effect("marks disconnected and aged machine readings stale without rewriting source times", () => Effect.scoped(Effect.gen(function*() {
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
+  const at = yield* Clock.currentTimeMillis;
+  const p: MetricProvenance = { ...provenance, scope: "host", observedAt: at, sampleWindow: { startedAt: at, endedAt: at }, shared: true };
+  const resources = {
+    scope: "host" as const, scopeId: "boot", source: "linux-proc", observedAt: at,
+    cpu: { usagePercent: metric("percent-one-core", 50, p), capacityCores: metric("cores", 2, p), usedPercent: metric("percent", 25, p) },
+    memory: { usedBytes: metric("bytes", 20, p), capacityBytes: metric("bytes", 100, p), availableBytes: metric("bytes", 80, p), usedPercent: metric("percent", 20, p) },
+  };
+  const source = { ...presence, machine: { ...presence.machine, resources } };
+  yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [source] });
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions[0]?.machine?.resources?.cpu.usagePercent.provenance.stale, false);
+  yield* TestClock.adjust("31 seconds");
+  yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [source] });
+  const aged = (yield* inspector.list(reader, { limit: 10 })).sessions[0]?.machine?.resources;
+  assert.strictEqual(aged?.cpu.usagePercent.provenance.stale, true);
+  assert.strictEqual(aged?.memory.availableBytes.provenance.stale, true);
+  assert.strictEqual(aged?.observedAt, at);
+  assert.strictEqual(aged?.cpu.usagePercent.provenance.observedAt, at);
+  assert.deepStrictEqual(aged?.cpu.usagePercent.provenance.sampleWindow, p.sampleWindow);
+  assert.deepStrictEqual((yield* inspector.list(outsider, { limit: 10 })).sessions, []);
+  yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [{ ...source, machine: { ...source.machine, resources: { ...resources, observedAt: yield* Clock.currentTimeMillis } } }] });
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions[0]?.machine?.resources?.cpu.capacityCores.provenance.stale, false);
+  yield* inspector.disconnect(publisher, identity);
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions[0]?.machine?.resources?.cpu.capacityCores.provenance.stale, true);
+})));
+
+it.effect("preserves per-session percentages while demoting duplicate process claims and aging source readings", () => Effect.scoped(Effect.gen(function*() {
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
+  const at = yield* Clock.currentTimeMillis;
+  const p = { ...provenance, observedAt: at };
+  const resources: NonNullable<SessionPresence["resources"]> = {
+    observedAt: at, machineScopeId: "boot", attribution: "owned",
+    cpuPercent: metric("percent-one-core", 250, p), cpuCapacityPercent: metric("percent", 62.5, p),
+    rssBytes: metric("bytes", 800, p), rssCapacityPercent: metric("percent", 80, p),
+  };
+  const first: SessionPresence = { ...presence, resources, processes: [{ pid: 123, startIdentity: "birth", ownership: "owned" }] };
+  yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [first] });
+  const exclusive = (yield* inspector.list(reader, { limit: 10 })).sessions[0]?.resources;
+  assert.strictEqual(exclusive?.attribution, "owned");
+  assert.strictEqual(exclusive?.cpuCapacityPercent.value, 62.5);
+  assert.strictEqual(exclusive?.rssCapacityPercent.provenance.shared, false);
+  const second: SessionPresence = { ...first, ref: { ...first.ref, nativeSessionId: "second" } };
+  const otherIdentity = { connectorId: "second-connector", incarnation: "first" };
+  yield* inspector.announce(publisher, { ...otherIdentity, machineId: "mac", sessions: [second] });
+  const shared = (yield* inspector.list(reader, { limit: 10 })).sessions;
+  for (const row of shared) {
+    assert.strictEqual(row.resources?.attribution, "shared");
+    assert.strictEqual(row.resources?.cpuCapacityPercent.value, 62.5);
+    assert.strictEqual(row.resources?.rssCapacityPercent.value, 80);
+    assert.ok(row.resources);
+    for (const value of [row.resources.cpuPercent, row.resources.cpuCapacityPercent, row.resources.rssBytes, row.resources.rssCapacityPercent]) {
+      assert.strictEqual(value.provenance.shared, true);
+    }
+  }
+  const query = yield* Effect.forkChild(inspector.inspect(reader, { ref: first.ref }), { startImmediately: true });
+  const request = (yield* inspector.poll(publisher, identity)).requests[0];
+  assert.ok(request);
+  yield* inspector.complete(publisher, { ...identity, requestId: request.requestId, observation: createInspection(first, at) });
+  assert.strictEqual((yield* Fiber.join(query)).presence.resources?.attribution, "shared");
+  yield* inspector.disconnect(publisher, otherIdentity);
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions.find((row) => row.ref.nativeSessionId === first.ref.nativeSessionId)?.resources?.attribution, "owned");
+  yield* TestClock.adjust("31 seconds");
+  yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [first] });
+  const aged = (yield* inspector.list(reader, { limit: 10 })).sessions.find((row) => row.ref.nativeSessionId === first.ref.nativeSessionId)?.resources;
+  assert.strictEqual(aged?.cpuCapacityPercent.provenance.stale, true);
+  assert.strictEqual(aged?.rssCapacityPercent.provenance.stale, true);
+  assert.strictEqual(aged?.observedAt, at);
+  assert.strictEqual(aged?.cpuCapacityPercent.value, 62.5);
+  yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [{ ...first, resources: { ...resources, observedAt: yield* Clock.currentTimeMillis } }] });
+  yield* inspector.disconnect(publisher, identity);
+  assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions.find((row) => row.ref.nativeSessionId === first.ref.nativeSessionId)?.resources?.rssCapacityPercent.provenance.stale, true);
+})));
 
 it.effect("authenticates owner keys across machines while isolating owners and connector principals", () => Effect.scoped(Effect.gen(function*() {
   const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));

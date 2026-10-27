@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { Cause, Clock, ConfigProvider, Crypto, Deferred, Effect, Fiber, FileSystem, Layer, Logger, Path, PlatformError, Queue, Random, References, Schedule, Schema, Stream } from "effect";
+import { Cause, Clock, ConfigProvider, Console, Crypto, Deferred, Effect, Fiber, FileSystem, Layer, Logger, Path, PlatformError, Queue, Random, References, Schedule, Schema, Stream } from "effect";
 import type { Scope } from "effect";
 import { Hex } from "effect/encoding";
 import { TestClock } from "effect/testing";
@@ -9,11 +9,13 @@ import { NodeServices } from "@effect/platform-node";
 import { claudeRoster, connectExternal, connectNative, projectHook, projectClaudeStatus, projectCodexNotification, writeNativeCache, writeHermesHook, readNativeCache, readPrivateFile, loadConnectorConfig, readConnectorToken, resolveNativeConfig, withProcessResources } from "../src/native.ts";
 import type { NativeConfig, NativeNotice } from "../src/native.ts";
 import type { ConnectorConfig, InspectorPrincipal, SessionPresence } from "../src/inspection.ts";
-import { ConnectorAnnounce, ConnectorResult, INSPECTION_LIMIT, HttpError, decodeConnectorResult, decodeSessionInspection, sessionRefKey } from "../src/inspection.ts";
+import { ConnectorAnnounce, ConnectorResult, INSPECTION_LIMIT, HttpError, SessionInspection, decodeConnectorResult, decodeSessionInspection, sessionRefKey } from "../src/inspection.ts";
 import { Inspector } from "../src/inspector.ts";
-import { Mcp } from "../src/mcp.ts";
+import { Mcp, serve } from "../src/mcp.ts";
 import { Host, checkExecutable, serverLayer } from "../src/platform.ts";
+import type { MachineResources } from "../src/inspection.ts";
 import { cli } from "../src/main.ts";
+import { identifyProcess } from "../src/resources.ts";
 
 const fixture = <A, E>(effect: Effect.Effect<A, E, NodeServices.NodeServices | Host | Scope.Scope | HttpClient.HttpClient>) => Effect.scoped(effect.pipe(Effect.provide(FetchHttpClient.layer), Effect.provide(NodeServices.layer), Effect.provide(Host.layer)));
 const expectFailure = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.gen(function*() {
@@ -222,6 +224,35 @@ it.live("starts authenticated readers without creating or requiring writable ins
     assert.strictEqual((yield* fs.readFileString(blocked)), "unchanged");
     assert.deepStrictEqual(((yield* fs.readDirectory(directory))).sort(), ["not-a-directory"]);
 })));
+
+it.live("prints every session when real inspector byte limits require multiple CLI list pages", () => fixture(Effect.gen(function*() {
+  const transport = yield* Mcp.make;
+  const console = yield* Console.Console;
+  const crypto = yield* Crypto.Crypto;
+  const token = "pagination-owner-key";
+  const tokenHash = Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(token)));
+  const inspector = yield* Inspector.make({ host: "127.0.0.1", port: 0, principals: [{ id: "pagination", owner: "owner", tokenHash }] });
+  const principal = yield* inspector.authorize(token);
+  const records = Array.from({ length: 30 }, (_, index): SessionPresence => ({
+    ref: { machineId: "machine", harness: "omp", nativeSessionId: `session-${String(index).padStart(2, "0")}` },
+    observedAt: 1, workspace: { cwd: `/${"p".repeat(3000)}` },
+  }));
+  for (let start = 0; start < records.length; start += 10) {
+    yield* inspector.announce(principal, { connectorId: `part-${start}`, incarnation: "current", machineId: "machine", sessions: records.slice(start, start + 10) });
+  }
+  assert.notStrictEqual((yield* inspector.list(principal, { limit: 100 })).nextCursor, null);
+  const server = yield* HttpServer.HttpServer;
+  yield* serve(server, inspector);
+  const printed: unknown[] = [];
+  yield* cli(["list"]).pipe(
+    Effect.provideService(Mcp, transport),
+    Effect.provideService(Console.Console, { ...console, log: (...values) => { printed.push(...values); } }),
+    Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord({ COORDINATOR_API_URL: HttpServer.formatAddress(server.address), COORDINATOR_API_TOKEN: token })),
+  );
+  const result = JSON.parse(String(printed[0]));
+  assert.deepStrictEqual(result.sessions.map((entry: SessionPresence) => entry.ref), records.map((entry) => entry.ref));
+  assert.strictEqual(result.nextCursor, null);
+}).pipe(Effect.provide(serverLayer("127.0.0.1", 0)))));
 
 it.live("startup hooks capture all three native harnesses without waiting for a stalled inspector", () => fixture(Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
@@ -434,24 +465,91 @@ it.live("projects Claude roster groups while reusing the previous local workspac
     if (ChildProcess.isStandardCommand(command) && command.command === "claude") {
       return spawner.spawn(ChildProcess.make(host.executable, ["-e", `console.log(${JSON.stringify(JSON.stringify(rows))})`], { stdin: "ignore" }));
     }
-    gitCalls++;
+    if (ChildProcess.isStandardCommand(command) && command.command === "git") gitCalls++;
     return spawner.spawn(command);
   } };
-  const first = (yield* claudeRoster(config).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner))).at(0);
+  const targetReads = new Map<string, Effect.Effect<MachineResources>>();
+  const first = (yield* claudeRoster(config, new Map(), targetReads).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner))).at(0);
   if (!first) return yield* Effect.die("Missing roster session");
   assert.deepStrictEqual(first.agent, { kind: "native-agent" });
   assert.deepStrictEqual(first.workspace?.project, { root: directory, id: "configured", source: "configured" });
   assert.strictEqual(first.workspace?.cwd, cwd);
   assert.strictEqual(first.machine?.name, host.hostname);
+  assert.ok(first.machine?.resources, "Roster-only sessions must publish source machine telemetry");
+  yield* decodeSessionInspection({ ...(yield* projectClaudeStatus("machine", { session_id: "session" })), presence: first });
+  assert.strictEqual(targetReads.size, 1);
   assert.strictEqual(first.model, undefined);
   assert.ok(gitCalls > 0);
   const initialGitCalls = gitCalls;
   const inspection = yield* projectClaudeStatus("machine", { session_id: "session" });
   const previous = new Map([[sessionRefKey(first.ref), { ...inspection, presence: first }]]);
-  const second = (yield* claudeRoster(config, previous).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner))).at(0);
+  const second = (yield* claudeRoster(config, previous, targetReads).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner))).at(0);
   assert.deepStrictEqual(second?.workspace, first.workspace);
   assert.strictEqual(gitCalls, initialGitCalls);
+  assert.ok(second?.machine?.resources);
+  assert.strictEqual(targetReads.size, 1, "The source PID baseline must survive roster refresh");
+  const source = first.machine;
+  if (!source?.resources) return yield* Effect.die("Missing roster source telemetry");
+  const unrelated = { ...first, processes: [], machine: { ...source, resources: { ...source.resources, scopeId: "unrelated-source" } } };
+  const mismatched = yield* claudeRoster(config, new Map([[sessionRefKey(first.ref), { ...inspection, presence: unrelated }]]), targetReads).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner));
+  assert.deepStrictEqual(mismatched, [], "Roster identity without a matching source scope or PID birth must not replace hook telemetry");
+  rows.length = 0;
+  assert.deepStrictEqual(yield* claudeRoster(config, new Map(), targetReads).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner)), []);
+  assert.strictEqual(targetReads.size, 0, "Removed source processes must release sampling baselines");
 })));
+
+it.live("batches cached and roster sessions sharing a host before publishing normalized process capacity", () => fixture(Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const host = yield* Host;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const server = yield* HttpServer.HttpServer;
+  const directory = yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-session-capacity-" });
+  yield* fs.chmod(directory, 0o700);
+  const config: NativeConfig = { inspectorUrl: HttpServer.formatAddress(server.address), apiToken: "capacity-fixture", machineId: "machine", stateDirectory: directory };
+  const identity = yield* identifyProcess(host.pid);
+  if (identity.status !== "available") return yield* Effect.die("Missing fixture process identity");
+  const inspection = yield* projectClaudeStatus("machine", { session_id: "cached" });
+  yield* writeNativeCache(config, { ...inspection, presence: { ...inspection.presence, processes: [{ pid: host.pid, startIdentity: identity.startTime, ownership: "owned" }] } });
+  const announcements = yield* Queue.unbounded<ReadonlyArray<SessionPresence>>();
+  const requests = yield* Queue.unbounded<SessionPresence["ref"]>();
+  const details = yield* Queue.unbounded<typeof ConnectorResult.Type>();
+  yield* server.serve(Effect.gen(function*() {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    if (request.url === "/connector/announce") {
+      yield* Queue.offer(announcements, (yield* Schema.decodeUnknownEffect(ConnectorAnnounce)(yield* request.json)).sessions);
+    } else if (request.url === "/connector/poll") {
+      const ref = yield* Queue.take(requests);
+      return HttpServerResponse.jsonUnsafe({ requests: [{ requestId: "capacity", ref }] });
+    } else if (request.url === "/connector/result") {
+      yield* Queue.offer(details, yield* Schema.decodeUnknownEffect(ConnectorResult)(yield* request.json));
+    }
+    return HttpServerResponse.jsonUnsafe({ accepted: true });
+  }));
+  const nativeSpawner: typeof spawner = { ...spawner, spawn: (command) => ChildProcess.isStandardCommand(command) && command.command === "claude"
+    ? spawner.spawn(ChildProcess.make(host.executable, ["-e", `console.log(${JSON.stringify(JSON.stringify([{ sessionId: "roster", pid: host.pid, status: "idle" }]))})`], { stdin: "ignore" }))
+    : spawner.spawn(command) };
+  const connector = yield* connectExternal(config).pipe(Effect.scoped, Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner), Effect.provide(Mcp.layer), Effect.forkChild);
+  const sessions = yield* Queue.take(announcements);
+  assert.strictEqual(sessions.length, 2);
+  const first = sessions[0];
+  if (!first?.resources) return yield* Effect.die("Missing published capacity");
+  for (const presence of sessions) {
+    assert.deepStrictEqual(presence.resources, first.resources, "One shared batch must expose identical measured numbers and times");
+    assert.strictEqual(presence.resources?.attribution, "shared");
+    assert.strictEqual(presence.resources?.machineScopeId, presence.machine?.resources?.scopeId);
+    for (const value of [presence.resources?.cpuCapacityPercent, presence.resources?.rssCapacityPercent]) {
+      assert.strictEqual(value?.status, "available");
+      assert.strictEqual(value?.provenance.shared, true);
+    }
+  }
+  yield* Queue.offer(requests, first.ref);
+  const result = yield* Queue.take(details);
+  if (!("presence" in result.observation)) return yield* Effect.die("Missing inspection");
+  assert.strictEqual(result.observation.presence.resources?.attribution, "shared", "Singleton detail refresh must retain shared host ownership");
+  assert.strictEqual(result.observation.presence.resources?.cpuCapacityPercent.status, "available");
+  assert.strictEqual(result.observation.presence.resources?.rssCapacityPercent.status, "available");
+  yield* Fiber.interrupt(connector);
+}).pipe(Effect.provide(serverLayer("127.0.0.1", 0)))), 30000);
 
 it.effect("refreshes idle cached publishers without hooks and recomputes projects independently of Git TTL", () => fixture(Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
@@ -528,6 +626,11 @@ it.effect("refreshes idle cached publishers without hooks and recomputes project
     Effect.forkChild,
   );
   const first = yield* Queue.take(announcements);
+  for (const presence of first) {
+    assert.strictEqual(presence.resources?.attribution, "unknown");
+    assert.strictEqual(presence.resources?.cpuCapacityPercent.status, "unavailable");
+    assert.strictEqual(presence.resources?.rssCapacityPercent.status, "unavailable");
+  }
   const checkDetail = Effect.gen(function*() {
     const result = yield* Queue.take(details);
     assert.ok("presence" in result.observation);
@@ -589,6 +692,21 @@ it.effect("refreshes idle cached publishers without hooks and recomputes project
   assert.strictEqual(gitCalls, refreshedCalls, "Refreshed in-memory Git must beat the older hook file cache");
   for (const presence of removed) assert.deepStrictEqual(presence.workspace?.project, presence.ref.nativeSessionId === "native-project" ? { root, source: "native" } : undefined);
   assert.deepStrictEqual(yield* Effect.forEach(files, (file) => fs.readFileString(path.join(namespace, file))), original);
+  for (const file of files) {
+    const cache = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ version: Schema.Literal(3), kind: Schema.Literal("inspection"), expiresAt: Schema.Finite, inspection: SessionInspection })))(yield* fs.readFileString(path.join(namespace, file)));
+    const source = cache.inspection.presence.machine;
+    if (!source?.resources) return yield* Effect.die("Missing source machine telemetry");
+    yield* fs.writeFileString(path.join(namespace, file), JSON.stringify({ ...cache, inspection: { ...cache.inspection, presence: { ...cache.inspection.presence, machine: { ...source, resources: { ...source.resources, scopeId: "different-source-boundary" } } } } }));
+  }
+  const mismatched = yield* next;
+  for (const presence of mismatched) {
+    assert.strictEqual(presence.machine?.resources?.scopeId, "different-source-boundary");
+    assert.strictEqual(presence.machine?.resources?.cpu.capacityCores.provenance.stale, true);
+    assert.strictEqual(presence.machine?.resources?.observedAt, at);
+    assert.strictEqual(presence.resources?.cpuCapacityPercent.provenance.stale, true);
+    assert.strictEqual(presence.resources?.rssCapacityPercent.provenance.stale, true);
+  }
+  assert.strictEqual(gitCalls, refreshedCalls, "A connector must not refresh unrelated source environments");
   yield* Fiber.interrupt(connector);
 }).pipe(Effect.provide(serverLayer("127.0.0.1", 0)))));
 
@@ -717,6 +835,18 @@ it.live("keeps native Hermes idle presence tied to the shared host without refre
     assert.strictEqual(observation.presence.lastActivityAt, at + 2);
     assert.ok(observation.presence.observedAt > at + 120000);
     assert.deepStrictEqual(observation.presence.processes?.map((binding) => [binding.pid, binding.ownership]), [[host.pid, "shared"]]);
+    const summary = observation.presence.resources;
+    const capacity = observation.presence.machine?.resources;
+    if (!summary || !capacity) return yield* Effect.die("Source cache omitted session capacity");
+    assert.strictEqual(summary.attribution, "shared");
+    assert.strictEqual(summary.machineScopeId, capacity.scopeId);
+    for (const value of [summary.cpuPercent, summary.cpuCapacityPercent, summary.rssBytes, summary.rssCapacityPercent]) {
+      assert.strictEqual(value.status, "available");
+      assert.strictEqual(value.provenance.shared, true);
+      assert.ok(value.value !== null && value.value >= 0 && Number.isFinite(value.value));
+    }
+    if (summary.cpuPercent.value !== null && capacity.cpu.capacityCores.value !== null) assert.strictEqual(summary.cpuCapacityPercent.value, summary.cpuPercent.value / capacity.cpu.capacityCores.value);
+    if (summary.rssBytes.value !== null && capacity.memory.capacityBytes.value !== null) assert.strictEqual(summary.rssCapacityPercent.value, 100 * summary.rssBytes.value / capacity.memory.capacityBytes.value);
     const usage = observation.tokens.latestNativeUpdate;
     assert.deepStrictEqual([usage.inputTokens.value, usage.outputTokens.value, usage.cacheReadTokens.value, usage.cacheWriteTokens.value, usage.reasoningOutputTokens.value, usage.totalTokens.value], [100, 0, 20, 0, 0, 100]);
     for (const counter of Object.values(usage)) {
@@ -730,6 +860,9 @@ it.live("keeps native Hermes idle presence tied to the shared host without refre
     assert.strictEqual(resources.resources.processes.at(0)?.process.ownership, "shared");
     assert.strictEqual(resources.resources.ownedRssBytes.status, "unavailable");
     assert.strictEqual(resources.resources.ownedCpuPercent.status, "unavailable");
+    assert.strictEqual(resources.presence.resources?.attribution, "shared");
+    assert.strictEqual(resources.presence.resources?.cpuCapacityPercent.status, "available");
+    assert.strictEqual(resources.presence.resources?.rssCapacityPercent.status, "available");
     assert.ok(new TextEncoder().encode(JSON.stringify(resources)).length < INSPECTION_LIMIT);
     const namespace = path.join(directory, "native-observations");
     for (const file of (yield* fs.readDirectory(namespace))) assert.strictEqual(((yield* fs.readFileString(path.join(namespace, file)))).includes("secret"), false);

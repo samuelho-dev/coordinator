@@ -1,6 +1,8 @@
-import { Clock, Data, Effect, FileSystem, Option, Schema, Stream } from "effect";
+import { Clock, Crypto, Data, Effect, FileSystem, Option, Path, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { Host } from "./platform.ts";
+import { metric, unavailableMetric, staleSessionResources, sessionRefKey, type SessionPresence, type SessionResources, type MachineResources, type Metric, type MetricProvenance } from "./inspection.ts";
+import { makeMachineSampler } from "./machine.ts";
 
 export interface ResourceRoot {
   readonly pid: number;
@@ -334,4 +336,149 @@ export const observeResources = (roots: ReadonlyArray<ResourceRoot>): Effect.Eff
     partial, truncated: first.truncated || second.truncated,
     unavailableReason: partial ? first.unavailable.values().next().value ?? second.unavailable.values().next().value ?? "incomplete-process-observation" : null,
   };
+});
+
+export interface SessionResourceTarget {
+  readonly pid: number;
+  readonly startIdentity: string;
+  readonly before: MachineResources;
+  readonly after: MachineResources;
+}
+
+/** Project one process sample; stop descendant attribution at the nearest known session root. */
+export const projectSessionResources = (
+  presences: readonly SessionPresence[],
+  sample: ResourceObservation | null,
+  targets: readonly SessionResourceTarget[],
+  observedAt: number,
+): readonly SessionPresence[] => {
+  const key = (pid: number, birth: string) => `${pid}:${birth}`;
+  const claims = new Map<string, Set<string>>();
+  const roots = new Set<number>();
+  for (const presence of presences) for (const root of presence.processes ?? []) {
+    roots.add(root.pid);
+    const identity = key(root.pid, root.startIdentity);
+    const owners = claims.get(identity) ?? new Set<string>();
+    owners.add(sessionRefKey(presence.ref));
+    claims.set(identity, owners);
+  }
+  const processes = new Map(sample?.processes.map((row) => [row.pid, row]) ?? []);
+  const targetMap = new Map(targets.map((target) => [key(target.pid, target.startIdentity), target]));
+  return presences.map((presence) => {
+    const bindings = presence.processes ?? [];
+    const source = presence.machine?.resources;
+    const matched = bindings.map((binding) => targetMap.get(key(binding.pid, binding.startIdentity)));
+    const accessible = bindings.length > 0 && matched.every((target) => target !== undefined
+      && source?.scopeId !== null && source?.scopeId !== undefined && source.scopeId === target.before.scopeId);
+    if (!accessible && presence.resources) return { ...presence, resources: staleSessionResources(presence.resources) };
+    const selected: ResourceProcess[] = [];
+    const ownRoots = new Map(bindings.map((binding) => [binding.pid, binding]));
+    if (accessible && sample) for (const row of sample.processes) {
+      let current: ResourceProcess | undefined = row;
+      const visited = new Set<number>();
+      while (current && !visited.has(current.pid)) {
+        visited.add(current.pid);
+        if (roots.has(current.pid)) {
+          const binding = ownRoots.get(current.pid);
+          if (binding && current.startTime === binding.startIdentity) selected.push(row);
+          break;
+        }
+        current = current.ppid === null ? undefined : processes.get(current.ppid);
+      }
+    }
+    const rootValid = accessible && bindings.every((binding) => {
+      const row = processes.get(binding.pid);
+      return row?.startTime === binding.startIdentity && row.unavailableReason === null;
+    });
+    const duplicateRoots = bindings.some((binding) => (claims.get(key(binding.pid, binding.startIdentity))?.size ?? 0) > 1);
+    const shared = duplicateRoots || bindings.some((binding) => binding.ownership === "shared");
+    const unknown = !rootValid || bindings.some((binding) => binding.ownership === "unknown")
+      || selected.some((row) => row.ownership === "unknown");
+    const attribution = shared ? "shared" : unknown ? "unknown" : "owned";
+    const provenance: MetricProvenance = {
+      source: "native-process-sample", scope: attribution === "owned" ? "owned-processes" : "process",
+      scopeDescription: "Session root and descendants, excluding separately identified session trees; RSS sums resident sets, not unique physical RAM",
+      observedAt: sample?.sampledAt ?? observedAt, nativeUpdatedAt: null,
+      estimated: false, derived: true, shared, partial: !rootValid || (sample?.partial ?? true), stale: false,
+      ...(sample && sample.sampledAt >= sample.sampleStartedAt ? { sampleWindow: { startedAt: sample.sampleStartedAt, endedAt: sample.sampledAt } } : {}),
+    };
+    const sum = (field: "cpuPercent" | "rssBytes") => {
+      if (!rootValid || selected.length === 0) return null;
+      const values = selected.flatMap((row) => row[field] === null ? [] : [row[field]]);
+      const result = values.reduce((total, value) => total + value, 0);
+      return values.length > 0 && Number.isFinite(result) ? result : null;
+    };
+    const cpu = sum("cpuPercent"), rss = sum("rssBytes");
+    const value = <U extends "percent-one-core" | "bytes" | "percent">(unit: U, amount: number | null, reason: string) =>
+      amount !== null && Number.isFinite(amount) && amount >= 0
+        ? metric(unit, amount, provenance) : unavailableMetric(unit, reason, provenance);
+    const denominator = (select: (machine: MachineResources) => Metric): number | null => {
+      if (!accessible || !source || source.scope === "unknown") return null;
+      const initial = select(source);
+      if (initial.status !== "available" || !Number.isFinite(initial.value) || initial.value <= 0 || initial.provenance.stale) return null;
+      for (const target of matched) {
+        if (!target || target.before.scope === "unknown" || target.after.scope === "unknown"
+          || target.before.scopeId !== source.scopeId || target.after.scopeId !== source.scopeId) return null;
+        for (const machine of [target.before, target.after]) {
+          const reading = select(machine);
+          if (reading.status !== "available" || reading.provenance.stale || reading.value !== initial.value) return null;
+        }
+      }
+      return initial.value;
+    };
+    const cores = denominator((machine) => machine.cpu.capacityCores);
+    const memory = denominator((machine) => machine.memory.capacityBytes);
+    const reason = bindings.length === 0 ? "No identified session process" : "Process observation unavailable or target identity/scope changed";
+    const resources: SessionResources = {
+      observedAt: sample?.sampledAt ?? observedAt, machineScopeId: source?.scopeId ?? null, attribution,
+      cpuPercent: value("percent-one-core", cpu, reason),
+      rssBytes: value("bytes", rss, reason),
+      cpuCapacityPercent: value("percent", cpu !== null && cores !== null ? cpu / cores : null, "CPU capacity unavailable, stale, or changed"),
+      rssCapacityPercent: value("percent", rss !== null && memory !== null ? 100 * rss / memory : null, "Memory capacity unavailable, stale, or changed"),
+    };
+    return { ...presence, ...(duplicateRoots ? { processes: bindings.map((binding): typeof binding =>
+      (claims.get(key(binding.pid, binding.startIdentity))?.size ?? 0) > 1 ? { ...binding, ownership: "shared" } : binding) } : {}), resources };
+  });
+};
+
+/** One interval for the entire batch, with target-local scope reads bracketing it. */
+export const observeSessionResources = (presences: readonly SessionPresence[]): Effect.Effect<{
+  sessions: readonly SessionPresence[];
+  sample: ResourceObservation | null;
+}, never, FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner | Host | Path.Path | Crypto.Crypto> => Effect.gen(function*() {
+  const candidates = new Map<string, { root: ResourceRoot; before: MachineResources; read: Effect.Effect<MachineResources> }>();
+  for (const presence of presences) for (const binding of presence.processes ?? []) {
+    const key = `${binding.pid}:${binding.startIdentity}`;
+    if (candidates.has(key)) continue;
+    const identity = yield* identifyProcess(binding.pid).pipe(Effect.catchTag("ResourceError", () => Effect.succeed(null)));
+    if (identity?.status !== "available" || identity.startTime !== binding.startIdentity) continue;
+    const sampler = yield* makeMachineSampler(binding.pid);
+    const before = yield* sampler.read;
+    if (presence.machine?.resources && (!before.scopeId || before.scopeId !== presence.machine.resources.scopeId)) continue;
+    const ownership = binding.ownership === "owned" ? "exclusive" : binding.ownership;
+    candidates.set(key, { root: { pid: binding.pid, startTime: binding.startIdentity, ownership }, before, read: sampler.read });
+  }
+  const claimants = new Map<string, Set<string>>();
+  for (const presence of presences) for (const binding of presence.processes ?? []) {
+    const key = `${binding.pid}:${binding.startIdentity}`;
+    const owners = claimants.get(key) ?? new Set<string>();
+    owners.add(sessionRefKey(presence.ref));
+    claimants.set(key, owners);
+    const candidate = candidates.get(key);
+    if (candidate && (owners.size > 1 || binding.ownership === "shared")) {
+      candidates.set(key, { ...candidate, root: { ...candidate.root, ownership: "shared" } });
+    } else if (candidate && binding.ownership === "unknown" && candidate.root.ownership !== "shared") {
+      candidates.set(key, { ...candidate, root: { ...candidate.root, ownership: "unknown" } });
+    }
+  }
+  const sample = candidates.size === 0 ? null : yield* observeResources([...candidates.values()].map((value) => value.root)).pipe(
+    Effect.catchTag("ResourceError", () => Effect.succeed(null)),
+  );
+  const targets: SessionResourceTarget[] = [];
+  for (const value of candidates.values()) {
+    const identity = yield* identifyProcess(value.root.pid).pipe(Effect.catchTag("ResourceError", () => Effect.succeed(null)));
+    if (identity?.status !== "available" || identity.startTime !== value.root.startTime) continue;
+    targets.push({ pid: value.root.pid, startIdentity: identity.startTime, before: value.before, after: yield* value.read });
+  }
+  return { sessions: projectSessionResources(presences, sample, targets, yield* Clock.currentTimeMillis), sample };
 });

@@ -9,6 +9,7 @@ import { ConnectorAccepted, ConnectorAnnounce, InspectionTools, InspectorConfig,
 import { Mcp, serve } from "../src/mcp.ts";
 import { connectNative, withProcessResources } from "../src/native.ts";
 import { identifyProcess } from "../src/resources.ts";
+import { makeMachineSampler } from "../src/machine.ts";
 
 const verify = {
   equal: (actual: unknown, expected: unknown, message = "Smoke equality failed") => Object.is(actual, expected) ? Effect.void : Effect.die(new Error(message)),
@@ -46,7 +47,7 @@ const program = Effect.gen(function*() {
   const searchPath = yield* Config.String("PATH").pipe(Config.withDefault("/usr/bin:/bin"));
   const mcp = yield* Mcp;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const root = yield* fs.makeTempDirectoryScoped({ prefix: "inspector-smoke-" });
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "inspector-smoke-" }).pipe(Effect.flatMap(fs.realPath));
   yield* fs.chmod(root, 0o700);
   const token = yield* crypto.randomUUIDv4(), siblingToken = yield* crypto.randomUUIDv4(), outsiderToken = yield* crypto.randomUUIDv4();
   const machineId = `smoke-${yield* crypto.randomUUIDv4()}`;
@@ -122,7 +123,7 @@ const program = Effect.gen(function*() {
     return yield* Effect.die(`Disposable ${harness} connector presence deadline expired`);
   });
   yield* waitForSession("pi", presence.ref.nativeSessionId);
-  yield* verify.equal(detailRequests, 0, "Presence/list must not sample native details or process resources");
+  yield* verify.equal(detailRequests, 0, "Presence/list must not request native inspection details");
   const sameOwner = yield* mcp.call(inspectorUrl, siblingToken, InspectionTools.list, { machineId, limit: 100 });
   yield* verify.equal(sameOwner.sessions.length, 1);
   yield* verify.equal((yield* mcp.call(inspectorUrl, outsiderToken, InspectionTools.list, { limit: 100 })).sessions.length, 0);
@@ -180,6 +181,25 @@ const program = Effect.gen(function*() {
     yield* fs.makeDirectory(worktreeRoot, { mode: 0o700 });
   }
   const project = { root: hermesHome, source: "configured", id: "smoke-project", name: "Explicit smoke scope" } as const;
+  const verifySessionResources = (session: SessionPresence, attribution: "owned" | "shared") => Effect.gen(function*() {
+    const resources = session.resources;
+    const machine = session.machine?.resources;
+    if (!resources || !machine) return yield* verify.fail("Native list/inspect must include process and target capacity summaries");
+    yield* verify.equal(resources.attribution, attribution);
+    yield* verify.equal(resources.machineScopeId, machine.scopeId, "Process percentages must use the target execution scope");
+    for (const value of [resources.cpuPercent, resources.cpuCapacityPercent, resources.rssBytes, resources.rssCapacityPercent]) {
+      yield* verify.equal(value.status, "available", "Native process capacity measurement must be available");
+      yield* verify.ok(value.value !== null && Number.isFinite(value.value) && value.value >= 0);
+      yield* verify.equal(value.provenance.shared, attribution === "shared", "Shared host measurements must never appear exclusively owned");
+    }
+    if (resources.cpuPercent.value !== null && machine.cpu.capacityCores.value !== null) {
+      yield* verify.equal(resources.cpuCapacityPercent.value, resources.cpuPercent.value / machine.cpu.capacityCores.value);
+    }
+    if (resources.rssBytes.value !== null && machine.memory.capacityBytes.value !== null) {
+      yield* verify.equal(resources.rssCapacityPercent.value, 100 * resources.rssBytes.value / machine.memory.capacityBytes.value);
+      yield* verify.ok(resources.rssBytes.value > 0);
+    }
+  });
   const verifyWorkspace = (session: SessionPresence, cwd = worktreeRoot, branch = "smoke-linked") => Effect.gen(function*() {
     yield* verify.equal(session.workspace?.cwd, cwd, "Native cwd must survive workspace grouping");
     yield* verify.deepEqual(session.workspace?.project, project, "Private configured project must survive list/inspect");
@@ -274,11 +294,13 @@ const program = Effect.gen(function*() {
   const hermes = yield* waitForSession("hermes", hermesId, hermesMachineId);
   yield* verify.equal(hermes.activity?.state, "idle", "Turn end retains Hermes identity as idle");
   yield* verifyWorkspace(hermes, repositoryRoot, "main");
+  yield* verifySessionResources(hermes, "shared");
   const hermesUsage = yield* mcp.call(inspectorUrl, token, InspectionTools.inspect, { ref: hermes.ref });
   yield* verify.equal(hermesUsage.presence.agent?.profile, "synthetic-profile");
   yield* verify.equal(hermesUsage.presence.model?.provider, "synthetic-provider");
   yield* verify.equal(hermesUsage.presence.model?.id, "synthetic-model");
   yield* verifyWorkspace(hermesUsage.presence, repositoryRoot, "main");
+  yield* verifySessionResources(hermesUsage.presence, "shared");
   yield* verify.deepEqual(hermesUsage.presence.processes, [{ pid: host.pid, startIdentity: identity.startTime, ownership: "shared" }]);
   yield* verify.equal(hermesUsage.resources.processes[0]?.process.pid, host.pid);
   yield* verify.equal(hermesUsage.resources.processes[0]?.rssBytes.status, "available");
@@ -467,6 +489,7 @@ const program = Effect.gen(function*() {
             const displayedNative = content.sessions.find((entry) => entry.ref.machineId === hermesMachineId && entry.ref.harness === harness);
             if (displayedNative === undefined) return yield* verify.fail("Displayed native session missing");
             yield* verifyWorkspace(displayedNative);
+            yield* verifySessionResources(displayedNative, harness === "omp" ? "shared" : "owned");
             yield* verify.ok(!result.content.includes(token));
             yield* Deferred.succeed(listVerified, undefined);
             return;
@@ -503,7 +526,20 @@ const program = Effect.gen(function*() {
     yield* verify.equal(native.rex?.blockId, rex.blockId);
     yield* verify.deepEqual(native.programStatus, { state: "idle" }, "Native startup has a known idle status");
     yield* verifyWorkspace(native);
+    yield* verifySessionResources(native, harness === "omp" ? "shared" : "owned");
     yield* verify.ok(native.machine?.name !== undefined && native.machine.os?.platform !== undefined, "Native machine facts must use the grouped shape");
+    const expectedMachine = yield* (yield* makeMachineSampler()).read;
+    const nativeMachine = native.machine?.resources;
+    if (!nativeMachine) return yield* verify.fail("Native presence must publish its local execution environment");
+    yield* verify.equal(nativeMachine.scope, expectedMachine.scope, "Native telemetry must not broaden container scope to the node");
+    yield* verify.equal(nativeMachine.scopeId, expectedMachine.scopeId, "Parent and native child must identify the same execution environment");
+    for (const { actual, expected } of [
+      { actual: nativeMachine.cpu.capacityCores, expected: expectedMachine.cpu.capacityCores },
+      { actual: nativeMachine.memory.capacityBytes, expected: expectedMachine.memory.capacityBytes },
+    ]) {
+      yield* verify.equal(actual.status, "available", "Native execution capacity must be measured");
+      yield* verify.equal(actual.value, expected.value, "Native capacity must agree with an independent local sampler");
+    }
     if (harness === "omp") yield* verify.deepEqual(native.model, { provider: "inspector-smoke", id: "inspector-smoke" });
     const beforeList = detailRequests;
     yield* Deferred.succeed(runList, undefined);
@@ -512,6 +548,7 @@ const program = Effect.gen(function*() {
     const inspected = yield* mcp.call(inspectorUrl, token, InspectionTools.inspect, { ref: native.ref });
     yield* verify.equal(inspected.presence.ref.harness, harness);
     yield* verifyWorkspace(inspected.presence);
+    yield* verifySessionResources(inspected.presence, harness === "omp" ? "shared" : "owned");
     yield* verify.equal(native.ref.machineId, hermesMachineId, "Pi, OMP and hooks share one local installation identity");
     yield* verify.equal((yield* fs.readFileString(join(home, "state", "coordinator", "machine-id"))).trim(), hermesMachineId);
     const discovered = yield* mcp.call(inspectorUrl, token, InspectionTools.list, { limit: 100 });
@@ -601,7 +638,7 @@ const program = Effect.gen(function*() {
   yield* otherConnector.kill();
   yield* otherConnector.exitCode;
   yield* Console.log(JSON.stringify({ scenario: "ephemeral-inspector", status: "ok", authenticatedHttpMcp: true, outboundConnector: true,
-    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, groupedMetadata: true, realGitWorktree: nativeHarnesses, explicitProjectScope: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
+    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, groupedMetadata: true, localMachineTelemetry: nativeHarnesses, realGitWorktree: nativeHarnesses, explicitProjectScope: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
 });
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("120 seconds"), Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer, NodeHttpClient.layerUndici, Mcp.layer))));

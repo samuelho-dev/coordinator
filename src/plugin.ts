@@ -7,10 +7,12 @@ import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, Progr
 import { Mcp } from "./mcp.ts";
 import { connectNative, loadConnectorConfig, NativeError, readConnectorToken, resolveNativeConfig, withProcessResources } from "./native.ts";
 import type { NativeNotice } from "./native.ts";
-import { identifyProcess } from "./resources.ts";
+import { identifyProcess, observeSessionResources } from "./resources.ts";
 import { Host as PlatformHost } from "./platform.ts";
 import { createRexReporter, readRexContext } from "./rex.ts";
 import { readWorkspace } from "./workspace.ts";
+import { makeMachineSampler } from "./machine.ts";
+import type { MachineResources } from "./inspection.ts";
 import { highlightCode, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
@@ -350,11 +352,18 @@ export default function plugin(host: Host): void {
     rexReporter?.update(observer.presence()?.programStatus, terminal);
     // Native TUI constructors register core keywords before session_start hooks.
     if (harness === "omp" && ctx.hasUI && ctx.mode === "tui") yield* registerCoordinateKeyword;
+    const sampler = yield* makeMachineSampler();
+    let machineResources: MachineResources | undefined;
+    let latestPresence: SessionPresence | undefined;
     runtime.runFork(connectNative(nativeConfig, {
       presence: () => Effect.gen(function*() {
+        const resources = yield* sampler.read;
         yield* observer?.refreshWorkspace(config?.project ? { ...config.project, source: "configured" } : undefined) ?? Effect.void;
+        machineResources = resources;
         const p = observer?.presence();
-        return p ? [p] : [];
+        const observed = yield* observeSessionResources(p ? [{ ...p, machine: { ...p.machine, resources } }] : []);
+        latestPresence = observed.sessions[0];
+        return observed.sessions;
       }),
       inspect: (ref) => Effect.gen(function*() {
         yield* observer?.refreshWorkspace(config?.project ? { ...config.project, source: "configured" } : undefined) ?? Effect.void;
@@ -362,7 +371,10 @@ export default function plugin(host: Host): void {
         if (!observation || sessionRefKey(ref) !== sessionRefKey(observation.presence.ref)) {
           return yield* new HttpError({ status: 404, message: "Native session unavailable" });
         }
-        return yield* withProcessResources(observation);
+        const summary = latestPresence && sessionRefKey(latestPresence.ref) === sessionRefKey(ref) ? latestPresence.resources : undefined;
+        const detailed = yield* withProcessResources({ ...observation, presence: { ...observation.presence, ...(summary ? { resources: summary } : {}), machine: { ...observation.presence.machine, ...(machineResources ? { resources: machineResources } : {}) } } });
+        latestPresence = detailed.presence;
+        return detailed;
       }),
       report: report(ctx),
     }).pipe(

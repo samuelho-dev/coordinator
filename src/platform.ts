@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
-import { arch, homedir, hostname, platform, release } from "node:os";
+import { arch, cpus, homedir, hostname, platform, release } from "node:os";
 import { NodeHttpServer, NodeStdio, NodeStream } from "@effect/platform-node";
 import { Context, Effect, FileSystem, Layer, PlatformError, Stdio } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -15,10 +15,12 @@ export class Host extends Context.Service<Host, {
   readonly ppid: number;
   readonly uid: number | undefined;
   readonly executable: string;
+  readonly cpuTimes?: Effect.Effect<ReadonlyArray<{ readonly user: number; readonly nice: number; readonly sys: number; readonly idle: number; readonly irq: number }>, PlatformError.PlatformError>;
 }>()("@samuelho-dev/coordinator/Host") {
   static readonly layer = Layer.sync(this, () => ({
     homeDirectory: homedir(), hostname: hostname(), release: release(), platform: platform(),
     architecture: arch(), pid: process.pid, ppid: process.ppid, uid: process.getuid?.(), executable: process.execPath,
+    cpuTimes: Effect.try({ try: () => cpus().map((cpu) => cpu.times), catch: (cause) => PlatformError.systemError({ _tag: "Unknown", module: "Host", method: "cpuTimes", cause }) }),
   }));
 }
 

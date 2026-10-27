@@ -1,13 +1,13 @@
 import { assert, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
-import { ConfigProvider, Context as EffectContext, Crypto, Deferred, Effect, Fiber, FileSystem, Layer, Path, Stream } from "effect";
+import { ConfigProvider, Context as EffectContext, Crypto, Deferred, Effect, Fiber, FileSystem, Layer, Path, Schema, Stream } from "effect";
 import { ChildProcess } from "effect/process";
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Host, serverLayer } from "../src/platform.ts";
 import { createNativeObserver, isCoordinateInput, transformCoordinateInput } from "../src/plugin.ts";
 import type { Context } from "../src/plugin.ts";
 import type { SessionListOutput } from "../src/inspection.ts";
-import { decodeConnectorResult } from "../src/inspection.ts";
+import { ConnectorAnnounce, decodeConnectorResult } from "../src/inspection.ts";
 import { Hex } from "effect/encoding";
 import { Inspector } from "../src/inspector.ts";
 import { Mcp, serve } from "../src/mcp.ts";
@@ -391,6 +391,20 @@ it("repairs startup and rotated credentials without leaking host hooks or shutdo
       if (request.url === "/connector/disconnect") {
         if (activeCase.startsWith("startup-")) yield* fs.writeFileString(path.join(activeHome, "disconnect"), "yes");
         return yield* Effect.interruptible(Effect.never);
+      }
+      if (request.url === "/connector/announce") {
+        const announcement = yield* Schema.decodeUnknownEffect(ConnectorAnnounce)(yield* request.json);
+        const presence = announcement.sessions.at(0);
+        const resources = presence?.resources;
+        if (!presence || !resources) return yield* Effect.die("Native publisher omitted session capacity summary");
+        const shared = activeCase !== "startup-pi";
+        assert.strictEqual(resources.attribution, shared ? "shared" : "owned");
+        assert.strictEqual(resources.machineScopeId, presence.machine?.resources?.scopeId);
+        for (const value of [resources.cpuPercent, resources.cpuCapacityPercent, resources.rssBytes, resources.rssCapacityPercent]) {
+          assert.strictEqual(value.status, "available");
+          assert.ok(value.value !== null && Number.isFinite(value.value) && value.value >= 0);
+          assert.strictEqual(value.provenance.shared, shared);
+        }
       }
       if (activeCase.startsWith("startup-") && request.url === "/connector/announce") {
         const home = activeHome;
