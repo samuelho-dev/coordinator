@@ -9,7 +9,8 @@ import { connectNative, loadConnectorConfig, NativeError, readConnectorToken, re
 import type { NativeNotice } from "./native.ts";
 import { identifyProcess, observeSessionResources } from "./resources.ts";
 import { Host as PlatformHost } from "./platform.ts";
-import { createRexReporter, readRexContext } from "./rex.ts";
+import { createProgramStatusReporter } from "./program-status.ts";
+import { readTerminalContext } from "./terminal.ts";
 import { readWorkspace } from "./workspace.ts";
 import { makeMachineSampler } from "./machine.ts";
 import type { MachineResources } from "./inspection.ts";
@@ -70,7 +71,7 @@ export type NativeObserver = {
 export const createNativeObserver = (harness: Harness, machineId: string, processes: ReadonlyArray<ProcessIdentity> = []) => Effect.gen(function*() {
   const host = yield* PlatformHost;
   const clock = yield* Clock.Clock;
-  const rex = yield* readRexContext;
+  const terminal = yield* readTerminalContext;
   let programStatus: ProgramStatus | undefined;
   let userPrompt: ProgramStatus | undefined;
   let stopReason: string | undefined;
@@ -129,7 +130,7 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
     ref: { machineId, harness, nativeSessionId: current.sessionManager.getSessionId(), ...(harness === "omp" && current.agent?.id ? { nativeAgentId: current.agent.id } : {}) },
     observedAt: now, ...(lastActivityAt === undefined ? {} : { lastActivityAt }), workspace: workspace ?? { cwd: current.cwd }, processes,
     machine: { name: machineName, ...(os ? { os } : {}) },
-    ...(rex ? { rex } : {}),
+    ...(terminal ? { terminal } : {}),
     ...(status ? { programStatus: status } : {}),
     ...(current.model ? { model: { provider: current.model.provider, id: current.model.id } } : {}),
     ...(current.agent ? { agent: { kind: current.agent.kind, ...(current.agent.name ? { name: current.agent.name } : {}) } } : {}),
@@ -246,7 +247,7 @@ export default function plugin(host: Host): void {
   let starting: Promise<void> | undefined;
   let stopped = false;
   // Stock OMP owns OSC 7501 (terminal.programStatus); never duplicate or override it.
-  const rexReporter = harness === "pi" ? createRexReporter((sequence) => process.stdout.write(sequence)) : undefined;
+  const statusReporter = harness === "pi" ? createProgramStatusReporter((sequence) => process.stdout.write(sequence)) : undefined;
   let terminal = false;
   host.registerMessageRenderer("coordinator-list", (message) => {
     if (typeof message.content !== "string") return undefined;
@@ -349,7 +350,7 @@ export default function plugin(host: Host): void {
     observer = yield* createNativeObserver(harness, nativeConfig.machineId, processIdentity.status === "available" ? [{ pid: host.pid, startIdentity: processIdentity.startTime, ownership: harness === "omp" ? "shared" : "owned" }] : []);
     observer.update(ctx);
     terminal = ctx.mode === "tui" && ctx.hasUI && process.stdout.isTTY === true;
-    rexReporter?.update(observer.presence()?.programStatus, terminal);
+    statusReporter?.update(observer.presence()?.programStatus, terminal);
     // Native TUI constructors register core keywords before session_start hooks.
     if (harness === "omp" && ctx.hasUI && ctx.mode === "tui") yield* registerCoordinateKeyword;
     const sampler = yield* makeMachineSampler();
@@ -399,16 +400,16 @@ export default function plugin(host: Host): void {
       await start(ctx);
       if (stopped || !observer) return;
       await runtime.runPromiseExit(Effect.sync(() => {
-        if (name === "session_switch") rexReporter?.update(undefined, terminal);
+        if (name === "session_switch") statusReporter?.update(undefined, terminal);
         observer?.update(ctx, event);
         terminal = ctx.mode === "tui" && ctx.hasUI && process.stdout.isTTY === true;
-        rexReporter?.update(observer?.presence()?.programStatus, terminal);
+        statusReporter?.update(observer?.presence()?.programStatus, terminal);
       }).pipe(Effect.tapCause(reportCause(ctx, "native update"))));
     });
   }
   host.on("session_shutdown", async () => {
     stopped = true;
-    rexReporter?.close(terminal);
+    statusReporter?.close(terminal);
     try { await runtime.dispose(); }
     finally { observer?.clear(); observer = undefined; config = undefined; }
   });

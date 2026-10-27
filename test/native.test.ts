@@ -450,6 +450,26 @@ it.live("keeps private cached usage aged across metadata updates and expires sto
     (yield* expectFailure((readPrivateFile(link))));
 })));
 
+it.live("preserves the hook's terminal identity rather than attributing cached sessions to the connector's terminal", () => fixture(Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const directory = yield* fs.makeTempDirectoryScoped({ prefix: "coordinator-origin-" });
+  yield* fs.chmod(directory, 0o700);
+  const config: NativeConfig = { inspectorUrl: "http://127.0.0.1:8080", machineId: "machine", stateDirectory: path.join(directory, "metadata") };
+  const inside = yield* projectHook("claude", "machine", { session_id: "inside", hook_event_name: "SessionStart" });
+  yield* writeNativeCache(config, inside).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord({
+    TERM_PROGRAM: "source-terminal", TERM_PROGRAM_VERSION: "1.0", PRIVATE_TOKEN: "private-credential",
+  })));
+  const outside = yield* projectHook("claude", "machine", { session_id: "outside", hook_event_name: "SessionStart" });
+  yield* writeNativeCache(config, outside).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord({})));
+  const cached = yield* readNativeCache(config).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord({
+    TERM_PROGRAM: "connector-terminal",
+  })));
+  assert.deepStrictEqual(cached.find((entry) => entry.presence.ref.nativeSessionId === "inside")?.presence.terminal, { name: "source-terminal", version: "1.0" });
+  assert.strictEqual(cached.find((entry) => entry.presence.ref.nativeSessionId === "outside")?.presence.terminal, undefined);
+  assert.strictEqual(JSON.stringify(cached).includes("private-credential"), false);
+})));
+
 it.live("projects Claude roster groups while reusing the previous local workspace observation", () => fixture(Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -693,7 +713,7 @@ it.effect("refreshes idle cached publishers without hooks and recomputes project
   for (const presence of removed) assert.deepStrictEqual(presence.workspace?.project, presence.ref.nativeSessionId === "native-project" ? { root, source: "native" } : undefined);
   assert.deepStrictEqual(yield* Effect.forEach(files, (file) => fs.readFileString(path.join(namespace, file))), original);
   for (const file of files) {
-    const cache = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ version: Schema.Literal(3), kind: Schema.Literal("inspection"), expiresAt: Schema.Finite, inspection: SessionInspection })))(yield* fs.readFileString(path.join(namespace, file)));
+    const cache = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Struct({ version: Schema.Literal(4), kind: Schema.Literal("inspection"), expiresAt: Schema.Finite, inspection: SessionInspection })))(yield* fs.readFileString(path.join(namespace, file)));
     const source = cache.inspection.presence.machine;
     if (!source?.resources) return yield* Effect.die("Missing source machine telemetry");
     yield* fs.writeFileString(path.join(namespace, file), JSON.stringify({ ...cache, inspection: { ...cache.inspection, presence: { ...cache.inspection.presence, machine: { ...source, resources: { ...source.resources, scopeId: "different-source-boundary" } } } } }));
@@ -756,11 +776,11 @@ it.live("associates native and scoped configured projects locally, caching Git w
   const namespace = path.join(directory, "native-observations");
   const files = yield* fs.readDirectory(namespace);
   assert.strictEqual(files.length, 1);
-  assert.ok(files.every((file) => /^v3-[a-f0-9]{64}\.json$/.test(file)));
+  assert.ok(files.every((file) => /^v4-[a-f0-9]{64}\.json$/.test(file)));
   const file = files.at(0);
   if (!file) return yield* Effect.die("Missing cache file");
-  const legacy = path.join(namespace, file.slice(3));
-  const original = JSON.stringify({ version: 2, kind: "inspection", expiresAt: 1, inspection: initial });
+  const legacy = path.join(namespace, "v3-" + file.slice(3));
+  const original = JSON.stringify({ version: 3, kind: "inspection", expiresAt: (yield* Clock.currentTimeMillis) + 120000, inspection: { ...initial, presence: { ...initial.presence, rex: { sessionId: "old-vendor-context" } } } });
   yield* fs.writeFileString(legacy, original, { mode: 0o600 });
   yield* writeNativeCache(config, hook);
   assert.strictEqual((yield* readNativeCache(config)).length, 1);
@@ -794,8 +814,8 @@ it.live("isolates native observations from legacy journals and reclaims only exp
     const old = (yield* (projectHook("codex", "machine", { session_id: "expired", hook_event_name: "Stop" }, 1)));
     (yield* Effect.forEach(Array.from({ length: 1024 }, (_, index) => index), (index) => Effect.gen(function*() {
       const ref = { ...old.presence.ref, nativeSessionId: `expired-${index}` };
-      const file = "v3-" + Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(ref)))) + ".json";
-      (yield* fs.writeFileString(path.join(namespace, file), JSON.stringify({ version: 3, kind: "inspection", expiresAt: 2, inspection: { ...old, presence: { ...old.presence, ref } } }), { mode: 0o600 }));
+      const file = "v4-" + Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(ref)))) + ".json";
+      (yield* fs.writeFileString(path.join(namespace, file), JSON.stringify({ version: 4, kind: "inspection", expiresAt: 2, inspection: { ...old, presence: { ...old.presence, ref } } }), { mode: 0o600 }));
     }), { concurrency: "unbounded" }));
     const current = (yield* (projectHook("codex", "machine", { session_id: "new", hook_event_name: "Stop" })));
     (yield* (writeNativeCache(config, current)));
@@ -936,7 +956,7 @@ it.live("does not promote a dead, reused or unavailable Hermes host to live or o
     const reusedRef = { ...reused.presence.ref, harness: "hermes" as const };
     (yield* (writeNativeCache(config, { ...reused, presence: { ...reused.presence, ref: reusedRef, workspace: { cwd: directory, project: { root: directory, source: "native" } }, agent: { profile: "original-profile" }, model: { id: "original-model", provider: "original-provider" }, processes: [{ pid: host.pid, startIdentity: "different-birth", ownership: "shared" }] } })));
     const crypto = yield* Crypto.Crypto;
-    const file = path.join(directory, "native-observations", "v3-hermes-" + Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(reusedRef)))) + ".json");
+    const file = path.join(directory, "native-observations", "v4-hermes-" + Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(reusedRef)))) + ".json");
     const original = yield* fs.readFileString(file);
     assert.strictEqual(((yield* (readNativeCache(config)))).some((item) => item.presence.ref.nativeSessionId === "reused"), false);
     (yield* (writeHermesHook(config, { session_id: "reused", hook_event_name: "on_session_end", cwd: path.dirname(directory), profile: "replacement-profile", extra: { model: "replacement-model", provider: "replacement-provider" } }, (yield* Clock.currentTimeMillis), host.pid)));

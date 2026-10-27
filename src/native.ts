@@ -6,7 +6,7 @@ import { Stream } from "effect";
 import { Mcp } from "./mcp.ts";
 import { INSPECTION_LIMIT, ConnectorConfig, ConnectorAnnounce, ConnectorAccepted, ConnectorPoll, ConnectorPollResult, ConnectorResult, ConnectorDisconnect, SessionInspection, createInspection, metric, unavailableMetric, sessionRefKey, type ObservationError, type SessionPresence, type SessionRef, type MetricProvenance, type MetricUnit } from "./inspection.ts";
 import { identifyProcess, observeSessionResources, type ProcessIdentification } from "./resources.ts";
-import { readRexContext } from "./rex.ts";
+import { readTerminalContext } from "./terminal.ts";
 import { readWorkspace } from "./workspace.ts";
 import { makeMachineSampler } from "./machine.ts";
 import { staleMachineResources } from "./inspection.ts";
@@ -334,14 +334,14 @@ const HermesHook = Schema.Struct({
   cwd: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))), profile: Schema.optional(Id),
   extra: Schema.Struct({ old_session_id: Schema.optional(Id), model: Schema.optional(Id), provider: Schema.optional(Id), usage: Schema.optional(Schema.NullOr(HermesUsage)) }),
 });
-const Cache = Schema.Struct({ version: Schema.Literal(3), kind: Schema.Literal("inspection"), expiresAt: N, inspection: SessionInspection });
+const Cache = Schema.Struct({ version: Schema.Literal(4), kind: Schema.Literal("inspection"), expiresAt: N, inspection: SessionInspection });
 const identifyHermesHost = (pid: number) => identifyProcess(pid).pipe(Effect.catchTag("ResourceError", (error) =>
   Console.error(JSON.stringify({ error: "Hermes hook host identity unavailable", code: error._tag })).pipe(Effect.as<ProcessIdentification>({ status: "unavailable", reason: "host-identity-unavailable" }))));
 const cacheFile = (config: NativeConfig, ref: SessionRef) => Effect.gen(function*() {
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
   const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(sessionRefKey(ref)));
-  return path.join(config.stateDirectory, "native-observations", "v3-" + (ref.harness === "hermes" ? "hermes-" : "") + Hex.encode(digest) + ".json");
+  return path.join(config.stateDirectory, "native-observations", "v4-" + (ref.harness === "hermes" ? "hermes-" : "") + Hex.encode(digest) + ".json");
 });
 const matchingScope = (source: MachineResources | undefined, local: MachineResources) =>
   source?.scopeId != null && source.scope === local.scope && source.scopeId === local.scopeId;
@@ -354,7 +354,7 @@ const cacheRecords = (config: NativeConfig, hermesIdentities = new Map<number, P
   const entries = yield* fs.readDirectory(directory);
   const records = new Map<string, typeof Cache.Type>();
   for (const entry of entries) {
-    if (!/^v3-(hermes-)?[a-f0-9]{64}\.json$/.test(entry)) continue;
+    if (!/^v4-(hermes-)?[a-f0-9]{64}\.json$/.test(entry)) continue;
     const file = path.join(directory, entry);
     const parsed = yield* readPrivateFile(file).pipe(Effect.flatMap(json), Effect.map(Schema.decodeUnknownOption(Cache, { onExcessProperty: "error" })), Effect.catch((error) => Console.error(JSON.stringify({ error: "Ignoring unsupported native cache", code: error._tag })).pipe(Effect.as(undefined))));
     if (parsed === undefined || parsed._tag === "None") continue;
@@ -402,8 +402,8 @@ const refreshWorkspace = (config: NativeConfig, workspace: NonNullable<SessionPr
   return config.project && !observed.project && native ? yield* readWorkspace(workspace.cwd, observed, native) : observed;
 });
 export const writeNativeCache = (config: NativeConfig, incoming: SessionInspection) => Effect.gen(function*() {
-  const rex = yield* readRexContext;
-  if (rex) incoming = { ...incoming, presence: { ...incoming.presence, rex } };
+  const terminal = yield* readTerminalContext;
+  if (terminal) incoming = { ...incoming, presence: { ...incoming.presence, terminal } };
   const records = yield* cacheRecords(config);
   const target = yield* cacheFile(config, incoming.presence.ref);
   if (records.size >= 1024 && !records.has(target)) return yield* new NativeError({ operation: "Metadata cache exceeds bound" });
@@ -431,7 +431,7 @@ export const writeNativeCache = (config: NativeConfig, incoming: SessionInspecti
   const crypto = yield* Crypto.Crypto;
   // Directory entries include dangling symlinks; unsupported inputs are never replaced.
   if (!records.has(target) && (yield* fs.readDirectory(path.dirname(target))).includes(path.basename(target))) return yield* new NativeError({ operation: "Unsupported cache input" });
-  const bytes = new TextEncoder().encode(JSON.stringify({ version: 3, kind: "inspection", expiresAt: incoming.presence.observedAt + cacheLifetime, inspection }));
+  const bytes = new TextEncoder().encode(JSON.stringify({ version: 4, kind: "inspection", expiresAt: incoming.presence.observedAt + cacheLifetime, inspection }));
   if (bytes.length > maximumBytes) return yield* new NativeError({ operation: "Metadata cache exceeds bound" });
   const temporary = target + "." + (yield* crypto.randomUUIDv4());
   yield* Effect.scoped(Effect.gen(function*() {

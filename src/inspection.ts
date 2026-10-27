@@ -36,8 +36,8 @@ export const ProcessIdentity = Schema.Struct({
 });
 export type ProcessIdentity = typeof ProcessIdentity.Type;
 const NativeWorkState = Schema.Struct({ id: Id, state: Schema.Literals(["pending", "active", "completed", "cancelled", "unknown"]) });
-const RexText = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096), Schema.makeFilter((value) =>
-  /[\u0000-\u001f\u007f-\u009f]/u.test(value) ? "Control characters are forbidden" : undefined,
+const NativeReference = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096), Schema.makeFilter((value) =>
+  /[\u0000-\u001f\u007f-\u009f]/u.test(value) || !value.trim() ? "Nonblank text without control characters required" : undefined,
 ));
 export const ProgramStatus = Schema.Union([
   Schema.Struct({ state: Schema.Literals(["idle", "working", "done", "error"]) }),
@@ -137,6 +137,8 @@ export const SessionWorkspace = Schema.Struct({
   cwd: Path, git: Schema.optional(SessionGit), project: Schema.optional(SessionProject),
 });
 export type SessionWorkspace = typeof SessionWorkspace.Type;
+export const SessionTerminal = Schema.Struct({ name: NativeReference, version: Schema.optional(NativeReference) });
+export type SessionTerminal = typeof SessionTerminal.Type;
 export const SessionPresence = Schema.Struct({
   ref: SessionRef,
   observedAt: Timestamp,
@@ -150,7 +152,7 @@ export const SessionPresence = Schema.Struct({
   lastActivityAt: Schema.optional(Schema.NullOr(Timestamp)),
   parent: Schema.optional(SessionRef),
   label: Schema.optional(Label),
-  rex: Schema.optional(Schema.Struct({ serverAddress: Schema.optional(RexText), blockId: Schema.optional(RexText), sessionId: Schema.optional(RexText) })),
+  terminal: Schema.optional(SessionTerminal),
   programStatus: Schema.optional(ProgramStatus),
   processes: Schema.optional(bounded(ProcessIdentity, 128)),
   resources: Schema.optional(SessionResources),

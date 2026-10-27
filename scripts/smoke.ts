@@ -10,6 +10,7 @@ import { Mcp, serve } from "../src/mcp.ts";
 import { connectNative, withProcessResources } from "../src/native.ts";
 import { identifyProcess } from "../src/resources.ts";
 import { makeMachineSampler } from "../src/machine.ts";
+import { readTerminalContext } from "../src/terminal.ts";
 
 const verify = {
   equal: (actual: unknown, expected: unknown, message = "Smoke equality failed") => Object.is(actual, expected) ? Effect.void : Effect.die(new Error(message)),
@@ -219,15 +220,14 @@ const program = Effect.gen(function*() {
       yield* verify.ok(!Object.hasOwn(session, key), `Legacy flat metadata must be absent: ${key}`);
     }
   });
-  // Synthetic Rex references verify native metadata transport, not a live Rex server.
-  const rex = { serverAddress: "unix:/tmp/coordinator-smoke-rex.sock", sessionId: `session:${yield* crypto.randomUUIDv4()}`, blockId: `block:${yield* crypto.randomUUIDv4()}` };
+  const terminal = yield* readTerminalContext;
   const hostEnvironment = (home: string) => ({
     HOME: home, PATH: searchPath,
     XDG_CONFIG_HOME: join(home, "config"), XDG_STATE_HOME: join(home, "state"), XDG_CACHE_HOME: join(home, "cache"),
     PI_CODING_AGENT_DIR: join(home, ".pi", "agent"),
     PI_OFFLINE: "1",
     COORDINATOR_API_URL: inspectorUrl, COORDINATOR_API_TOKEN: token,
-    REX_SERVER: rex.serverAddress, REX_SESSION: rex.sessionId, REX_BLOCK: rex.blockId,
+    TERM_PROGRAM: terminal?.name, TERM_PROGRAM_VERSION: terminal?.version,
   });
   const hermesEnv = hostEnvironment(hermesHome);
   const compiledMain = resolve(scriptDirectory, "../src/main.js");
@@ -334,7 +334,7 @@ const program = Effect.gen(function*() {
   const cacheEntries = yield* fs.readDirectory(cacheDirectory);
   for (const entry of cacheEntries) {
     const file = join(cacheDirectory, entry);
-    yield* verify.ok(entry.startsWith("v3-"), "Ephemeral native cache must use the incompatible v3 namespace");
+    yield* verify.ok(entry.startsWith("v4-"), "Ephemeral native cache must use the incompatible v4 namespace");
     const text = yield* fs.readFileString(file);
     yield* verify.ok(!text.includes(sensitive) && !text.includes(token), "Sensitive wire extras and credentials must not enter cache");
     yield* verify.equal((yield* fs.stat(file)).mode & 0o077, 0, "Cache must remain private");
@@ -458,7 +458,7 @@ const program = Effect.gen(function*() {
     let sawNativeReady = false;
     let startupNotice = "";
     const stdout = yield* child.stdout.pipe(Stream.decodeText(), Stream.splitLines, Stream.runForEach((line) => Effect.gen(function*() {
-      yield* verify.ok(!line.includes("\u001b]7501"), "Rex OSC reports must never corrupt native RPC stdout");
+      yield* verify.ok(!line.includes("\u001b]7501"), "OSC 7501 reports must never corrupt native RPC stdout");
       yield* Schema.decodeEffect(NativeStartupMessage)(line).pipe(Effect.matchEffect({
         onFailure: () => Effect.void,
         onSuccess: (message) => Effect.gen(function*() {
@@ -490,6 +490,7 @@ const program = Effect.gen(function*() {
             if (displayedNative === undefined) return yield* verify.fail("Displayed native session missing");
             yield* verifyWorkspace(displayedNative);
             yield* verifySessionResources(displayedNative, harness === "omp" ? "shared" : "owned");
+            yield* verify.deepEqual(displayedNative.terminal, terminal, "Displayed native list must retain source terminal identity");
             yield* verify.ok(!result.content.includes(token));
             yield* Deferred.succeed(listVerified, undefined);
             return;
@@ -521,9 +522,7 @@ const program = Effect.gen(function*() {
       yield* Fiber.join(stderr);
       return yield* Effect.die(`Disposable ${harness} exited ${code} before presence; stderr (last 4096 characters): ${JSON.stringify(nativeStderr)}`);
     }));
-    yield* verify.equal(native.rex?.serverAddress, rex.serverAddress);
-    yield* verify.equal(native.rex?.sessionId, rex.sessionId);
-    yield* verify.equal(native.rex?.blockId, rex.blockId);
+    yield* verify.deepEqual(native.terminal, terminal, "Native presence must preserve inherited terminal identity");
     yield* verify.deepEqual(native.programStatus, { state: "idle" }, "Native startup has a known idle status");
     yield* verifyWorkspace(native);
     yield* verifySessionResources(native, harness === "omp" ? "shared" : "owned");
@@ -548,6 +547,7 @@ const program = Effect.gen(function*() {
     const inspected = yield* mcp.call(inspectorUrl, token, InspectionTools.inspect, { ref: native.ref });
     yield* verify.equal(inspected.presence.ref.harness, harness);
     yield* verifyWorkspace(inspected.presence);
+    yield* verify.deepEqual(inspected.presence.terminal, terminal, "Inspection must preserve source terminal identity");
     yield* verifySessionResources(inspected.presence, harness === "omp" ? "shared" : "owned");
     yield* verify.equal(native.ref.machineId, hermesMachineId, "Pi, OMP and hooks share one local installation identity");
     yield* verify.equal((yield* fs.readFileString(join(home, "state", "coordinator", "machine-id"))).trim(), hermesMachineId);
@@ -633,12 +633,12 @@ const program = Effect.gen(function*() {
     }));
     yield* child.kill();
     yield* child.exitCode;
-    nativeResults.push({ harness, status: "actual disposable CLI; startup is nonblocking; /coordinator list displays same-owner machines without a model turn or detail sampling; Rex references/status round-trip and no OSC on RPC" });
+    nativeResults.push({ harness, status: "actual disposable CLI; startup is nonblocking; /coordinator list displays same-owner machines without a model turn or detail sampling; generic terminal identity/status round-trip and no OSC on RPC" });
   }
   yield* otherConnector.kill();
   yield* otherConnector.exitCode;
   yield* Console.log(JSON.stringify({ scenario: "ephemeral-inspector", status: "ok", authenticatedHttpMcp: true, outboundConnector: true,
-    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, groupedMetadata: true, localMachineTelemetry: nativeHarnesses, realGitWorktree: nativeHarnesses, explicitProjectScope: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
+    ownerIsolation: true, sharedOwnerMultipleInstallations: true, sameInstallationNativeIdentity: true, groupedMetadata: true, terminalIdentity: terminal !== undefined, localMachineTelemetry: nativeHarnesses, realGitWorktree: nativeHarnesses, explicitProjectScope: true, selfHostBootstrap: true, authenticatedClientSetup: true, onDemandOsResources: true, fixtureNativeCounters: "unavailable, not fabricated", nativeHarnesses, nativePrograms: nativeResults }));
 });
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("120 seconds"), Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer, NodeHttpClient.layerUndici, Mcp.layer))));

@@ -11,7 +11,7 @@ import { ConnectorAnnounce, decodeConnectorResult } from "../src/inspection.ts";
 import { Hex } from "effect/encoding";
 import { Inspector } from "../src/inspector.ts";
 import { Mcp, serve } from "../src/mcp.ts";
-import { createRexReporter, rexSequence } from "../src/rex.ts";
+import { createProgramStatusReporter, programStatusSequence } from "../src/program-status.ts";
 
 const context = (id = "surrounding-session"): Context => ({
   cwd: "/workspace", mode: "rpc", hasUI: false,
@@ -64,9 +64,9 @@ it("projects native lifecycle outcomes without treating tools, retries or unknow
   }
 });
 
-it("emits complete scoped Rex records only on terminal status changes", () => {
+it("emits complete scoped OSC 7501 records only on terminal status changes", () => {
   const output: string[] = [];
-  const reporter = createRexReporter((sequence) => output.push(sequence));
+  const reporter = createProgramStatusReporter((sequence) => output.push(sequence));
   reporter.update({ state: "working" }, false);
   reporter.update({ state: "done" }, false);
   assert.deepStrictEqual(output, []);
@@ -85,10 +85,10 @@ it("emits complete scoped Rex records only on terminal status changes", () => {
   assert.ok(!output[2]!.includes(":kind="));
   reporter.close(true);
   assert.ok(output.at(-1)!.includes(":state=clear:"));
-  assert.strictEqual(rexSequence("550e8400-e29b-41d4-a716-446655440000", { state: "idle" }), "");
-  assert.strictEqual(rexSequence("bad\u001b", { state: "idle" }), "");
+  assert.strictEqual(programStatusSequence("550e8400-e29b-41d4-a716-446655440000", { state: "idle" }), "");
+  assert.strictEqual(programStatusSequence("bad\u001b", { state: "idle" }), "");
   const completed: string[] = [];
-  const done = createRexReporter((sequence) => completed.push(sequence));
+  const done = createProgramStatusReporter((sequence) => completed.push(sequence));
   done.update({ state: "done" }, true);
   done.close(true);
   assert.strictEqual(completed.length, 1);
