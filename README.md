@@ -9,7 +9,7 @@ There are two parts: **one inspector service**, plus **native integrations on ea
 The API and setup CLI require Node >=22.19. Install the version-pinned release:
 
 ```sh
-npm install --global @samuelho-dev/coordinator@0.3.0-beta.8
+npm install --global @samuelho-dev/coordinator@0.3.0-beta.9
 ```
 
 For source development only, use a reviewed checkout with `pnpm install --frozen-lockfile && pnpm build` (pnpm 11.9.0). `coordinator-install --source` deliberately activates that exact local package; never source-link a native package manager's own `node_modules` directory.
@@ -18,7 +18,7 @@ The [esbuild build](scripts/build.ts) keeps Pi dependencies external and bundles
 
 Client and server code stays in [`src/mcp.ts`](src/mcp.ts). The `Mcp` layer contains only client calls; separate HTTP/stdio exports let native bundles discard server-only protocol and tool initialization.
 
-The grouped metadata/workspace contract introduced in `0.3.0-beta.5` is a breaking cutover from beta.4 and earlier APIs, publishers and readers. `0.3.0-beta.6` retains that contract and works with the beta.5 API. `0.3.0-beta.7` adds machine/session resource telemetry; `0.3.0-beta.8` replaces product-specific references with generic terminal name/version. Both require matching API, native publisher and reader upgrades; deploy the API first.
+The grouped metadata/workspace contract introduced in `0.3.0-beta.5` is a breaking cutover from beta.4 and earlier APIs, publishers and readers. `0.3.0-beta.6` retains that contract and works with the beta.5 API. `0.3.0-beta.7` adds machine/session resource telemetry; `0.3.0-beta.8` replaces product-specific references with generic terminal name/version. Both require matching API, native publisher and reader upgrades; deploy the API first. `0.3.0-beta.9` changes only native Darwin machine scope identity; no API rollout is required.
 
 For Kubernetes, follow the [chart operator guide](deploy/helm/coordinator/README.md): provide an existing Secret, verified image digest and matching source SHA. The chart creates an inspector Deployment/internal Service, not native plugins, TLS routing, a database or runners. Operators own rollout and supervision. Existing broker state requires the guide's preservation/migration procedure; the plugin does not migrate or delete it.
 
@@ -109,8 +109,8 @@ The installer validates prerequisites and creates launchers/config fragments. `-
 
 | Target | Activation | Presence publisher |
 | --- | --- | --- |
-| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.8`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
-| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.8`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
+| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.9`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
+| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.9`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
 | Claude Code | `claude --plugin-dir "$PRIVATE/claude-host"`; approve generated hooks/MCP tools; preserve existing status-line configuration. | Separate `connector.sh`. |
 | Codex CLI | Merge generated `hooks/hooks.json` and coordinator `mcp.toml`; trust only Coordinator's handlers in native `/hooks`. | Separate `connector.sh`. |
 | Hermes | Merge generated hook entries and `mcp_servers.coordinator` from `mcp.yaml` into the selected profile; no Python plugin installation. | Separate `connector.sh`. |
@@ -170,13 +170,13 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. E
 
 ## Plugin publication
 
-The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.8`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.9`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
 For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.8
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.8
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.9
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.9
 ```
 
 Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
@@ -194,6 +194,8 @@ Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixe
 `0.3.0-beta.7` adds portable Linux host/cgroup and macOS CPU/RAM telemetry plus per-session CPU/RSS capacity percentages in list and inspect. Sampling uses the existing native publishing cadence and pinned Effect platform services, with explicit shared-process attribution, target-scope/PID birth checks, stale/unavailable readings, and complete list pagination. No new runtime dependency or monitoring backend is required. Deploy the matching API before updating and deliberately reloading native publishers/readers; existing credentials and installation identities remain valid.
 
 `0.3.0-beta.8` adds generic `terminal: { name, version? }` in session presence, list and inspect, replacing product-specific associations. Capture reads only the standard terminal markers; there are no per-product detectors or compatibility aliases. Cache version 4 isolates older records. Deploy the matching API and coordinate all publisher/reader upgrades before enabling this breaking wire change. Existing beta.7 installations do not gain it merely by reloading; no credential rotation, installation identity changes, runtime dependencies or stock host modifications are required.
+
+`0.3.0-beta.9` canonicalizes the Darwin boot timestamp to validated numeric seconds/microseconds before hashing it with the hostname. Locale/timezone renderings of the same boot now retain one machine scope ID; a reboot or different host still gets another. Missing or malformed boot data produces no scope ID. The wire schema and runtime dependencies are unchanged; update and reload native publishers/readers without redeploying the API.
 
 | Host | Publication route |
 | --- | --- |

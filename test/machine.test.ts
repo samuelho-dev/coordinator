@@ -208,18 +208,21 @@ it.effect("samples target PID mount roots, isolates baselines, and refuses missi
   assert.strictEqual(vanished.memory.usedBytes.status, "unavailable");
 }));
 
-it.effect("uses real Darwin VM page sizes and compressor occupancy without speculative double-counting", () => Effect.gen(function*() {
+it.effect("uses real Darwin VM pages and timezone-independent boot scope identity", () => Effect.gen(function*() {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const clock = yield* Clock.Clock;
   let time = 1_000_000_000n, cpu = 100;
+  let bootTime: string | null = "{ sec = 123, usec = 4 } Mon Nov  3 10:00:00 UTC 2026";
   let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 50.\nPages active: 100.\nPages inactive: 200.\nPages speculative: 30.\nPages wired down: 10.\nPages stored in compressor: 900.\nPages occupied by compressor: 20.";
-  const nativeSpawner: typeof spawner = { ...spawner, spawn: (command) => Effect.gen(function*() {
-    if (!ChildProcess.isStandardCommand(command)) return yield* Effect.die("Shell invocation forbidden");
-    assert.ok(["/usr/sbin/sysctl", "/usr/bin/vm_stat"].includes(command.command));
-    const output = command.command === "/usr/bin/vm_stat" ? vm : command.args.includes("hw.memsize") ? "34359738368" : "{ sec = 123, usec = 4 }";
-    const child = yield* spawner.spawn(ChildProcess.make("/usr/bin/true", [], { stdin: "ignore" }));
-    return { ...child, stdout: Stream.make(new TextEncoder().encode(output)) };
-  }) };
+  const nativeSpawner: typeof spawner = {
+    ...spawner, spawn: (command) => Effect.gen(function*() {
+      if (!ChildProcess.isStandardCommand(command)) return yield* Effect.die("Shell invocation forbidden");
+      assert.ok(["/usr/sbin/sysctl", "/usr/bin/vm_stat"].includes(command.command));
+      const output = command.command === "/usr/bin/vm_stat" ? vm : command.args.includes("hw.memsize") ? "34359738368" : bootTime ?? "";
+      const child = yield* spawner.spawn(ChildProcess.make("/usr/bin/true", [], { stdin: "ignore" }));
+      return { ...child, stdout: Stream.make(new TextEncoder().encode(output)) };
+    })
+  };
   const sampler = yield* makeMachineSampler().pipe(
     Effect.provideService(Host, { ...host, platform: "darwin", cpuTimes: Effect.sync(() => [{ user: cpu, nice: 0, sys: 0, idle: 100, irq: 0 }]) }),
     Effect.provideService(Clock.Clock, { ...clock, monotonicTimeNanos: Effect.sync(() => time) }),
@@ -236,4 +239,22 @@ it.effect("uses real Darwin VM page sizes and compressor occupancy without specu
   assert.strictEqual(partial.memory.usedBytes.status, "unavailable");
   assert.strictEqual(partial.memory.capacityBytes.value, 34359738368);
   yield* Schema.decodeEffect(MachineResources)(partial);
+  assert.ok(first.scopeId);
+  time += 1_000_000_000n; bootTime = "{ sec = 000123, usec = 000004 } Mon Nov  3 02:00:00 PST 2026";
+  assert.strictEqual((yield* sampler.read).scopeId, first.scopeId);
+  for (const changed of ["{ sec = 124, usec = 4 }", "{ sec = 123, usec = 5 }"]) {
+    time += 1_000_000_000n; bootTime = changed;
+    assert.notStrictEqual((yield* sampler.read).scopeId, first.scopeId);
+  }
+  time += 1_000_000_000n; bootTime = "{ sec = 123, usec = 4 }";
+  const otherHost = yield* makeMachineSampler().pipe(
+    Effect.provideService(Host, { ...host, hostname: "other", platform: "darwin" }),
+    Effect.provideService(Clock.Clock, { ...clock, monotonicTimeNanos: Effect.sync(() => time) }),
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, nativeSpawner),
+  );
+  assert.notStrictEqual((yield* otherHost.read).scopeId, first.scopeId);
+  for (const malformed of [null, "", "{ sec = -1, usec = 4 }", "{ sec = 123, usec = 1000000 }", "{ sec = 9007199254740992, usec = 4 }", "{ sec = 123 }", "{ sec = 123, usec = 4 }garbage"]) {
+    time += 1_000_000_000n; bootTime = malformed;
+    assert.strictEqual((yield* sampler.read).scopeId, null);
+  }
 }).pipe(Effect.provide(NodeServices.layer)));
