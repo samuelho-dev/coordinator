@@ -263,8 +263,9 @@ export const makeMachineSampler = (pid?: number) => Effect.gen(function*() {
   });
   const darwin = Effect.gen(function*() {
     const result = blank("darwin"); result.scope = "host";
-    const boot = yield* command("/usr/sbin/sysctl", ["-n", "kern.boottime"]);
-    result.identity = boot ? `darwin:${host.hostname}:${boot}` : null;
+    const boot = /^\{\s*sec\s*=\s*(\d+)\s*,\s*usec\s*=\s*(\d+)\s*\}(?:[ \t]+[^\r\n]*)?$/.exec((yield* command("/usr/sbin/sysctl", ["-n", "kern.boottime"])) ?? "");
+    const sec = integer(boot?.[1] ?? null), usec = integer(boot?.[2] ?? null);
+    result.identity = sec !== null && usec !== null && usec <= 999999 ? `darwin:${host.hostname}:${sec}:${usec}` : null;
     const cpus = host.cpuTimes ? yield* host.cpuTimes.pipe(Effect.catch(() => Effect.succeed(null))) : null;
     result.cpuAt = yield* clock.monotonicTimeNanos;
     if (cpus?.length && cpus.every((cpu) => Object.values(cpu).every((value) => Number.isFinite(value) && value >= 0))) {

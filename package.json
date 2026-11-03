@@ -1,6 +1,6 @@
 {
   "name": "@samuelho-dev/coordinator",
-  "version": "0.3.0-beta.8",
+  "version": "0.3.0-beta.9",
   "type": "module",
   "description": "Read-only native agent session inspection across self-hosted machines",
   "license": "MIT",
