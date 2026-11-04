@@ -43,7 +43,7 @@ type Pending = {
   requestId: string; sessionKey: string; ref: SessionRef; connector: Connector; incarnation: string;
   deadline: number; delivered: boolean; reply: Deferred.Deferred<SessionInspection, HttpError>;
 };
-type Cursor = { owner: string; machineId: string | undefined; harness: string | undefined; after: string; expires: number };
+type Cursor = { owner: string; machineId: string | undefined; repository: string | undefined; after: string; expires: number };
 
 const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpError, Scope.Scope | Crypto.Crypto> => Effect.gen(function*() {
   const crypto = yield* Crypto.Crypto;
@@ -184,11 +184,12 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
       if (!authenticated(principal)) return Effect.fail(error(401, "Unauthorized"));
       prune();
       const cursor = input.cursor === undefined ? undefined : cursors.get(input.cursor);
-      if (input.cursor !== undefined && (!cursor || cursor.owner !== principal.owner || cursor.machineId !== input.machineId || cursor.harness !== input.harness)) return Effect.fail(error(400, "Invalid session cursor"));
+      if (input.cursor !== undefined && (!cursor || cursor.owner !== principal.owner || cursor.machineId !== input.machineId || cursor.repository !== input.repository)) return Effect.fail(error(400, "Invalid session cursor"));
       const entries = Array.from(sessions.entries()).filter(([id, session]) =>
         session.connector.owner === principal.owner && (cursor === undefined || id > cursor.after) &&
         (input.machineId === undefined || session.presence.ref.machineId === input.machineId) &&
-        (input.harness === undefined || session.presence.ref.harness === input.harness),
+        (input.repository === undefined || (session.presence.workspace?.git?.state === "available" &&
+          session.presence.workspace.git.commonDir === input.repository)),
       ).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
       const page: ListSession[] = [];
       const machines = new Map<string, ListMachine>();
@@ -218,7 +219,7 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
           const oldest = cursors.keys().next().value;
           if (oldest !== undefined) cursors.delete(oldest);
         }
-        cursors.set(next, { owner: principal.owner, machineId: input.machineId, harness: input.harness, after, expires: now() + EXPIRE_MS });
+        cursors.set(next, { owner: principal.owner, machineId: input.machineId, repository: input.repository, after, expires: now() + EXPIRE_MS });
         return Effect.succeed({ machines: machineRows, sessions: page, nextCursor: next });
       }
       return Effect.succeed({ machines: machineRows, sessions: page, nextCursor: null });

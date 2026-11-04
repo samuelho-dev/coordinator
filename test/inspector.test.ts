@@ -178,6 +178,49 @@ it.effect("preserves per-session percentages while demoting duplicate process cl
   assert.strictEqual((yield* inspector.list(reader, { limit: 10 })).sessions.find((row) => row.ref.nativeSessionId === first.ref.nativeSessionId)?.resources?.rssCapacityPercent.stale, true);
 })));
 
+it.effect("matches published repositories across worktrees and harnesses without widening owner or machine scope", () => Effect.scoped(Effect.gen(function*() {
+  const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
+  const git = presence.workspace?.git;
+  if (git?.state !== "available") return yield* Effect.die("Missing fixture repository");
+  const repository = git.commonDir;
+  const matching = (["pi", "omp", "hermes", "codex", "claude"] as const).map((harness): SessionPresence => ({
+    ...presence, ref: { ...presence.ref, harness },
+    workspace: { ...presence.workspace, cwd: `/work/${harness}/src`, git: { ...git, worktreeRoot: `/work/${harness}`, branch: harness } },
+  }));
+  const excluded: SessionPresence[] = [
+    { ref: { ...presence.ref, nativeSessionId: "missing-workspace" }, observedAt: presence.observedAt },
+    ...([
+      { cwd: repository, git: { ...git, commonDir: `${repository}-sibling` } },
+      { cwd: repository, project: { root: repository, source: "configured", id: repository, name: repository }, git: { ...git, worktreeRoot: repository, branch: repository, commonDir: "/other/repository/.git" } },
+      { cwd: repository, git: { state: "unavailable", observedAt: 5 } },
+      { cwd: repository, git: { state: "not-repository", observedAt: 5 } },
+      { cwd: repository },
+    ] satisfies NonNullable<SessionPresence["workspace"]>[]).map((workspace, index): SessionPresence => ({
+      ...presence, ref: { ...presence.ref, nativeSessionId: `excluded-${index}` }, workspace,
+    })),
+  ];
+  yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: [...matching, ...excluded] });
+  const remote: SessionPresence = { ...presence, ref: { ...presence.ref, machineId: "linux" } };
+  yield* inspector.announce(publisher, { connectorId: "remote", incarnation: "first", machineId: "linux", sessions: [remote] });
+  const privateSession: SessionPresence = { ...presence, ref: { ...presence.ref, nativeSessionId: "other-owner" } };
+  yield* inspector.announce(outsider, { ...identity, machineId: "mac", sessions: [privateSession] });
+  const listed = yield* inspector.list(reader, { limit: 100, repository });
+  assert.strictEqual(listed.sessions.length, matching.length + 1);
+  assert.deepStrictEqual(new Set(listed.sessions.map((session) => JSON.stringify(session.ref))), new Set([...matching, remote].map((session) => JSON.stringify(session.ref))));
+  assert.deepStrictEqual(new Set(listed.machines.map((machine) => machine.machineId)), new Set(["mac", "linux"]));
+  const local = yield* inspector.list(reader, { limit: 100, machineId: "mac", repository });
+  assert.deepStrictEqual(new Set(local.sessions.map((session) => JSON.stringify(session.ref))), new Set(matching.map((session) => JSON.stringify(session.ref))));
+  assert.deepStrictEqual(local.machines.map((machine) => machine.machineId), ["mac"]);
+  assert.deepStrictEqual((yield* inspector.list(reader, { limit: 100, machineId: "linux", repository })).sessions.map((session) => session.ref), [remote.ref]);
+  assert.deepStrictEqual((yield* inspector.list(reader, { limit: 100, machineId: "missing", repository })).sessions, []);
+  for (const other of [repository.slice(0, -1), `${repository}/`]) {
+    assert.deepStrictEqual((yield* inspector.list(reader, { limit: 100, repository: other })).sessions, []);
+  }
+  assert.strictEqual((yield* inspector.list(reader, { limit: 100 })).sessions.length, matching.length + excluded.length + 1);
+  assert.deepStrictEqual((yield* inspector.list(outsider, { limit: 100, repository })).sessions.map((session) => session.ref), [privateSession.ref]);
+  assert.deepStrictEqual((yield* inspector.list(outsider, { limit: 100, machineId: "linux", repository })).sessions, []);
+})));
+
 it.effect("authenticates owner keys across machines while isolating owners and connector principals", () => Effect.scoped(Effect.gen(function*() {
   const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
   assert.deepStrictEqual(yield* inspector.authorize("publisher-secret"), publisher);
@@ -360,7 +403,7 @@ it.effect("marks a process shared across native sessions without charging either
   if (!((yield* inspector.list(reader, { limit: 10 })).sessions.every((session) => session.processes?.at(0)?.ownership === "owned"))) throw new Error("Expected truthy value");
 })));
 
-it.effect("paginates by actual response bytes using opaque owner-bound cursors", () => Effect.scoped(Effect.gen(function*() {
+it.effect("paginates repository matches by actual response bytes using owner- and filter-bound cursors", () => Effect.scoped(Effect.gen(function*() {
   const inspector = yield* Inspector.make(config).pipe(Effect.provide(NodeServices.layer));
   const at = yield* Clock.currentTimeMillis;
   const p = { ...provenance, scope: "host" as const, observedAt: at };
@@ -372,13 +415,15 @@ it.effect("paginates by actual response bytes using opaque owner-bound cursors",
   const large = Array.from({ length: 30 }, (_, index): SessionPresence => ({
     ...presence, ref: { ...presence.ref, nativeSessionId: `session-${String(index).padStart(2, "0")}` },
     machine: { ...presence.machine, resources: { ...resources, observedAt: at + index, memory: { ...resources.memory, usedBytes: metric("bytes", 20 + index, { ...p, scopeDescription: `sample-${index} ${"x".repeat(index * 15)}` }) } } },
-    workspace: { cwd: `/${"x".repeat(3000)}` },
+    workspace: { ...presence.workspace, cwd: `/${"x".repeat(3000)}` },
     activity: { state: "idle", goals: Array.from({ length: 100 }, (_, goal): { id: string; state: "pending" } => ({ id: `${goal}`.padEnd(256, "x"), state: "pending" })) },
   }));
   yield* inspector.announce(publisher, { ...identity, machineId: "mac", sessions: large });
-  const first = yield* inspector.list(reader, { limit: 100 });
+  const filter = { machineId: "mac", repository: "/work/main/.git" };
+  const first = yield* inspector.list(reader, { limit: 100, ...filter });
   assert.ok(new TextEncoder().encode(JSON.stringify(first)).byteLength <= INSPECTION_LIMIT);
   const checkSnapshot = (page: SessionListOutput) => {
+    assert.ok(page.sessions.every((session) => session.workspace?.git?.state === "available" && session.workspace.git.commonDir === filter.repository));
     const last = page.sessions.at(-1);
     assert.ok(last);
     const index = Number(last.ref.nativeSessionId.slice(-2));
@@ -387,14 +432,20 @@ it.effect("paginates by actual response bytes using opaque owner-bound cursors",
   };
   checkSnapshot(first);
   if (!(first.nextCursor)) throw new Error("Expected truthy value");
-  assert.strictEqual((yield* Effect.flip(inspector.list(outsider, { limit: 100, cursor: first.nextCursor }))).status, 400);
-  assert.strictEqual((yield* Effect.flip(inspector.list(reader, { limit: 100, cursor: first.nextCursor, machineId: "other" }))).status, 400);
+  assert.strictEqual((yield* Effect.flip(inspector.list(outsider, { limit: 100, ...filter, cursor: first.nextCursor }))).status, 400);
+  assert.strictEqual((yield* Effect.flip(inspector.list(reader, { limit: 100, ...filter, cursor: first.nextCursor, machineId: "other" }))).status, 400);
+  assert.strictEqual((yield* Effect.flip(inspector.list(reader, { limit: 100, ...filter, cursor: first.nextCursor, repository: `${filter.repository}-sibling` }))).status, 400);
+  assert.strictEqual((yield* Effect.flip(inspector.list(reader, { limit: 100, machineId: filter.machineId, cursor: first.nextCursor }))).status, 400);
+  assert.strictEqual((yield* Effect.flip(inspector.list(reader, { limit: 100, repository: filter.repository, cursor: first.nextCursor }))).status, 400);
+  const unfiltered = yield* inspector.list(reader, { limit: 1, machineId: filter.machineId });
+  if (!unfiltered.nextCursor) throw new Error("Expected unfiltered continuation");
+  assert.strictEqual((yield* Effect.flip(inspector.list(reader, { limit: 100, ...filter, cursor: unfiltered.nextCursor }))).status, 400);
   const found = new Set(first.sessions.map((session) => session.ref.nativeSessionId));
   const machines = new Map<string, SessionListOutput["machines"][number]>();
   mergeListMachines(machines, first.machines);
   let cursor: string | null = first.nextCursor;
   while (cursor !== null) {
-    const page: SessionListOutput = yield* inspector.list(reader, { limit: 100, cursor });
+    const page: SessionListOutput = yield* inspector.list(reader, { limit: 100, ...filter, cursor });
     assert.ok(new TextEncoder().encode(JSON.stringify(page)).byteLength <= INSPECTION_LIMIT);
     checkSnapshot(page);
     mergeListMachines(machines, page.machines);

@@ -194,7 +194,10 @@ export const ListMachine = Schema.Struct({
 });
 export type ListMachine = typeof ListMachine.Type;
 const ListGit = Schema.Union([
-  Schema.Struct({ state: Schema.Literal("available"), observedAt: Timestamp, branch: Schema.NullOr(Id), head: Schema.NullOr(Schema.String.check(Schema.isPattern(/^(?:[a-f0-9]{40}|[a-f0-9]{64})(?![\s\S])/))) }),
+  Schema.Struct({
+    state: Schema.Literal("available"), observedAt: Timestamp, worktreeRoot: Path, commonDir: Path,
+    branch: Schema.NullOr(Id), head: Schema.NullOr(Schema.String.check(Schema.isPattern(/^(?:[a-f0-9]{40}|[a-f0-9]{64})(?![\s\S])/))),
+  }),
   Schema.Struct({ state: Schema.Literal("not-repository"), observedAt: Timestamp }),
   Schema.Struct({ state: Schema.Literal("unavailable"), observedAt: Timestamp }),
 ]);
@@ -258,7 +261,11 @@ export const projectListSession = (presence: SessionPresence): ListSession => ({
       cwd: presence.workspace.cwd, ...(presence.workspace.project ? { project: presence.workspace.project } : {}),
       ...(presence.workspace.git ? {
         git: presence.workspace.git.state === "available"
-          ? { state: "available" as const, observedAt: presence.workspace.git.observedAt, branch: presence.workspace.git.branch, head: presence.workspace.git.head }
+          ? {
+            state: "available" as const, observedAt: presence.workspace.git.observedAt,
+            worktreeRoot: presence.workspace.git.worktreeRoot, commonDir: presence.workspace.git.commonDir,
+            branch: presence.workspace.git.branch, head: presence.workspace.git.head,
+          }
           : { state: presence.workspace.git.state, observedAt: presence.workspace.git.observedAt }
       } : {}),
     }
@@ -430,7 +437,7 @@ export const ConnectorDisconnect = Schema.Struct(ConnectorIdentity);
 export type ConnectorDisconnect = typeof ConnectorDisconnect.Type;
 export const SessionListInput = Schema.Struct({
   cursor: Schema.optional(Id), limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
-  machineId: Schema.optional(Id), harness: Schema.optional(Harness),
+  machineId: Schema.optional(Id), repository: Schema.optional(Path),
 });
 export type SessionListInput = typeof SessionListInput.Type;
 export const SessionListOutput = Schema.Struct({ machines: bounded(ListMachine, 100), sessions: bounded(ListSession, 100), nextCursor: Schema.NullOr(Id) });

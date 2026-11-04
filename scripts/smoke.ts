@@ -118,8 +118,9 @@ const program = Effect.gen(function*() {
   }).pipe(Effect.forkScoped);
   const waitForSession = (harness: "pi" | "omp" | "hermes", sessionId?: string, installationId = machineId) => Effect.gen(function*() {
     for (let attempt = 0; attempt < 300; attempt++) {
-      const result = yield* mcp.call(inspectorUrl, token, InspectionTools.list, { machineId: installationId, harness, limit: 100 });
-      const found = result.sessions.find((session) => sessionId === undefined ? session.ref.nativeSessionId !== presence.ref.nativeSessionId : session.ref.nativeSessionId === sessionId);
+      const result = yield* mcp.call(inspectorUrl, token, InspectionTools.list, { machineId: installationId, limit: 100 });
+      const found = result.sessions.find((session) => session.ref.harness === harness &&
+        (sessionId === undefined ? session.ref.nativeSessionId !== presence.ref.nativeSessionId : session.ref.nativeSessionId === sessionId));
       if (found !== undefined) return found;
       yield* Effect.sleep(100);
     }
@@ -322,8 +323,8 @@ const program = Effect.gen(function*() {
   yield* Effect.sleep(25);
   yield* hermesHook("on_session_end");
   for (let attempt = 0; attempt < 300; attempt++) {
-    const current = yield* mcp.call(inspectorUrl, token, InspectionTools.list, { machineId: hermesMachineId, harness: "hermes", limit: 100 });
-    const updated = current.sessions.find((session) => session.ref.nativeSessionId === hermesId);
+    const current = yield* mcp.call(inspectorUrl, token, InspectionTools.list, { machineId: hermesMachineId, limit: 100 });
+    const updated = current.sessions.find((session) => session.ref.harness === "hermes" && session.ref.nativeSessionId === hermesId);
     if (updated?.lastActivityAt !== undefined && updated.lastActivityAt !== hermes.lastActivityAt) break;
     yield* verify.ok(attempt < 299, "Idle presence refresh deadline expired");
     yield* Effect.sleep(100);
@@ -346,8 +347,8 @@ const program = Effect.gen(function*() {
   yield* hermesHook("post_api_request", { usage: { input_tokens: 999 }, response: sensitive });
   yield* hermesHook("on_session_end");
   for (let attempt = 0; attempt < 300; attempt++) {
-    const current = yield* mcp.call(inspectorUrl, token, InspectionTools.list, { machineId: hermesMachineId, harness: "hermes", limit: 100 });
-    if (!current.sessions.some((session) => session.ref.nativeSessionId === hermesId)) break;
+    const current = yield* mcp.call(inspectorUrl, token, InspectionTools.list, { machineId: hermesMachineId, limit: 100 });
+    if (!current.sessions.some((session) => session.ref.harness === "hermes" && session.ref.nativeSessionId === hermesId)) break;
     yield* verify.ok(attempt < 299, "Finalized Hermes identity must disappear and late callbacks cannot resurrect it");
     yield* Effect.sleep(100);
   }
@@ -495,7 +496,11 @@ const program = Effect.gen(function*() {
             yield* verify.equal(displayedNative.workspace?.cwd, worktreeRoot);
             yield* verify.deepEqual(displayedNative.workspace?.project, project);
             yield* verify.equal(displayedNative.workspace?.git?.state, "available");
-            if (displayedNative.workspace?.git?.state === "available") yield* verify.equal(displayedNative.workspace.git.head, gitHead);
+            if (displayedNative.workspace?.git?.state === "available") {
+              yield* verify.equal(displayedNative.workspace.git.head, gitHead);
+              yield* verify.equal(displayedNative.workspace.git.worktreeRoot, worktreeRoot);
+              yield* verify.equal(displayedNative.workspace.git.commonDir, join(repositoryRoot, ".git"));
+            }
             yield* verify.equal(displayedNative.resources.attribution, harness === "omp" ? "shared" : "owned");
             yield* verify.equal(displayedNative.resources.machineScopeId, displayedMachine.scopeId);
             yield* verify.equal(displayedNative.resources.rssBytes.shared, harness === "omp" ? true : undefined);
@@ -608,6 +613,7 @@ const program = Effect.gen(function*() {
           yield* guard(listing.sessions.some((entry) => entry.ref.machineId === ref.machineId && entry.ref.harness === "pi" && entry.ref.nativeSessionId === ref.nativeSessionId), "Native reader must discover the independent disposable Pi CLI");
           const listedNative = listing.sessions.find((entry) => entry.ref.nativeSessionId === ref.nativeSessionId && entry.ref.machineId === ref.machineId && entry.ref.harness === ref.harness);
           yield* guard(listedNative?.workspace?.cwd === ${JSON.stringify(worktreeRoot)} && listedNative.workspace.git?.state === "available" && listedNative.workspace.git.head === ${JSON.stringify(gitHead)}, "Native list JSON must retain real linked-worktree association");
+          yield* guard(listedNative?.workspace?.git?.state === "available" && listedNative.workspace.git.worktreeRoot === ${JSON.stringify(worktreeRoot)} && listedNative.workspace.git.commonDir === ${JSON.stringify(join(repositoryRoot, ".git"))}, "Native list JSON must retain shared Git identity and distinct worktree root");
           yield* guard(listedNative?.workspace?.project?.root === ${JSON.stringify(project.root)} && listedNative.workspace.project.id === "smoke-project", "Native list JSON must retain explicit project scope");
           yield* guard(listing.sessions.some((entry) => entry.ref.machineId === otherMachineId), "Native owner-key reader must discover separate installation");
           const inspected = yield* Effect.promise(() => inspect.execute("native-smoke-inspect", { ref }));

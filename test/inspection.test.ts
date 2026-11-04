@@ -102,7 +102,7 @@ it("projects only list fields while keeping unavailable reasons, partiality and 
   assert.deepStrictEqual(list.sessions[0]?.processes, value.processes);
   assert.deepStrictEqual(list.sessions[0]?.terminal, { name: "Terminal" });
   assert.deepStrictEqual(list.sessions[0]?.activity, { state: "waiting", wait: "approval", approval: "pending" });
-  assert.strictEqual(JSON.stringify(list).includes("worktreeRoot"), false);
+  assert.deepStrictEqual(list.sessions[0]?.workspace?.git, grouped.workspace?.git);
   assert.strictEqual(JSON.stringify(list).includes("sampleWindow"), false);
   assert.deepStrictEqual((await run(decodeSessionInspection(createInspection(value, 200)))).presence, value);
 });
@@ -117,6 +117,8 @@ it("accepts SHA-1, SHA-256, detached, unborn and explicit negative Git observati
   ] satisfies SessionGit[]) {
     const value = { ...presence, workspace: { cwd: "/work/project", git } };
     assert.deepStrictEqual(await run(decodeSessionPresence(value)), value);
+    const list = { machines: [projectListMachine(value)], sessions: [projectListSession(value)], nextCursor: null };
+    assert.deepStrictEqual((await run(decodeSessionListOutput(list))).sessions[0]?.workspace?.git, git);
   }
   for (const head of ["", "A".repeat(40), "g".repeat(40), "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), `${"a".repeat(40)}\n`, `${"a".repeat(64)}\r\n`]) {
     await expect(run(decodeSessionPresence({ ...presence, workspace: { cwd: "/work/project", git: { ...available, branch: "main", head } } }))).rejects.toThrow();
@@ -213,6 +215,15 @@ it("requires bounded pagination and TLS outside loopback", async () => {
   }
   for (const limit of [0, 101, 1.5]) await expect(run(decodeSessionListInput({ limit }))).rejects.toThrow();
   await expect(run(decodeSessionListInput({ limit: 1, cursor: "x".repeat(257) }))).rejects.toThrow();
+  for (const repository of ["/", "/remote/work/project/.git", "x".repeat(4096)]) {
+    const input = { limit: 1, machineId: "remote-machine", repository };
+    assert.deepStrictEqual(await run(decodeSessionListInput(input)), input);
+  }
+  for (const repository of ["", "x".repeat(4097), 12, null]) {
+    await expect(run(decodeSessionListInput({ limit: 1, repository }))).rejects.toThrow();
+  }
+  await expect(run(decodeSessionListInput({ limit: 1, harness: "pi" }))).rejects.toThrow();
+  await expect(run(decodeSessionListInput({ limit: 1, repository: "/remote/work/project/.git", harness: "pi" }))).rejects.toThrow();
 });
 
 it("requires canonical private token paths without restricting native metadata", async () => {

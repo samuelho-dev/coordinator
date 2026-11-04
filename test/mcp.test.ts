@@ -56,7 +56,7 @@ it("native MCP exposes only read-only tools and escapes or rejects private param
       assert.strictEqual(tool.annotations?.openWorldHint, false);
       assert.ok(tool.outputSchema);
     }
-    const listing = mcp.call(url, token, InspectionTools.list, { limit: 10 });
+    const listing = mcp.call(url, token, InspectionTools.list, { limit: 10, machineId: "machine-a", repository: "/work/main/.git" });
     expectTypeOf(listing).toEqualTypeOf<Effect.Effect<SessionListOutput, HttpError | Cause.TimeoutError>>();
     const listed = await app.runPromise(listing);
     assert.strictEqual(listed.sessions.length, 1);
@@ -66,7 +66,8 @@ it("native MCP exposes only read-only tools and escapes or rejects private param
     assert.strictEqual(listed.sessions[0]?.machineScopeId, null);
     assert.deepStrictEqual(listed.sessions[0]?.agent, presence.agent);
     assert.deepStrictEqual(listed.sessions[0]?.model, presence.model);
-    assert.deepStrictEqual(listed.sessions[0]?.workspace, { cwd: "/work/linked/subdir", project: presence.workspace?.project, git: { state: "available", observedAt: 1, branch: "feature", head: "a".repeat(40) } });
+    assert.deepStrictEqual(listed.sessions[0]?.workspace, presence.workspace);
+    assert.deepStrictEqual((await app.runPromise(mcp.call(url, token, InspectionTools.list, { limit: 10, repository: "/work/linked" }))).sessions, []);
     const inspection = mcp.call(url, token, InspectionTools.inspect, { ref: presence.ref });
     expectTypeOf(inspection).toEqualTypeOf<Effect.Effect<SessionInspection, HttpError | Cause.TimeoutError>>();
     const inspected = await app.runPromise(Effect.gen(function*() {
@@ -93,6 +94,7 @@ it("native MCP exposes only read-only tools and escapes or rejects private param
     const rejected = await client.callTool({ name: "session.list", arguments: { limit: 10, transcript: "private-model-input" } });
     assert.strictEqual(rejected.isError, true);
     assert.strictEqual(JSON.stringify(rejected).includes("private-model-input"), false);
+    assert.strictEqual((await client.callTool({ name: "session.list", arguments: { limit: 10, harness: "pi" } })).isError, true);
   } finally { await client.close(); await app.dispose(); }
 }, 15000);
 
@@ -118,9 +120,10 @@ it("one owner key discovers multiple installations while connector fences and ow
     const second: SessionPresence = { ...presence, ref: { ...presence.ref, machineId: "machine-b" } };
     await app.runPromise(mcp.post(url, token, "/connector/announce", ConnectorAnnounce, ConnectorAccepted, { ...connector, machineId: "machine-a", sessions: [presence] }));
     await app.runPromise(mcp.post(url, token, "/connector/announce", ConnectorAnnounce, ConnectorAccepted, { connectorId: "second-installation", incarnation: "second-process", machineId: "machine-b", sessions: [second] }));
-    const listed = await app.runPromise(mcp.call(url, token, InspectionTools.list, { limit: 10 }));
+    const listed = await app.runPromise(mcp.call(url, token, InspectionTools.list, { limit: 10, repository: "/work/main/.git" }));
     assert.deepStrictEqual(listed.sessions.map((session) => session.ref.machineId).sort(), ["machine-a", "machine-b"]);
-    assert.strictEqual((await app.runPromise(mcp.call(url, outsiderToken, InspectionTools.list, { limit: 10 }))).sessions.length, 0);
+    assert.deepStrictEqual((await app.runPromise(mcp.call(url, token, InspectionTools.list, { limit: 10, machineId: "machine-b", repository: "/work/main/.git" }))).sessions.map((session) => session.ref), [second.ref]);
+    assert.strictEqual((await app.runPromise(mcp.call(url, outsiderToken, InspectionTools.list, { limit: 10, repository: "/work/main/.git" }))).sessions.length, 0);
     for (const ref of [presence.ref, second.ref]) {
       await app.runPromise(mcp.call(url, outsiderToken, InspectionTools.inspect, { ref }).pipe(Effect.match({
         onSuccess: () => assert.fail("Cross-owner detail accepted"),
