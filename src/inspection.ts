@@ -92,7 +92,8 @@ export const MachineResources = Schema.Struct({
 export type MachineResources = typeof MachineResources.Type;
 export const staleMachineResources = (resources: MachineResources): MachineResources => {
   const stale = <M extends Metric>(value: M): M => ({ ...value, provenance: { ...value.provenance, stale: true } });
-  return { ...resources,
+  return {
+    ...resources,
     cpu: { usagePercent: stale(resources.cpu.usagePercent), capacityCores: stale(resources.cpu.capacityCores), usedPercent: stale(resources.cpu.usedPercent) },
     memory: { usedBytes: stale(resources.memory.usedBytes), capacityBytes: stale(resources.memory.capacityBytes), availableBytes: stale(resources.memory.availableBytes), usedPercent: stale(resources.memory.usedPercent) },
   };
@@ -105,8 +106,10 @@ export const SessionResources = Schema.Struct({
 export type SessionResources = typeof SessionResources.Type;
 export const staleSessionResources = (resources: SessionResources): SessionResources => {
   const stale = <M extends Metric>(value: M): M => ({ ...value, provenance: { ...value.provenance, stale: true } });
-  return { ...resources, cpuPercent: stale(resources.cpuPercent), cpuCapacityPercent: stale(resources.cpuCapacityPercent),
-    rssBytes: stale(resources.rssBytes), rssCapacityPercent: stale(resources.rssCapacityPercent) };
+  return {
+    ...resources, cpuPercent: stale(resources.cpuPercent), cpuCapacityPercent: stale(resources.cpuCapacityPercent),
+    rssBytes: stale(resources.rssBytes), rssCapacityPercent: stale(resources.rssCapacityPercent)
+  };
 };
 export const SessionMachine = Schema.Struct({
   name: Schema.optional(Label),
@@ -166,6 +169,142 @@ export const SessionPresence = Schema.Struct({
   })),
 });
 export type SessionPresence = typeof SessionPresence.Type;
+
+// List-only projection; connector announcements and inspection retain the full observations.
+const ListMetric = <S extends Schema.Constraint>(value: S) => Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("available"), value,
+    estimated: Schema.optional(Schema.Literal(true)), shared: Schema.optional(Schema.Literal(true)),
+    partial: Schema.optional(Schema.Literal(true)), stale: Schema.optional(Schema.Literal(true))
+  }),
+  Schema.Struct({
+    status: Schema.Literal("unavailable"), value: Schema.Null, reason: Label,
+    estimated: Schema.optional(Schema.Literal(true)), shared: Schema.optional(Schema.Literal(true)),
+    partial: Schema.optional(Schema.Literal(true)), stale: Schema.optional(Schema.Literal(true))
+  }),
+]);
+export const ListMachine = Schema.Struct({
+  machineId: Id, scopeId: Schema.NullOr(Id), name: Schema.optional(Label),
+  os: Schema.optional(Schema.Struct({ platform: Schema.Literals(["linux", "darwin"]) })),
+  resources: Schema.optional(Schema.Struct({
+    scope: Schema.Literals(["host", "cgroup", "unknown"]), source: Label, observedAt: Timestamp,
+    cpu: Schema.Struct({ capacityCores: ListMetric(Nonnegative), usedPercent: ListMetric(Nonnegative) }),
+    memory: Schema.Struct({ accounting: Label, usedBytes: ListMetric(Count), capacityBytes: ListMetric(Count), usedPercent: ListMetric(Nonnegative) }),
+  })),
+});
+export type ListMachine = typeof ListMachine.Type;
+const ListGit = Schema.Union([
+  Schema.Struct({ state: Schema.Literal("available"), observedAt: Timestamp, branch: Schema.NullOr(Id), head: Schema.NullOr(Schema.String.check(Schema.isPattern(/^(?:[a-f0-9]{40}|[a-f0-9]{64})(?![\s\S])/))) }),
+  Schema.Struct({ state: Schema.Literal("not-repository"), observedAt: Timestamp }),
+  Schema.Struct({ state: Schema.Literal("unavailable"), observedAt: Timestamp }),
+]);
+export const ListSession = Schema.Struct({
+  ref: SessionRef, observedAt: Timestamp, machineScopeId: Schema.NullOr(Id),
+  agent: Schema.optional(SessionAgent), model: Schema.optional(SessionModel),
+  workspace: Schema.optional(Schema.Struct({ cwd: Path, project: Schema.optional(SessionProject), git: Schema.optional(ListGit) })),
+  connection: Schema.optional(Schema.Struct({ state: Schema.Literals(["live", "stale"]), receivedAt: Timestamp, liveUntil: Timestamp })),
+  startedAt: Schema.optional(Schema.NullOr(Timestamp)), lastActivityAt: Schema.optional(Schema.NullOr(Timestamp)),
+  parent: Schema.optional(SessionRef), label: Schema.optional(Label),
+  terminal: Schema.optional(Schema.Struct({ name: NativeReference })), programStatus: Schema.optional(ProgramStatus),
+  processes: Schema.optional(bounded(ProcessIdentity, 128)),
+  resources: Schema.optional(Schema.Struct({
+    observedAt: Timestamp, machineScopeId: Schema.NullOr(Id), attribution: Schema.Literals(["owned", "shared", "unknown"]),
+    cpuCapacityPercent: ListMetric(Nonnegative), rssBytes: ListMetric(Count), rssCapacityPercent: ListMetric(Nonnegative),
+  })),
+  activity: Schema.optional(Schema.Struct({
+    state: Schema.Literals(["idle", "working", "waiting", "stopped", "unknown"]),
+    wait: Schema.optional(Schema.Literals(["api", "tool", "user", "approval", "unknown"])),
+    approval: Schema.optional(Schema.Literals(["pending", "approved", "denied", "unknown"])),
+    currentToolName: Schema.optional(Id),
+  })),
+});
+export type ListSession = typeof ListSession.Type;
+const listMetric = (value: Metric) => {
+  const flags = {
+    ...(value.provenance.estimated ? { estimated: true as const } : {}),
+    ...(value.provenance.shared ? { shared: true as const } : {}),
+    ...(value.provenance.partial ? { partial: true as const } : {}),
+    ...(value.provenance.stale ? { stale: true as const } : {}),
+  };
+  return value.status === "unavailable"
+    ? { status: "unavailable" as const, value: null, reason: value.reason, ...flags }
+    : { status: "available" as const, value: value.value, ...flags };
+};
+export const projectListMachine = (presence: SessionPresence): ListMachine => {
+  const machine = presence.machine;
+  const resources = machine?.resources;
+  return {
+    machineId: presence.ref.machineId, scopeId: resources?.scopeId ?? null,
+    ...(machine?.name ? { name: machine.name } : {}),
+    ...(machine?.os ? { os: { platform: machine.os.platform } } : {}),
+    ...(resources ? {
+      resources: {
+        scope: resources.scope, source: resources.source, observedAt: resources.observedAt,
+        cpu: { capacityCores: listMetric(resources.cpu.capacityCores), usedPercent: listMetric(resources.cpu.usedPercent) },
+        memory: {
+          accounting: resources.memory.usedBytes.provenance.scopeDescription,
+          usedBytes: listMetric(resources.memory.usedBytes), capacityBytes: listMetric(resources.memory.capacityBytes),
+          usedPercent: listMetric(resources.memory.usedPercent)
+        },
+      }
+    } : {}),
+  };
+};
+export const projectListSession = (presence: SessionPresence): ListSession => ({
+  ref: presence.ref, observedAt: presence.observedAt, machineScopeId: presence.machine?.resources?.scopeId ?? null,
+  ...(presence.agent ? { agent: presence.agent } : {}), ...(presence.model ? { model: presence.model } : {}),
+  ...(presence.workspace ? {
+    workspace: {
+      cwd: presence.workspace.cwd, ...(presence.workspace.project ? { project: presence.workspace.project } : {}),
+      ...(presence.workspace.git ? {
+        git: presence.workspace.git.state === "available"
+          ? { state: "available" as const, observedAt: presence.workspace.git.observedAt, branch: presence.workspace.git.branch, head: presence.workspace.git.head }
+          : { state: presence.workspace.git.state, observedAt: presence.workspace.git.observedAt }
+      } : {}),
+    }
+  } : {}),
+  ...(presence.connection ? { connection: presence.connection } : {}),
+  ...(presence.startedAt !== undefined ? { startedAt: presence.startedAt } : {}),
+  ...(presence.lastActivityAt !== undefined ? { lastActivityAt: presence.lastActivityAt } : {}),
+  ...(presence.parent ? { parent: presence.parent } : {}), ...(presence.label ? { label: presence.label } : {}),
+  ...(presence.terminal ? { terminal: { name: presence.terminal.name } } : {}),
+  ...(presence.programStatus ? { programStatus: presence.programStatus } : {}),
+  ...(presence.processes ? { processes: presence.processes } : {}),
+  ...(presence.resources ? {
+    resources: {
+      observedAt: presence.resources.observedAt, machineScopeId: presence.resources.machineScopeId, attribution: presence.resources.attribution,
+      cpuCapacityPercent: listMetric(presence.resources.cpuCapacityPercent), rssBytes: listMetric(presence.resources.rssBytes),
+      rssCapacityPercent: listMetric(presence.resources.rssCapacityPercent),
+    }
+  } : {}),
+  ...(presence.activity ? {
+    activity: {
+      state: presence.activity.state, ...(presence.activity.wait ? { wait: presence.activity.wait } : {}),
+      ...(presence.activity.approval ? { approval: presence.activity.approval } : {}),
+      ...(presence.activity.currentToolName ? { currentToolName: presence.activity.currentToolName } : {}),
+    }
+  } : {}),
+});
+export const listMachineKey = (machine: ListMachine): string => JSON.stringify([machine.machineId, machine.scopeId]);
+const staleListMetricCount = (resources: NonNullable<ListMachine["resources"]>): number =>
+  Number(resources.cpu.capacityCores.stale === true) + Number(resources.cpu.usedPercent.stale === true) +
+  Number(resources.memory.usedBytes.stale === true) + Number(resources.memory.capacityBytes.stale === true) +
+  Number(resources.memory.usedPercent.stale === true);
+export const preferListMachine = (candidate: ListMachine, current: ListMachine | undefined): boolean => {
+  if (!current) return true;
+  const next = candidate.resources, previous = current.resources;
+  if (!next) return false;
+  if (!previous) return true;
+  return next.observedAt !== previous.observedAt
+    ? next.observedAt > previous.observedAt
+    : staleListMetricCount(next) < staleListMetricCount(previous);
+};
+export const mergeListMachines = (target: Map<string, ListMachine>, machines: ReadonlyArray<ListMachine>): void => {
+  for (const machine of machines) {
+    const id = listMachineKey(machine);
+    if (preferListMachine(machine, target.get(id))) target.set(id, machine);
+  }
+};
 
 const TokenMetric = metricSchema("tokens", Count);
 const CountMetric = metricSchema("count", Count);
@@ -266,7 +405,7 @@ export const ConnectorConfig = Schema.Struct({
 export type ConnectorConfig = typeof ConnectorConfig.Type;
 export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", {
   status: Schema.Int.check(Schema.isBetween({ minimum: 400, maximum: 599 })), message: Label,
-}) {}
+}) { }
 export const ObservationError = Schema.Struct({
   code: Schema.Literals(["unavailable", "not-found", "timeout", "disconnected", "invalid-observation"]),
   message: Schema.Literal("Native session observation unavailable"),
@@ -294,7 +433,7 @@ export const SessionListInput = Schema.Struct({
   machineId: Schema.optional(Id), harness: Schema.optional(Harness),
 });
 export type SessionListInput = typeof SessionListInput.Type;
-export const SessionListOutput = Schema.Struct({ sessions: bounded(SessionPresence, 100), nextCursor: Schema.NullOr(Id) });
+export const SessionListOutput = Schema.Struct({ machines: bounded(ListMachine, 100), sessions: bounded(ListSession, 100), nextCursor: Schema.NullOr(Id) });
 export type SessionListOutput = typeof SessionListOutput.Type;
 export const SessionInspectInput = Schema.Struct({ ref: SessionRef });
 export type SessionInspectInput = typeof SessionInspectInput.Type;

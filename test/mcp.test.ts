@@ -26,15 +26,17 @@ class Endpoint extends Context.Service<Endpoint>()("test/InspectorHttp", {
   make: Effect.gen(function*() {
     const mcp = yield* Mcp;
     const crypto = yield* Crypto.Crypto;
-    const inspector = yield* Inspector.make({ host: "127.0.0.1", port: 0, principals: [
-      { id: "reader", owner: "owner", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(token))) },
-      { id: "outsider", owner: "other-owner", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(outsiderToken))) },
-    ] });
+    const inspector = yield* Inspector.make({
+      host: "127.0.0.1", port: 0, principals: [
+        { id: "reader", owner: "owner", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(token))) },
+        { id: "outsider", owner: "other-owner", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode(outsiderToken))) },
+      ]
+    });
     const server = yield* HttpServer.HttpServer;
     yield* serve(server, inspector);
     return { mcp, url: HttpServer.formatAddress(server.address) };
   }),
-}) {}
+}) { }
 const runtime = () => ManagedRuntime.make(Layer.effect(Endpoint, Endpoint.make).pipe(Layer.provideMerge(Layer.mergeAll(Mcp.layer, NodeServices.layer, NodeHttpClient.layerUndici, serverLayer("127.0.0.1", 0)))));
 const connector = { connectorId: "native-connector", incarnation: "process-incarnation" };
 
@@ -60,10 +62,11 @@ it("native MCP exposes only read-only tools and escapes or rejects private param
     assert.strictEqual(listed.sessions.length, 1);
     assert.deepStrictEqual(listed.sessions[0]?.ref, presence.ref);
     assert.strictEqual(listed.sessions[0]?.label, presence.label);
-    assert.deepStrictEqual(listed.sessions[0]?.machine, presence.machine);
+    assert.deepStrictEqual(listed.machines, [{ machineId: presence.ref.machineId, scopeId: null, name: presence.machine?.name, os: { platform: "linux" } }]);
+    assert.strictEqual(listed.sessions[0]?.machineScopeId, null);
     assert.deepStrictEqual(listed.sessions[0]?.agent, presence.agent);
     assert.deepStrictEqual(listed.sessions[0]?.model, presence.model);
-    assert.deepStrictEqual(listed.sessions[0]?.workspace, presence.workspace);
+    assert.deepStrictEqual(listed.sessions[0]?.workspace, { cwd: "/work/linked/subdir", project: presence.workspace?.project, git: { state: "available", observedAt: 1, branch: "feature", head: "a".repeat(40) } });
     const inspection = mcp.call(url, token, InspectionTools.inspect, { ref: presence.ref });
     expectTypeOf(inspection).toEqualTypeOf<Effect.Effect<SessionInspection, HttpError | Cause.TimeoutError>>();
     const inspected = await app.runPromise(Effect.gen(function*() {
@@ -205,18 +208,20 @@ for (const variant of ["401", "503", "oversized-json", "oversized-sse", "timeout
           const status = variant === "redirect" ? 307 : variant === "401" || variant === "503" ? Number(variant) : 200;
           const first = variant === "401" || variant === "503" ? "private-rejection".repeat(LIMIT)
             : variant === "oversized-json" ? "x".repeat(512 * 1024 + 1)
-            : variant === "oversized-sse" ? `data: ${"x".repeat(MCP_RESPONSE_LIMIT)}` : ": waiting\n\n";
+              : variant === "oversized-sse" ? `data: ${"x".repeat(MCP_RESPONSE_LIMIT)}` : ": waiting\n\n";
           const body = (variant === "interrupted" ? Stream.fail(new Error("Interrupted fixture response"))
             : variant === "redirect" ? Stream.empty
-            : Stream.concat(Stream.make(new TextEncoder().encode(first)), Stream.never)).pipe(
-              Stream.ensuring(Effect.sync(disconnected.resolve)),
-            );
-          return HttpServerResponse.stream(body, { status, headers: variant === "redirect" ? { location: "http://localhost:1/steal" }
-            : { "content-type": variant === "oversized-json" ? "application/json" : "text/event-stream" } });
+              : Stream.concat(Stream.make(new TextEncoder().encode(first)), Stream.never)).pipe(
+                Stream.ensuring(Effect.sync(disconnected.resolve)),
+              );
+          return HttpServerResponse.stream(body, {
+            status, headers: variant === "redirect" ? { location: "http://localhost:1/steal" }
+              : { "content-type": variant === "oversized-json" ? "application/json" : "text/event-stream" }
+          });
         }));
         return HttpServer.formatAddress(server.address);
       }),
-    }) {}
+    }) { }
     const app = ManagedRuntime.make(Layer.merge(Mcp.layer, Layer.effect(Fixture, Fixture.make).pipe(Layer.provide(serverLayer("127.0.0.1", 0)))));
     try {
       const url = await app.runPromise(Fixture);

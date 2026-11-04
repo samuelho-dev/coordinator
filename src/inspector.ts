@@ -3,12 +3,12 @@ import { Hex } from "effect/encoding";
 import { equalDigests } from "./platform.ts";
 import {
   INSPECTION_LIMIT, HttpError, sessionRefKey, unavailableMetric, staleMachineResources, staleSessionResources,
+  listMachineKey, preferListMachine, projectListMachine, projectListSession,
   type ConnectorAccepted, type ConnectorAnnounce, type ConnectorDisconnect, type ConnectorPoll,
   type ConnectorPollResult, type ConnectorResult, type InspectorConfig, type InspectorPrincipal,
-  type ProcessIdentity, type ProcessObservation, type SessionInspection, type SessionInspectInput, type SessionListInput,
+  type ListMachine, type ListSession, type ProcessIdentity, type ProcessObservation, type SessionInspection, type SessionInspectInput, type SessionListInput,
   type SessionListOutput, type SessionPresence, type SessionRef, type Metric,
 } from "./inspection.ts";
-
 const LIVE_MS = 30_000;
 const EXPIRE_MS = 120_000;
 const REQUEST_MS = 10_000;
@@ -113,9 +113,11 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
     let resources = presence.resources;
     if (resources && (resources.attribution === "shared" || presence.processes?.some((process) => process.ownership === "shared" || sharedProcess(session, process, shared)))) {
       const markShared = <M extends Metric>(value: M): M => ({ ...value, provenance: { ...value.provenance, shared: true } });
-      resources = { ...resources, attribution: "shared", cpuPercent: markShared(resources.cpuPercent),
+      resources = {
+        ...resources, attribution: "shared", cpuPercent: markShared(resources.cpuPercent),
         cpuCapacityPercent: markShared(resources.cpuCapacityPercent), rssBytes: markShared(resources.rssBytes),
-        rssCapacityPercent: markShared(resources.rssCapacityPercent) };
+        rssCapacityPercent: markShared(resources.rssCapacityPercent)
+      };
     }
     if (resources && (!live(session.connector) || wall() - resources.observedAt >= LIVE_MS)) resources = staleSessionResources(resources);
     return {
@@ -188,29 +190,38 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
         (input.machineId === undefined || session.presence.ref.machineId === input.machineId) &&
         (input.harness === undefined || session.presence.ref.harness === input.harness),
       ).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
-      const page: Array<SessionPresence> = [];
+      const page: ListSession[] = [];
+      const machines = new Map<string, ListMachine>();
       const shared = sharedProcesses(principal.owner);
       let after: string | undefined;
       for (const [id, session] of entries) {
         if (page.length >= input.limit) break;
         const presence = normalizedPresence(session, shared);
-        page.push(presence);
-        if (bytes({ sessions: page, nextCursor: next }) > INSPECTION_LIMIT) {
+        const row = projectListSession(presence);
+        const machine = projectListMachine(presence);
+        const machineKey = listMachineKey(machine);
+        const previous = machines.get(machineKey);
+        if (preferListMachine(machine, previous)) machines.set(machineKey, machine);
+        page.push(row);
+        if (bytes({ machines: [...machines.values()], sessions: page, nextCursor: next }) > INSPECTION_LIMIT) {
           page.pop();
+          if (previous) machines.set(machineKey, previous);
+          else machines.delete(machineKey);
           if (page.length === 0) return Effect.fail(error(413, "Native session presence exceeds response limit"));
           break;
         }
         after = id;
       }
+      const machineRows = [...machines.values()];
       if (page.length < entries.length && after !== undefined) {
         if (cursors.size >= MAX_CURSORS) {
           const oldest = cursors.keys().next().value;
           if (oldest !== undefined) cursors.delete(oldest);
         }
         cursors.set(next, { owner: principal.owner, machineId: input.machineId, harness: input.harness, after, expires: now() + EXPIRE_MS });
-        return Effect.succeed({ sessions: page, nextCursor: next });
+        return Effect.succeed({ machines: machineRows, sessions: page, nextCursor: next });
       }
-      return Effect.succeed({ sessions: page, nextCursor: null });
+      return Effect.succeed({ machines: machineRows, sessions: page, nextCursor: null });
     }))),
     inspect: (principal: InspectorPrincipal, input: SessionInspectInput): Effect.Effect<SessionInspection, HttpError> => uuid.pipe(Effect.flatMap((requestId) => Effect.uninterruptibleMask((restore) => Effect.suspend(() => {
       if (!authenticated(principal)) return Effect.fail(error(401, "Unauthorized"));
@@ -256,8 +267,12 @@ const make = (config: InspectorConfig): Effect.Effect<InspectorService, HttpErro
         else if (current.connector !== previous && live(current.connector)) return Effect.fail(error(409, "Native session already has an active publisher"));
       }
       if (sessions.size + newCount - removedCount > MAX_SESSIONS) return Effect.fail(error(429, "Native session capacity reached"));
-      // UUID cursors always occupy 36 ASCII bytes; validate presence before admitting it.
-      for (const presence of input.sessions) if (bytes({ sessions: [{ ...presence, connection: { state: "live", receivedAt: wall(), liveUntil: wall() + LIVE_MS } }], nextCursor: "0".repeat(36) }) > INSPECTION_LIMIT) return Effect.fail(error(413, "Native session presence exceeds response limit"));
+      // A one-row compact list page must be admissible, including machine metadata and cursor.
+      // Reserve normalization growth: up to 128 shared process labels, 8 stale and 3 shared metric flags.
+      for (const presence of input.sessions) {
+        const connected = { ...presence, connection: { state: "live" as const, receivedAt: wall(), liveUntil: wall() + LIVE_MS } };
+        if (bytes({ machines: [projectListMachine(connected)], sessions: [projectListSession(connected)], nextCursor: "0".repeat(36) }) + 512 > INSPECTION_LIMIT) return Effect.fail(error(413, "Native session presence exceeds response limit"));
+      }
       let connector = previous;
       if (!connector || connector.incarnation !== input.incarnation) {
         const retired = previous?.retired ?? new Set<string>();
