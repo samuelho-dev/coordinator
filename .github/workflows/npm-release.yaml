@@ -104,4 +104,19 @@ jobs:
           test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SHA"
           test "$(sha256sum package.tgz | cut -d' ' -f1)" = "$(jq -r .archiveSha256 npm.json)"
           npm publish ./package.tgz --ignore-scripts --access public --tag beta --provenance --registry=https://registry.npmjs.org
-          printf 'Published `@samuelho-dev/coordinator@%s` under `beta` from CI `%s`, source `%s`, SHA256 `%s`. No rebuild or visibility change.\n' "$VERSION" '${{ inputs.ci_run_id }}' "$SHA" "$(jq -r .archiveSha256 npm.json)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify published version and tarball integrity
+        working-directory: npm-evidence
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          INTEGRITY="sha512-$(openssl dgst -sha512 -binary package.tgz | openssl base64 -A)"
+          for attempt in {1..10}; do
+            STATUS="$(curl --silent --show-error --output "$RUNNER_TEMP/published.json" --write-out '%{http_code}' "https://registry.npmjs.org/@samuelho-dev%2fcoordinator/$VERSION")"
+            if [ "$STATUS" = 200 ]; then break; fi
+            if [ "$attempt" = 10 ]; then echo "Registry verification failed (HTTP $STATUS)." >&2; exit 1; fi
+            sleep 5
+          done
+          jq -e --arg version "$VERSION" --arg integrity "$INTEGRITY" '.name == "@samuelho-dev/coordinator" and .version == $version and .dist.integrity == $integrity' "$RUNNER_TEMP/published.json"
+          printf 'Published and verified `@samuelho-dev/coordinator@%s` under `beta` from CI `%s`, source `%s`, SHA256 `%s`. No rebuild or visibility change.\n' "$VERSION" '${{ inputs.ci_run_id }}' "$SHA" "$(jq -r .archiveSha256 npm.json)" >> "$GITHUB_STEP_SUMMARY"
