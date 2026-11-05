@@ -219,6 +219,8 @@ Release gaps and constraints:
 - Publish only the accepted tarball from successful current-main CI. Apply the [release workflow's](.github/workflows/npm-release.yaml) source/run/attempt, required-job, unique-unexpired-artifact, manifest/repository, normalized source-contract, SHA256 and unused-version checks. Do not rebuild, repack a dirty checkout or create a dummy bootstrap version. Explicitly publish that archive with `--ignore-scripts --access public --tag beta --registry=https://registry.npmjs.org`; an interactive first publication has no hosted npm provenance.
 - For later releases, configure [npm's trusted publisher](https://docs.npmjs.com/trusted-publishers/) for GitHub owner `samuelho-dev`, repository `coordinator`, workflow `npm-release.yaml`, environment `npm-public`, with direct publishing allowed. Protect that GitHub environment with maintainers/reviewers and main-only restrictions; naming it in YAML does not create those rules. The hosted OIDC workflow publishes the verified archive with provenance, without an npm token fallback, then checks the registry's exact version and SHA-512 integrity against that archive. A failed post-publication check requires investigation; it does not undo a successful publish.
 
+Registry verification allows up to 120 checks, ten seconds apart, for npm processing. Publishing is not retried; an integrity mismatch still fails the release.
+
 
 ## Internal contract
 

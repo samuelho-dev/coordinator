@@ -23,7 +23,7 @@ jobs:
   publish:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment: npm-public
     permissions:
       contents: read
@@ -112,11 +112,11 @@ jobs:
         run: |
           set -euo pipefail
           INTEGRITY="sha512-$(openssl dgst -sha512 -binary package.tgz | openssl base64 -A)"
-          for attempt in {1..10}; do
+          for attempt in {1..120}; do
             STATUS="$(curl --silent --show-error --output "$RUNNER_TEMP/published.json" --write-out '%{http_code}' "https://registry.npmjs.org/@samuelho-dev%2fcoordinator/$VERSION")"
             if [ "$STATUS" = 200 ]; then break; fi
-            if [ "$attempt" = 10 ]; then echo "Registry verification failed (HTTP $STATUS)." >&2; exit 1; fi
-            sleep 5
+            if [ "$STATUS" != 404 ] || [ "$attempt" = 120 ]; then echo "Registry verification failed (HTTP $STATUS)." >&2; exit 1; fi
+            sleep 10
           done
           jq -e --arg version "$VERSION" --arg integrity "$INTEGRITY" '.name == "@samuelho-dev/coordinator" and .version == $version and .dist.integrity == $integrity' "$RUNNER_TEMP/published.json"
           printf 'Published and verified `@samuelho-dev/coordinator@%s` under `beta` from CI `%s`, source `%s`, SHA256 `%s`. No rebuild or visibility change.\n' "$VERSION" '${{ inputs.ci_run_id }}' "$SHA" "$(jq -r .archiveSha256 npm.json)" >> "$GITHUB_STEP_SUMMARY"
