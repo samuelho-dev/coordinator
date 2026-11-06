@@ -178,13 +178,13 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. E
 
 ## Plugin publication
 
-The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.10`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.11`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
 For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.10
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.10
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.11
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.11
 ```
 
 Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
@@ -206,6 +206,8 @@ Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixe
 `0.3.0-beta.9` canonicalizes the Darwin boot timestamp to validated numeric seconds/microseconds before hashing it with the hostname. Locale/timezone renderings of the same boot now retain one machine scope ID; a reboot or different host still gets another. Missing or malformed boot data produces no scope ID. The wire schema and runtime dependencies are unchanged; update and reload native publishers/readers without redeploying the API.
 
 `0.3.0-beta.10` consolidates session list metadata into machine and session collections and adds repository and machine ID filters. This is a breaking list API and reader cutover; coordinate the matching inspector and native readers as described above.
+
+`0.3.0-beta.11` fixes fresh Pi startup when the unused Redis peer is not installed. It changes no wire contract or runtime dependencies; the beta.10 API and chart need no redeployment.
 
 | Host | Publication route |
 | --- | --- |

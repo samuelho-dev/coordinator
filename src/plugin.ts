@@ -1,4 +1,4 @@
-import { NodeServices } from "@effect/platform-node";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Cause, Clock, Config, Console, Effect, Formatter, Layer, Logger, ManagedRuntime, Schema } from "effect";
 import type { FileSystem, Path, Scope } from "effect";
 import type { ChildProcessSpawner } from "effect/process";
