@@ -3,7 +3,9 @@ import { HttpClient, HttpClientRequest, HttpServer } from "effect/http";
 import { Hex } from "effect/encoding";
 import { Host, serverLayer } from "../src/platform.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
-import { NodeHttpClient, NodeRuntime, NodeServices } from "@effect/platform-node";
+import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Inspector } from "../src/inspector.ts";
 import { ConnectorAccepted, ConnectorAnnounce, InspectionTools, InspectorConfig, SessionPresence, createInspection } from "../src/inspection.ts";
 import { Mcp, serve } from "../src/mcp.ts";
@@ -580,7 +582,8 @@ const program = Effect.gen(function*() {
         import { createAgentSession, DefaultResourceLoader, SessionManager } from ${JSON.stringify(piSdk)};
         import { Config, Console, Effect, FileSystem, Path, Schema } from ${JSON.stringify(import.meta.resolve("effect"))};
         import { Stdio } from ${JSON.stringify(import.meta.resolve("effect/Stdio"))};
-        import { NodeRuntime, NodeServices } from ${JSON.stringify(import.meta.resolve("@effect/platform-node"))};
+        import * as NodeRuntime from ${JSON.stringify(import.meta.resolve("@effect/platform-node/NodeRuntime"))};
+        import * as NodeServices from ${JSON.stringify(import.meta.resolve("@effect/platform-node/NodeServices"))};
         import { InspectionTools, SessionRef } from ${JSON.stringify((yield* path.toFileUrl(resolve(dirname(main), "inspection.js"))).href)};
         const guard = (condition, message) => condition ? Effect.void : Effect.die(message);
         const program = Effect.gen(function*() {

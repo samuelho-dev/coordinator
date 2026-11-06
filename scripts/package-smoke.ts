@@ -54,16 +54,20 @@ const program = Effect.gen(function*() {
     yield* guard(entries.includes(`package/${required}`), `Missing public tarball entry: ${required}`);
   }
   yield* fs.writeFileString(path.join(root, "package.json"), JSON.stringify({ private: true, type: "module" }));
-  yield* run("npm", ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", tarball]);
+  yield* run("npm", ["install", "--omit=dev", "--legacy-peer-deps", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", tarball]);
   const packageRoot = path.join(root, "node_modules", "@samuelho-dev", "coordinator");
+  for (const directory of [root, packageRoot, path.join(root, "node_modules", "@effect", "platform-node")]) {
+    yield* guard(!(yield* fs.exists(path.join(directory, "node_modules", "redis"))), "Redis must be absent from the production installation");
+  }
   const manifest = yield* Schema.decodeEffect(Schema.fromJsonString(Manifest))(yield* fs.readFileString(path.join(packageRoot, "package.json")));
   yield* guard(manifest.name === "@samuelho-dev/coordinator", "Unexpected installed package identity");
   yield* guard(manifest.scripts?.preinstall === undefined && manifest.scripts?.install === undefined && manifest.scripts?.postinstall === undefined, "Published package must not define install lifecycle scripts");
   const { "coordinator-install": installerBin } = manifest.bin;
   yield* guard(manifest.bin.coordinator.replace(/^\.\//, "") === "dist/src/main.js" && installerBin.replace(/^\.\//, "") === "dist/scripts/install.js", "Public binaries must point to built entrypoints");
   yield* guard(JSON.stringify(manifest.pi.extensions) === JSON.stringify(["./dist/plugins/pi.js"]) && JSON.stringify(manifest.omp.extensions) === JSON.stringify(["./dist/plugins/omp.js"]), "Native package metadata must select the published extensions");
-  const installed = (yield* run("npm", ["ls", "--all", "--omit=dev", "--parseable"])).trim().split("\n");
+  const installed = (yield* run("npm", ["ls", "--all", "--omit=dev", "--omit=peer", "--parseable"])).trim().split("\n");
   for (const dependency of installed) {
+    yield* guard(!/\/node_modules\/redis$/.test(dependency), `Redis must be absent from the production installation: ${dependency}`);
     yield* guard(!/\/node_modules\/(?:@earendil-works\/|@oh-my-pi\/|@effect\/(?:tsgo|vitest)(?:\/|$)|(?:typescript|vitest|esbuild)(?:\/|$))/.test(dependency), `Development/native SDK dependency leaked into production installation: ${dependency}`);
   }
   for (const binary of ["coordinator", "coordinator-install"]) {
@@ -90,10 +94,12 @@ const program = Effect.gen(function*() {
     ownerIsolation: Schema.Literal(true), sameInstallationNativeIdentity: Schema.Literal(true), nativeHarnesses: Schema.Literal(true),
   })))(evidence.trim().split("\n").at(-1) ?? "");
   yield* Console.log(evidence.trim());
-  yield* Console.log(JSON.stringify({ scenario: "npm-package-acceptance", status: "ok", package: manifest.name, version: manifest.version,
+  yield* Console.log(JSON.stringify({
+    scenario: "npm-package-acceptance", status: "ok", package: manifest.name, version: manifest.version,
     payloadEntries: entries.length, productionOnly: true, lifecycleScripts: false, isolatedInstall: true,
     installedBins: ["coordinator", "coordinator-install"], installedNativeEntrypoints: ["pi", "omp"], hostOwnedSdkReaders: true,
-    groupedMetadata: true, realGitWorktree: true, explicitProjectScope: true }));
+    groupedMetadata: true, realGitWorktree: true, explicitProjectScope: true
+  }));
 });
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("5 minutes"), Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer))));

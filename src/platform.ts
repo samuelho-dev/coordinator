@@ -1,7 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { arch, cpus, homedir, hostname, platform, release } from "node:os";
-import { NodeHttpServer, NodeStdio, NodeStream } from "@effect/platform-node";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import * as NodeStdio from "@effect/platform-node/NodeStdio";
+import * as NodeStream from "@effect/platform-node/NodeStream";
 import { Context, Effect, FileSystem, Layer, PlatformError, Stdio } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 

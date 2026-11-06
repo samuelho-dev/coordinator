@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-import { NodeRuntime, NodeServices } from "@effect/platform-node";
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Config, Console, Effect, FileSystem, Layer, Logger, Option, Path, Schema } from "effect";
 import { Command, Flag } from "effect/cli";
 import { loadConnectorConfig, readConnectorToken } from "../src/native.ts";
 import { checkExecutable, Host } from "../src/platform.ts";
 
-class InstallError extends Schema.TaggedError<InstallError>()("InstallError", { message: Schema.String }) {}
+class InstallError extends Schema.TaggedError<InstallError>()("InstallError", { message: Schema.String }) { }
 const installationFailure = () => new InstallError({ message: "Installation failed; check owner, private paths, installed package and destination permissions. Existing native configuration was not changed." });
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const packageRoot = new URL("../../", import.meta.url);

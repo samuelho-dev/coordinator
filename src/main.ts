@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { Cause, Config, Console, Context, Effect, FileSystem, Layer, Logger, Path, Schema, Stdio, Stream } from "effect";
 import { HttpServer } from "effect/http";
-import { NodeRuntime, NodeServices } from "@effect/platform-node";
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Inspector } from "./inspector.ts";
 import { Mcp, serve, serveStdio } from "./mcp.ts";
 import { Host, cliStdioLayer, serverLayer } from "./platform.ts";
