@@ -5,10 +5,10 @@ import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Inspector } from "./inspector.ts";
 import { Mcp, serve, serveStdio } from "./mcp.ts";
 import { Host, cliStdioLayer, serverLayer } from "./platform.ts";
-import { InspectorConfig, InspectionTools, SessionInspectInput } from "./inspection.ts";
+import { InspectorConfig, InspectionTools, SessionInspectInput, mergeListMachines } from "./inspection.ts";
 import { NativeError, connectExternal, loadConnectorConfig, resolveNativeConfig, readConnectorToken, readPrivateFile, projectHook, projectClaudeStatus, projectCodexNotification, writeNativeCache, writeHermesHook } from "./native.ts";
 import { runSetup } from "./setup.ts";
-import type { SessionPresence } from "./inspection.ts";
+import type { ListMachine, ListSession } from "./inspection.ts";
 
 const readInput = Effect.gen(function*() {
   const stdio = yield* Stdio.Stdio;
@@ -66,14 +66,16 @@ export const cli = (args: ReadonlyArray<string>) => Effect.scoped(Effect.gen(fun
   };
   if (mode === "mcp") return yield* serveStdio(reader);
   if (mode === "list") {
-    const sessions: SessionPresence[] = [];
+    const sessions: ListSession[] = [];
+    const machines = new Map<string, ListMachine>();
     let cursor: string | undefined;
     do {
       const page = yield* reader.list({ limit: 100, ...(cursor === undefined ? {} : { cursor }) });
       sessions.push(...page.sessions);
+      mergeListMachines(machines, page.machines);
       cursor = page.nextCursor ?? undefined;
     } while (cursor !== undefined);
-    return yield* Console.log(JSON.stringify({ sessions, nextCursor: null }));
+    return yield* Console.log(JSON.stringify({ machines: [...machines.values()], sessions, nextCursor: null }));
   }
   if (mode === "inspect") {
     const input = yield* Schema.decodeUnknownEffect(SessionInspectInput)(yield* readInput);
@@ -92,9 +94,11 @@ if (import.meta.main) {
       return Console.error(JSON.stringify({
         error: "Native inspector operation unavailable",
         reasons: cause.reasons.map((reason) => reason._tag === "Fail"
-          ? { kind: reason._tag, code: reason.error._tag,
+          ? {
+            kind: reason._tag, code: reason.error._tag,
             ...(reason.error._tag === "HttpError" ? { status: reason.error.status } : {}),
-            ...(reason.error._tag === "NativeError" ? { operation: reason.error.operation } : {}) }
+            ...(reason.error._tag === "NativeError" ? { operation: reason.error.operation } : {})
+          }
           : { kind: reason._tag }),
       })).pipe(Effect.andThen(hook ? Effect.void : Effect.failCause(cause)));
     }));

@@ -4,7 +4,7 @@ import { NodeServices } from "@effect/platform-node";
 import { assert, expect, it } from "@effect/vitest";
 import {
   createInspection, decodeConnectorAnnounce, decodeConnectorConfig, decodeConnectorResult, decodeInspectorConfig,
-  decodeSessionInspection, decodeSessionListInput, decodeSessionListOutput, decodeSessionPresence, metric, sessionRefKey,
+  decodeSessionInspection, decodeSessionListInput, decodeSessionListOutput, decodeSessionPresence, metric, projectListMachine, projectListSession, sessionRefKey,
   type MachineResources, type MetricProvenance, type SessionGit, type SessionPresence,
 } from "../src/inspection.ts";
 
@@ -67,8 +67,9 @@ it("validates per-session capacity units, fractional quotas and nonexclusive RSS
 it("round trips grouped metadata through public list, inspection and connector boundaries", async () => {
   const copy = JSON.parse(JSON.stringify(grouped));
   assert.deepStrictEqual(await run(decodeSessionPresence(copy)), grouped);
-  const list = { sessions: [copy], nextCursor: null };
+  const list = { machines: [projectListMachine(copy)], sessions: [projectListSession(copy)], nextCursor: null };
   assert.deepStrictEqual(await run(decodeSessionListOutput(list)), list);
+  await expect(run(decodeSessionListOutput({ ...list, sessions: [copy] }))).rejects.toThrow();
   const observation = createInspection(copy, 300);
   assert.deepStrictEqual(await run(decodeSessionInspection(observation)), observation);
   const connector = { connectorId: "connector", incarnation: "incarnation" };
@@ -76,6 +77,34 @@ it("round trips grouped metadata through public list, inspection and connector b
   assert.deepStrictEqual(await run(decodeConnectorAnnounce(announce)), announce);
   const result = { ...connector, requestId: "request", observation };
   assert.deepStrictEqual(await run(decodeConnectorResult(result)), result);
+});
+
+it("projects only list fields while keeping unavailable reasons, partiality and scope distinct", async () => {
+  const summary: NonNullable<SessionPresence["resources"]> = {
+    observedAt: 200, machineScopeId: "process-boundary", attribution: "shared",
+    cpuPercent: metric("percent-one-core", 120, machineProvenance),
+    cpuCapacityPercent: { status: "unavailable", value: null, unit: "percent", reason: "No matching CPU scope", provenance: { ...machineProvenance, partial: true, stale: true } },
+    rssBytes: metric("bytes", 110, { ...machineProvenance, estimated: true }),
+    rssCapacityPercent: metric("percent", 110, machineProvenance),
+  };
+  const value: SessionPresence = {
+    ...grouped, machine: { ...grouped.machine, resources: machineResources },
+    resources: summary, processes: [{ pid: 123, startIdentity: "birth", ownership: "shared" }],
+    terminal: { name: "Terminal", version: "18" },
+    activity: { state: "waiting", wait: "approval", approval: "pending", streaming: true, goals: [{ id: "goal", state: "active" }] },
+  };
+  const list = { machines: [projectListMachine(value)], sessions: [projectListSession(value)], nextCursor: null };
+  assert.deepStrictEqual(await run(decodeSessionListOutput(list)), list);
+  assert.strictEqual(list.machines[0]?.resources?.memory.accounting, machineProvenance.scopeDescription);
+  assert.strictEqual(list.sessions[0]?.machineScopeId, "boot-boundary");
+  assert.strictEqual(list.sessions[0]?.resources?.machineScopeId, "process-boundary");
+  assert.deepStrictEqual(list.sessions[0]?.resources?.cpuCapacityPercent, { status: "unavailable", value: null, reason: "No matching CPU scope", shared: true, partial: true, stale: true });
+  assert.deepStrictEqual(list.sessions[0]?.processes, value.processes);
+  assert.deepStrictEqual(list.sessions[0]?.terminal, { name: "Terminal" });
+  assert.deepStrictEqual(list.sessions[0]?.activity, { state: "waiting", wait: "approval", approval: "pending" });
+  assert.deepStrictEqual(list.sessions[0]?.workspace?.git, grouped.workspace?.git);
+  assert.strictEqual(JSON.stringify(list).includes("sampleWindow"), false);
+  assert.deepStrictEqual((await run(decodeSessionInspection(createInspection(value, 200)))).presence, value);
 });
 
 it("accepts SHA-1, SHA-256, detached, unborn and explicit negative Git observations", async () => {
@@ -88,6 +117,8 @@ it("accepts SHA-1, SHA-256, detached, unborn and explicit negative Git observati
   ] satisfies SessionGit[]) {
     const value = { ...presence, workspace: { cwd: "/work/project", git } };
     assert.deepStrictEqual(await run(decodeSessionPresence(value)), value);
+    const list = { machines: [projectListMachine(value)], sessions: [projectListSession(value)], nextCursor: null };
+    assert.deepStrictEqual((await run(decodeSessionListOutput(list))).sessions[0]?.workspace?.git, git);
   }
   for (const head of ["", "A".repeat(40), "g".repeat(40), "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), `${"a".repeat(40)}\n`, `${"a".repeat(64)}\r\n`]) {
     await expect(run(decodeSessionPresence({ ...presence, workspace: { cwd: "/work/project", git: { ...available, branch: "main", head } } }))).rejects.toThrow();
@@ -184,6 +215,15 @@ it("requires bounded pagination and TLS outside loopback", async () => {
   }
   for (const limit of [0, 101, 1.5]) await expect(run(decodeSessionListInput({ limit }))).rejects.toThrow();
   await expect(run(decodeSessionListInput({ limit: 1, cursor: "x".repeat(257) }))).rejects.toThrow();
+  for (const repository of ["/", "/remote/work/project/.git", "x".repeat(4096)]) {
+    const input = { limit: 1, machineId: "remote-machine", repository };
+    assert.deepStrictEqual(await run(decodeSessionListInput(input)), input);
+  }
+  for (const repository of ["", "x".repeat(4097), 12, null]) {
+    await expect(run(decodeSessionListInput({ limit: 1, repository }))).rejects.toThrow();
+  }
+  await expect(run(decodeSessionListInput({ limit: 1, harness: "pi" }))).rejects.toThrow();
+  await expect(run(decodeSessionListInput({ limit: 1, repository: "/remote/work/project/.git", harness: "pi" }))).rejects.toThrow();
 });
 
 it("requires canonical private token paths without restricting native metadata", async () => {

@@ -67,7 +67,7 @@ const program = Command.make("deployment-smoke", {
     let found = false;
     for (let page = 0; page < 10; page++) {
       const result = yield* mcp.call(config.inspectorUrl, token, InspectionTools.list, {
-        machineId: ref.machineId, harness: ref.harness, limit: 100, ...(cursor === undefined ? {} : { cursor }),
+        machineId: ref.machineId, limit: 100, ...(cursor === undefined ? {} : { cursor }),
       });
       if (result.sessions.some((presence) => sessionRefKey(presence.ref) === sessionRefKey(ref))) { found = true; break; }
       if (result.nextCursor === null) break;

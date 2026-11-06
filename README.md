@@ -9,7 +9,7 @@ There are two parts: **one inspector service**, plus **native integrations on ea
 The API and setup CLI require Node >=22.19. Install the version-pinned release:
 
 ```sh
-npm install --global @samuelho-dev/coordinator@0.3.0-beta.9
+npm install --global @samuelho-dev/coordinator@0.3.0-beta.10
 ```
 
 For source development only, use a reviewed checkout with `pnpm install --frozen-lockfile && pnpm build` (pnpm 11.9.0). `coordinator-install --source` deliberately activates that exact local package; never source-link a native package manager's own `node_modules` directory.
@@ -19,6 +19,8 @@ The [esbuild build](scripts/build.ts) keeps Pi dependencies external and bundles
 Client and server code stays in [`src/mcp.ts`](src/mcp.ts). The `Mcp` layer contains only client calls; separate HTTP/stdio exports let native bundles discard server-only protocol and tool initialization.
 
 The grouped metadata/workspace contract introduced in `0.3.0-beta.5` is a breaking cutover from beta.4 and earlier APIs, publishers and readers. `0.3.0-beta.6` retains that contract and works with the beta.5 API. `0.3.0-beta.7` adds machine/session resource telemetry; `0.3.0-beta.8` replaces product-specific references with generic terminal name/version. Both require matching API, native publisher and reader upgrades; deploy the API first. `0.3.0-beta.9` changes only native Darwin machine scope identity; no API rollout is required.
+
+The list-only metadata consolidation changes list output to `{ "machines": [...], "sessions": [...], "nextCursor": ... }` and replaces the `harness` list filter with `repository`. API and `coordinate` snapshots may have a non-null cursor; the CLI drains pages and emits `nextCursor: null`, while `/coordinator list` drains pages and omits the cursor. This is a breaking API/reader cutover: deploy matching API and readers together, then restart native readers/hosts. MCP protocol negotiation does not negotiate the tool-input or tool-result shape; strict boundaries reject the removed `harness` input, and old and new strict readers cannot decode each other's list output. Full connector announcements, native `ref.harness` identity and `session.inspect` are unchanged; no credential, installation-identity, or publisher migration is required for this list-only change. These local source changes are not a published release; live beta.9 is unchanged.
 
 For Kubernetes, follow the [chart operator guide](deploy/helm/coordinator/README.md): provide an existing Secret, verified image digest and matching source SHA. The chart creates an inspector Deployment/internal Service, not native plugins, TLS routing, a database or runners. Operators own rollout and supervision. Existing broker state requires the guide's preservation/migration procedure; the plugin does not migrate or delete it.
 
@@ -109,8 +111,8 @@ The installer validates prerequisites and creates launchers/config fragments. `-
 
 | Target | Activation | Presence publisher |
 | --- | --- | --- |
-| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.9`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
-| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.9`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
+| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.10`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
+| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.10`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
 | Claude Code | `claude --plugin-dir "$PRIVATE/claude-host"`; approve generated hooks/MCP tools; preserve existing status-line configuration. | Separate `connector.sh`. |
 | Codex CLI | Merge generated `hooks/hooks.json` and coordinator `mcp.toml`; trust only Coordinator's handlers in native `/hooks`. | Separate `connector.sh`. |
 | Hermes | Merge generated hook entries and `mcp_servers.coordinator` from `mcp.yaml` into the selected profile; no Python plugin installation. | Separate `connector.sh`. |
@@ -127,9 +129,9 @@ Hook/status-line/notification capture is local and can initialize identity/cache
 
 ### Native session commands and terminal identity
 
-Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and returns pretty JSON (`{ "sessions": [...] }`) using Effect's JSON formatter, with native JSON syntax highlighting in the terminal. Each session preserves full native session/agent IDs, machine names/installation IDs, harness and all reported metadata: model/provider, workspace, activity, connection liveness, process identity, resource usage and terminal name/version. Missing metadata is omitted; an empty listing returns `{ "sessions": [] }`. It reads published snapshots directly, with no model turn, on-demand per-session sampling or separate MCP registration.
+Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and returns pretty JSON (`{ "machines": [...], "sessions": [...] }`) using Effect's JSON formatter, with native JSON syntax highlighting in the terminal. Machines are deduplicated by installation ID and resource scope; session rows retain full inspectable refs, bindings, activity state, model and workspace identity without repeating machine telemetry. Missing metadata is omitted; an empty listing returns `{ "machines": [], "sessions": [] }`. It reads published snapshots directly, with no model turn, on-demand per-session sampling or separate MCP registration.
 
-Presence groups optional metadata under `machine`, `agent`, `model`, `workspace` and `terminal`; absent facts/groups are omitted, with no old flat or product-specific aliases:
+Full connector publishing and inspection presence groups optional metadata under `machine`, `agent`, `model`, `workspace` and `terminal`; this is not the compact list representation. Absent facts/groups are omitted, with no old flat or product-specific aliases:
 
 ```json
 {
@@ -148,6 +150,12 @@ Presence groups optional metadata under `machine`, `agent`, `model`, `workspace`
 ```
 
 Git discovery is read-only and local to the session machine, bounded to two seconds without network, hooks, remote URLs or working-tree scans. `available` reports the actual worktree root and shared absolute Git common directory (including linked worktrees); `branch: null` means detached HEAD, `head: null` an unborn branch. `not-repository` means genuinely outside Git; `unavailable` means discovery failed, was denied, timed out or Git was missing. All three outcomes include `observedAt` and are cached for 30 seconds at unchanged cwd; future timestamps force refresh. Changing cwd clears stale associations. Native startup does not await discovery.
+
+The compact `session.list` representation separates machine records (installation `machineId` plus nullable resource `scopeId`) from session rows (`ref.machineId` and nullable `machineScopeId`). Available `workspace.git` retains `worktreeRoot`, `commonDir`, `branch` and `head` for discovery and grouping. A null scope is unknown, never a substitute installation ID or proof of a shared execution boundary. Resource percentages on a session retain their own `resources.machineScopeId`, which may differ from the row's source machine scope. Repeated machine readings in the same scope use the newest intact observed snapshot, not combined metric values; the same installation can report multiple scopes across reboots or cgroups. Each page includes its own machines, and CLI/native command aggregate across pages by the composite identity. Pages are bounded to 48 KiB including machines and cursor, but are not a transactionally frozen fleet snapshot.
+
+The optional `repository` list selector matches the exact published `workspace.git.commonDir` only when `git.state` is `available`, across all native harnesses and linked worktrees sharing that directory. For example, `{ "limit": 100, "machineId": "installation-uuid", "repository": "/home/operator/projects/product/main/.git" }` uses the path published by that remote machine, not the reader's local checkout. The selector is a 1–4096-character path and can be combined with `machineId`; owner visibility always applies. A common directory is machine-local, not a global cross-machine repository ID. Missing Git metadata, `not-repository` and `unavailable` observations do not match. The inspector does no filesystem/Git lookup or normalization and does not match path prefixes, cwd, worktree root, `workspace.project`, branch, directory basename or inferred remote identity. Omit `repository` for all repositories and non-Git sessions. Continuation cursors are bound to the owner and exact `machineId`/`repository` inputs, including whether each was omitted; adding, changing or removing either selector invalidates the cursor.
+
+Equal-timestamp copies prefer the intact snapshot with fewer stale readings, so a disconnected publisher cannot hide a live copy of the same sample.
 
 Projects are explicit scope, independent of Git: Claude's documented status-line [`workspace.project_dir`](https://code.claude.com/docs/en/statusline) supplies its launch directory as `source: "native"`, not a guessed Git repository or application identity. The optional private configuration `project` above uses `source: "configured"` and wins only for cwd inside its root; outside that root, a valid native association can remain. Association respects directory/symlink boundaries and is recomputed independently of the Git cache. No project ID/name is inferred from a directory, repository or branch.
 
@@ -170,13 +178,13 @@ This is a clean schema cutover, with no legacy aliases or compatibility shims. E
 
 ## Plugin publication
 
-The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.9`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
+The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.10`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
 
 For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.9
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.9
+omp plugin install @samuelho-dev/coordinator@0.3.0-beta.10
+pi install npm:@samuelho-dev/coordinator@0.3.0-beta.10
 ```
 
 Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
@@ -196,6 +204,8 @@ Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixe
 `0.3.0-beta.8` adds generic `terminal: { name, version? }` in session presence, list and inspect, replacing product-specific associations. Capture reads only the standard terminal markers; there are no per-product detectors or compatibility aliases. Cache version 4 isolates older records. Deploy the matching API and coordinate all publisher/reader upgrades before enabling this breaking wire change. Existing beta.7 installations do not gain it merely by reloading; no credential rotation, installation identity changes, runtime dependencies or stock host modifications are required.
 
 `0.3.0-beta.9` canonicalizes the Darwin boot timestamp to validated numeric seconds/microseconds before hashing it with the hostname. Locale/timezone renderings of the same boot now retain one machine scope ID; a reboot or different host still gets another. Missing or malformed boot data produces no scope ID. The wire schema and runtime dependencies are unchanged; update and reload native publishers/readers without redeploying the API.
+
+`0.3.0-beta.10` consolidates session list metadata into machine and session collections and adds repository and machine ID filters. This is a breaking list API and reader cutover; coordinate the matching inspector and native readers as described above.
 
 | Host | Publication route |
 | --- | --- |
@@ -224,7 +234,7 @@ Registry verification allows up to 120 checks, ten seconds apart, for npm proces
 
 ## Internal contract
 
-- **Read API:** `/mcp` exposes only `session.list` and `session.inspect`. List requires `limit` 1–100, with cursor/machine/harness filters. Inspect takes the complete returned `SessionRef`: `machineId`, `harness`, `nativeSessionId`, optional `nativeAgentId`.
+- **Read API:** `/mcp` exposes only `session.list` and `session.inspect`. List requires `limit` 1–100, with optional `cursor`, `machineId` and exact published Git-common-directory `repository` selectors. `harness` is not a list input; it remains native identity in the complete returned `SessionRef`: `machineId`, `harness`, `nativeSessionId`, optional `nativeAgentId`. Inspect takes that complete ref unchanged.
 - **Publishing:** native hosts initiate outbound `/connector/announce`, `/connector/poll`, `/connector/result` and `/connector/disconnect` requests. Detail queries are correlated transient read RPCs, not execution jobs.
 - **Startup:** generated integrations do not await the inspector during activation. Pi/OMP publish in the background; Claude/Codex/Hermes hooks capture locally; the local stdio bridge initializes and lists tools without a remote handshake. Explicit inspection/`coordinate` requests may await a bounded remote reply. Local configuration, filesystem and native loading still run during initialization.
 - **State/lifetime:** the owner-isolated registry is in memory; restart loses discovery until reannouncement, never native sessions. A Pi/OMP plugin owns one Effect managed runtime; presence/poll failures cancel their peer and shutdown disposes its fibers without killing the host. Closing the stdio reader's stdin ends its scope and cancels pending HTTP reads. Failed startup/terminated connectors can restart on a later native event.
@@ -257,6 +267,8 @@ Local environment telemetry is published as optional `machine.resources`, reusin
 CPU exposes one-core consumption, visible capacity in cores, and percentage of that capacity. Quota/cpuset/visible ancestor bounds are not reserved CPU; bursts are not clamped. The first sample, counter reset or scope change requires a new interval before CPU usage is available. Memory is cgroup-accounted usage on Linux cgroups, `MemTotal - MemAvailable` on ungrouped Linux, and `(active + inactive + wired + compressor-occupied pages) × actual page size` on macOS. The macOS value includes inactive cache, not Activity Monitor memory pressure; compressed pages are physical occupied pages, not their uncompressed size. Cgroups and macOS do not fabricate `availableBytes` from limit headroom or free pages.
 
 Each observation retains source, scope identity, timestamp, units, sample window and unavailable/stale provenance. Repeated session rows with the same `scopeId` share environment totals: never sum them. Session rows identify native agent sessions, not OS threads. Shutdown or expired observations remain explicitly stale; collection ends with the native runtime.
+
+List-only metrics retain `status`, `value` (null and `reason` when unavailable) and true-only `estimated`, `shared`, `partial`, `stale` flags; absent flags mean false. Field names determine units: CPU `capacityCores` in cores, `usedPercent` and `cpuCapacityPercent` in percent of execution capacity, `usedBytes`/`capacityBytes`/`rssBytes` in bytes, and `rssCapacityPercent` in percent of memory capacity. Machine resources retain scope, source and observation time; `memory.accounting` carries the source's used-memory definition once per machine record (not once per metric). In particular macOS used memory includes inactive cache and must not be read as memory pressure. Session rows retain observation time and separate source machine scope and process-resource scope; shared process readings overlap and must never be summed. Verbose provenance, raw one-core CPU, `availableBytes`, detailed activity, worktree/common Git paths, OS release/architecture and terminal version remain on full announcements and `session.inspect`, not list.
 
 ## Source
 

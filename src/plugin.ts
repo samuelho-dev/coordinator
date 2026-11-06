@@ -2,8 +2,8 @@ import { NodeServices } from "@effect/platform-node";
 import { Cause, Clock, Config, Console, Effect, Formatter, Layer, Logger, ManagedRuntime, Schema } from "effect";
 import type { FileSystem, Path, Scope } from "effect";
 import type { ChildProcessSpawner } from "effect/process";
-import { createInspection, HttpError, InspectionTools, metric, sessionRefKey, unavailableMetric } from "./inspection.ts";
-import type { ConnectorConfig, Harness, MetricProvenance, ProcessIdentity, ProgramStatus, SessionInspection, SessionListOutput, SessionPresence, SessionProject, SessionWorkspace } from "./inspection.ts";
+import { createInspection, HttpError, InspectionTools, mergeListMachines, metric, sessionRefKey, unavailableMetric } from "./inspection.ts";
+import type { ConnectorConfig, Harness, ListMachine, ListSession, MetricProvenance, ProcessIdentity, ProgramStatus, SessionInspection, SessionListOutput, SessionPresence, SessionProject, SessionWorkspace } from "./inspection.ts";
 import { Mcp } from "./mcp.ts";
 import { connectNative, loadConnectorConfig, NativeError, readConnectorToken, resolveNativeConfig, withProcessResources } from "./native.ts";
 import type { NativeNotice } from "./native.ts";
@@ -108,12 +108,14 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
     const message = event?.message;
     if (message?.role === "assistant" && message.usage) {
       const u = message.usage;
-      latest = { observedAt: now, nativeUpdatedAt: message.timestamp ?? null, usage: {
-        input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, totalTokens: u.totalTokens,
-        reasoningTokens: harness === "pi" ? u.reasoning : u.reasoningTokens, premiumRequests: u.premiumRequests,
-        ...(u.credits ? { credits: { cost: u.credits.cost, committedCost: u.credits.committedCost, acuCost: u.credits.acuCost } } : {}),
-        cost: { input: u.cost.input, output: u.cost.output, cacheRead: u.cost.cacheRead, cacheWrite: u.cost.cacheWrite, total: u.cost.total },
-      } };
+      latest = {
+        observedAt: now, nativeUpdatedAt: message.timestamp ?? null, usage: {
+          input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, totalTokens: u.totalTokens,
+          reasoningTokens: harness === "pi" ? u.reasoning : u.reasoningTokens, premiumRequests: u.premiumRequests,
+          ...(u.credits ? { credits: { cost: u.credits.cost, committedCost: u.credits.committedCost, acuCost: u.credits.acuCost } } : {}),
+          cost: { input: u.cost.input, output: u.cost.output, cacheRead: u.cost.cacheRead, cacheWrite: u.cost.cacheWrite, total: u.cost.total },
+        }
+      };
     }
   };
   const refreshWorkspace = (project?: SessionProject) => Effect.gen(function*() {
@@ -127,17 +129,18 @@ export const createNativeObserver = (harness: Harness, machineId: string, proces
     const currentToolName = activeTools.values().next().value;
     const status = userPrompt ?? programStatus;
     return {
-    ref: { machineId, harness, nativeSessionId: current.sessionManager.getSessionId(), ...(harness === "omp" && current.agent?.id ? { nativeAgentId: current.agent.id } : {}) },
-    observedAt: now, ...(lastActivityAt === undefined ? {} : { lastActivityAt }), workspace: workspace ?? { cwd: current.cwd }, processes,
-    machine: { name: machineName, ...(os ? { os } : {}) },
-    ...(terminal ? { terminal } : {}),
-    ...(status ? { programStatus: status } : {}),
-    ...(current.model ? { model: { provider: current.model.provider, id: current.model.id } } : {}),
-    ...(current.agent ? { agent: { kind: current.agent.kind, ...(current.agent.name ? { name: current.agent.name } : {}) } } : {}),
-    activity: { state: userPrompt ? "waiting" : current.isIdle() ? "idle" : "working", streaming: !current.isIdle(),
-      ...(currentToolName === undefined ? {} : { currentToolName }),
-      ...(userPrompt ? { wait: "user" } : currentToolName === undefined ? {} : { wait: "tool" }),
-    },
+      ref: { machineId, harness, nativeSessionId: current.sessionManager.getSessionId(), ...(harness === "omp" && current.agent?.id ? { nativeAgentId: current.agent.id } : {}) },
+      observedAt: now, ...(lastActivityAt === undefined ? {} : { lastActivityAt }), workspace: workspace ?? { cwd: current.cwd }, processes,
+      machine: { name: machineName, ...(os ? { os } : {}) },
+      ...(terminal ? { terminal } : {}),
+      ...(status ? { programStatus: status } : {}),
+      ...(current.model ? { model: { provider: current.model.provider, id: current.model.id } } : {}),
+      ...(current.agent ? { agent: { kind: current.agent.kind, ...(current.agent.name ? { name: current.agent.name } : {}) } } : {}),
+      activity: {
+        state: userPrompt ? "waiting" : current.isIdle() ? "idle" : "working", streaming: !current.isIdle(),
+        ...(currentToolName === undefined ? {} : { currentToolName }),
+        ...(userPrompt ? { wait: "user" } : currentToolName === undefined ? {} : { wait: "tool" }),
+      },
     };
   };
   const inspect = (now = clock.currentTimeMillisUnsafe()): SessionInspection | undefined => {
@@ -265,14 +268,16 @@ export default function plugin(host: Host): void {
         if (!activeConfig) return yield* new NativeError({ operation: "Connector configuration required" });
         const token = yield* readConnectorToken(activeConfig);
         const mcp = yield* Mcp;
-        const sessions: SessionPresence[] = [];
+        const sessions: ListSession[] = [];
+        const machines = new Map<string, ListMachine>();
         let cursor: string | undefined;
         do {
           const page = yield* mcp.call(activeConfig.inspectorUrl, token, InspectionTools.list, { limit: 100, ...(cursor === undefined ? {} : { cursor }) });
-          for (const session of page.sessions) sessions.push(session);
+          sessions.push(...page.sessions);
+          mergeListMachines(machines, page.machines);
           cursor = page.nextCursor ?? undefined;
         } while (cursor !== undefined);
-        return sessions;
+        return { machines: [...machines.values()], sessions };
       }));
       if (stopped) return;
       if (exit._tag === "Failure") {
@@ -285,7 +290,7 @@ export default function plugin(host: Host): void {
         }, { triggerTurn: false });
         return;
       }
-      const result = { sessions: exit.value };
+      const result = exit.value;
       host.sendMessage({
         customType: "coordinator-list", content: Formatter.formatJson(result, { space: 2 }), display: true,
         details: result,

@@ -18,7 +18,7 @@ const context = (id = "surrounding-session"): Context => ({
   model: { provider: "native-provider", id: "native-model" },
   sessionManager: { getSessionId: () => id },
   getContextUsage: () => ({ tokens: null, contextWindow: 1000, percent: null }),
-  isIdle: () => true, ui: { notify: () => {} },
+  isIdle: () => true, ui: { notify: () => { } },
 });
 const usage = { input: 10, output: 3, cacheRead: 5, cacheWrite: 2, totalTokens: 20, cost: { input: 0.1, output: 0.2, cacheRead: 0.01, cacheWrite: 0.02, total: 0.33 } };
 
@@ -151,8 +151,27 @@ it("retains linked-worktree metadata through native list and inspect and clears 
     const principal = { id: "native", owner: "owner", tokenHash: Hex.encode(yield* crypto.digest("SHA-256", new TextEncoder().encode("native-worktree-secret"))) };
     const inspector = yield* Inspector.make({ host: "127.0.0.1", port: 0, principals: [principal] });
     const identity = { connectorId: "native", incarnation: "first" };
-    yield* inspector.announce(principal, { ...identity, machineId: "machine", sessions: [observation.presence] });
-    assert.deepStrictEqual((yield* inspector.list(principal, { limit: 10 })).sessions.at(0)?.workspace, workspace);
+    const mainObserver = yield* createNativeObserver("pi", "machine");
+    mainObserver.update({ ...context(), cwd: repository });
+    yield* mainObserver.refreshWorkspace(project);
+    const mainPresence = mainObserver.presence();
+    if (mainPresence?.workspace?.git?.state !== "available") return yield* Effect.die("Missing main worktree observation");
+    assert.strictEqual(mainPresence.workspace.git.commonDir, workspace.git.commonDir);
+    assert.strictEqual(mainPresence.workspace.git.worktreeRoot, yield* fs.realPath(repository));
+    assert.notStrictEqual(mainPresence.workspace.git.worktreeRoot, workspace.git.worktreeRoot);
+    yield* inspector.announce(principal, { ...identity, machineId: "machine", sessions: [observation.presence, mainPresence] });
+    const listed = yield* inspector.list(principal, { limit: 10, machineId: "machine", repository: workspace.git.commonDir });
+    assert.deepStrictEqual(listed.sessions.map((session) => session.ref), [observation.presence.ref, mainPresence.ref]);
+    assert.deepStrictEqual(listed.sessions.find((session) => session.ref.harness === "pi")?.workspace?.git, mainPresence.workspace.git);
+    assert.strictEqual((yield* inspector.list(principal, { limit: 10, repository: linked })).sessions.length, 0);
+    assert.strictEqual((yield* inspector.list(principal, { limit: 10, repository: repository })).sessions.length, 0);
+    const listedWorkspace = listed.sessions.find((session) => session.ref.harness === "omp")?.workspace;
+    assert.strictEqual(listedWorkspace?.cwd, cwd);
+    assert.deepStrictEqual(listedWorkspace?.project, project);
+    if (listedWorkspace?.git?.state !== "available") return yield* Effect.die("Missing listed Git observation");
+    assert.strictEqual(listedWorkspace.git.branch, "native-worktree");
+    assert.strictEqual(listedWorkspace.git.head, workspace.git.head);
+    assert.deepStrictEqual(listedWorkspace.git, workspace.git);
     const query = yield* Effect.forkChild(inspector.inspect(principal, { ref: observation.presence.ref }), { startImmediately: true });
     const request = (yield* inspector.poll(principal, identity)).requests.at(0);
     if (!request) return yield* Effect.die("Missing native inspect request");
@@ -179,9 +198,11 @@ it("discards pending workspace discovery after cwd changes, session switches and
       const observer = yield* createNativeObserver("omp", "machine");
       observer.update({ ...context(), cwd });
       const started = yield* Deferred.make<void>(), release = yield* Deferred.make<void>();
-      const injected = { ...fs, realPath: (file: string) => file === cwd
-        ? Effect.andThen(Deferred.succeed(started, undefined), Effect.andThen(Deferred.await(release), fs.realPath(file)))
-        : fs.realPath(file) };
+      const injected = {
+        ...fs, realPath: (file: string) => file === cwd
+          ? Effect.andThen(Deferred.succeed(started, undefined), Effect.andThen(Deferred.await(release), fs.realPath(file)))
+          : fs.realPath(file)
+      };
       const refresh = yield* observer.refreshWorkspace({ root: cwd, source: "configured" }).pipe(
         Effect.provideService(FileSystem.FileSystem, injected), Effect.forkChild,
       );
@@ -296,9 +317,9 @@ it("matches only a leading bounded coordinate token and preserves native input r
   for (const text of ["coordinate", "coordinate inspect", "coordinate\ninspect"]) assert.strictEqual(isCoordinateInput(text), true);
   for (const text of ["/coordinate", "please coordinate", " coordinate", "coordinates", "coordinate_task", "coordinate/file", "Coordinate"]) {
     assert.strictEqual(isCoordinateInput(text), false);
-    assert.strictEqual(transformCoordinateInput("omp", { text }, { sessions: [], nextCursor: null }), undefined);
+    assert.strictEqual(transformCoordinateInput("omp", { text }, { machines: [], sessions: [], nextCursor: null }), undefined);
   }
-  const snapshot: SessionListOutput = { sessions: [{ ref: { machineId: "remote", harness: "omp", nativeSessionId: "actual-fleet-session" }, observedAt: 1 }], nextCursor: null };
+  const snapshot: SessionListOutput = { machines: [{ machineId: "remote", scopeId: null, name: "Remote" }], sessions: [{ ref: { machineId: "remote", harness: "omp", nativeSessionId: "actual-fleet-session" }, observedAt: 1, machineScopeId: null }], nextCursor: null };
   const omp = transformCoordinateInput("omp", { text: "coordinate inspect" }, snapshot);
   const pi = transformCoordinateInput("pi", { text: "coordinate inspect" }, snapshot);
   assert.strictEqual(omp?.text.includes("actual-fleet-session"), true);
@@ -356,10 +377,12 @@ it("adds the real native coordinate shortcut without enabling disabled core keyw
           check(JSON.stringify(magicKeywordRanges("coordinate")) === JSON.stringify([{ from: 0, to: 10 }]), "Duplicate registration changed highlight");
         }
       }).pipe(Effect.provide(NodeServices.layer)));
-    `], { extendEnv: true, env: {
-      HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
-      COORDINATOR_CONNECTOR_CONFIG: undefined, COORDINATOR_API_URL: undefined, COORDINATOR_API_TOKEN: undefined,
-    } });
+    `], {
+      extendEnv: true, env: {
+        HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
+        COORDINATOR_CONNECTOR_CONFIG: undefined, COORDINATOR_API_URL: undefined, COORDINATOR_API_TOKEN: undefined,
+      }
+    });
   })).pipe(Effect.provide(NodeServices.layer)));
 });
 
@@ -698,11 +721,13 @@ it("authenticates the OMP stdio reader from the native environment without creat
         check(!JSON.stringify(result).includes("PRIVATE_REJECTION_BODY"), "Reader leaked response body");
         check(!(yield* fs.exists(path.join(home, "state"))), "Reader created native state");
       })).pipe(Effect.provide(NodeServices.layer)));
-    `], { extendEnv: true, env: {
-      HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
-      COORDINATOR_API_URL: `http://127.0.0.1:${server.address.port}`, COORDINATOR_API_TOKEN: token,
-      COORDINATOR_CONNECTOR_CONFIG: undefined,
-    } }).pipe(Effect.timeout("20 seconds"));
+    `], {
+      extendEnv: true, env: {
+        HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
+        COORDINATOR_API_URL: `http://127.0.0.1:${server.address.port}`, COORDINATOR_API_TOKEN: token,
+        COORDINATOR_CONNECTOR_CONFIG: undefined,
+      }
+    }).pipe(Effect.timeout("20 seconds"));
     assert.isAbove(requests, 0, "The actual native stdio child must receive the owner's token");
   })).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer))));
 }, 25000);
@@ -767,11 +792,12 @@ it("lists every authorized session across pages and machines without native capt
         const list = () => Effect.promise(() => commands.get("coordinator").handler("list", {}));
         yield* list();
         const message = messages.pop();
-        const sessions = JSON.parse(message.content).sessions;
+        const { machines, sessions } = JSON.parse(message.content);
         check(sessions.length === 101, "List silently stopped at the first API page");
+        check(machines.length === 2 && machines.every(machine => machine.name === "same-hostname" && machine.scopeId === null), "Cross-page machines must be deduplicated by installation and scope");
         check(sessions.some(session => session.ref.machineId === "local-machine"), "Local machine missing");
         check(sessions.some(session => session.ref.machineId === "remote-machine"), "Remote machine missing");
-        check(sessions.every(session => session.machine.name === "same-hostname" && (!session.model || session.model.id === "test-model") && session.workspace.cwd.startsWith("/workspace/")), "Grouped metadata missing");
+        check(sessions.every(session => session.machineScopeId === null && (!session.model || session.model.id === "test-model") && session.workspace.cwd.startsWith("/workspace/")), "Compact metadata missing");
         check(sessions.find(session => session.ref.nativeSessionId === "native-0").model === undefined, "No-model session gained a model");
         check(sessions.every(session => !["machineName", "os", "kind", "provider", "profile", "cwd", "repository"].some(key => key in session)), "Flat metadata leaked");
         check(!message.content.includes("hidden-session") && !message.content.includes("hidden-machine"), "List exposed another owner's sessions");
@@ -790,11 +816,13 @@ it("lists every authorized session across pages and machines without native capt
       })).pipe(Effect.provide(NodeServices.layer)));
     `;
     for (const harness of ["pi", "omp"]) {
-      yield* runScript("bun", ["--eval", script], { extendEnv: true, env: {
-        HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
-        COORDINATOR_CONNECTOR_CONFIG: configFile, COORDINATOR_API_URL: undefined, COORDINATOR_API_TOKEN: undefined,
-        FIXTURE_HARNESS: harness,
-      } });
+      yield* runScript("bun", ["--eval", script], {
+        extendEnv: true, env: {
+          HOME: home, XDG_CONFIG_HOME: path.join(home, "config"), XDG_STATE_HOME: path.join(home, "state"),
+          COORDINATOR_CONNECTOR_CONFIG: configFile, COORDINATOR_API_URL: undefined, COORDINATOR_API_TOKEN: undefined,
+          FIXTURE_HARNESS: harness,
+        }
+      });
       yield* fs.writeFileString(tokenFile, token, { mode: 0o600 });
     }
   })).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, Host.layer, Mcp.layer))));
