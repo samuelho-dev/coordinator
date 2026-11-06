@@ -65,8 +65,8 @@ const program = Effect.gen(function*() {
   const { "coordinator-install": installerBin } = manifest.bin;
   yield* guard(manifest.bin.coordinator.replace(/^\.\//, "") === "dist/src/main.js" && installerBin.replace(/^\.\//, "") === "dist/scripts/install.js", "Public binaries must point to built entrypoints");
   yield* guard(JSON.stringify(manifest.pi.extensions) === JSON.stringify(["./dist/plugins/pi.js"]) && JSON.stringify(manifest.omp.extensions) === JSON.stringify(["./dist/plugins/omp.js"]), "Native package metadata must select the published extensions");
-  const installed = (yield* run("npm", ["ls", "--all", "--omit=dev", "--omit=peer", "--parseable"])).trim().split("\n");
-  for (const dependency of installed) {
+  const installed = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Array(Schema.Struct({ path: Schema.String }))))(yield* run("npm", ["query", "*", "--json"]));
+  for (const { path: dependency } of installed) {
     yield* guard(!/\/node_modules\/redis$/.test(dependency), `Redis must be absent from the production installation: ${dependency}`);
     yield* guard(!/\/node_modules\/(?:@earendil-works\/|@oh-my-pi\/|@effect\/(?:tsgo|vitest)(?:\/|$)|(?:typescript|vitest|esbuild)(?:\/|$))/.test(dependency), `Development/native SDK dependency leaked into production installation: ${dependency}`);
   }
