@@ -479,13 +479,12 @@ try {
   const host = {on:(name,fn)=>handlers.set(name,fn),registerCommand(){},registerTool:t=>tools.set(t.name,t),registerMessageRenderer(){},sendMessage:(m,o)=>messages.push([m,o])};
   registerNative(host,harness,()=>null);
   await handlers.get('session_start')({},ctx);
-  await new Promise(resolve=>setTimeout(resolve,250));
+  const reply = await tools.get('coordinator_message_reply').execute('tool',{replyId:'original',text:'answer'},undefined,undefined,ctx);
   assert.equal(messages.length,1);
   assert.match(messages[0][0].content,/replyID: original/);
   assert.match(messages[0][0].content,/not user approval/);
   assert.equal(messages[0][1].triggerTurn,idle);
   assert.equal(messages[0][1].deliverAs,'followUp');
-  const reply = await tools.get('coordinator_message_reply').execute('tool',{replyId:'original',text:'answer'},undefined,undefined,ctx);
   assert.equal(reply.details.inReplyTo,'original');
   const oldCtx = {...ctx,sessionManager:{getSessionId:()=> 'session'}};
   session = 'rotated'; await handlers.get('session_switch')({},ctx);
