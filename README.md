@@ -123,6 +123,8 @@ go vet ./...
 
 The builder generates schemas, bundles adapters and builds the current platform. `COORDINATOR_BUILD_TARGETS=linux-x64,linux-arm64` selects Linux targets; Darwin builds require macOS/cgo. `go run ./cmd/smoke` exercises installed native hosts; `go run ./cmd/package-smoke path/to/package.tgz` checks a packaged installation.
 
+CI seeds private configuration through a Docker volume, then checks the production image as UID1000 with a read-only root, no capabilities and no privilege escalation; the DinD runner needs no host `chown` or shared bind-mount path.
+
 ### First npm publication
 
 Publish only the exact CI-accepted tarball with owner authorization, reviewed contents and required license text in `LICENSE`. First publication requires an authorized npm login and 2FA; subsequent releases use the protected `npm-public` trusted-publisher environment. See [npm release](.github/workflows/npm-release.yaml) and [server/chart release](.github/workflows/release.yaml) workflows. Publication does not deploy, activate hosts or register marketplaces.
