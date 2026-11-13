@@ -333,7 +333,7 @@ func main1() (failure error) {
 	}
 	stage = "smoke"
 	env = append(env, "COORDINATOR_BINARY="+binary, "COORDINATOR_PACKAGE_ROOT="+pkg)
-	if _, err = run(checkout, env, 180*time.Second, "go", "run", "./cmd/smoke"); err != nil {
+	if _, err = run(checkout, env, 180*time.Second, "go", "run", "-modcacherw", "./cmd/smoke"); err != nil {
 		return err
 	}
 	fmt.Printf("{\"scenario\":\"package-acceptance\",\"status\":\"ok\",\"version\":%q,\"platform\":%q,\"arch\":%q,\"release\":%t}\n", manifest.Version, runtime.GOOS, runtime.GOARCH, release)
