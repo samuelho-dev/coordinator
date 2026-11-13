@@ -17,7 +17,10 @@ func TestWorkspaceUsesDiscoveredGitAndIgnoresGitEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo := t.TempDir()
+	repo, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(git, "init", "-q", repo)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init: %s %v", out, err)

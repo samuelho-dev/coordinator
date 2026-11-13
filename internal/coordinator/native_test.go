@@ -3,6 +3,8 @@ package coordinator
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -110,5 +112,75 @@ func TestNativeReverseSnapshotAndEOF(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("EOF did not stop host")
+	}
+}
+
+func TestNativeListPreservesPagination(t *testing.T) {
+	const token = "pagination-token-12345"
+	hash := sha256.Sum256([]byte(token))
+	principal := wire.InspectorPrincipal{ID: "owner", Owner: "owner", TokenHash: hex.EncodeToString(hash[:])}
+	reg, err := NewRegistry(wire.InspectorConfig{Principals: []wire.InspectorPrincipal{principal}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	sessions := []wire.SessionPresence{}
+	for _, id := range []string{"one", "two"} {
+		sessions = append(sessions, wire.SessionPresence{Ref: wire.SessionRef{MachineID: "machine", Harness: "pi", NativeSessionID: id}, ObservedAt: 1})
+	}
+	if _, err := reg.Announce(principal, wire.ConnectorAnnounce{ConnectorID: "connector", Incarnation: "first", MachineID: "machine", Sessions: sessions}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(Handler(reg))
+	defer server.Close()
+	in, input := io.Pipe()
+	output, out := io.Pipe()
+	defer input.Close()
+	defer output.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- RunNative(ctx, Config{ConnectorConfig: wire.ConnectorConfig{InspectorURL: server.URL, APIToken: token}, MachineID: "machine"}, "pi", os.Getppid(), in, out)
+	}()
+	frames := make(chan wire.NativeMessage, 4)
+	go func() {
+		scanner := bufio.NewScanner(output)
+		for scanner.Scan() {
+			var frame wire.NativeMessage
+			if json.Unmarshal(scanner.Bytes(), &frame) == nil && frame.ID != "" {
+				frames <- frame
+			}
+		}
+	}()
+	encoder := json.NewEncoder(input)
+	page := func(id, cursor string) wire.SessionListOutput {
+		t.Helper()
+		if err := encoder.Encode(wire.NativeMessage{Version: 1, ID: id, Method: "list", Input: &wire.SessionListInput{Limit: 1, Cursor: cursor}}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case frame := <-frames:
+			var result wire.SessionListOutput
+			if frame.ID != id || frame.Error != nil || json.Unmarshal(frame.Result, &result) != nil || len(result.Sessions) != 1 {
+				t.Fatalf("invalid page: %+v", frame)
+			}
+			return result
+		case <-ctx.Done():
+			t.Fatal("native list did not respond")
+			return wire.SessionListOutput{}
+		}
+	}
+	first := page("first", "")
+	if first.NextCursor == nil {
+		t.Fatal("first page lost continuation cursor")
+	}
+	second := page("second", *first.NextCursor)
+	if second.NextCursor != nil || second.Sessions[0].Ref == first.Sessions[0].Ref {
+		t.Fatal("continuation did not advance to the second session")
+	}
+	input.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

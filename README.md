@@ -78,7 +78,7 @@ printf '%s\n' '{"ref":{"machineId":"installation-uuid","harness":"omp","nativeSe
 
 Copy the complete `ref` from a listed session, including `nativeAgentId` when present. Pi/OMP also provide `/coordinator list` without starting a model turn.
 
-Lists return `{machines, sessions, nextCursor}`; CLI/native commands drain all pages. MCP `session.list` accepts `limit` (1–100), optional `cursor`, `machineId` and `repository` (the exact remote Git common-directory path). `session.inspect` accepts the complete ref. HTTP MCP is at `/mcp`; `coordinator mcp` provides stdio.
+Lists return `{machines, sessions, nextCursor}`. CLI and slash-list displays drain pages; Pi's `coordinator_session_list` and MCP `session.list` preserve pagination with `limit` (1–100), optional `cursor`, `machineId` and `repository` (the exact remote Git common-directory path). `session.inspect` accepts the complete ref. HTTP MCP is at `/mcp`; `coordinator mcp` provides stdio.
 
 ### Peer messaging
 

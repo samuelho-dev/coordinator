@@ -434,7 +434,7 @@ func RunNative(ctx context.Context, cfg Config, harness string, pid int, in io.R
 							respond(m.ID, nil, errors.New("missing input"))
 							return
 						}
-						v, e := client.ListAll(c, *m.Input)
+						v, e := client.List(c, *m.Input)
 						respond(m.ID, v, e)
 					} else if m.Method == "message.send" {
 						if m.Send == nil {

@@ -16,8 +16,20 @@ import (
 	"github.com/samuelho-dev/coordinator/internal/wire"
 )
 
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestInitializePrivateNoOverwrite(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "private")
+	dir := filepath.Join(privateTempDir(t), "private")
 	if err := initialize([]string{"--directory", dir, "--owner", "alice"}); err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +71,7 @@ func TestExecutableResolution(t *testing.T) {
 	}
 }
 func TestStageConfigRejectsEscapingSymlink(t *testing.T) {
-	root := t.TempDir()
+	root := privateTempDir(t)
 	input := filepath.Join(root, "input")
 	if err := os.Mkdir(input, 0700); err != nil {
 		t.Fatal(err)
@@ -79,7 +91,7 @@ func TestStageConfigRejectsEscapingSymlink(t *testing.T) {
 func TestMessagingSetup(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		t.Run(map[bool]string{false: "default", true: "enabled"}[enabled], func(t *testing.T) {
-			dir := filepath.Join(t.TempDir(), "server")
+			dir := filepath.Join(privateTempDir(t), "server")
 			args := []string{"--directory", dir}
 			if enabled {
 				args = append(args, "--messaging")
@@ -136,7 +148,7 @@ func TestConnectMessagingOptIn(t *testing.T) {
 	t.Setenv("COORDINATOR_API_TOKEN", "test-token-1234567890")
 	unsetEnv(t, "COORDINATOR_API_URL")
 	for _, enabled := range []bool{false, true} {
-		dir := filepath.Join(t.TempDir(), "client")
+		dir := filepath.Join(privateTempDir(t), "client")
 		config := filepath.Join(dir, "inspector.json")
 		args := []string{"--endpoint", server.URL, "--config", config}
 		if enabled {
@@ -194,13 +206,7 @@ func TestInstallMessagingRequiresOptIn(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("installer requires nonroot owner")
 	}
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(root, 0700); err != nil {
-		t.Fatal(err)
-	}
+	root := privateTempDir(t)
 	config := filepath.Join(root, "inspector.json")
 	unsetEnv(t, "COORDINATOR_API_URL")
 	unsetEnv(t, "COORDINATOR_API_TOKEN")

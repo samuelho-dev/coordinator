@@ -38,7 +38,7 @@ func TestCaptureProjections(t *testing.T) {
 }
 func TestHermesCaptureLifecycle(t *testing.T) {
 	ctx := context.Background()
-	cfg := Config{MachineID: "machine", StateDirectory: t.TempDir()}
+	cfg := Config{MachineID: "machine", StateDirectory: privateTempDir(t)}
 	send := func(body string) {
 		t.Helper()
 		if err := Capture(ctx, cfg, "hermes", strings.NewReader(body)); err != nil {
@@ -64,7 +64,7 @@ func TestClaudeCaptureSourceMetadata(t *testing.T) {
 	t.Setenv("TERM_PROGRAM", "test-terminal")
 	t.Setenv("TERM_PROGRAM_VERSION", "1.2")
 	ctx := context.Background()
-	cfg := Config{MachineID: "machine", StateDirectory: t.TempDir()}
+	cfg := Config{MachineID: "machine", StateDirectory: privateTempDir(t)}
 	if err := CaptureClaudeStatus(ctx, cfg, strings.NewReader(`{"session_id":"claude-session"}`)); err != nil {
 		t.Fatal(err)
 	}

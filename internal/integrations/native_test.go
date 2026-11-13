@@ -494,6 +494,74 @@ try {
  }
 } finally { if (old === undefined) delete process.env.COORDINATOR_BINARY; else process.env.COORDINATOR_BINARY=old; await rm(dir,{recursive:true,force:true}); }
 `},
+		{"native pages stay bounded while display aggregation and child recovery remain available", `import { strict as assert } from 'node:assert';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { registerNative } from './native.js';
+const dir = await mkdtemp(join(tmpdir(), 'coordinator-paged-'));
+const binary = join(dir, 'child');
+const old = process.env.COORDINATOR_BINARY;
+process.env.COORDINATOR_BINARY = binary;
+const handlers = new Map(), tools = new Map(), messages = [];
+let command;
+const host = {
+  on: (name, handler) => handlers.set(name, handler),
+  registerCommand: (_name, options) => { command = options.handler; },
+  registerTool: tool => tools.set(tool.name, tool),
+  registerMessageRenderer() {},
+  sendMessage: (message, options) => messages.push({message, options})
+};
+const ctx = {cwd:'/work', mode:'rpc', hasUI:false, sessionManager:{getSessionId:()=> 'session'}, isIdle:()=>true, ui:{notify(){}}};
+try {
+  registerNative(host, 'pi', text => text);
+  await handlers.get('session_start')({}, ctx);
+  await assert.rejects(tools.get('coordinator_session_list').execute('missing', {limit:1}), /ENOENT|closed|exited|unavailable/);
+  await writeFile(binary, ` + "`" + `#!${process.execPath}
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  buffer += chunk;
+  let end;
+  while ((end = buffer.indexOf('\\n')) >= 0) {
+    const frame = JSON.parse(buffer.slice(0,end)); buffer = buffer.slice(end+1);
+    if (frame.method === 'shutdown') process.exit(0);
+    if (frame.method !== 'list') continue;
+    const second = frame.input.cursor === 'page-two';
+    if (frame.input.cursor && !second) throw new Error('cursor lost');
+    const machine = {machineId:'machine',scopeId:'scope',resources:{observedAt:1,cpu:{usedPercent:{status:'available',value:2,...(!second ? {stale:true} : {})}}}};
+    const result = {machines:[machine],sessions:[{ref:{machineId:'machine',harness:'pi',nativeSessionId:second?'two':'one'},label:'x'.repeat(36000)}],nextCursor:second?null:'page-two'};
+    const line = JSON.stringify({version:1,id:frame.id,result})+'\\n';
+    if (Buffer.byteLength(line)>65536) throw new Error('page exceeds pipe bound');
+    process.stdout.write(line);
+  }
+});` + "`" + `, {mode:0o700});
+  await handlers.get('turn_start')({}, ctx);
+  const first = await tools.get('coordinator_session_list').execute('first', {limit:1});
+  assert.equal(first.details.sessions.length, 1);
+  assert.equal(first.details.nextCursor, 'page-two');
+  const second = await tools.get('coordinator_session_list').execute('second', {limit:1,cursor:first.details.nextCursor});
+  assert.equal(second.details.sessions[0].ref.nativeSessionId, 'two');
+  assert.equal(second.details.nextCursor, null);
+  await command('list');
+  assert.equal(messages[0].options.triggerTurn, false);
+  const full = messages[0].message.details;
+  assert.deepEqual(full.sessions.map(session=>session.ref.nativeSessionId), ['one','two']);
+  assert.equal(full.nextCursor, null);
+  assert.equal(full.machines.length, 1);
+  assert.equal(full.machines[0].resources.cpu.usedPercent.stale, undefined);
+  assert.ok(Buffer.byteLength(messages[0].message.content)>65536);
+  const transformed = await handlers.get('input')({text:'coordinate review'},ctx);
+  assert.ok(transformed.text.includes('"nativeSessionId":"two"'));
+  await handlers.get('turn_end')({}, ctx);
+  await command('list');
+  assert.equal(messages[1].message.details.sessions[1].ref.nativeSessionId, 'two');
+} finally {
+  await handlers.get('session_shutdown')({}, ctx);
+  if (old === undefined) delete process.env.COORDINATOR_BINARY; else process.env.COORDINATOR_BINARY = old;
+  await rm(dir,{recursive:true,force:true});
+}
+`},
 	}
 	for _, scenario := range scenarios {
 		t.Run(scenario.name, func(t *testing.T) {

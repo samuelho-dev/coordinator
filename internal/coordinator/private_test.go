@@ -14,8 +14,20 @@ import (
 	"github.com/samuelho-dev/coordinator/internal/wire"
 )
 
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestPrivateExclusiveAndSymlinks(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "private")
+	dir := filepath.Join(privateTempDir(t), "private")
 	if err := WritePrivate(dir, map[string][]byte{"secret": []byte("original")}); err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +56,7 @@ func TestPrivateExclusiveAndSymlinks(t *testing.T) {
 	}
 }
 func TestWritePrivateConcurrentDirectoryCreation(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "state", "coordinator")
+	dir := filepath.Join(privateTempDir(t), "state", "coordinator")
 	const count = 64
 	start := make(chan struct{})
 	results := make(chan error, count)
@@ -73,7 +85,7 @@ func TestWritePrivateConcurrentDirectoryCreation(t *testing.T) {
 }
 
 func TestIdentityAndTokenReread(t *testing.T) {
-	base := t.TempDir()
+	base := privateTempDir(t)
 	t.Setenv("XDG_STATE_HOME", base)
 	a, err := ResolveConfig(wire.ConnectorConfig{})
 	if err != nil {
@@ -102,7 +114,7 @@ func TestIdentityAndTokenReread(t *testing.T) {
 	}
 }
 func TestHermesFinalizeBlocksLateCallbacks(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", privateTempDir(t))
 	cfg, err := ResolveConfig(wire.ConnectorConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +156,7 @@ func TestMergePreservesMetadataAndProcessIdentity(t *testing.T) {
 	}
 }
 func TestHermesGuardsPriorBinding(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", privateTempDir(t))
 	cfg, err := ResolveConfig(wire.ConnectorConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -188,7 +200,7 @@ func TestHermesGuardsPriorBinding(t *testing.T) {
 	}
 }
 func TestCacheLockCancellationAndExpiredTombstone(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", privateTempDir(t))
 	cfg, err := ResolveConfig(wire.ConnectorConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -227,7 +239,7 @@ func TestCacheLockCancellationAndExpiredTombstone(t *testing.T) {
 	}
 }
 func TestCacheV6PreservesV5(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", privateTempDir(t))
 	cfg, err := ResolveConfig(wire.ConnectorConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -280,7 +292,7 @@ func TestCacheV6PreservesV5(t *testing.T) {
 }
 
 func TestEmptyEnvironmentTokenDoesNotFallBack(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "private")
+	dir := filepath.Join(privateTempDir(t), "private")
 	if err := WritePrivate(dir, map[string][]byte{"config": []byte(`{"inspectorUrl":"http://localhost:3000","tokenFile":"/tmp/secret"}`)}); err != nil {
 		t.Fatal(err)
 	}
