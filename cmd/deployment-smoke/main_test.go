@@ -73,7 +73,13 @@ func TestDeploymentDiscoveryAndExplicitTarget(t *testing.T) {
 	base.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 	http.DefaultTransport = base
 	t.Cleanup(func() { http.DefaultTransport = oldTransport; base.CloseIdleConnections() })
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	config := filepath.Join(dir, "config.json")
 	b, _ := json.Marshal(map[string]any{"inspectorUrl": tlsServer.URL, "apiToken": token})
 	if err := os.WriteFile(config, b, 0600); err != nil {

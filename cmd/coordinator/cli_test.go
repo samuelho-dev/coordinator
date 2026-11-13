@@ -194,7 +194,13 @@ func TestInstallMessagingRequiresOptIn(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("installer requires nonroot owner")
 	}
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
 	config := filepath.Join(root, "inspector.json")
 	unsetEnv(t, "COORDINATOR_API_URL")
 	unsetEnv(t, "COORDINATOR_API_TOKEN")
