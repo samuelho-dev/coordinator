@@ -47,7 +47,7 @@ jobs:
           gh api "repos/$REPOSITORY/actions/runs/$CI_RUN" > "$RUNNER_TEMP/ci.json"
           jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" '.repository.full_name == $repo and .head_repository.full_name == $repo and .head_sha == $sha and .head_branch == "main" and .path == ".github/workflows/ci.yaml" and (.event == "push" or .event == "workflow_dispatch") and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/ci.json"
           ATTEMPT="$(jq -er '.run_attempt | tostring' "$RUNNER_TEMP/ci.json")"
-          gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/attempts/$ATTEMPT/jobs?per_page=100" --jq '.jobs[] | {name,conclusion}' | jq -s -e 'all(.[]; .conclusion == "success") and any(.[]; .name == "supplementary") and any(.[]; .name == "chart") and any(.[]; .name == "npm-package") and any(.[]; .name == "publish")'
+          gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/attempts/$ATTEMPT/jobs?per_page=100" --jq '.jobs[] | {name,conclusion}' | jq -s -e 'all(.[]; .conclusion == "success") and any(.[]; .name == "supplementary") and any(.[]; .name == "chart") and any(.[]; .name == "npm-package") and any(.[]; .name == "publish") and ([.[] | select(.name | startswith("native ("))] | length == 4)'
           NAME="npm-$SHA-$ATTEMPT"
           gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/artifacts?per_page=100" --jq '.artifacts[]' | jq -s -e --arg name "$NAME" '[.[] | select(.name == $name and .expired == false)] | if length == 1 then .[0] else error("missing unique unexpired npm artifact; rerun CI") end' > "$RUNNER_TEMP/artifact.json"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
@@ -83,6 +83,9 @@ jobs:
           test "$(git -C source rev-parse HEAD)" = "$SHA"
           jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg attempt "$ATTEMPT" --arg version "$VERSION" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .ciRunAttempt == $attempt and .gate == "npm-package" and .packageName == "@samuelho-dev/coordinator" and .packageVersion == $version and .acceptance == "production-only-packed-native-install" and (.archiveSha256 | test("^[0-9a-f]{64}$"))' npm-evidence/npm.json
           test "$(sha256sum npm-evidence/package.tgz | cut -d' ' -f1)" = "$(jq -r .archiveSha256 npm-evidence/npm.json)"
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            tar -tzf npm-evidence/package.tgz | grep -Fx "package/dist/bin/$target/coordinator" >/dev/null
+          done
           tar -xOf npm-evidence/package.tgz package/package.json > "$RUNNER_TEMP/package.json"
           jq -e --arg version "$VERSION" --arg url "git+https://github.com/$REPOSITORY.git" '.name == "@samuelho-dev/coordinator" and .version == $version and .private != true and .repository.url == $url' "$RUNNER_TEMP/package.json"
           # npm normalizes bin targets (for example ./dist -> dist); compare the public contract, not bytes.

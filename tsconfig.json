@@ -9,14 +9,7 @@
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "noEmit": true,
-    "types": ["node"],
-    "plugins": [
-      {
-        "name": "@effect/language-service",
-        "ignoreEffectWarningsInTscExitCode": true,
-        "ignoreEffectErrorsInTscExitCode": false
-      }
-    ]
+    "types": ["node"]
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"]
+  "include": ["integrations/native.ts", "integrations/pi.ts", "integrations/omp.ts", "integrations/wire.generated.ts"]
 }

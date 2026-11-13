@@ -8,3 +8,4 @@ coverage/
 *.log
 *.bundle
 dist/
+internal/integrations/assets/plugins/

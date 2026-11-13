@@ -1,0 +1,11 @@
+name: coordinator
+version: "1.0"
+description: Session-bound Coordinator messaging
+provides_tools:
+  - coordinator_message_send
+  - coordinator_message_reply
+  - coordinator_message_get
+provides_hooks:
+  - on_session_finalize
+  - on_session_reset
+  - post_compaction
