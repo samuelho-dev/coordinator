@@ -62,23 +62,7 @@ spec:
         - name: stage-config
           image: {{ printf "%s@%s" $repository $digest | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command:
-            - node
-            - --input-type=module
-            - -e
-            - |
-              import { Effect, FileSystem } from 'effect';
-              import { NodeRuntime, NodeServices } from '@effect/platform-node';
-              NodeRuntime.runMain(Effect.gen(function* () {
-                const fs = yield* FileSystem.FileSystem;
-                yield* fs.makeDirectory('/config/private', { mode: 0o700, recursive: true });
-                yield* fs.chmod('/config/private', 0o700);
-                for (const name of ['inspector.json', 'health.token']) {
-                  const destination = `/config/private/${name}`;
-                  yield* fs.writeFile(destination, yield* fs.readFile(`/input/${name}`), { mode: 0o600 });
-                  yield* fs.chmod(destination, 0o600);
-                }
-              }).pipe(Effect.provide(NodeServices.layer)));
+          command: [coordinator, stage-config, --input, /input, --destination, /config/private]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -91,7 +75,7 @@ spec:
         - name: inspector
           image: {{ printf "%s@%s" $repository $digest | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: [node, dist/src/main.js, inspector]
+          command: [coordinator, inspector]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -102,7 +86,7 @@ spec:
             - {name: COORDINATOR_EXPECTED_SOURCE_SHA, value: {{ $sha | quote }}}
             - {name: HOME, value: /tmp}
             {{- if $caSecret }}
-            - {name: NODE_EXTRA_CA_CERTS, value: /etc/coordinator/ca/ca.crt}
+            - {name: SSL_CERT_FILE, value: /etc/coordinator/ca/ca.crt}
             {{- end }}
           ports:
             - {name: http, containerPort: {{ $settings.port }}, protocol: TCP}
@@ -115,31 +99,7 @@ spec:
             periodSeconds: 20
           readinessProbe:
             exec:
-              command:
-                - node
-                - --input-type=module
-                - -e
-                - |
-                  import { Config, Effect, FileSystem, Option } from 'effect';
-                  import { Headers, HttpClient } from 'effect/http';
-                  import { NodeHttpClient, NodeRuntime, NodeServices } from '@effect/platform-node';
-                  NodeRuntime.runMain(Effect.gen(function* () {
-                    const fs = yield* FileSystem.FileSystem;
-                    const token = (yield* fs.readFileString('/config/private/health.token')).trim();
-                    if (!token || /[\r\n]/.test(token)) return yield* Effect.fail('Invalid health token');
-                    const expectedSha = yield* Config.String('COORDINATOR_EXPECTED_SOURCE_SHA');
-                    const response = yield* HttpClient.get('http://127.0.0.1:{{ $settings.port }}/readyz', {
-                      headers: { authorization: `Bearer ${token}` }
-                    }).pipe(Effect.timeout('3 seconds'));
-                    if (response.status < 200 || response.status >= 300 ||
-                        Option.getOrUndefined(Headers.get(response.headers, 'x-coordinator-source-sha')) !== expectedSha) {
-                      return yield* Effect.fail('Readiness failed');
-                    }
-                  }).pipe(
-                    Effect.scoped,
-                    Effect.provide(NodeHttpClient.layerNodeHttp),
-                    Effect.provide(NodeServices.layer)
-                  ), { disableErrorReporting: true });
+              command: [coordinator, health, --url, "http://127.0.0.1:{{ $settings.port }}", --token-file, /config/private/health.token, --source-sha, {{ $sha | quote }}]
             periodSeconds: 5
             timeoutSeconds: 5
           resources:

@@ -1,36 +1,25 @@
 # Coordinator
 
-Read-only inspection of existing Pi, OMP, Claude Code, Codex CLI and Hermes sessions on Linux/macOS. Presence, native counters, local machine/container CPU and memory, and per-session process CPU/RSS capacity: no conversations, prompt forwarding, task execution or agent control.
+Inspect existing Pi, OMP, Claude Code, Codex CLI and Hermes sessions across Linux/macOS. Report identity, activity, workspace, machine/container CPU and memory, and session process usage. Optional peer messaging is asynchronous and explicitly authorized.
 
-## Deployment and rollback
+One Go executable runs the inspector, CLI, MCP bridge and native helpers. Pi/OMP use small JavaScript adapters for host APIs. No transcript collection, token/cost telemetry or remote tool execution.
 
-There are two parts: **one inspector service**, plus **native integrations on each host**. Configuration/Helm values describe desired settings; activation and service startup are explicit commands. Building and artifact generation do not deploy, activate or hot-reload anything. CI/release workflows produce artifacts, not host installations.
+## Install
 
-The API and setup CLI require Node >=22.19. Install the version-pinned release:
+Install a pinned release; replace `VERSION` with the required version:
 
 ```sh
-npm install --global @samuelho-dev/coordinator@0.3.0-beta.10
+npm install --global @samuelho-dev/coordinator@VERSION
+coordinator --version
 ```
 
-For source development only, use a reviewed checkout with `pnpm install --frozen-lockfile && pnpm build` (pnpm 11.9.0). `coordinator-install --source` deliberately activates that exact local package; never source-link a native package manager's own `node_modules` directory.
-
-The [esbuild build](scripts/build.ts) keeps Pi dependencies external and bundles OMP dependencies to avoid compatibility-loader traversal. Native host APIs stay external; OMP uses [Bun's native CommonJS support](https://bun.com/docs/runtime/module-resolution#module-systems), not an injected shim. Rebuild and restart OMP after source updates.
-
-Client and server code stays in [`src/mcp.ts`](src/mcp.ts). The `Mcp` layer contains only client calls; separate HTTP/stdio exports let native bundles discard server-only protocol and tool initialization.
-
-The grouped metadata/workspace contract introduced in `0.3.0-beta.5` is a breaking cutover from beta.4 and earlier APIs, publishers and readers. `0.3.0-beta.6` retains that contract and works with the beta.5 API. `0.3.0-beta.7` adds machine/session resource telemetry; `0.3.0-beta.8` replaces product-specific references with generic terminal name/version. Both require matching API, native publisher and reader upgrades; deploy the API first. `0.3.0-beta.9` changes only native Darwin machine scope identity; no API rollout is required.
-
-The list-only metadata consolidation changes list output to `{ "machines": [...], "sessions": [...], "nextCursor": ... }` and replaces the `harness` list filter with `repository`. API and `coordinate` snapshots may have a non-null cursor; the CLI drains pages and emits `nextCursor: null`, while `/coordinator list` drains pages and omits the cursor. This is a breaking API/reader cutover: deploy matching API and readers together, then restart native readers/hosts. MCP protocol negotiation does not negotiate the tool-input or tool-result shape; strict boundaries reject the removed `harness` input, and old and new strict readers cannot decode each other's list output. Full connector announcements, native `ref.harness` identity and `session.inspect` are unchanged; no credential, installation-identity, or publisher migration is required for this list-only change. These local source changes are not a published release; live beta.9 is unchanged.
-
-For Kubernetes, follow the [chart operator guide](deploy/helm/coordinator/README.md): provide an existing Secret, verified image digest and matching source SHA. The chart creates an inspector Deployment/internal Service, not native plugins, TLS routing, a database or runners. Operators own rollout and supervision. Existing broker state requires the guide's preservation/migration procedure; the plugin does not migrate or delete it.
+The package bundles platform binaries; the Go runtime needs no Node server. Installed behavior follows the selected release, not this checkout.
 
 ## Configuration
 
-### Operator/API setup
+### Inspector
 
-Provision owner-scoped bearer keys. The server stores SHA-256 hashes, not raw tokens; every principal contains only `id`, `owner` and `tokenHash`. A key authorizes reads and publishing across that owner's fleet, not one physical device. Same-owner keys can announce multiple installations; installation IDs are labels, not device authentication. Anyone holding an owner key can publish under any of that owner's machine labels. Revoking a shared key revokes every holder; there is no separate read-only or health-token role.
-
-Bootstrap a new API with one owner key:
+Create a new private server configuration and start the inspector:
 
 ```sh
 PRIVATE="${XDG_CONFIG_HOME:-$HOME/.config}/coordinator/server"
@@ -38,267 +27,102 @@ coordinator init --directory "$PRIVATE" --owner operator
 COORDINATOR_CONFIG="$PRIVATE/server.json" coordinator inspector
 ```
 
-`init` generates a random 32-byte bearer in `owner.token` and its SHA-256 principal in `server.json`, with directory0700/files0600. It prints paths and the start command, never the bearer. Existing files, unsafe ownership/permissions and symlinks are rejected; partial writes are removed. Defaults are loopback `127.0.0.1:8787`; `--listen-host` and `--port` select another bind address. No database is required.
+`init` creates `server.json` and a random bearer in `owner.token`; the server stores its SHA-256 hash. The default bind is `127.0.0.1:8787`. Supervise the process yourself. Remote clients require HTTPS; HTTP is allowed only on loopback.
 
-Run the API under your normal process supervisor. Remote clients require operator-provided HTTPS with ordinary certificate verification; only loopback permits HTTP. For Kubernetes, bootstrap with `--listen-host 0.0.0.0`, provision the existing Secret from `server.json` and `owner.token` as described in the chart guide, and deploy the verified image/chart. Do not publish the token or expose an unauthenticated HTTP service.
+For Kubernetes, use the [Helm chart guide](deploy/helm/coordinator/README.md). It requires an existing Secret, a verified image digest and matching source SHA; it does not install native integrations or TLS routing.
 
-`COORDINATOR_CONFIG` selects server configuration, not client credentials. Initialization does not start a service, provision TLS or replace an existing server configuration.
+### Clients
 
-### Native-owner/client setup
-
-Configure a native client interactively:
-
-```sh
-coordinator connect
-```
-
-This prompts for the endpoint and a masked owner credential, performs an authenticated API read, and only then saves the private client configuration. It does not create machine identity or change native settings. For private-file provisioning:
+Provision the owner's token privately, then connect each host:
 
 ```sh
 coordinator connect --endpoint https://inspector.example.net --token-file /absolute/private/owner.token
 ```
 
-`--config` chooses a new client file; otherwise the shared default location below is used. Existing files are never overwritten. `COORDINATOR_API_TOKEN` may supply the credential instead of the prompt, but credentials are never accepted as argv. Environment URL/token overrides still take precedence after setup.
+Omit `--token-file` for a masked credential prompt. Connection is verified before saving; existing files are never overwritten.
 
-
-Clients need only `inspectorUrl` and `apiToken`, supplied through private JSON or `COORDINATOR_API_URL` / `COORDINATOR_API_TOKEN`. The environment overrides corresponding file fields. Have the native owner's secret manager inject the token into the environment of the native host, reader bridge and separately supervised connector; never put raw keys in Git, argv, generated native MCP configuration or logs:
-
-```sh
-export COORDINATOR_API_URL="https://inspector.example.net"
-# Provision COORDINATOR_API_TOKEN through the owner's secret manager before starting clients.
-node dist/src/main.js list
-```
-
-Alternatively, use a private client file (`inspector.json`), with either `apiToken` or the optional `tokenFile`:
-
-```json
-{
-  "inspectorUrl": "https://inspector.example.net",
-  "tokenFile": "/home/operator/.config/coordinator-inspector-private/owner.token",
-  "project": {
-    "root": "/home/operator/projects/product",
-    "id": "product",
-    "name": "Product workspace"
-  }
-}
-```
-
-Resolved `apiToken` takes precedence over `tokenFile`. Explicit `--config` (where supported) selects the client file before `COORDINATOR_CONNECTOR_CONFIG`, then `$XDG_CONFIG_HOME/coordinator/inspector.json` or `~/.config/coordinator/inspector.json`. Private files and their immediate parent must be owner-owned/private (0600/0700), canonical absolute paths without symlinks; files are limited to 64 KiB. JSON does not expand `~` or environment variables. Unknown fields are rejected. An explicit missing/invalid file is an error; a missing default is allowed for env-only setup. No configured endpoint leaves extension observation inactive, not pointed implicitly at localhost. Network consumers require credentials and never fall back after authentication rejection.
-
-Native capture automatically creates one private persistent UUID in `machine-id` beneath `$XDG_STATE_HOME/coordinator`, otherwise `~/.local/state/coordinator` on Linux or `~/Library/Application Support/coordinator` on macOS. The state root is canonical, owner-owned and 0700; `machine-id` is 0600. All harnesses/processes on that installation share it across endpoints, key rotations and profiles. Different installations get different IDs; unsafe/corrupt identity files fail rather than being replaced. Do not configure `machineId` or `stateDirectory`. Read-only list/inspect/MCP clients and artifact generation do not create local identity/state.
+- Default client file: `$XDG_CONFIG_HOME/coordinator/inspector.json`, otherwise `~/.config/coordinator/inspector.json`.
+- Select another file with `COORDINATOR_CONNECTOR_CONFIG` or `connect --config`.
+- Client JSON uses `inspectorUrl` and either `tokenFile` or `apiToken`. `COORDINATOR_API_URL` / `COORDINATOR_API_TOKEN` override file values; `COORDINATOR_CONFIG` is server-only.
+- Private paths must be canonical and absolute, without symlinks; directories/files must be owner-owned and private (0700/0600). Never put credentials in Git, argv or logs.
+- Owner keys authorize fleet-wide reads and publishing. Machine IDs are installation labels, not device authentication; any holder of a shared owner key can publish under that owner's machine labels.
 
 ## Native host setup
 
-Run as the nonroot native user with the endpoint and credentials provisioned as above. Choose `omp`, `pi`, `claude`, `codex` or `hermes` and a new destination:
+Run as the nonroot native user after client configuration. Choose `omp`, `pi`, `claude`, `codex` or `hermes`:
 
 ```sh
 TARGET=omp
 PRIVATE="${XDG_CONFIG_HOME:-$HOME/.config}/coordinator"
-coordinator-install --target "$TARGET" --destination "$PRIVATE/$TARGET-host" --dry-run
-coordinator-install --target "$TARGET" --destination "$PRIVATE/$TARGET-host"
+coordinator install --target "$TARGET" --destination "$PRIVATE/$TARGET-host" --dry-run
+coordinator install --target "$TARGET" --destination "$PRIVATE/$TARGET-host"
 ```
 
-`--config "$PRIVATE/inspector.json"` is optional. An explicit flag or `COORDINATOR_CONNECTOR_CONFIG` selection is retained as a literal private-file pointer, never the raw token. Without either, clients look up `$XDG_CONFIG_HOME/coordinator/inspector.json` or `~/.config/coordinator/inspector.json` at runtime; the installer does not freeze that file's current endpoint into launchers or hooks. File-backed endpoint/credential changes take effect after ordinary process restart. Keep the same configuration environment available to the native host, hooks and separately supervised connector:
+The destination must be new and its parent private. The installer stages a binary and host configuration, then prints activation instructions. It never activates integrations, grants hook trust or starts services.
 
-- **Pi/OMP:** launch the harness with the selected private-file pointer or default-file environment, plus any URL/token overrides. Pi runs in-process; the pinned OMP stdio transport merges `Bun.env` before server `env`, so no token interpolation/config entry is needed.
-- **Codex:** generated `env_vars` forwards `COORDINATOR_API_TOKEN`, `COORDINATOR_API_URL` and `XDG_CONFIG_HOME` by name. No URL literal masks a runtime override. A selected private-file pointer stays in `env`; [Codex merges literal `env` after forwarded names](https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/utils.rs), so an ambient config pointer cannot replace the installer's explicit selection.
-- **Claude Code:** generated MCP configuration uses [documented `${VAR}` expansion](https://code.claude.com/docs/en/mcp#environment-variable-expansion-in-mcp-json) only for URL/token overrides present during generation, and for `XDG_CONFIG_HOME` when set. Private-file-only setup does not require URL/token variables. Keep every referenced variable provisioned whenever launching Claude; unset references are not optional and can retain literal text. Remove an override reference deliberately when switching back to file credentials.
-- **Hermes:** generated MCP `env` likewise references only URL/token overrides present during generation and `XDG_CONFIG_HOME` when set, never their credential values. Its [stdio environment is filtered](https://github.com/NousResearch/hermes-agent/blob/main/tools/mcp_tool_config.py), so these entries preserve the custom default-file location and explicitly provisioned overrides. Private-file-only setup emits no URL/token references. Use a Hermes version supporting `${VAR}` interpolation and keep referenced variables provisioned in the selected profile's environment/secret scope, not an unrelated gateway profile.
-
-Secret-manager provisioning must reach the native host and separately supervised connector; an installer's environment does not persist into later native launches. No generated MCP entry embeds a bearer in `env` or argv.
-
-The installer validates prerequisites and creates launchers/config fragments. `--dry-run` writes nothing. It does **not** activate integrations, trust hooks, overwrite native settings or start services. Follow its printed instructions:
-
-| Target | Activation | Presence publisher |
+| Host | Activation | Presence publisher |
 | --- | --- | --- |
-| OMP | `omp plugin install @samuelho-dev/coordinator@0.3.0-beta.10`; merge only the generated `mcp.json` coordinator entry into native MCP settings. `/coordinator list` needs no MCP registration. | In-session extension. |
-| Pi | `pi install npm:@samuelho-dev/coordinator@0.3.0-beta.10`; directly registers `coordinator_session_list` / `coordinator_session_inspect`, without an MCP bridge. | In-session extension. |
-| Claude Code | `claude --plugin-dir "$PRIVATE/claude-host"`; approve generated hooks/MCP tools; preserve existing status-line configuration. | Separate `connector.sh`. |
-| Codex CLI | Merge generated `hooks/hooks.json` and coordinator `mcp.toml`; trust only Coordinator's handlers in native `/hooks`. | Separate `connector.sh`. |
-| Hermes | Merge generated hook entries and `mcp_servers.coordinator` from `mcp.yaml` into the selected profile; no Python plugin installation. | Separate `connector.sh`. |
+| Pi / OMP | Load the staged extension using the printed command. OMP's generated `mcp.json` enables MCP tools separately. | Adapter-owned Go child |
+| Claude Code | Use the printed `claude --plugin-dir` command; approve hooks/MCP. | Supervise generated `connector.sh` |
+| Codex CLI | Merge generated hooks and `mcp.toml` into native settings; approve hooks in `/hooks`. | Supervise generated `connector.sh` |
+| Hermes | Merge generated hooks and MCP settings into the selected profile. | Supervise generated `connector.sh` |
 
-Generated directories contain configuration, not a package copy. Launchers reference the installed package's absolute paths, so keep that package available. Updates use explicit native package installs, followed by deliberate native reload/new sessions and restart of affected reader bridges/external connectors. Already-open sessions retain loaded code. Updating configuration alone does not update the plugin. Private token files are reread for rotation/recovery; environment or config-token changes require process reload. Staged server Secret changes require a controlled inspector restart.
+`mcp.sh` is the stdio reader bridge. Hook capture is local; publishing requires the connector and credentials. Machine identity is created automatically on first native capture. Building or installing artifacts never starts a publisher.
 
-`mcp.sh` is the stdio reader bridge; `connector.sh` publishes external hook metadata. The latter's equivalent foreground command is:
-
-```sh
-COORDINATOR_CONNECTOR_CONFIG="$PRIVATE/inspector.json" node dist/src/main.js connector
-```
-
-Hook/status-line/notification capture is local and can initialize identity/cache on first use while offline, without a token; it is not an offline delivery queue. Network publishing still needs credentials and a running publisher. Metadata cache is bounded to 1024 observations and 64 KiB per file, normally expires after 120 s, and may retain Hermes observations while the attributed host remains live. The terminal contract uses cache version 4 and versioned filenames; older records are ignored, not decoded or overwritten. No transcripts are collected.
-
-### Native session commands and terminal identity
-
-Pi/OMP register `/coordinator list`. It follows every API page visible to the owner key and returns pretty JSON (`{ "machines": [...], "sessions": [...] }`) using Effect's JSON formatter, with native JSON syntax highlighting in the terminal. Machines are deduplicated by installation ID and resource scope; session rows retain full inspectable refs, bindings, activity state, model and workspace identity without repeating machine telemetry. Missing metadata is omitted; an empty listing returns `{ "machines": [], "sessions": [] }`. It reads published snapshots directly, with no model turn, on-demand per-session sampling or separate MCP registration.
-
-Full connector publishing and inspection presence groups optional metadata under `machine`, `agent`, `model`, `workspace` and `terminal`; this is not the compact list representation. Absent facts/groups are omitted, with no old flat or product-specific aliases:
-
-```json
-{
-  "ref": { "machineId": "installation-uuid", "harness": "omp", "nativeSessionId": "native-session-id" },
-  "observedAt": 1792886400000,
-  "machine": { "name": "workstation", "os": { "platform": "linux", "architecture": "x64" } },
-  "agent": { "kind": "coding", "name": "native-agent", "profile": "work" },
-  "model": { "provider": "provider-id", "id": "model-id" },
-  "terminal": { "name": "terminal-name", "version": "terminal-version" },
-  "workspace": {
-    "cwd": "/home/operator/projects/product/worktree/src",
-    "project": { "root": "/home/operator/projects/product", "source": "configured", "id": "product", "name": "Product workspace" },
-    "git": { "state": "available", "observedAt": 1792886400000, "worktreeRoot": "/home/operator/projects/product/worktree", "commonDir": "/home/operator/projects/product/main/.git", "branch": "feature", "head": "0123456789abcdef0123456789abcdef01234567" }
-  }
-}
-```
-
-Git discovery is read-only and local to the session machine, bounded to two seconds without network, hooks, remote URLs or working-tree scans. `available` reports the actual worktree root and shared absolute Git common directory (including linked worktrees); `branch: null` means detached HEAD, `head: null` an unborn branch. `not-repository` means genuinely outside Git; `unavailable` means discovery failed, was denied, timed out or Git was missing. All three outcomes include `observedAt` and are cached for 30 seconds at unchanged cwd; future timestamps force refresh. Changing cwd clears stale associations. Native startup does not await discovery.
-
-The compact `session.list` representation separates machine records (installation `machineId` plus nullable resource `scopeId`) from session rows (`ref.machineId` and nullable `machineScopeId`). Available `workspace.git` retains `worktreeRoot`, `commonDir`, `branch` and `head` for discovery and grouping. A null scope is unknown, never a substitute installation ID or proof of a shared execution boundary. Resource percentages on a session retain their own `resources.machineScopeId`, which may differ from the row's source machine scope. Repeated machine readings in the same scope use the newest intact observed snapshot, not combined metric values; the same installation can report multiple scopes across reboots or cgroups. Each page includes its own machines, and CLI/native command aggregate across pages by the composite identity. Pages are bounded to 48 KiB including machines and cursor, but are not a transactionally frozen fleet snapshot.
-
-The optional `repository` list selector matches the exact published `workspace.git.commonDir` only when `git.state` is `available`, across all native harnesses and linked worktrees sharing that directory. For example, `{ "limit": 100, "machineId": "installation-uuid", "repository": "/home/operator/projects/product/main/.git" }` uses the path published by that remote machine, not the reader's local checkout. The selector is a 1–4096-character path and can be combined with `machineId`; owner visibility always applies. A common directory is machine-local, not a global cross-machine repository ID. Missing Git metadata, `not-repository` and `unavailable` observations do not match. The inspector does no filesystem/Git lookup or normalization and does not match path prefixes, cwd, worktree root, `workspace.project`, branch, directory basename or inferred remote identity. Omit `repository` for all repositories and non-Git sessions. Continuation cursors are bound to the owner and exact `machineId`/`repository` inputs, including whether each was omitted; adding, changing or removing either selector invalidates the cursor.
-
-Equal-timestamp copies prefer the intact snapshot with fewer stale readings, so a disconnected publisher cannot hide a live copy of the same sample.
-
-Projects are explicit scope, independent of Git: Claude's documented status-line [`workspace.project_dir`](https://code.claude.com/docs/en/statusline) supplies its launch directory as `source: "native"`, not a guessed Git repository or application identity. The optional private configuration `project` above uses `source: "configured"` and wins only for cwd inside its root; outside that root, a valid native association can remain. Association respects directory/symlink boundaries and is recomputed independently of the Git cache. No project ID/name is inferred from a directory, repository or branch.
-
-`terminal` is generic: `name` comes directly from `TERM_PROGRAM`, and optional `version` from `TERM_PROGRAM_VERSION`. Any valid terminal name is accepted without a product whitelist, vendor environment keys, per-product session IDs, hostname guessing, CLI discovery or terminal queries. Missing, blank or malformed standard markers leave identity unknown; `TERM=xterm-256color` describes capabilities, not an application. Version alone does not identify a terminal. Hook metadata is captured at the hook source, never inferred from the connector's own terminal.
-
-This is inherited environment metadata, not authentication, live-terminal validation, process ownership or container identity. SSH and multiplexers may remove or change the markers. Local CPU/RAM scope remains under `machine.resources`; terminal identity does not widen it. See [runtime provenance research](docs/research/runtime-provenance.md) for the marker contract and limits.
-
-Session JSON is Coordinator's fleet model, not an OSC wire payload. Optional `programStatus` uses [OSC 7501 Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) semantics: idle/working/done/error, or blocked with permission/question/auth kind. Agent `kind` remains separate. Tool/API waits are working; unknown outcomes are omitted, not inferred from disconnects or generic stops. API connection leases do not expire terminal status records.
-
-Stock OMP 18.12.6 already owns OSC7501 through `terminal.programStatus`; Coordinator does not duplicate, override or patch that reporter. Pi's terminal-only adapter uses a private scoped record, full replacements and change-only reporting; no controls are written to RPC/JSON/print output. Pi user prompts are blocked/question; completion waits for native final settlement, not an intermediate loop end. Claude hooks supply explicit permission/question/completion/failure states; unavailable native UI-only reasons are not guessed. Prompt/error text is never copied into status reports.
-
-For beta.5, coordinate a breaking cutover across the API, every publisher and every reader; beta.4 and earlier are incompatible. Deploy the matching API **before** upgrading clients, then deliberately reload native hosts, reader bridges and connectors together. Strict schemas reject new fields on older APIs, and older readers cannot decode the grouped presence. Preserve existing credentials and installation identity; there are no flat-field compatibility aliases.
-
-The beta.7 machine and session resource extensions require the same API-first cutover across matching native publishers and readers; older strict schemas reject the new fields.
-
-## Coordinated migration
-
-This is a clean schema cutover, with no legacy aliases or compatibility shims. Existing owner-scoped credentials and installation identity remain valid for grouped metadata; do not rotate them merely for this change. For installations still using the older machine-bound configuration, a separately approved migration must provision owner keys privately, use server principals `{ id, owner, tokenHash }` and matching chart `health.token`, and replace manual client `machineId`/`stateDirectory` with endpoint/credential configuration (plus optional explicit `project`). Regenerate affected installer artifacts and deliberately restart the inspector and affected native hosts/bridges/connectors. These instructions do not perform a live rollout or rotate live keys.
-
-
-## Plugin publication
-
-The version-pinned beta is `@samuelho-dev/coordinator@0.3.0-beta.11`. The [npm workflow](.github/workflows/npm-release.yaml) promotes the exact-source CI-accepted tarball with owner authorization; [first-publication authentication and trust setup](#first-npm-publication) are prerequisites for a new publisher. The existing [release workflow](.github/workflows/release.yaml) publishes server/chart/GitHub artifacts, not native marketplace listings. Generated per-machine configuration is not a portable marketplace package.
-
-For a version-pinned install, use your native package manager, then follow [configuration](#configuration) and [native host setup](#native-host-setup):
+## Use
 
 ```sh
-omp plugin install @samuelho-dev/coordinator@0.3.0-beta.11
-pi install npm:@samuelho-dev/coordinator@0.3.0-beta.11
+coordinator list
+printf '%s\n' '{"ref":{"machineId":"installation-uuid","harness":"omp","nativeSessionId":"session-id"}}' | coordinator inspect
 ```
 
-Stock OMP 18.12.6 does not automatically update npm plugins. Until upstream fixes its channel handling and dry-run behavior, use explicit versioned installs for updates; avoid `omp plugin upgrade` and `upgrade --dry-run` for beta releases.
+Copy the complete `ref` from a listed session, including `nativeAgentId` when present. Pi/OMP also provide `/coordinator list` without starting a model turn.
 
-`0.3.0-beta.2` fixes clean-install startup failures by pinning `effect`, `@effect/platform-node` and `@effect/platform-node-shared` together at 4.0.3 in the published dependencies. Checkout-only pnpm overrides do not constrain npm/OMP consumers; leaving the shared package floating can select an incompatible release (`effect/Path` missing `make`). Keep these three pins aligned when upgrading.
+Lists return `{machines, sessions, nextCursor}`. CLI and slash-list displays drain pages; Pi's `coordinator_session_list` and MCP `session.list` preserve pagination with `limit` (1–100), optional `cursor`, `machineId` and `repository` (the exact remote Git common-directory path). `session.inspect` accepts the complete ref. HTTP MCP is at `/mcp`; `coordinator mcp` provides stdio.
 
-`0.3.0-beta.3` adds native `/coordinator list`, secure self-host bootstrap/authenticated client setup, and Rex references/status normalization without an OMP fork. Runtime dependency pins are unchanged.
+### Peer messaging
 
-`0.3.0-beta.4` fixes `/coordinator list` output: Effect-formatted, indented JSON with native syntax highlighting instead of hand-built text and literal fences. Native UI imports are static and selected at build time; the renderer registers once at startup. The session wire format and runtime dependencies are unchanged, so the existing beta.3 API needs no redeployment.
+Messaging is off by default. Enable it independently on the server principal (`init --messaging` for a new server), client (`connect --messaging`) and staged integration (`install --messaging`). These flags do not grant host trust or alter existing server permissions.
 
-`0.3.0-beta.5` groups machine, agent, model and workspace metadata; adds cached Git worktree/common-directory/branch/HEAD observations and native or explicitly configured project association; and migrates every harness and private metadata cache. This requires matching API, publishers and readers, but no credential rotation, new runtime dependencies or OMP fork.
+```sh
+coordinator message send <<'JSON'
+{"to":{"machineId":"installation-uuid","harness":"pi","nativeSessionId":"session-id"},"text":"Please review this change","requestId":"request-1"}
+JSON
+coordinator message get <<'JSON'
+{"messageId":"message-id"}
+JSON
+```
 
-`0.3.0-beta.6` removes server-only MCP protocol/tool initialization from native client bundles while keeping the implementation in `src/mcp.ts`. The wire contract, runtime dependencies, heartbeat timing and readiness probe are unchanged; the beta.5 API remains compatible.
+Pi/OMP support native send and correlated reply tools. Claude's receiver is a development preview requiring the printed development-channel activation command. Hermes requires its staged plugin, `plugins.entries.coordinator.allow_gateway_injection: true`, the same client configuration in the gateway, and `/coordinator enable` in the actual session. Codex supports unbound send/get, not receive or bound replies.
 
-`0.3.0-beta.7` adds portable Linux host/cgroup and macOS CPU/RAM telemetry plus per-session CPU/RSS capacity percentages in list and inspect. Sampling uses the existing native publishing cadence and pinned Effect platform services, with explicit shared-process attribution, target-scope/PID birth checks, stale/unavailable readings, and complete list pagination. No new runtime dependency or monitoring backend is required. Deploy the matching API before updating and deliberately reloading native publishers/readers; existing credentials and installation identities remain valid.
-
-`0.3.0-beta.8` adds generic `terminal: { name, version? }` in session presence, list and inspect, replacing product-specific associations. Capture reads only the standard terminal markers; there are no per-product detectors or compatibility aliases. Cache version 4 isolates older records. Deploy the matching API and coordinate all publisher/reader upgrades before enabling this breaking wire change. Existing beta.7 installations do not gain it merely by reloading; no credential rotation, installation identity changes, runtime dependencies or stock host modifications are required.
-
-`0.3.0-beta.9` canonicalizes the Darwin boot timestamp to validated numeric seconds/microseconds before hashing it with the hostname. Locale/timezone renderings of the same boot now retain one machine scope ID; a reboot or different host still gets another. Missing or malformed boot data produces no scope ID. The wire schema and runtime dependencies are unchanged; update and reload native publishers/readers without redeploying the API.
-
-`0.3.0-beta.10` consolidates session list metadata into machine and session collections and adds repository and machine ID filters. This is a breaking list API and reader cutover; coordinate the matching inspector and native readers as described above.
-
-`0.3.0-beta.11` fixes fresh Pi startup when the unused Redis peer is not installed. It changes no wire contract or runtime dependencies; the beta.10 API and chart need no redeployment.
-
-| Host | Publication route |
-| --- | --- |
-| [OMP](https://github.com/can1357/oh-my-pi/blob/main/docs/marketplace.md) | Publish a Git-backed `.omp-plugin/marketplace.json` catalog and runnable plugin tree with `package.json` `omp.extensions`. Claude-compatible `.claude-plugin/marketplace.json` is a fallback. npm catalog sources are not supported; ordinary `omp plugin install PACKAGE` is a separate npm route. |
-| [Pi](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md) | Publish an npm package with `keywords: ["pi-package"]` and `pi.extensions`; the keyword makes it eligible for the Pi gallery. Users install with `pi install npm:PACKAGE@VERSION`. Host SDK packages remain host-provided, not bundled. |
-| [Hermes](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission) | Publish a public plugin repository with `plugin.yaml` and a supported entrypoint; submit `plugin-catalog/NAME.yaml` to NousResearch/hermes-agent, pinned to a full reviewed commit SHA. Each update needs another pin-bump PR. |
-| [Codex](https://developers.openai.com/plugins/build/plugins) | Publish a portable plugin tree and `.agents/plugins/marketplace.json` in a Git repository. Users add it with `codex plugin marketplace add OWNER/REPO --ref TAG`; plugin installation/enabling and hook trust are separate steps. Current packaging docs explicitly guarantee hook bundles for manual desktop installs; CLI plugin-hook compatibility needs release-specific verification. |
-| [Claude Code](https://code.claude.com/docs/en/plugins/publish) | Publish a plugin and `.claude-plugin/marketplace.json` in Git. Users run `claude plugin marketplace add OWNER/REPO`, then `claude plugin install NAME@MARKETPLACE`. Anthropic's directory portal is a separate reviewed route, not submission to `claude-plugins-official`. |
-
-Release gaps and constraints:
-
-- The manifest now has a runtime-only `files` allowlist, Pi gallery metadata, public beta settings, and `coordinator` / `coordinator-install` binaries. Installer and generated-manifest versions come from `package.json`. Before publication, build and exercise a clean production-only tarball install, reconcile its bundled notices, finish retained-history/confidential-material review, and confirm npm scope/version authorization.
-- Keep one runtime implementation with host-specific manifests/catalog entries. Replace author-machine paths with supported plugin-root references or an explicitly provisioned CLI, and ship/provision its dependencies. Do not assume marketplace installation runs build/postinstall scripts, starts a connector or grants hook trust.
-- [OpenAI public-directory submissions reject lifecycle hooks](https://developers.openai.com/plugins/build/plugins#bundled-mcp-servers-and-lifecycle-hooks); the full observer therefore cannot be submitted unchanged. The [public MCP portal](https://developers.openai.com/plugins/deploy/submission#authentication-limitations) also lacks the current fixed-bearer authentication flow. An MCP-only offering would be a different scope.
-- [Hermes catalog rules](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission#admission-rules) require secrets through Hermes. Catalog packaging must use approved Hermes secret provisioning, not the optional direct-token-file mode; local environment forwarding alone is not catalog acceptance. Portable Hermes MCP/skill packages do not automatically activate our shell hooks or external connector. A Skills Hub listing distributes instructions, not this runtime integration.
-- Users still need the shared inspector HTTPS service, owner credentials supplied privately, explicit native approvals and, for hook hosts, one separately supervised connector. Validate real cached/package installs and minimum host versions before advertising marketplace compatibility.
-
-### First npm publication
-
-- Authenticate with native `npm login` as an account authorized for `@samuelho-dev`; satisfy 2FA and inspect existing package/access/version state. GitHub or AWS access does not grant npm rights. An anonymous 404 is not creation permission; stop if ownership or private-package state is ambiguous.
-- Publish only the accepted tarball from successful current-main CI. Apply the [release workflow's](.github/workflows/npm-release.yaml) source/run/attempt, required-job, unique-unexpired-artifact, manifest/repository, normalized source-contract, SHA256 and unused-version checks. Do not rebuild, repack a dirty checkout or create a dummy bootstrap version. Explicitly publish that archive with `--ignore-scripts --access public --tag beta --registry=https://registry.npmjs.org`; an interactive first publication has no hosted npm provenance.
-- For later releases, configure [npm's trusted publisher](https://docs.npmjs.com/trusted-publishers/) for GitHub owner `samuelho-dev`, repository `coordinator`, workflow `npm-release.yaml`, environment `npm-public`, with direct publishing allowed. Protect that GitHub environment with maintainers/reviewers and main-only restrictions; naming it in YAML does not create those rules. The hosted OIDC workflow publishes the verified archive with provenance, without an npm token fallback, then checks the registry's exact version and SHA-512 integrity against that archive. A failed post-publication check requires investigation; it does not undo a successful publish.
-
-Registry verification allows up to 120 checks, ten seconds apart, for npm processing. Publishing is not retried; an integrity mismatch still fails the release.
-
-
-## Internal contract
-
-- **Read API:** `/mcp` exposes only `session.list` and `session.inspect`. List requires `limit` 1–100, with optional `cursor`, `machineId` and exact published Git-common-directory `repository` selectors. `harness` is not a list input; it remains native identity in the complete returned `SessionRef`: `machineId`, `harness`, `nativeSessionId`, optional `nativeAgentId`. Inspect takes that complete ref unchanged.
-- **Publishing:** native hosts initiate outbound `/connector/announce`, `/connector/poll`, `/connector/result` and `/connector/disconnect` requests. Detail queries are correlated transient read RPCs, not execution jobs.
-- **Startup:** generated integrations do not await the inspector during activation. Pi/OMP publish in the background; Claude/Codex/Hermes hooks capture locally; the local stdio bridge initializes and lists tools without a remote handshake. Explicit inspection/`coordinate` requests may await a bounded remote reply. Local configuration, filesystem and native loading still run during initialization.
-- **State/lifetime:** the owner-isolated registry is in memory; restart loses discovery until reannouncement, never native sessions. A Pi/OMP plugin owns one Effect managed runtime; presence/poll failures cancel their peer and shutdown disposes its fibers without killing the host. Closing the stdio reader's stdin ends its scope and cancels pending HTTP reads. Failed startup/terminated connectors can restart on a later native event.
-- **Effect composition:** `NodeServices.layer` provides filesystem/path/crypto/process/stdio services; `Host.layer` provides host facts. `Mcp.layer` privately supplies its HTTP client. The CLI scope owns the inspector/server; one Pi/OMP `ManagedRuntime` owns plugin fibers/layers through shutdown. CLI-only stdin closes on completion; plugin stdin remains host-owned. Layer construction, provisioning and sharing follow the [v4 layer contract](https://effect.website/docs/v4/api/effect/Layer).
-- **Node bindings:** [`platform.ts`](src/platform.ts) confines host facts, CLI-owned stdin, server composition and constant-time digest comparison. Runtime private readers use Effect `FileSystem`; setup's exclusive private-file transaction uses Node opened descriptors and no-follow flags. Native SDK callbacks remain foreign interop boundaries.
-- **OMP shortcut:** a leading `coordinate` enriches the current input with fleet presence and an inspection cue. It does not contact other sessions with prompts.
-
-| Timing/bound | Value |
-| --- | --- |
-| Presence / healthy poll delay | 10 s / 1 s after a completed cycle |
-| Receiver liveness / discovery expiry | 30 s / 120 s |
-| Native detail / inspector query deadline | 8 s / 10 s |
-| HTTP / advisory disconnect deadline | 10 s / 500 ms |
-| Connector retry | Exponential from 2 s; 80–120% jitter; hard 30 s cap |
-| Connection diagnostics | Debug-only; 5 s grace checked on failed retries; coalesced across flaps; recovery/reset after 10 healthy seconds |
-| Payloads | 64 KiB HTTP/native input; 48 KiB inspection budget |
-
-Connector timeouts and HTTP 409/429/5xx retry and reannounce. HTTP 401/403 retry only after finding a changed token. Other failures end the attempt. Stable recovery resets backoff and error deduplication; one successful poll does not. Background connection failures and optional Claude roster unavailability are debug-only. Detail failures return correlated errors to their requester, not host warnings. Actionable configuration/authentication failures and defects use native UI or headless stderr, deduplicated by operation/code/status independently of connection state. Cancellation is quiet; advisory disconnect remains bounded. Default Effect logs and CLI diagnostics use stderr with safe operation/code/status, never credentials or rejected payloads ([`Logger.LogToStderr`](https://effect.website/docs/v4/api/effect/Logger#LogToStderr)). `/livez` is public; `/readyz` and `/healthz` require an owner bearer. Request deadlines do not bound arbitrary uninterruptible work.
+Peer text is not user approval or system instruction. Receivers reply using the original message ID as `replyId`; host tools supply caller identity. `accepted` means native admission, not completion. Delivery expires after 10 minutes; records last up to 30 minutes. Discovery and mailboxes are in memory and are lost on inspector restart.
 
 ## Metrics and provenance
 
-Only exposed native metadata/getters are observed; no transcript/screen scraping or retained prompt/tool contents. Pi/OMP use context/usage updates. Claude optionally adds status-line counters/native PID roster; Codex token counters require an already-attached app-server's v2 notifications. The `claude-statusline` / `codex-notification` stdin adapters do not attach to or launch agents. Hermes uses start, post-API, turn-end and finalize hooks: end means idle, finalize removes the record, and late callbacks cannot recreate it.
+Measurements come from the agent's own machine/VM or Linux cgroup, never the inspector. Lists read published snapshots; inspection refreshes native getters and process samples. Missing or stale counters stay explicitly unavailable/stale, not zero.
 
-Session process CPU/RSS is sampled over approximately 200 ms when publishing and inspecting; list reads the published snapshot rather than issuing one inspection per row. Optional presence `resources` reports `cpuPercent` (100% = one core), `cpuCapacityPercent`, `rssBytes`, `rssCapacityPercent`, `attribution`, `machineScopeId` and source observation time. CPU capacity share is `cpuPercent / capacityCores`; RSS capacity share is `100 * rssBytes / memoryCapacityBytes`, not unique physical RAM or memory pressure. Source/target scope and PID birth identity are checked before/after measurement. Invalid, stale or changing denominators are unavailable, never fabricated zeroes or a percentage of the inspector's machine.
+CPU/RSS capacity percentages use that execution scope's capacity. Shared process readings overlap: **never sum shared session rows or repeated machine readings**. RSS is not unique physical memory; macOS used memory includes inactive cache and is not memory pressure. [Wire types](internal/wire) define detailed fields.
 
-Publishers batch process roots into one interval; separately identified child-session roots in that batch are excluded from the parent's tree. Duplicate roots become explicit shared bindings, including later detail refreshes. OMP/Hermes host processes can serve multiple logical sessions: `attribution: "shared"` reports the measured shared group, not an exclusive charge or equal split. Do not sum overlapping/shared groups or RSS as unique physical memory. Missing ownership remains `unknown`. Detailed process rows remain available on inspection. Exact fields/units live in [inspection.ts](src/inspection.ts).
+### Coordinated migration
 
-Local environment telemetry is published as optional `machine.resources`, reusing the existing 10-second presence cadence; external native hooks also capture readings at source. It describes the agent's local machine/VM or identified Linux cgroup, never the inspector's machine. Linux cgroup v2, v1/hybrid and native macOS use direct local counters; no monitoring backend, cluster access, privileged mounts or additional daemon is required. Inaccessible target counters remain unavailable, and a connector in another scope cannot replace them with its own usage.
-
-CPU exposes one-core consumption, visible capacity in cores, and percentage of that capacity. Quota/cpuset/visible ancestor bounds are not reserved CPU; bursts are not clamped. The first sample, counter reset or scope change requires a new interval before CPU usage is available. Memory is cgroup-accounted usage on Linux cgroups, `MemTotal - MemAvailable` on ungrouped Linux, and `(active + inactive + wired + compressor-occupied pages) × actual page size` on macOS. The macOS value includes inactive cache, not Activity Monitor memory pressure; compressed pages are physical occupied pages, not their uncompressed size. Cgroups and macOS do not fabricate `availableBytes` from limit headroom or free pages.
-
-Each observation retains source, scope identity, timestamp, units, sample window and unavailable/stale provenance. Repeated session rows with the same `scopeId` share environment totals: never sum them. Session rows identify native agent sessions, not OS threads. Shutdown or expired observations remain explicitly stale; collection ends with the native runtime.
-
-List-only metrics retain `status`, `value` (null and `reason` when unavailable) and true-only `estimated`, `shared`, `partial`, `stale` flags; absent flags mean false. Field names determine units: CPU `capacityCores` in cores, `usedPercent` and `cpuCapacityPercent` in percent of execution capacity, `usedBytes`/`capacityBytes`/`rssBytes` in bytes, and `rssCapacityPercent` in percent of memory capacity. Machine resources retain scope, source and observation time; `memory.accounting` carries the source's used-memory definition once per machine record (not once per metric). In particular macOS used memory includes inactive cache and must not be read as memory pressure. Session rows retain observation time and separate source machine scope and process-resource scope; shared process readings overlap and must never be summed. Verbose provenance, raw one-core CPU, `availableBytes`, detailed activity, worktree/common Git paths, OS release/architecture and terminal version remain on full announcements and `session.inspect`, not list.
+Inspectors, adapters, MCP bridges and connectors require compatible strict contracts; MCP negotiation does not negotiate tool schemas. Update them together, explicitly restart affected services and reload native hosts/new sessions. Existing sessions retain loaded code. Preserve existing broker/PVC state; a source update is not authorization to delete it.
 
 ## Source
 
-| File | Responsibility |
-| --- | --- |
-| [inspection.ts](src/inspection.ts) | Strict config/wire schemas, identity, metric provenance and tool descriptors. |
-| [inspector.ts](src/inspector.ts) | `Inspector` service: authentication, registry, liveness and query correlation. |
-| [mcp.ts](src/mcp.ts) | `Mcp` service: bounded HTTP/MCP transport and stdio reader. |
-| [native.ts](src/native.ts) | Private files/cache, native projections and connector policy. |
-| [plugin.ts](src/plugin.ts) | Pi/OMP hooks, observers, tools and runtime ownership. |
-| [program-status.ts](src/program-status.ts) | Product-independent Pi-only scoped OSC 7501 reporting; stock OMP retains its own reporter. |
-| [terminal.ts](src/terminal.ts) | Bounded generic terminal name/version capture from standard environment markers. |
-| [setup.ts](src/setup.ts) | Private self-host initialization, masked client prompts and authenticated configuration creation. |
-| [resources.ts](src/resources.ts) | Linux/macOS process identity, batched session CPU/RSS capacity and detailed process sampling. |
-| [machine.ts](src/machine.ts) | Local Linux host/cgroup and macOS CPU/memory sampling, scope identity and shared interval state. |
-| [platform.ts](src/platform.ts) | Effect Node platform composition, scoped CLI stdin, and host/crypto/executable bindings. |
-| [main.ts](src/main.ts) | CLI entrypoints and layer composition. |
+`cmd/` contains the executable, builder, schema generator and smoke commands. `internal/` contains runtime (`coordinator`), contracts (`wire`), observations (`observe`) and embedded assets/tests (`integrations`). Top-level `integrations/` contains Pi/OMP TypeScript sources and generated bindings.
 
-## Verification
-
-Typechecking uses Effect tsgo. All test suites import `@effect/vitest`; native resource sampling uses `it.live`, while deterministic parsing uses `it.effect`.
+Requires Go 1.25+ and the pinned pnpm version in `package.json`:
 
 ```sh
+pnpm install --frozen-lockfile
+go run ./cmd/build
 pnpm check
-pnpm test
-pnpm smoke
+go test -race ./...
+go vet ./...
 ```
 
-Smoke uses disposable native sessions without model prompts; it is not deployment/live-provider acceptance. Pi disables automatic catalog refresh. Default source smoke and packed-package acceptance require Git, real linked worktrees, Pi and OMP. The production API image explicitly runs inspector-only smoke with `COORDINATOR_SMOKE_NATIVE=false`; it includes neither Git nor harness SDKs, so that path requires honest negative Git metadata while retaining authentication, owner isolation, project scope and resource checks. Evidence reports `realGitWorktree: false` for inspector-only smoke, never native Git proof. `COORDINATOR_TEST_PI` / `COORDINATOR_TEST_OMP` select existing absolute CLI paths. Source-package OMP needs Bun >=1.3.14; compiled OMP has its own runtime. A loading/discovery failure is a failed native smoke, not deployment proof.
+The builder generates schemas, bundles adapters and builds the current platform. `COORDINATOR_BUILD_TARGETS=linux-x64,linux-arm64` selects Linux targets; Darwin builds require macOS/cgo. `go run ./cmd/smoke` exercises installed native hosts; `go run ./cmd/package-smoke path/to/package.tgz` checks a packaged installation.
 
-After activation, use `node dist/src/main.js list`, then pass the selected `{"ref": ...}` on stdin to `node dist/src/main.js inspect`; check the intended session and metrics. CLI/installer `--help` list supported options. Versions are pinned in [package.json](package.json); [third-party notices](THIRD_PARTY_NOTICES.md) apply to redistribution.
+### First npm publication
+
+Publish only the exact CI-accepted tarball with owner authorization, reviewed contents and required license text in `LICENSE`. First publication requires an authorized npm login and 2FA; subsequent releases use the protected `npm-public` trusted-publisher environment. See [npm release](.github/workflows/npm-release.yaml) and [server/chart release](.github/workflows/release.yaml) workflows. Publication does not deploy, activate hosts or register marketplaces.

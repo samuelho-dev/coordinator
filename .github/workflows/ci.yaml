@@ -21,22 +21,83 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          version: 11.9.0
+      - run: npm install --global pnpm@11.9.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.4.2'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - run: go run ./cmd/build
+      - run: go test -race ./...
+      - run: go vet ./...
       - run: pnpm check
-      - run: pnpm test
       - name: Exercise ephemeral inspector and Pi/OMP native startup without provider calls
         env:
-          COORDINATOR_SMOKE_NATIVE: 'true'
-        run: pnpm smoke
+          COORDINATOR_BINARY: dist/bin/linux-x64/coordinator
+        run: go run ./cmd/smoke
+
+  native:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, target: linux-x64}
+          - {runner: ubuntu-24.04-arm, target: linux-arm64}
+          - {runner: macos-15-intel, target: darwin-x64}
+          - {runner: macos-15, target: darwin-arm64}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+      - run: npm install --global pnpm@11.9.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.2'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - run: pnpm install --frozen-lockfile
+      - run: go run ./cmd/build
+        env:
+          COORDINATOR_BUILD_TARGETS: ${{ matrix.target }}
+          COORDINATOR_IMAGE_SHA: ${{ github.sha }}
+      - run: go test -race ./...
+        env:
+          CGO_ENABLED: '1'
+      - run: go vet ./...
+        env:
+          CGO_ENABLED: '1'
+      - run: go run ./cmd/smoke
+        env:
+          COORDINATOR_BINARY: dist/bin/${{ matrix.target }}/coordinator
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binary-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist/bin/${{ matrix.target }}/coordinator
+          if-no-files-found: error
+          retention-days: 30
+      - name: Archive accepted native binary
+        run: |
+          mkdir -p binary-evidence
+          tar -czf binary-evidence/coordinator-${{ matrix.target }}.tar.gz -C dist/bin/${{ matrix.target }} coordinator -C "$GITHUB_WORKSPACE" LICENSE
+          (cd binary-evidence && shasum -a 256 *.tar.gz > SHA256SUMS-${{ matrix.target }})
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binary-archive-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: binary-evidence/
+          if-no-files-found: error
+          retention-days: 30
 
   npm-package:
+    needs: [native]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -48,14 +109,25 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          version: 11.9.0
+      - run: npm install --global pnpm@11.9.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.4.2'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - run: go run ./cmd/build
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binary-*-${{ github.sha }}-${{ github.run_attempt }}
+          path: binaries
+      - name: Assemble all four accepted native executables
+        run: |
+          set -euo pipefail
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            install -m 0755 "binaries/binary-$target-$GITHUB_SHA-$GITHUB_RUN_ATTEMPT/coordinator" "dist/bin/$target/coordinator" -D
+          done
       - name: Pack the built public payload once
         run: |
           set -euo pipefail
@@ -64,7 +136,7 @@ jobs:
           ARCHIVE="$(jq -er 'if length == 1 then .[0].filename else error("expected one package") end' "$RUNNER_TEMP/npm-pack.json")"
           mv "npm-evidence/$ARCHIVE" npm-evidence/package.tgz
       - name: Accept clean production-only packed installation and native extensions
-        run: node scripts/package-smoke.ts npm-evidence/package.tgz
+        run: go run ./cmd/package-smoke --release npm-evidence/package.tgz
       - name: Bind accepted tarball to exact CI source
         env:
           REPOSITORY: ${{ github.repository }}
@@ -111,6 +183,10 @@ jobs:
           helm lint --strict "$CHART" -f "$VALUES"
           helm template acceptance "$CHART" -f "$VALUES" > "$RUNNER_TEMP/chart-render.yaml"
           ruby -ryaml -e 'docs=YAML.load_stream(File.read(ARGV[0])).compact; deployments=docs.select{|d| d["kind"]=="Deployment"}; abort "unexpected workloads" unless deployments.map{|d| d.dig("metadata","name")}==["acceptance-inspector"]; deployments.each{|d| s=d.dig("spec","template","spec"); (s.fetch("containers")+s.fetch("initContainers",[])).each{|c| abort "mutable image" unless c["image"]==ARGV[1]; abort "unsafe container" unless c.dig("securityContext","readOnlyRootFilesystem")==true && c.dig("securityContext","allowPrivilegeEscalation")==false && c.dig("securityContext","capabilities","drop")==["ALL"]}; e=s["containers"][0]["env"]; abort "source mismatch" unless e.any?{|v| v["name"]=="COORDINATOR_EXPECTED_SOURCE_SHA" && v["value"]==ARGV[2]}; abort "baked revision override" if e.any?{|v| v["name"]=="COORDINATOR_IMAGE_SHA"}; abort "legacy volume" if s.fetch("volumes",[]).any?{|v| v.key?("persistentVolumeClaim")}}; abort "fresh install creates PVC" if docs.any?{|d| d["kind"]=="PersistentVolumeClaim"}; abort "private service required" unless docs.select{|d| d["kind"]=="Service"}.all?{|d| d.dig("spec","type")=="ClusterIP"}' "$RUNNER_TEMP/chart-render.yaml" "ghcr.io/${REPOSITORY,,}@sha256:$(printf 'a%.0s' {1..64})" "$SOURCE_SHA"
+          ruby -ryaml -e 's=YAML.load_stream(File.read(ARGV[0])).compact.find{|d| d["kind"]=="Deployment"}.dig("spec","template","spec"); abort "wrong init" unless s["initContainers"][0]["command"]==%w[coordinator stage-config --input /input --destination /config/private]; c=s["containers"][0]; abort "wrong server" unless c["command"]==%w[coordinator inspector]; abort "wrong readiness" unless c.dig("readinessProbe","exec","command")==["coordinator","health","--url","http://127.0.0.1:8787","--token-file","/config/private/health.token","--source-sha",ARGV[1]]' "$RUNNER_TEMP/chart-render.yaml" "$SOURCE_SHA"
+          jq '.tls.existingCaSecret="ca-input"' "$VALUES" > "$RUNNER_TEMP/ca-values.json"
+          helm template acceptance "$CHART" -f "$RUNNER_TEMP/ca-values.json" > "$RUNNER_TEMP/ca-render.yaml"
+          ruby -ryaml -e 'c=YAML.load_stream(File.read(ARGV[0])).compact.find{|d| d["kind"]=="Deployment"}.dig("spec","template","spec","containers",0); abort "wrong CA" unless c["env"].any?{|e| e["name"]=="SSL_CERT_FILE" && e["value"]=="/etc/coordinator/ca/ca.crt"}' "$RUNNER_TEMP/ca-render.yaml"
           jq '.legacyStorage={mode:"retain",claims:[{name:"legacy-backups",size:"1Gi",accessModes:["ReadWriteOnce"],storageClass:null}]}' "$VALUES" > "$RUNNER_TEMP/retain-values.json"
           helm template acceptance "$CHART" -f "$RUNNER_TEMP/retain-values.json" > "$RUNNER_TEMP/retain-render.yaml"
           ruby -ryaml -e 'd=YAML.load_stream(File.read(ARGV[0])).compact; p=d.select{|x| x["kind"]=="PersistentVolumeClaim"}; abort "retention inventory mismatch" unless p.map{|x| x.dig("metadata","name")}==["legacy-backups"]; p.each{|x| a=x.dig("metadata","annotations"); abort "unsafe retention" unless a["helm.sh/resource-policy"]=="keep" && a["argocd.argoproj.io/sync-options"]=="Prune=false,Delete=false"}; abort "legacy mount" if d.select{|x| x["kind"]=="Deployment"}.any?{|x| x.dig("spec","template","spec","volumes").any?{|v| v.key?("persistentVolumeClaim")}}' "$RUNNER_TEMP/retain-render.yaml"
@@ -133,7 +209,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [supplementary, chart, npm-package]
+    needs: [supplementary, native, chart, npm-package]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: coordinator-dind-runners
     timeout-minutes: 30
@@ -187,7 +263,32 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          timeout --signal=TERM --kill-after=5s 180s docker run --rm --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --env HOME=/tmp --env COORDINATOR_EXPECTED_SOURCE_SHA="$SOURCE_SHA" --env COORDINATOR_SMOKE_NATIVE=false "$IMAGE" node dist/scripts/smoke.js
+          ROOT="$(mktemp -d)"
+          NAME="coordinator-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -rf "$ROOT"' EXIT
+          TOKEN="$(cat /proc/sys/kernel/random/uuid)"
+          HASH="$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
+          printf '{"host":"0.0.0.0","port":8787,"principals":[{"id":"owner","owner":"smoke","tokenHash":"%s"}]}' "$HASH" > "$ROOT/inspector.json"
+          printf %s "$TOKEN" > "$ROOT/health.token"
+          printf '{"inspectorUrl":"http://127.0.0.1:8787","tokenFile":"/config/health.token"}' > "$ROOT/connector.json"
+          printf '{"inspectorUrl":"http://127.0.0.1:8787","tokenFile":"/config/bad.token"}' > "$ROOT/bad-connector.json"
+          printf 'invalid-token' > "$ROOT/bad.token"
+          chown -R 1000:1000 "$ROOT"
+          chmod 700 "$ROOT"
+          chmod 600 "$ROOT/"*
+          docker run -d --name "$NAME" --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 -p 127.0.0.1::8787 -v "$ROOT:/config:ro" -e HOME=/tmp -e COORDINATOR_CONFIG=/config/inspector.json "$IMAGE"
+          PORT="$(docker port "$NAME" 8787/tcp | awk -F: '{print $NF}')"
+          for attempt in {1..30}; do
+            if docker exec "$NAME" coordinator health --url http://127.0.0.1:8787 --token-file /config/health.token --source-sha "$SOURCE_SHA"; then break; fi
+            test "$attempt" -lt 30
+            sleep 1
+          done
+          if docker exec "$NAME" coordinator health --url http://127.0.0.1:8787 --token-file /config/health.token --source-sha 0000000000000000000000000000000000000000; then echo 'Incorrect source accepted' >&2; exit 1; fi
+          test "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/readyz")" = 401
+          curl -fsS -D "$ROOT/headers" -o /dev/null -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/readyz"
+          grep -iq "^x-coordinator-source-sha: $SOURCE_SHA" "$ROOT/headers"
+          docker exec -e COORDINATOR_CONNECTOR_CONFIG=/config/connector.json "$NAME" coordinator list | jq -e '(.machines | type=="array") and (.sessions | type=="array") and .nextCursor==null'
+          if docker exec -e COORDINATOR_CONNECTOR_CONFIG=/config/bad-connector.json "$NAME" coordinator list; then echo 'Invalid MCP credential accepted' >&2; exit 1; fi
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign and attest exact image source
         env:

@@ -46,7 +46,8 @@ jobs:
           [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$CI_RUN" =~ ^[0-9]+$ && "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.[1-9][0-9]*)?$ ]]
           gh api "repos/$REPOSITORY/actions/runs/$CI_RUN" > "$RUNNER_TEMP/ci.json"
           jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" '.repository.full_name == $repo and .head_repository.full_name == $repo and .head_sha == $sha and .head_branch == "main" and .path == ".github/workflows/ci.yaml" and (.event == "push" or .event == "workflow_dispatch") and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/ci.json"
-          gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/jobs?filter=latest&per_page=100" --jq '.jobs[] | {name,conclusion}' | jq -s -e 'all(.[]; .conclusion == "success") and any(.[]; .name == "supplementary") and any(.[]; .name == "chart") and any(.[]; .name == "publish")'
+          ATTEMPT="$(jq -er '.run_attempt | tostring' "$RUNNER_TEMP/ci.json")"
+          gh api --paginate "repos/$REPOSITORY/actions/runs/$CI_RUN/attempts/$ATTEMPT/jobs?per_page=100" --jq '.jobs[] | {name,conclusion}' | jq -s -e 'all(.[]; .conclusion == "success") and any(.[]; .name == "supplementary") and any(.[]; .name == "chart") and any(.[]; .name == "npm-package") and any(.[]; .name == "publish") and ([.[] | select(.name | startswith("native ("))] | length == 4)'
           # Release only the current immutable main source, never an older green run or mutable PR association.
           test "$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$SHA"
           mkdir -p producer
@@ -55,6 +56,11 @@ jobs:
           gh run download "$CI_RUN" --repo "$REPOSITORY" --name "chart-$SHA" --dir producer
           jq -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg run "$CI_RUN" --arg version "$VERSION" '.repository == $repo and .sourceSha == $sha and .ciRunId == $run and .gate == "chart" and .chartVersion == $version and (.chartArchiveSha256 | test("^[0-9a-f]{64}$"))' producer/chart.json
           test "$(sha256sum "producer/coordinator-$VERSION.tgz" | cut -d' ' -f1)" = "$(jq -r .chartArchiveSha256 producer/chart.json)"
+          mkdir -p producer/binaries
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            gh run download "$CI_RUN" --repo "$REPOSITORY" --name "binary-archive-$target-$SHA-$ATTEMPT" --dir producer/binaries
+            (cd producer/binaries && sha256sum -c "SHA256SUMS-$target")
+          done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.source_sha }}
@@ -97,10 +103,11 @@ jobs:
           test "$(helm show chart source/deploy/helm/coordinator | ruby -ryaml -e 'puts YAML.load(STDIN.read)["version"]')" = "$VERSION"
           test "$(helm show chart "producer/coordinator-$VERSION.tgz" | ruby -ryaml -e 'puts YAML.load(STDIN.read)["version"]')" = "$VERSION"
           cp "producer/coordinator-$VERSION.tgz" producer/chart.json release/
-          cp source/LICENSE source/THIRD_PARTY_NOTICES.md release/
+          cp source/LICENSE release/
+          cp producer/binaries/*.tar.gz producer/binaries/SHA256SUMS-* release/
           CHART_SHA="$(sha256sum "release/coordinator-$VERSION.tgz" | cut -d' ' -f1)"
           OWNER="${REPOSITORY%%/*}"
-          jq --slurpfile chartGate producer/chart.json --arg version "$VERSION" --arg chart "oci://ghcr.io/${OWNER,,}/charts/coordinator" --arg tarSha "$CHART_SHA" --arg identity "https://github.com/$REPOSITORY/.github/workflows/ci.yaml@refs/heads/main" '. + {releaseVersion:$version,chartVersion:$version,chartRepository:$chart,chartOciDigest:null,chartArchiveSha256:$tarSha,chartSourceGate:$chartGate[0],imageProducer:$identity,oidcIssuer:"https://token.actions.githubusercontent.com",publication:"prepared-private",redistributionAudit:"incomplete; see THIRD_PARTY_NOTICES.md"}' producer/image.json > release/release-manifest.json
+          jq --slurpfile chartGate producer/chart.json --arg version "$VERSION" --arg chart "oci://ghcr.io/${OWNER,,}/charts/coordinator" --arg tarSha "$CHART_SHA" --arg identity "https://github.com/$REPOSITORY/.github/workflows/ci.yaml@refs/heads/main" '. + {releaseVersion:$version,chartVersion:$version,chartRepository:$chart,chartOciDigest:null,chartArchiveSha256:$tarSha,chartSourceGate:$chartGate[0],imageProducer:$identity,oidcIssuer:"https://token.actions.githubusercontent.com",publication:"prepared-private"}' producer/image.json > release/release-manifest.json
           printf 'Private preparation only. Existing image verified; chart archive SHA256 is not an OCI digest. No artifact visibility changed.\n' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -161,7 +168,7 @@ jobs:
           jq -s -e --arg repo "$REPOSITORY" --arg sha "$SHA" --arg digest "${DIGEST#sha256:}" 'any(.[]; (.payload | @base64d | fromjson) as $s | any($s.subject[]; .digest.sha256 == $digest) and $s.predicate.buildDefinition.externalParameters == {repository:$repo,ref:"refs/heads/main",sha:$sha})' release/chart-attestation.json
           jq --arg digest "$DIGEST" '.chartOciDigest=$digest | .publication="published-existing-visibility"' release/release-manifest.json > "$RUNNER_TEMP/manifest.json"
           mv "$RUNNER_TEMP/manifest.json" release/release-manifest.json
-          printf 'Exact source: `%s`\n\nImage: `%s`\n\nChart: `oci://%s@%s`\n\nNative-session inspector; platform: linux/amd64; protocol: 2026-07-28. Native programs run on connected hosts, not inside this image.\n\nRedistribution audit is incomplete; this is not a public-ready certification. Package/repository visibility is unchanged.\n' "$SHA" "$IMAGE" "$CHART" "$DIGEST" > "$RUNNER_TEMP/release-notes.txt"
+          printf 'Exact source: `%s`\n\nImage: `%s`\n\nChart: `oci://%s@%s`\n\nNative-session inspector; platform: linux/amd64; protocol: 2026-07-28. Native programs run on connected hosts, not inside this image.\n\nPackage/repository visibility is unchanged. Dependency license text is included in LICENSE.\n' "$SHA" "$IMAGE" "$CHART" "$DIGEST" > "$RUNNER_TEMP/release-notes.txt"
           PRERELEASE=()
           if [[ "$VERSION" == *-beta.* ]]; then PRERELEASE=(--prerelease); fi
           gh release create "v$VERSION" release/* --repo "$REPOSITORY" --target "$SHA" --title "Native-session inspector $VERSION" --notes-file "$RUNNER_TEMP/release-notes.txt" "${PRERELEASE[@]}"
