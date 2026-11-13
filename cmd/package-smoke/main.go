@@ -244,6 +244,10 @@ func main1() (failure error) {
 		return err
 	}
 	defer os.RemoveAll(root)
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
 	home := filepath.Join(root, "home")
 	if err = os.Mkdir(home, 0700); err != nil {
 		return err

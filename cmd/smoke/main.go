@@ -391,6 +391,10 @@ func run() (err error) {
 		return errors.New("temporary directory failed")
 	}
 	defer os.RemoveAll(root)
+	root, e = filepath.EvalSymlinks(root)
+	if e != nil {
+		return errors.New("temporary directory failed")
+	}
 	home := filepath.Join(root, "home")
 	if e = os.Mkdir(home, 0700); e != nil {
 		return errors.New("home creation failed")
