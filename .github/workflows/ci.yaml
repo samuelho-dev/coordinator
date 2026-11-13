@@ -265,7 +265,9 @@ jobs:
           set -euo pipefail
           ROOT="$(mktemp -d)"
           NAME="coordinator-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -rf "$ROOT"' EXIT
+          SEED="$NAME-seed"
+          VOLUME="$NAME-config"
+          trap 'docker rm -f "$NAME" "$SEED" >/dev/null 2>&1 || true; docker volume rm "$VOLUME" >/dev/null 2>&1 || true; rm -rf "$ROOT"' EXIT
           TOKEN="$(cat /proc/sys/kernel/random/uuid)"
           HASH="$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
           printf '{"host":"0.0.0.0","port":8787,"principals":[{"id":"owner","owner":"smoke","tokenHash":"%s"}]}' "$HASH" > "$ROOT/inspector.json"
@@ -273,10 +275,16 @@ jobs:
           printf '{"inspectorUrl":"http://127.0.0.1:8787","tokenFile":"/config/health.token"}' > "$ROOT/connector.json"
           printf '{"inspectorUrl":"http://127.0.0.1:8787","tokenFile":"/config/bad.token"}' > "$ROOT/bad-connector.json"
           printf 'invalid-token' > "$ROOT/bad.token"
-          chown -R 1000:1000 "$ROOT"
           chmod 700 "$ROOT"
           chmod 600 "$ROOT/"*
-          docker run -d --name "$NAME" --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 -p 127.0.0.1::8787 -v "$ROOT:/config:ro" -e HOME=/tmp -e COORDINATOR_CONFIG=/config/inspector.json "$IMAGE"
+          # DinD has its own filesystem; seed private files without host chown or bind mounts.
+          docker volume create "$VOLUME" >/dev/null
+          docker create --name "$SEED" --user 0:0 --mount "type=volume,source=$VOLUME,target=/config" --entrypoint sh node:24.21.0-bookworm-slim -c 'cp /seed/* /config/ && chown -R 1000:1000 /config && chmod 700 /config && chmod 600 /config/*' >/dev/null
+          docker cp "$ROOT/." "$SEED:/seed"
+          docker start -a "$SEED"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$SEED")" = 0
+          docker rm "$SEED" >/dev/null
+          docker run -d --name "$NAME" --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 -p 127.0.0.1::8787 --mount "type=volume,source=$VOLUME,target=/config,readonly" -e HOME=/tmp -e COORDINATOR_CONFIG=/config/inspector.json "$IMAGE"
           PORT="$(docker port "$NAME" 8787/tcp | awk -F: '{print $NF}')"
           for attempt in {1..30}; do
             if docker exec "$NAME" coordinator health --url http://127.0.0.1:8787 --token-file /config/health.token --source-sha "$SOURCE_SHA"; then break; fi
