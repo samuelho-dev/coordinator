@@ -58,6 +58,7 @@ func newOAuth(cfg *wire.InspectorOAuthConfig, principals map[string]wire.Inspect
 	}
 	bindings := make(map[string]wire.InspectorPrincipal, len(cfg.Bindings))
 	bound := make(map[string]bool, len(cfg.Bindings))
+	scopes := []string{readScope}
 	for _, b := range cfg.Bindings {
 		p, ok := principals[b.PrincipalID]
 		if !ok || p.TokenHash != "" || b.Subject == "" || bound[p.ID] {
@@ -67,6 +68,9 @@ func newOAuth(cfg *wire.InspectorOAuthConfig, principals map[string]wire.Inspect
 			return nil, errors.New("Ambiguous OAuth subject")
 		}
 		bindings[b.Subject], bound[p.ID] = p, true
+		if p.Messaging && len(scopes) == 1 {
+			scopes = append(scopes, messageScope)
+		}
 	}
 	for _, p := range principals {
 		if p.TokenHash == "" && !bound[p.ID] {
@@ -93,7 +97,7 @@ func newOAuth(cfg *wire.InspectorOAuthConfig, principals map[string]wire.Inspect
 		metadataURL: metadataURL, bindings: bindings, keys: keys, cancel: cancel,
 		parser: jwt.NewParser(jwt.WithValidMethods([]string{"RS256", "ES256"}), jwt.WithIssuer(cfg.Issuer), jwt.WithAudience(cfg.Resource), jwt.WithExpirationRequired(), jwt.WithIssuedAt()),
 		metadata: auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
-			Resource: cfg.Resource, AuthorizationServers: []string{cfg.Issuer}, ScopesSupported: []string{readScope, messageScope}, BearerMethodsSupported: []string{"header"}, ResourceName: "Coordinator",
+			Resource: cfg.Resource, AuthorizationServers: []string{cfg.Issuer}, ScopesSupported: scopes, BearerMethodsSupported: []string{"header"}, ResourceName: "Coordinator",
 		}),
 	}, nil
 }

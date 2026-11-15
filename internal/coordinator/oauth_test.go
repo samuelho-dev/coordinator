@@ -31,7 +31,7 @@ type oauthTestEnv struct {
 	ref      wire.SessionRef
 }
 
-func newOAuthTestEnv(t *testing.T) *oauthTestEnv {
+func newOAuthTestEnv(t *testing.T, messaging bool) *oauthTestEnv {
 	t.Helper()
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -55,7 +55,7 @@ func newOAuthTestEnv(t *testing.T) *oauthTestEnv {
 	resource := "http://" + server.Listener.Addr().String() + "/mcp"
 	hash := sha256.Sum256([]byte("native-secret-123456"))
 	native := wire.InspectorPrincipal{ID: "native", Owner: "owner", TokenHash: hex.EncodeToString(hash[:]), Messaging: true}
-	principals := []wire.InspectorPrincipal{native, {ID: "oauth", Owner: "owner", Messaging: true}, {ID: "readonly", Owner: "owner"}, {ID: "other", Owner: "other", Messaging: true}, {ID: "peer", Owner: "owner", Messaging: true}}
+	principals := []wire.InspectorPrincipal{native, {ID: "oauth", Owner: "owner", Messaging: messaging}, {ID: "readonly", Owner: "owner"}, {ID: "other", Owner: "other", Messaging: messaging}, {ID: "peer", Owner: "owner", Messaging: messaging}}
 	cfg := wire.InspectorConfig{Principals: principals, OAuth: &wire.InspectorOAuthConfig{Resource: resource, Issuer: idp.URL, JWKSURL: idp.URL + "/jwks", Bindings: []wire.InspectorOAuthBinding{{Subject: "alice", PrincipalID: "oauth"}, {Subject: "readonly", PrincipalID: "readonly"}, {Subject: "other", PrincipalID: "other"}, {Subject: "peer", PrincipalID: "peer"}}}}
 	reg, err := NewRegistry(cfg)
 	if err != nil {
@@ -150,7 +150,7 @@ func oauthStatus(t *testing.T, result *mcp.CallToolResult, want int) {
 }
 
 func TestOAuthMetadataAndAuthentication(t *testing.T) {
-	e := newOAuthTestEnv(t)
+	e := newOAuthTestEnv(t, true)
 	for _, path := range []string{"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"} {
 		r := oauthRequest(t, e, "GET", path, "", "")
 		var metadata struct {
@@ -240,7 +240,7 @@ func TestOAuthMetadataAndAuthentication(t *testing.T) {
 }
 
 func TestOAuthMessagingAndNativeIsolation(t *testing.T) {
-	e := newOAuthTestEnv(t)
+	e := newOAuthTestEnv(t, true)
 	token := func(sub, scope string) string {
 		return e.token(t, jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"sub": sub, "scope": scope})
 	}
@@ -305,6 +305,31 @@ func TestOAuthMessagingAndNativeIsolation(t *testing.T) {
 	if r.StatusCode != 200 {
 		b, _ := io.ReadAll(r.Body)
 		t.Fatalf("native announce: %d %s", r.StatusCode, b)
+	}
+}
+
+func TestOAuthAdvertisedScopesMatchBoundPermissions(t *testing.T) {
+	for _, messaging := range []bool{false, true} {
+		t.Run(map[bool]string{false: "readonly", true: "messaging"}[messaging], func(t *testing.T) {
+			e := newOAuthTestEnv(t, messaging)
+			want := "coordinator:read"
+			if messaging {
+				want += " coordinator:message"
+			}
+			for _, path := range []string{"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"} {
+				response := oauthRequest(t, e, http.MethodGet, path, "", "")
+				var metadata struct {
+					Scopes []string `json:"scopes_supported"`
+				}
+				if err := json.NewDecoder(response.Body).Decode(&metadata); err != nil {
+					t.Fatal(err)
+				}
+				_ = response.Body.Close()
+				if response.StatusCode != http.StatusOK || strings.Join(metadata.Scopes, " ") != want {
+					t.Fatalf("%s: status=%d scopes=%v; want %s", path, response.StatusCode, metadata.Scopes, want)
+				}
+			}
+		})
 	}
 }
 
