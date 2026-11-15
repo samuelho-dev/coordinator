@@ -17,7 +17,7 @@ import (
 	"github.com/samuelho-dev/coordinator/internal/wire"
 )
 
-var Version = "0.3.0-beta.13"
+var Version = "0.3.0-beta.14"
 var SourceSHA string
 
 type Config struct {
