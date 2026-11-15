@@ -184,6 +184,10 @@ func TestOAuthMetadataAndAuthentication(t *testing.T) {
 	if out := oauthCall(t, oauthSession(t, e, ec), "session.list", map[string]any{"limit": 10}); out.IsError {
 		t.Fatalf("ES256 rejected: %+v", out)
 	}
+	scp := e.token(t, jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"scope": nil, "scp": []string{"openid", "offline_access", "coordinator:read"}})
+	if out := oauthCall(t, oauthSession(t, e, scp), "session.list", map[string]any{"limit": 10}); out.IsError {
+		t.Fatalf("issuer scp access token rejected: %+v", out)
+	}
 	other := e.token(t, jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"sub": "other"})
 	otherList := oauthCall(t, oauthSession(t, e, other), "session.list", map[string]any{"limit": 10})
 	b, _ = json.Marshal(otherList.StructuredContent)
@@ -215,6 +219,10 @@ func TestOAuthMetadataAndAuthentication(t *testing.T) {
 		{"subject", jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"sub": "unknown"}, 401},
 		{"unknown kid", jwt.SigningMethodRS256, e.rsa, "unknown", "at+jwt", nil, 401},
 		{"non-string scope", jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"scope": []string{"coordinator:read"}}, 401},
+		{"ambiguous scopes", jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"scp": []string{"coordinator:message"}}, 401},
+		{"non-array scp", jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"scope": nil, "scp": "coordinator:read"}, 401},
+		{"combined scp element", jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"scope": nil, "scp": []string{"coordinator:read coordinator:message"}}, 401},
+		{"scp missing read", jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"scope": nil, "scp": []string{"coordinator:message"}}, 403},
 		{"HS256", jwt.SigningMethodHS256, []byte("secret"), "rsa", "at+jwt", nil, 401},
 		{"none", jwt.SigningMethodNone, jwt.UnsafeAllowNoneSignatureType, "rsa", "at+jwt", nil, 401},
 		{"missing read", jwt.SigningMethodRS256, e.rsa, "rsa", "at+jwt", map[string]any{"scope": "coordinator:message"}, 403},

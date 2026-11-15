@@ -32,7 +32,8 @@ type oauthAccess struct {
 
 type accessClaims struct {
 	jwt.RegisteredClaims
-	Scope string `json:"scope"`
+	Scope *string  `json:"scope"`
+	SCP   []string `json:"scp"`
 }
 
 // Metadata and key URLs come only from operator configuration, never token headers.
@@ -115,11 +116,23 @@ func (r *Registry) verifyMCPToken(ctx context.Context, raw string, _ *http.Reque
 	if err != nil || !token.Valid || (token.Header["typ"] != "at+jwt" && token.Header["typ"] != "application/at+jwt") {
 		return nil, auth.ErrInvalidToken
 	}
+	scopes := claims.SCP
+	if claims.Scope != nil {
+		if scopes != nil {
+			return nil, auth.ErrInvalidToken
+		}
+		scopes = strings.Split(*claims.Scope, " ")
+	}
+	for _, scope := range scopes {
+		if scope == "" || strings.IndexFunc(scope, func(r rune) bool { return r < 0x21 || r > 0x7e || r == '"' || r == '\\' }) >= 0 {
+			return nil, auth.ErrInvalidToken
+		}
+	}
 	p, ok := r.oauth.bindings[claims.Subject]
 	if !ok {
 		return nil, auth.ErrInvalidToken
 	}
-	return &auth.TokenInfo{UserID: p.ID, Scopes: strings.Fields(claims.Scope), Expiration: claims.ExpiresAt.Time, Extra: map[string]any{"principal": p, "oauth": true}}, nil
+	return &auth.TokenInfo{UserID: p.ID, Scopes: scopes, Expiration: claims.ExpiresAt.Time, Extra: map[string]any{"principal": p, "oauth": true}}, nil
 }
 
 func principalForMCP(req *mcp.RequestExtra, messaging bool) (wire.InspectorPrincipal, error) {
