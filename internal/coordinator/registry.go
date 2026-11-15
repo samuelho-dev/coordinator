@@ -66,6 +66,7 @@ type Registry struct {
 	receivers       map[string]*connector
 	messages        map[string]*messageEntry
 	messageRequests map[string]messageRequest
+	oauth           *oauthAccess
 	closed          bool
 }
 
@@ -76,16 +77,34 @@ func NewRegistry(cfg wire.InspectorConfig) (*Registry, error) {
 	r.messageRequests = map[string]messageRequest{}
 	seen := map[string]bool{}
 	for _, p := range cfg.Principals {
-		b, e := hex.DecodeString(p.TokenHash)
-		if e != nil || len(b) != 32 || hex.EncodeToString(b) != p.TokenHash || p.ID == "" || p.Owner == "" || seen[p.TokenHash] {
-			return nil, failure(500, "Ambiguous inspector credentials")
+		var b []byte
+		if p.TokenHash != "" {
+			var e error
+			b, e = hex.DecodeString(p.TokenHash)
+			if e != nil || len(b) != 32 || hex.EncodeToString(b) != p.TokenHash || seen[p.TokenHash] {
+				return nil, failure(500, "Ambiguous inspector credentials")
+			}
+			seen[p.TokenHash] = true
+		} else if cfg.OAuth == nil {
+			return nil, failure(500, "Principal requires credentials")
+		}
+		if p.ID == "" || p.Owner == "" {
+			return nil, failure(500, "Invalid inspector principal")
 		}
 		if _, ok := r.principals[p.ID]; ok {
 			return nil, failure(500, "Ambiguous inspector credentials")
 		}
-		seen[p.TokenHash] = true
 		r.principals[p.ID] = p
-		r.hashes[p.ID] = b
+		if b != nil {
+			r.hashes[p.ID] = b
+		}
+	}
+	if cfg.OAuth != nil {
+		var err error
+		r.oauth, err = newOAuth(cfg.OAuth, r.principals)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return r, nil
 }
@@ -174,6 +193,9 @@ func (r *Registry) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closed = true
+	if r.oauth != nil {
+		r.oauth.cancel()
+	}
 	for _, p := range r.pending {
 		r.fail(p, failure(503, "Inspector disconnected"))
 	}

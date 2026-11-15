@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -105,7 +104,7 @@ func makeMCP(reader mcpReader, options *mcp.ServerOptions) *mcp.Server {
 	getIn, _ := wire.Schema("MessageGetInput")
 	messageOut, _ := wire.Schema("Message")
 	recordOut, _ := wire.Schema("MessageRecord")
-	s.AddTool(&mcp.Tool{Name: "message.send", Description: "Send a peer message. This has side effects.", InputSchema: sendIn, OutputSchema: output(messageOut)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.AddTool(&mcp.Tool{Name: "message.send", Description: "Send to the exact intended session ref supplied by the user or task launch. Never infer a parent/recipient from project, label, cwd or a shared credential; if its receiver is unavailable, stop rather than choosing another session. Unbound clients have no agent identity. This has side effects.", InputSchema: sendIn, OutputSchema: output(messageOut)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var in wire.MessageSendInput
 		var e error
 		if reader.bound {
@@ -146,16 +145,6 @@ func makeMCP(reader mcpReader, options *mcp.ServerOptions) *mcp.Server {
 		return messageToolResult(out, e), nil
 	})
 	return s
-}
-func principalForMCP(reg *Registry, req *mcp.CallToolRequest) (wire.InspectorPrincipal, error) {
-	if req.Extra == nil {
-		return wire.InspectorPrincipal{}, failure(401, "Unauthorized")
-	}
-	header := req.Extra.Header.Get("Authorization")
-	if !strings.HasPrefix(header, "Bearer ") || len(header) > 512 {
-		return wire.InspectorPrincipal{}, failure(401, "Unauthorized")
-	}
-	return reg.Authorize(strings.TrimPrefix(header, "Bearer "))
 }
 func ServeMCP(ctx context.Context, client *Client) error {
 	s := makeMCP(mcpReader{list: func(ctx context.Context, _ *mcp.CallToolRequest, in wire.SessionListInput) (wire.SessionListOutput, error) {

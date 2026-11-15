@@ -17,6 +17,7 @@ import (
 var schemaTypes = map[string]reflect.Type{
 	"SessionRef": reflect.TypeFor[SessionRef](), "ProcessIdentity": reflect.TypeFor[ProcessIdentity](), "Metric": reflect.TypeFor[Metric](), "MetricProvenance": reflect.TypeFor[MetricProvenance](), "MachineResources": reflect.TypeFor[MachineResources](), "SessionResources": reflect.TypeFor[SessionResources](), "SessionPresence": reflect.TypeFor[SessionPresence](), "SessionInspection": reflect.TypeFor[SessionInspection](), "InspectorConfig": reflect.TypeFor[InspectorConfig](), "ConnectorConfig": reflect.TypeFor[ConnectorConfig](), "ConnectorAnnounce": reflect.TypeFor[ConnectorAnnounce](), "ConnectorAccepted": reflect.TypeFor[ConnectorAccepted](), "ConnectorPoll": reflect.TypeFor[ConnectorPoll](), "ConnectorDisconnect": reflect.TypeFor[ConnectorDisconnect](), "ConnectorPollResult": reflect.TypeFor[ConnectorPollResult](), "ConnectorResult": reflect.TypeFor[ConnectorResult](), "SessionListInput": reflect.TypeFor[SessionListInput](), "SessionListOutput": reflect.TypeFor[SessionListOutput](), "SessionInspectInput": reflect.TypeFor[SessionInspectInput](), "ObservationError": reflect.TypeFor[ObservationError](), "ListMachine": reflect.TypeFor[ListMachine](), "ListSession": reflect.TypeFor[ListSession](), "NativeSnapshot": reflect.TypeFor[NativeSnapshot](), "NativeEvent": reflect.TypeFor[NativeEvent](), "NativeMessage": reflect.TypeFor[NativeMessage](), "NativeNotice": reflect.TypeFor[NativeNotice](),
 	"InspectorPrincipal": reflect.TypeFor[InspectorPrincipal](), "MessageCaller": reflect.TypeFor[MessageCaller](), "MessageSendParams": reflect.TypeFor[MessageSendParams](), "MessageReplyParams": reflect.TypeFor[MessageReplyParams](), "MessageSendInput": reflect.TypeFor[MessageSendInput](), "MessageReplyInput": reflect.TypeFor[MessageReplyInput](), "MessageGetInput": reflect.TypeFor[MessageGetInput](), "Message": reflect.TypeFor[Message](), "MessageRecord": reflect.TypeFor[MessageRecord](), "ConnectorMessageAck": reflect.TypeFor[ConnectorMessageAck](),
+	"InspectorOAuthConfig": reflect.TypeFor[InspectorOAuthConfig](), "InspectorOAuthBinding": reflect.TypeFor[InspectorOAuthBinding](),
 }
 
 func f(v float64) *float64 { return &v }
@@ -63,7 +64,7 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 			switch name {
 			case "name", "source", "scopeDescription", "reason", "message", "accounting":
 				p.MaxLength = n(512)
-			case "cwd", "root", "worktreeRoot", "commonDir", "tokenFile", "inspectorUrl", "repository", "version":
+			case "cwd", "root", "worktreeRoot", "commonDir", "tokenFile", "inspectorUrl", "repository", "version", "resource", "issuer", "jwksUrl":
 				p.MaxLength = n(4096)
 			}
 		}
@@ -193,6 +194,11 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 			p.Enum = enum("Native session observation unavailable")
 		}
 		switch t.Name() {
+		case "InspectorOAuthConfig":
+			if name == "bindings" {
+				p.MinItems = n(1)
+				p.MaxItems = n(256)
+			}
 		case "Message", "MessageSendParams", "MessageReplyParams", "MessageSendInput", "MessageReplyInput", "MessageGetInput", "MessageCaller", "ConnectorMessageAck":
 			switch name {
 			case "id", "messageId", "replyId", "inReplyTo", "requestId", "connectorId", "incarnation":
@@ -340,6 +346,18 @@ func special(v any) error {
 			}
 		}
 	case map[string]any:
+		if _, ok := x["jwksUrl"]; ok {
+			for _, field := range []string{"resource", "issuer", "jwksUrl"} {
+				raw, ok := x[field].(string)
+				u, err := url.Parse(raw)
+				if !ok || err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(raw, "\x00\r\n") || (u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1"))) {
+					return fmt.Errorf("invalid OAuth %s URL", field)
+				}
+				if field == "resource" && (u.Path != "/mcp" || u.RawPath != "") {
+					return fmt.Errorf("OAuth resource must end in /mcp")
+				}
+			}
+		}
 		if text, ok := x["text"].(string); ok {
 			if strings.TrimSpace(text) == "" {
 				return fmt.Errorf("message text is blank")

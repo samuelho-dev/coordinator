@@ -175,10 +175,11 @@ func (r *Registry) admit(p wire.InspectorPrincipal, caller *wire.MessageCaller, 
 		return zero, err
 	}
 	now := time.Now()
-	m := wire.Message{ID: id, Sender: p.ID, To: to, Text: text, CreatedAt: float64(now.UnixMilli()), ExpiresAt: float64(now.Add(messageTTL).UnixMilli()), Status: "queued"}
+	m := wire.Message{ID: id, Sender: "unbound", To: to, Text: text, CreatedAt: float64(now.UnixMilli()), ExpiresAt: float64(now.Add(messageTTL).UnixMilli()), Status: "queued"}
 	if caller != nil {
 		ref := caller.Ref
 		m.From = &ref
+		m.Sender = ref.NativeSessionID
 	}
 	if parent != nil {
 		m.InReplyTo = parent.message.ID
@@ -274,8 +275,11 @@ func (r *Registry) ReplyMessage(p wire.InspectorPrincipal, in wire.MessageReplyI
 func (r *Registry) GetMessage(p wire.InspectorPrincipal, in wire.MessageGetInput) (wire.MessageRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e := r.messageAuth(p); e != nil {
-		return wire.MessageRecord{}, e
+	if !r.auth(p) {
+		return wire.MessageRecord{}, failure(401, "Unauthorized")
+	}
+	if p.TokenHash != "" && !p.Messaging {
+		return wire.MessageRecord{}, failure(403, "Messaging not permitted")
 	}
 	r.prune()
 	if wire.Validate(in) != nil {
