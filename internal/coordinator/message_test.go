@@ -53,6 +53,9 @@ func TestMessageExternalReceiverAndReply(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	if m.Sender != "unbound" || m.From != nil {
+		t.Fatalf("unbound client exposed an agent or credential identity: %+v", m)
+	}
 	again, e := r.SendMessage(a, input)
 	if e != nil || again.ID != m.ID {
 		t.Fatalf("idempotency: %+v %v", again, e)
@@ -111,6 +114,9 @@ func TestMessageReverseAndFencing(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	if m.Sender != source.NativeSessionID || m.From == nil || m.From.Key() != source.Key() {
+		t.Fatalf("bound sender lost its exact session identity: %+v", m)
+	}
 	target := &wire.MessageCaller{ConnectorID: recv.ConnectorID, Incarnation: recv.Incarnation, Ref: pub.Sessions[0].Ref}
 	if _, e = r.Poll(b, wire.ConnectorPoll{ConnectorID: recv.ConnectorID, Incarnation: recv.Incarnation}); e != nil {
 		t.Fatal(e)
@@ -118,6 +124,9 @@ func TestMessageReverseAndFencing(t *testing.T) {
 	reply, e := r.ReplyMessage(b, wire.MessageReplyInput{ReplyID: m.ID, Text: "back", Caller: target})
 	if e != nil || reply.To == nil || reply.To.Key() != source.Key() {
 		t.Fatalf("reverse: %+v %v", reply, e)
+	}
+	if reply.Sender != pub.Sessions[0].Ref.NativeSessionID || reply.From == nil || reply.From.Key() != pub.Sessions[0].Ref.Key() {
+		t.Fatalf("reply sender lost its exact session identity: %+v", reply)
 	}
 	batch, e := r.Poll(a, wire.ConnectorPoll{ConnectorID: src.ConnectorID, Incarnation: src.Incarnation})
 	if e != nil || len(batch.Messages) != 1 || batch.Messages[0].ID != reply.ID {

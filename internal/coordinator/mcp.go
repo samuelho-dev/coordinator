@@ -104,7 +104,7 @@ func makeMCP(reader mcpReader, options *mcp.ServerOptions) *mcp.Server {
 	getIn, _ := wire.Schema("MessageGetInput")
 	messageOut, _ := wire.Schema("Message")
 	recordOut, _ := wire.Schema("MessageRecord")
-	s.AddTool(&mcp.Tool{Name: "message.send", Description: "Send a peer message. This has side effects.", InputSchema: sendIn, OutputSchema: output(messageOut)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.AddTool(&mcp.Tool{Name: "message.send", Description: "Send to the exact intended session ref supplied by the user or task launch. Never infer a parent/recipient from project, label, cwd or a shared credential; if its receiver is unavailable, stop rather than choosing another session. Unbound clients have no agent identity. This has side effects.", InputSchema: sendIn, OutputSchema: output(messageOut)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var in wire.MessageSendInput
 		var e error
 		if reader.bound {

@@ -175,10 +175,11 @@ func (r *Registry) admit(p wire.InspectorPrincipal, caller *wire.MessageCaller, 
 		return zero, err
 	}
 	now := time.Now()
-	m := wire.Message{ID: id, Sender: p.ID, To: to, Text: text, CreatedAt: float64(now.UnixMilli()), ExpiresAt: float64(now.Add(messageTTL).UnixMilli()), Status: "queued"}
+	m := wire.Message{ID: id, Sender: "unbound", To: to, Text: text, CreatedAt: float64(now.UnixMilli()), ExpiresAt: float64(now.Add(messageTTL).UnixMilli()), Status: "queued"}
 	if caller != nil {
 		ref := caller.Ref
 		m.From = &ref
+		m.Sender = ref.NativeSessionID
 	}
 	if parent != nil {
 		m.InReplyTo = parent.message.ID
