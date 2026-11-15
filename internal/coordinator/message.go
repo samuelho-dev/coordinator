@@ -274,8 +274,11 @@ func (r *Registry) ReplyMessage(p wire.InspectorPrincipal, in wire.MessageReplyI
 func (r *Registry) GetMessage(p wire.InspectorPrincipal, in wire.MessageGetInput) (wire.MessageRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e := r.messageAuth(p); e != nil {
-		return wire.MessageRecord{}, e
+	if !r.auth(p) {
+		return wire.MessageRecord{}, failure(401, "Unauthorized")
+	}
+	if p.TokenHash != "" && !p.Messaging {
+		return wire.MessageRecord{}, failure(403, "Messaging not permitted")
 	}
 	r.prune()
 	if wire.Validate(in) != nil {

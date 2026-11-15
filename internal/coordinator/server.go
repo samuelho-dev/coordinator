@@ -9,43 +9,55 @@ import (
 	"os"
 	"strings"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/samuelho-dev/coordinator/internal/wire"
 )
 
 func Handler(reg *Registry) http.Handler {
 	server := makeMCP(mcpReader{list: func(ctx context.Context, req *mcp.CallToolRequest, in wire.SessionListInput) (wire.SessionListOutput, error) {
-		p, e := principalForMCP(reg, req)
+		p, e := principalForMCP(req.Extra, false)
 		if e != nil {
 			return wire.SessionListOutput{}, e
 		}
 		return reg.List(p, in)
 	}, inspect: func(ctx context.Context, req *mcp.CallToolRequest, ref wire.SessionRef) (wire.SessionInspection, error) {
-		p, e := principalForMCP(reg, req)
+		p, e := principalForMCP(req.Extra, false)
 		if e != nil {
 			return wire.SessionInspection{}, e
 		}
 		return reg.Inspect(ctx, p, ref)
 	}, send: func(ctx context.Context, req *mcp.CallToolRequest, in wire.MessageSendInput) (wire.Message, error) {
-		p, e := principalForMCP(reg, req)
+		p, e := principalForMCP(req.Extra, true)
 		if e != nil {
 			return wire.Message{}, e
+		}
+		if oauthCaller(req.Extra.TokenInfo) && in.Caller != nil {
+			return wire.Message{}, failure(403, "OAuth callers cannot bind native sessions")
 		}
 		return reg.SendMessage(p, in)
 	}, reply: func(ctx context.Context, req *mcp.CallToolRequest, in wire.MessageReplyInput) (wire.Message, error) {
-		p, e := principalForMCP(reg, req)
+		p, e := principalForMCP(req.Extra, true)
 		if e != nil {
 			return wire.Message{}, e
 		}
+		if oauthCaller(req.Extra.TokenInfo) {
+			return wire.Message{}, failure(403, "Bound reply caller required")
+		}
 		return reg.ReplyMessage(p, in)
 	}, get: func(ctx context.Context, req *mcp.CallToolRequest, in wire.MessageGetInput) (wire.MessageRecord, error) {
-		p, e := principalForMCP(reg, req)
+		p, e := principalForMCP(req.Extra, false)
 		if e != nil {
 			return wire.MessageRecord{}, e
 		}
 		return reg.GetMessage(p, in)
 	}}, nil)
 	transport := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: httpLimit})
+	opts := &auth.RequireBearerTokenOptions{Scopes: []string{readScope}, AllowMissingExpiration: true}
+	if reg.oauth != nil {
+		opts.ResourceMetadataURL = reg.oauth.metadataURL
+	}
+	mcpHandler := auth.RequireBearerToken(reg.verifyMCPToken, opts)(transport)
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		sha := os.Getenv("COORDINATOR_IMAGE_SHA")
@@ -70,8 +82,20 @@ func Handler(reg *Registry) http.Handler {
 			_, _ = io.WriteString(w, `{"status":"ok"}`)
 			return
 		}
+		if reg.oauth != nil && (req.URL.Path == resourceMetadataPath || req.URL.Path == resourceMetadataPath+"/mcp") {
+			reg.oauth.metadata.ServeHTTP(w, req)
+			return
+		}
 		if _, exists := req.Header["Origin"]; exists {
 			writeError(failure(403, "Origin prohibited"))
+			return
+		}
+		if req.URL.Path == "/mcp" {
+			if len(req.Header.Values("Authorization")) > 1 || len(req.Header.Get("Authorization")) > 16*1024+7 {
+				writeError(failure(401, "Invalid credential"))
+				return
+			}
+			mcpHandler.ServeHTTP(w, req)
 			return
 		}
 		auth := req.Header.Get("Authorization")
@@ -91,10 +115,6 @@ func Handler(reg *Registry) http.Handler {
 		}
 		if req.ContentLength > httpLimit {
 			writeError(failure(413, "Request exceeds bound"))
-			return
-		}
-		if req.URL.Path == "/mcp" {
-			transport.ServeHTTP(w, req)
 			return
 		}
 		if req.Method != http.MethodPost {

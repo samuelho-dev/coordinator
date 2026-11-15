@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -146,16 +145,6 @@ func makeMCP(reader mcpReader, options *mcp.ServerOptions) *mcp.Server {
 		return messageToolResult(out, e), nil
 	})
 	return s
-}
-func principalForMCP(reg *Registry, req *mcp.CallToolRequest) (wire.InspectorPrincipal, error) {
-	if req.Extra == nil {
-		return wire.InspectorPrincipal{}, failure(401, "Unauthorized")
-	}
-	header := req.Extra.Header.Get("Authorization")
-	if !strings.HasPrefix(header, "Bearer ") || len(header) > 512 {
-		return wire.InspectorPrincipal{}, failure(401, "Unauthorized")
-	}
-	return reg.Authorize(strings.TrimPrefix(header, "Bearer "))
 }
 func ServeMCP(ctx context.Context, client *Client) error {
 	s := makeMCP(mcpReader{list: func(ctx context.Context, _ *mcp.CallToolRequest, in wire.SessionListInput) (wire.SessionListOutput, error) {

@@ -31,6 +31,33 @@ COORDINATOR_CONFIG="$PRIVATE/server.json" coordinator inspector
 
 For Kubernetes, use the [Helm chart guide](deploy/helm/coordinator/README.md). It requires an existing Secret, a verified image digest and matching source SHA; it does not install native integrations or TLS routing.
 
+### Hosted OAuth MCP
+
+For a hosted MCP client, optionally add `oauth` to the private inspector server JSON and bind each allowed IdP subject to a dedicated principal without `tokenHash`. Keep the native bearer principal and its SHA-256 `tokenHash` for connectors and health checks. For example (replace the placeholders in private configuration):
+
+```json
+{
+  "host": "0.0.0.0",
+  "port": 8787,
+  "principals": [
+    {"id": "native", "owner": "operator", "tokenHash": "REPLACE_WITH_NATIVE_TOKEN_SHA256"},
+    {"id": "hosted", "owner": "operator", "messaging": true}
+  ],
+  "oauth": {
+    "resource": "https://inspector.example.net/mcp",
+    "issuer": "https://idp.example.net",
+    "jwksUrl": "https://idp.example.net/.well-known/jwks.json",
+    "bindings": [{"subject": "IDP_SUBJECT", "principalId": "hosted"}]
+  }
+}
+```
+
+The `resource` is the exact public `/mcp` URL; issuer and JWKS URL require HTTPS except for loopback tests. The IdP issues [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access tokens with `typ: at+jwt`, RS256 or ES256 signature, exact issuer and resource audience, expiration, an allowlisted subject and a string `scope`; `nbf` is honored. `coordinator:read` is required for MCP access. `message.send` also requires `coordinator:message` and the bound principal's `messaging: true`; `message.get` is limited to an original participant. OAuth cannot publish presence, access health or connector routes, enroll, provide a caller identity or send bound replies.
+
+Use an external IdP for authorization code with [S256 PKCE](https://www.rfc-editor.org/rfc/rfc7636), refresh and client registration or pre-registration; Coordinator is not a login server. Follow [MCP authorization](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) and configure the public gateway to allow only `/mcp`, `/.well-known/oauth-protected-resource`, and `/.well-known/oauth-protected-resource/mcp`; keep native routes and probes private. Never put tokens, client secrets or other credentials in URLs, logs or Git.
+
+Local token and MCP checks do not establish hosted-client acceptance. After an authorized deployment, connect the actual hosted app through its IdP flow and verify `session.list` returns the expected authorized sessions; separately verify the private native publishing path.
+
 ### Clients
 
 Provision the owner's token privately, then connect each host:

@@ -233,13 +233,24 @@ type SessionInspection struct {
 type InspectorPrincipal struct {
 	ID        string `json:"id"`
 	Owner     string `json:"owner"`
-	TokenHash string `json:"tokenHash"`
+	TokenHash string `json:"tokenHash,omitempty"`
 	Messaging bool   `json:"messaging,omitempty"`
 }
+type InspectorOAuthBinding struct {
+	Subject     string `json:"subject"`
+	PrincipalID string `json:"principalId"`
+}
+type InspectorOAuthConfig struct {
+	Resource string                  `json:"resource"`
+	Issuer   string                  `json:"issuer"`
+	JWKSURL  string                  `json:"jwksUrl"`
+	Bindings []InspectorOAuthBinding `json:"bindings"`
+}
 type InspectorConfig struct {
-	Host       string               `json:"host"`
-	Port       int                  `json:"port"`
-	Principals []InspectorPrincipal `json:"principals"`
+	Host       string                `json:"host"`
+	Port       int                   `json:"port"`
+	Principals []InspectorPrincipal  `json:"principals"`
+	OAuth      *InspectorOAuthConfig `json:"oauth,omitempty"`
 }
 type ConnectorConfig struct {
 	InspectorURL string             `json:"inspectorUrl"`
