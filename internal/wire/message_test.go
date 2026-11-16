@@ -97,3 +97,62 @@ func TestMessagingRejections(t *testing.T) {
 		t.Fatal("schema accepted unknown field")
 	}
 }
+
+func TestRecipientContract(t *testing.T) {
+	ref := wire.SessionRef{MachineID: "machine", Harness: "pi", NativeSessionID: "session"}
+	session := wire.SessionRecipient(ref)
+	if session.Key() == (wire.RecipientRef{Kind: "subscription", SubscriptionID: ref.Key()}).Key() {
+		t.Fatal("recipient keys collide across kinds")
+	}
+	for _, value := range []any{session, wire.RecipientRef{Kind: "subscription", SubscriptionID: "subscription"}, wire.RecipientListInput{Limit: 10}, wire.RecipientListOutput{Recipients: []wire.Recipient{}}} {
+		if err := wire.Validate(value); err != nil {
+			t.Fatalf("%T: %v", value, err)
+		}
+	}
+	s, err := wire.Schema("RecipientRef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := s.Resolve(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{
+		`{"kind":"session"}`,
+		`{"kind":"subscription"}`,
+		`{"kind":"session","session":{"machineId":"m","harness":"pi","nativeSessionId":"s"},"subscriptionId":"id"}`,
+		`{"kind":"subscription","session":{"machineId":"m","harness":"pi","nativeSessionId":"s"},"subscriptionId":"id"}`,
+		`{"kind":"other","subscriptionId":"id"}`,
+	} {
+		var value any
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			t.Fatal(err)
+		}
+		if err := resolved.Validate(value); err == nil {
+			t.Fatalf("schema accepted %s", raw)
+		}
+		if _, err := wire.Decode[wire.RecipientRef](strings.NewReader(raw), 4096); err == nil {
+			t.Fatalf("decoder accepted %s", raw)
+		}
+	}
+	for _, raw := range []string{
+		`{"stateDirectory":"relative","callbackHosts":["example.com"]}`,
+		`{"stateDirectory":"/tmp/../state","callbackHosts":["example.com"]}`,
+		`{"stateDirectory":"/","callbackHosts":["example.com"]}`,
+		`{"stateDirectory":"/tmp/state","callbackHosts":["*.example.com"]}`,
+		`{"stateDirectory":"/tmp/state","callbackHosts":["Example.com"]}`,
+		`{"stateDirectory":"/tmp/state","callbackHosts":["127.0.0.1"]}`,
+		`{"stateDirectory":"/tmp/state","callbackHosts":["localhost"]}`,
+		`{"stateDirectory":"/tmp/state","callbackHosts":["example.com:443"]}`,
+	} {
+		if _, err := wire.Decode[wire.InspectorHostedConfig](strings.NewReader(raw), 4096); err == nil {
+			t.Fatalf("decoder accepted %s", raw)
+		}
+	}
+	if _, err := wire.Decode[wire.InspectorHostedConfig](strings.NewReader(`{"stateDirectory":"/tmp/state","callbackHosts":["example.com"]}`), 4096); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.Decode[wire.ConnectorConfig](strings.NewReader(`{"inspectorUrl":"https://example.com","codexSocket":"relative"}`), 4096); err == nil {
+		t.Fatal("accepted relative codex socket")
+	}
+}

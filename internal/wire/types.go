@@ -52,6 +52,23 @@ func (r SessionRef) Key() string {
 	return out.String()
 }
 
+type RecipientRef struct {
+	Kind           string      `json:"kind"`
+	Session        *SessionRef `json:"session,omitempty"`
+	SubscriptionID string      `json:"subscriptionId,omitempty"`
+}
+
+func SessionRecipient(ref SessionRef) RecipientRef {
+	return RecipientRef{Kind: "session", Session: &ref}
+}
+
+func (r RecipientRef) Key() string {
+	if r.Kind == "session" && r.Session != nil {
+		return "session:" + r.Session.Key()
+	}
+	return "subscription:" + r.SubscriptionID
+}
+
 type ProcessIdentity struct {
 	PID           int    `json:"pid"`
 	StartIdentity string `json:"startIdentity"`
@@ -246,11 +263,16 @@ type InspectorOAuthConfig struct {
 	JWKSURL  string                  `json:"jwksUrl"`
 	Bindings []InspectorOAuthBinding `json:"bindings"`
 }
+type InspectorHostedConfig struct {
+	StateDirectory string   `json:"stateDirectory"`
+	CallbackHosts  []string `json:"callbackHosts"`
+}
 type InspectorConfig struct {
-	Host       string                `json:"host"`
-	Port       int                   `json:"port"`
-	Principals []InspectorPrincipal  `json:"principals"`
-	OAuth      *InspectorOAuthConfig `json:"oauth,omitempty"`
+	Host       string                 `json:"host"`
+	Port       int                    `json:"port"`
+	Principals []InspectorPrincipal   `json:"principals"`
+	OAuth      *InspectorOAuthConfig  `json:"oauth,omitempty"`
+	Hosted     *InspectorHostedConfig `json:"hosted,omitempty"`
 }
 type ConnectorConfig struct {
 	InspectorURL string             `json:"inspectorUrl"`
@@ -258,6 +280,7 @@ type ConnectorConfig struct {
 	TokenFile    string             `json:"tokenFile,omitempty"`
 	Messaging    bool               `json:"messaging,omitempty"`
 	Project      *ConfiguredProject `json:"project,omitempty"`
+	CodexSocket  string             `json:"codexSocket,omitempty"`
 }
 type ConfiguredProject struct {
 	Root string `json:"root"`
@@ -307,6 +330,21 @@ type SessionListOutput struct {
 	Machines   []ListMachine `json:"machines"`
 	Sessions   []ListSession `json:"sessions"`
 	NextCursor *string       `json:"nextCursor"`
+}
+type RecipientListInput struct {
+	Cursor string `json:"cursor,omitempty"`
+	Limit  int    `json:"limit"`
+}
+type Recipient struct {
+	Ref         RecipientRef `json:"ref"`
+	Name        string       `json:"name"`
+	Application string       `json:"application"`
+	Available   bool         `json:"available"`
+	ExpiresAt   *float64     `json:"expiresAt,omitempty"`
+}
+type RecipientListOutput struct {
+	Recipients []Recipient `json:"recipients"`
+	NextCursor *string     `json:"nextCursor"`
 }
 type SessionInspectInput struct {
 	Ref SessionRef `json:"ref"`

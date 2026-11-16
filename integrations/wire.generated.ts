@@ -6,6 +6,24 @@
  * and run json-schema-to-typescript to regenerate this file.
  */
 
+export type RecipientRef = {
+  kind: string;
+  session?: {
+    machineId: string;
+    harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+    nativeSessionId: string;
+    nativeAgentId?: string;
+  };
+  subscriptionId?: string;
+} & RecipientRef1;
+export type RecipientRef1 =
+  | {
+      kind?: "session";
+    }
+  | {
+      kind?: "subscription";
+    };
+
 export interface WireTypes {
   Message: Message;
   MessageGetInput: MessageGetInput;
@@ -13,6 +31,10 @@ export interface WireTypes {
   MessageReplyParams: MessageReplyParams;
   MessageSendParams: MessageSendParams;
   NativeSnapshot: NativeSnapshot;
+  Recipient: Recipient;
+  RecipientListInput: RecipientListInput;
+  RecipientListOutput: RecipientListOutput;
+  RecipientRef: RecipientRef;
   SessionInspectInput: SessionInspectInput;
   SessionListInput: SessionListInput;
   SessionRef: SessionRef;
@@ -140,6 +162,62 @@ export interface NativeSnapshot {
     pending: number;
   };
 }
+export interface Recipient {
+  ref: (
+    | {
+        kind?: "session";
+      }
+    | {
+        kind?: "subscription";
+      }
+  ) & {
+    kind: string;
+    session?: {
+      machineId: string;
+      harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+      nativeSessionId: string;
+      nativeAgentId?: string;
+    };
+    subscriptionId?: string;
+  };
+  name: string;
+  application: string;
+  available: boolean;
+  expiresAt?: number;
+}
+export interface RecipientListInput {
+  cursor?: string;
+  limit: number;
+}
+export interface RecipientListOutput {
+  /**
+   * @maxItems 100
+   */
+  recipients: {
+    ref: (
+      | {
+          kind?: "session";
+        }
+      | {
+          kind?: "subscription";
+        }
+    ) & {
+      kind: string;
+      session?: {
+        machineId: string;
+        harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+        nativeSessionId: string;
+        nativeAgentId?: string;
+      };
+      subscriptionId?: string;
+    };
+    name: string;
+    application: string;
+    available: boolean;
+    expiresAt?: number;
+  }[];
+  nextCursor: null | string;
+}
 export interface SessionInspectInput {
   ref: {
     machineId: string;
@@ -160,6 +238,8 @@ export interface SessionRef {
   nativeSessionId: string;
   nativeAgentId?: string;
 }
+
+export const RecipientListInputSchema = {"type":"object","properties":{"cursor":{"type":"string","minLength":1,"maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["limit"],"additionalProperties":false} as const;
 
 export const SessionListInputSchema = {"type":"object","properties":{"cursor":{"type":"string","minLength":1,"maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":100},"machineId":{"type":"string","minLength":1,"maxLength":256},"repository":{"type":"string","minLength":1,"maxLength":4096}},"required":["limit"],"additionalProperties":false} as const;
 
