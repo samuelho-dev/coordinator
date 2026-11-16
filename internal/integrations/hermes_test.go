@@ -1,11 +1,14 @@
 package integrations
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 func TestHermesBridge(t *testing.T) {
@@ -37,8 +40,34 @@ func TestHermesBridge(t *testing.T) {
 	}
 	cmd := exec.Command(python, "-c", hermesFixture, module, child)
 	cmd.Env = append(os.Environ(), "COORDINATOR_BINARY="+child)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("Hermes fixture: %v\n%s", err, out)
+	}
+	var schema jsonschema.Schema
+	if err = json.Unmarshal(out, &schema); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []struct {
+		to    string
+		valid bool
+	}{
+		{`{"kind":"session","session":{"machineId":"machine","harness":"hermes","nativeSessionId":"a"}}`, true},
+		{`{"kind":"subscription","subscriptionId":"chat"}`, true},
+		{`{"machineId":"machine","harness":"hermes","nativeSessionId":"a"}`, false},
+		{`{"kind":"subscription","subscriptionId":"chat","session":{"machineId":"machine","harness":"hermes","nativeSessionId":"a"}}`, false},
+	} {
+		var to any
+		if err = json.Unmarshal([]byte(sample.to), &to); err != nil {
+			t.Fatal(err)
+		}
+		if valid := resolved.Validate(map[string]any{"to": to, "text": "peer data"}) == nil; valid != sample.valid {
+			t.Fatalf("Hermes send recipient %s accepted=%v", sample.to, valid)
+		}
 	}
 }
 
@@ -61,7 +90,8 @@ for line in sys.stdin:
         target = dict(ref)
         if mid == 'wrong-target': target['nativeSessionId'] = 'other'
         expiry = time.time()*1000 + (-1 if mid == 'expired' else 60000)
-        message = {'id':mid, 'to':target, 'sender':'peer', 'text':'hostile peer text', 'expiresAt':expiry}
+        recipient = target if mid == 'legacy-target' else {'kind':'subscription','subscriptionId':'chat'} if mid == 'hosted-target' else {'kind':'session','session':target}
+        message = {'id':mid, 'to':recipient, 'sender':'peer', 'text':'hostile peer text', 'expiresAt':expiry}
         send({'id':'delivery', 'method':'message', 'message':message})
         ack = json.loads(sys.stdin.readline())
         if mid == 'duplicate':
@@ -78,11 +108,11 @@ import importlib.util, json, os, sys
 spec = importlib.util.spec_from_file_location('coordinator_plugin', sys.argv[1])
 p = importlib.util.module_from_spec(spec); spec.loader.exec_module(p)
 class Host:
-    def __init__(self): self.tools={}; self.hooks={}; self.injected=[]; self.permitted=True; self.result=True
+    def __init__(self): self.tools={}; self.schemas={}; self.hooks={}; self.injected=[]; self.permitted=True; self.result=True
     def _gateway_injection_allowed(self): return self.permitted
     def register_command(self, name, handler, description): self.command=handler
     def register_hook(self, name, fn): self.hooks[name]=fn
-    def register_tool(self, name, toolset, schema, handler): self.tools[name]=handler
+    def register_tool(self, name, toolset, schema, handler): self.tools[name]=handler; self.schemas[name]=schema
     def inject_message(self, text, role='user', *, session_key=None):
         self.injected.append((text, role, session_key))
         if self.result == 'exception': raise RuntimeError('dispatch uncertain')
@@ -111,7 +141,7 @@ h.result=True
 assert call(send, {'to':{}, 'text':'id-b'}, 'b')['session']=='b'
 assert h.injected[-1][2]=='key-b'
 before=len(h.injected)
-for mid in ('wrong-target','expired'):
+for mid in ('wrong-target','expired','legacy-target','hosted-target'):
     assert call(send, {'to':{}, 'text':mid}, 'a')['status']=='refused'
 assert len(h.injected)==before
 assert call(send, {'to':{}, 'text':'duplicate'}, 'a')['status']=='accepted'
@@ -131,4 +161,5 @@ assert 'enabled' in cmd('enable')
 h.hooks['post_compaction'](session_id='new',old_session_id='a')
 assert 'error' in call(get, {'messageId':'original'}, 'a')
 h.unload()
+print(json.dumps(h.schemas['coordinator_message_send']['parameters']))
 `

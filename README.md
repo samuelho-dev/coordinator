@@ -160,6 +160,8 @@ Inspectors, adapters, MCP bridges and connectors require compatible strict contr
 
 The beta.15 recipient contract changes `message.send.to` and message `from`/`to` from native session refs to discriminated recipient refs. Deploy the inspector and native readers/adapters together; beta.14 callers are not compatible with this message shape.
 
+Beta.16 corrects the Hermes adapter's recipient guard and send-tool schema to that same contract. Beta.15 Hermes receivers refuse these messages before injection; upgrade the native package and start an owner-approved fresh gateway before enabling reception.
+
 ## Source
 
 `cmd/` contains the executable, builder, schema generator and smoke commands. `internal/` contains runtime (`coordinator`), contracts (`wire`), observations (`observe`) and embedded assets/tests (`integrations`). Top-level `integrations/` contains Pi/OMP TypeScript sources and generated bindings.

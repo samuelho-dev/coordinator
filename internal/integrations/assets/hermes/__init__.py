@@ -121,7 +121,7 @@ class _Child:
                 self.seen = {k: v for k, v in self.seen.items() if v[0] > now}
                 valid = (not self.closed and self.owner.children.get(self.session_id) is self and self.ref is not None
                          and isinstance(frame_id, str) and bool(frame_id) and isinstance(msg, dict)
-                         and msg.get("to") == self.ref and isinstance(msg.get("id"), str) and bool(msg["id"])
+                         and msg.get("to") == {"kind": "session", "session": self.ref} and isinstance(msg.get("id"), str) and bool(msg["id"])
                          and isinstance(msg.get("text"), str) and isinstance(msg.get("expiresAt"), (int, float))
                          and msg["expiresAt"] > now)
                 if valid and msg["id"] in self.seen:
@@ -279,8 +279,13 @@ def register(ctx):
     for hook in ("on_session_finalize", "on_session_reset"):
         ctx.register_hook(hook, bridge.end)
     ctx.register_hook("post_compaction", bridge.compact)
+    session_ref = {"type": "object", "properties": {"machineId": {"type": "string"}, "harness": {"type": "string"}, "nativeSessionId": {"type": "string"}, "nativeAgentId": {"type": "string"}}, "required": ["machineId", "harness", "nativeSessionId"], "additionalProperties": False}
+    recipient_ref = {"oneOf": [
+        {"type": "object", "properties": {"kind": {"const": "session"}, "session": session_ref}, "required": ["kind", "session"], "additionalProperties": False},
+        {"type": "object", "properties": {"kind": {"const": "subscription"}, "subscriptionId": {"type": "string"}}, "required": ["kind", "subscriptionId"], "additionalProperties": False},
+    ]}
     properties = {
-        "send": {"to": {"type": "object", "properties": {"machineId": {"type": "string"}, "harness": {"type": "string"}, "nativeSessionId": {"type": "string"}, "nativeAgentId": {"type": "string"}}, "required": ["machineId", "harness", "nativeSessionId"], "additionalProperties": False}, "text": {"type": "string"}, "requestId": {"type": "string"}},
+        "send": {"to": recipient_ref, "text": {"type": "string"}, "requestId": {"type": "string"}},
         "reply": {"replyId": {"type": "string"}, "text": {"type": "string"}, "requestId": {"type": "string"}},
         "get": {"messageId": {"type": "string"}},
     }
