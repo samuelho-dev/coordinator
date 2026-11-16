@@ -2,9 +2,11 @@ package wire
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"path/filepath"
 	"reflect"
@@ -18,6 +20,8 @@ var schemaTypes = map[string]reflect.Type{
 	"SessionRef": reflect.TypeFor[SessionRef](), "ProcessIdentity": reflect.TypeFor[ProcessIdentity](), "Metric": reflect.TypeFor[Metric](), "MetricProvenance": reflect.TypeFor[MetricProvenance](), "MachineResources": reflect.TypeFor[MachineResources](), "SessionResources": reflect.TypeFor[SessionResources](), "SessionPresence": reflect.TypeFor[SessionPresence](), "SessionInspection": reflect.TypeFor[SessionInspection](), "InspectorConfig": reflect.TypeFor[InspectorConfig](), "ConnectorConfig": reflect.TypeFor[ConnectorConfig](), "ConnectorAnnounce": reflect.TypeFor[ConnectorAnnounce](), "ConnectorAccepted": reflect.TypeFor[ConnectorAccepted](), "ConnectorPoll": reflect.TypeFor[ConnectorPoll](), "ConnectorDisconnect": reflect.TypeFor[ConnectorDisconnect](), "ConnectorPollResult": reflect.TypeFor[ConnectorPollResult](), "ConnectorResult": reflect.TypeFor[ConnectorResult](), "SessionListInput": reflect.TypeFor[SessionListInput](), "SessionListOutput": reflect.TypeFor[SessionListOutput](), "SessionInspectInput": reflect.TypeFor[SessionInspectInput](), "ObservationError": reflect.TypeFor[ObservationError](), "ListMachine": reflect.TypeFor[ListMachine](), "ListSession": reflect.TypeFor[ListSession](), "NativeSnapshot": reflect.TypeFor[NativeSnapshot](), "NativeEvent": reflect.TypeFor[NativeEvent](), "NativeMessage": reflect.TypeFor[NativeMessage](), "NativeNotice": reflect.TypeFor[NativeNotice](),
 	"InspectorPrincipal": reflect.TypeFor[InspectorPrincipal](), "MessageCaller": reflect.TypeFor[MessageCaller](), "MessageSendParams": reflect.TypeFor[MessageSendParams](), "MessageReplyParams": reflect.TypeFor[MessageReplyParams](), "MessageSendInput": reflect.TypeFor[MessageSendInput](), "MessageReplyInput": reflect.TypeFor[MessageReplyInput](), "MessageGetInput": reflect.TypeFor[MessageGetInput](), "Message": reflect.TypeFor[Message](), "MessageRecord": reflect.TypeFor[MessageRecord](), "ConnectorMessageAck": reflect.TypeFor[ConnectorMessageAck](),
 	"InspectorOAuthConfig": reflect.TypeFor[InspectorOAuthConfig](), "InspectorOAuthBinding": reflect.TypeFor[InspectorOAuthBinding](),
+	"RecipientRef": reflect.TypeFor[RecipientRef](), "Recipient": reflect.TypeFor[Recipient](), "RecipientListInput": reflect.TypeFor[RecipientListInput](), "RecipientListOutput": reflect.TypeFor[RecipientListOutput](), "InspectorHostedConfig": reflect.TypeFor[InspectorHostedConfig](),
+	"HostedEventArguments": reflect.TypeFor[HostedEventArguments](), "HostedEventDelivery": reflect.TypeFor[HostedEventDelivery](), "HostedEventSubscribeInput": reflect.TypeFor[HostedEventSubscribeInput](), "HostedEventUnsubscribeInput": reflect.TypeFor[HostedEventUnsubscribeInput](), "HostedEventSubscribeOutput": reflect.TypeFor[HostedEventSubscribeOutput](), "HostedEventData": reflect.TypeFor[HostedEventData](), "HostedEventEnvelope": reflect.TypeFor[HostedEventEnvelope](),
 }
 
 func f(v float64) *float64 { return &v }
@@ -51,7 +55,7 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 		}
 		ft := field.Type
 		optional := strings.Contains(field.Tag.Get("json"), "omitempty")
-		if optional && ft.Kind() == reflect.Pointer && name != "startedAt" && name != "lastActivityAt" && name != "nativeUpdatedAt" && !(t.Name() == "SessionGit" && (name == "branch" || name == "head")) {
+		if optional && ft.Kind() == reflect.Pointer && name != "startedAt" && name != "lastActivityAt" && name != "nativeUpdatedAt" && !(t.Name() == "SessionGit" && (name == "branch" || name == "head")) && !(t.Name() == "HostedEventSubscribeInput" && (name == "cursor" || name == "ttlMs")) {
 			if len(p.Types) > 0 {
 				p.Type = p.Types[len(p.Types)-1]
 				p.Types = nil
@@ -64,7 +68,7 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 			switch name {
 			case "name", "source", "scopeDescription", "reason", "message", "accounting":
 				p.MaxLength = n(512)
-			case "cwd", "root", "worktreeRoot", "commonDir", "tokenFile", "inspectorUrl", "repository", "version", "resource", "issuer", "jwksUrl":
+			case "cwd", "root", "worktreeRoot", "commonDir", "tokenFile", "inspectorUrl", "repository", "version", "resource", "issuer", "jwksUrl", "stateDirectory", "codexSocket":
 				p.MaxLength = n(4096)
 			}
 		}
@@ -139,6 +143,14 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 			} else {
 				p.MaxItems = n(100)
 			}
+		case "recipients":
+			p.MaxItems = n(100)
+		case "callbackHosts":
+			p.MinItems = n(0)
+			p.MaxItems = n(256)
+			p.Items.MinLength = n(1)
+			p.Items.MaxLength = n(253)
+			p.Items.Pattern = `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`
 		case "machines":
 			p.MaxItems = n(100)
 		case "processes":
@@ -194,6 +206,31 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 			p.Enum = enum("Native session observation unavailable")
 		}
 		switch t.Name() {
+		case "RecipientRef":
+			if name == "subscriptionId" {
+				p.MaxLength = n(128)
+				p.Pattern = "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+			}
+		case "HostedEventSubscribeInput", "HostedEventUnsubscribeInput", "HostedEventEnvelope":
+			if name == "name" {
+				p.Enum = enum("message.received")
+			}
+			if name == "ttlMs" {
+				p.Minimum = f(1)
+				p.Maximum = f(604800000)
+			}
+		case "HostedEventDelivery":
+			switch name {
+			case "mode":
+				p.Enum = enum("webhook")
+			case "url":
+				p.MaxLength = n(4096)
+				p.Pattern = "^https://"
+			case "secret":
+				p.MinLength = n(38)
+				p.MaxLength = n(94)
+				p.Pattern = "^whsec_[A-Za-z0-9+/]+={0,2}$"
+			}
 		case "InspectorOAuthConfig":
 			if name == "bindings" {
 				p.MinItems = n(1)
@@ -215,8 +252,7 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 				}
 			}
 		}
-		if (t.Name() == "Message" && (name == "to" || name == "from")) ||
-			((t.Name() == "MessageSendParams" || t.Name() == "MessageSendInput") && name == "to") ||
+		if (t.Name() == "RecipientRef" && name == "session") ||
 			(t.Name() == "MessageCaller" && name == "ref") {
 			for _, key := range []string{"machineId", "nativeSessionId", "nativeAgentId"} {
 				if id := p.Properties[key]; id != nil {
@@ -235,7 +271,8 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 			b, _ := Schema("SessionListOutput")
 			c, _ := Schema("Message")
 			d, _ := Schema("MessageRecord")
-			s.Properties[name] = &jsonschema.Schema{OneOf: []*jsonschema.Schema{a, b, c, d}}
+			e, _ := Schema("RecipientListOutput")
+			s.Properties[name] = &jsonschema.Schema{OneOf: []*jsonschema.Schema{a, b, c, d, e}}
 		}
 		if t.Name() == "NativeMessage" && name == "ack" {
 			ack, _ := Schema("ConnectorMessageAck")
@@ -245,6 +282,17 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 	}
 	// Encode discriminated unions with complete branch-specific required and forbidden fields.
 	switch t.Name() {
+	case "HostedEventSubscribeInput":
+		s.Properties["delivery"].Required = append(s.Properties["delivery"].Required, "secret")
+		s.Properties["cursor"].Type = "null"
+		s.Properties["cursor"].Types = nil
+	case "HostedEventUnsubscribeInput":
+		s.Properties["delivery"].Not = &jsonschema.Schema{Required: []string{"secret"}}
+	case "RecipientRef":
+		s.OneOf = []*jsonschema.Schema{
+			{Properties: map[string]*jsonschema.Schema{"kind": {Enum: enum("session")}}, Required: []string{"session"}, Not: &jsonschema.Schema{Required: []string{"subscriptionId"}}},
+			{Properties: map[string]*jsonschema.Schema{"kind": {Enum: enum("subscription")}}, Required: []string{"subscriptionId"}, Not: &jsonschema.Schema{Required: []string{"session"}}},
+		}
 	case "Metric", "ListMetric":
 		metricConstraints(s, t.Name() == "ListMetric")
 	case "ProgramStatus":
@@ -346,6 +394,32 @@ func special(v any) error {
 			}
 		}
 	case map[string]any:
+		if x["mode"] == "webhook" {
+			raw, ok := x["url"].(string)
+			u, err := url.Parse(raw)
+			if !ok || err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(raw, "\x00\r\n") {
+				return fmt.Errorf("invalid webhook URL")
+			}
+			if secret, ok := x["secret"].(string); ok {
+				key, err := base64.StdEncoding.Strict().DecodeString(strings.TrimPrefix(secret, "whsec_"))
+				if err != nil || len(key) < 24 || len(key) > 64 {
+					return fmt.Errorf("invalid webhook secret")
+				}
+			}
+		}
+		for _, field := range []string{"stateDirectory", "codexSocket"} {
+			if p, ok := x[field].(string); ok && (!privatePath(p) || p == string(filepath.Separator) || strings.IndexFunc(p, unicode.IsControl) >= 0) {
+				return fmt.Errorf("invalid %s path", field)
+			}
+		}
+		if hosts, ok := x["callbackHosts"].([]any); ok {
+			for _, value := range hosts {
+				host, ok := value.(string)
+				if !ok || net.ParseIP(host) != nil || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+					return fmt.Errorf("invalid callback host")
+				}
+			}
+		}
 		if _, ok := x["jwksUrl"]; ok {
 			for _, field := range []string{"resource", "issuer", "jwksUrl"} {
 				raw, ok := x[field].(string)

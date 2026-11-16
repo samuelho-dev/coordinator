@@ -42,7 +42,7 @@ func main() {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
-		return output(map[string]any{"commands": []string{"init [--messaging]", "connect [--messaging]", "install [--messaging]", "inspector", "connector", "native", "receiver --harness hermes --session-id ID --pid PID", "claude-channel", "mcp", "list", "inspect", "message send|reply|get (JSON stdin)", "hook", "claude-statusline", "stage-config", "health"}})
+		return output(map[string]any{"commands": []string{"init [--messaging]", "connect [--messaging]", "install [--messaging] [--codex-socket ABS]", "inspector", "connector", "native", "receiver --harness hermes --session-id ID --pid PID", "claude-channel", "codex-mcp", "mcp", "list", "recipients", "inspect", "message send|reply|get (JSON stdin)", "hook", "claude-statusline", "stage-config", "health"}})
 	}
 	mode := args[0]
 	args = args[1:]
@@ -97,7 +97,7 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	switch mode {
-	case "hook", "claude-statusline", "connector", "native", "receiver", "claude-channel":
+	case "hook", "claude-statusline", "connector", "native", "receiver", "claude-channel", "codex-mcp":
 		if mode == "hook" {
 			if len(args) != 1 {
 				return errors.New("harness required")
@@ -120,6 +120,8 @@ func run(ctx context.Context, args []string) error {
 			return coordinator.RunConnector(ctx, resolved)
 		case "claude-channel":
 			return coordinator.ServeClaudeChannel(ctx, resolved)
+		case "codex-mcp":
+			return coordinator.ServeCodexMCP(ctx, resolved)
 		case "receiver":
 			f := flags(mode)
 			h := f.String("harness", "", "")
@@ -153,7 +155,7 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		return message(ctx, client, args[0], os.Stdin)
-	case "mcp", "list", "inspect":
+	case "mcp", "list", "recipients", "inspect":
 		if err := noArgs(args); err != nil {
 			return err
 		}
@@ -166,6 +168,12 @@ func run(ctx context.Context, args []string) error {
 			return coordinator.ServeMCP(ctx, client)
 		case "list":
 			result, err := client.ListAll(ctx, wire.SessionListInput{Limit: 100})
+			if err != nil {
+				return err
+			}
+			return output(result)
+		case "recipients":
+			result, err := client.ListAllRecipients(ctx)
 			if err != nil {
 				return err
 			}

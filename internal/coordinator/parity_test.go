@@ -189,7 +189,7 @@ func TestMCPProtocolAndMalformedArguments(t *testing.T) {
 			for _, tool := range tools.Tools {
 				names[tool.Name] = true
 			}
-			if len(names) != 5 || !names["session.list"] || !names["session.inspect"] || !names["message.send"] || !names["message.reply"] || !names["message.get"] {
+			if len(names) != 6 || !names["recipient.list"] || !names["session.list"] || !names["session.inspect"] || !names["message.send"] || !names["message.reply"] || !names["message.get"] {
 				t.Fatalf("unexpected tools: %v", names)
 			}
 			for _, tc := range []struct {

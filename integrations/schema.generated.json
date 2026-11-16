@@ -1,8 +1,38 @@
 {
   "type": "object",
   "properties": {
+    "ConnectorConfig": {
+      "$ref": "#/definitions/ConnectorConfig"
+    },
     "ConnectorMessageAck": {
       "$ref": "#/definitions/ConnectorMessageAck"
+    },
+    "HostedEventArguments": {
+      "$ref": "#/definitions/HostedEventArguments"
+    },
+    "HostedEventData": {
+      "$ref": "#/definitions/HostedEventData"
+    },
+    "HostedEventDelivery": {
+      "$ref": "#/definitions/HostedEventDelivery"
+    },
+    "HostedEventEnvelope": {
+      "$ref": "#/definitions/HostedEventEnvelope"
+    },
+    "HostedEventSubscribeInput": {
+      "$ref": "#/definitions/HostedEventSubscribeInput"
+    },
+    "HostedEventSubscribeOutput": {
+      "$ref": "#/definitions/HostedEventSubscribeOutput"
+    },
+    "HostedEventUnsubscribeInput": {
+      "$ref": "#/definitions/HostedEventUnsubscribeInput"
+    },
+    "InspectorConfig": {
+      "$ref": "#/definitions/InspectorConfig"
+    },
+    "InspectorHostedConfig": {
+      "$ref": "#/definitions/InspectorHostedConfig"
     },
     "ListMachine": {
       "$ref": "#/definitions/ListMachine"
@@ -46,6 +76,18 @@
     "NativeSnapshot": {
       "$ref": "#/definitions/NativeSnapshot"
     },
+    "Recipient": {
+      "$ref": "#/definitions/Recipient"
+    },
+    "RecipientListInput": {
+      "$ref": "#/definitions/RecipientListInput"
+    },
+    "RecipientListOutput": {
+      "$ref": "#/definitions/RecipientListOutput"
+    },
+    "RecipientRef": {
+      "$ref": "#/definitions/RecipientRef"
+    },
     "SessionInspectInput": {
       "$ref": "#/definitions/SessionInspectInput"
     },
@@ -67,6 +109,63 @@
   },
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "ConnectorConfig": {
+      "type": "object",
+      "properties": {
+        "inspectorUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "apiToken": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 4096,
+          "pattern": "^[A-Za-z0-9._~+/-]+=*$"
+        },
+        "tokenFile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "messaging": {
+          "type": "boolean"
+        },
+        "project": {
+          "type": "object",
+          "properties": {
+            "root": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          },
+          "required": [
+            "root"
+          ],
+          "additionalProperties": false
+        },
+        "codexSocket": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "inspectorUrl"
+      ],
+      "additionalProperties": false
+    },
     "ConnectorMessageAck": {
       "type": "object",
       "properties": {
@@ -104,6 +203,947 @@
         "incarnation",
         "messageId",
         "status"
+      ],
+      "additionalProperties": false
+    },
+    "HostedEventArguments": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "HostedEventData": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            },
+            "sender": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "from": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "session": {
+                  "type": "object",
+                  "properties": {
+                    "machineId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "harness": {
+                      "type": "string",
+                      "enum": [
+                        "pi",
+                        "omp",
+                        "hermes",
+                        "codex",
+                        "claude"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "nativeSessionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "nativeAgentId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "machineId",
+                    "harness",
+                    "nativeSessionId"
+                  ],
+                  "additionalProperties": false
+                },
+                "subscriptionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "session"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "session"
+                  ],
+                  "not": {
+                    "required": [
+                      "subscriptionId"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "subscription"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "subscriptionId"
+                  ],
+                  "not": {
+                    "required": [
+                      "session"
+                    ]
+                  }
+                }
+              ]
+            },
+            "to": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "session": {
+                  "type": "object",
+                  "properties": {
+                    "machineId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "harness": {
+                      "type": "string",
+                      "enum": [
+                        "pi",
+                        "omp",
+                        "hermes",
+                        "codex",
+                        "claude"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "nativeSessionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "nativeAgentId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "machineId",
+                    "harness",
+                    "nativeSessionId"
+                  ],
+                  "additionalProperties": false
+                },
+                "subscriptionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "session"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "session"
+                  ],
+                  "not": {
+                    "required": [
+                      "subscriptionId"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "subscription"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "subscriptionId"
+                  ],
+                  "not": {
+                    "required": [
+                      "session"
+                    ]
+                  }
+                }
+              ]
+            },
+            "text": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "pattern": "^[^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f][^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*$"
+            },
+            "inReplyTo": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            },
+            "createdAt": {
+              "type": "number",
+              "minimum": 0
+            },
+            "expiresAt": {
+              "type": "number",
+              "minimum": 0
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "queued",
+                "dispatched",
+                "accepted",
+                "refused",
+                "expired",
+                "unknown"
+              ],
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "required": [
+            "id",
+            "sender",
+            "text",
+            "createdAt",
+            "expiresAt",
+            "status"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "HostedEventDelivery": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "webhook"
+          ],
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^https://"
+        },
+        "secret": {
+          "type": "string",
+          "minLength": 38,
+          "maxLength": 94,
+          "pattern": "^whsec_[A-Za-z0-9+/]+={0,2}$"
+        }
+      },
+      "required": [
+        "mode",
+        "url"
+      ],
+      "additionalProperties": false
+    },
+    "HostedEventEnvelope": {
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "name": {
+          "type": "string",
+          "enum": [
+            "message.received"
+          ],
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "timestamp": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "sender": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "from": {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "session": {
+                      "type": "object",
+                      "properties": {
+                        "machineId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        },
+                        "harness": {
+                          "type": "string",
+                          "enum": [
+                            "pi",
+                            "omp",
+                            "hermes",
+                            "codex",
+                            "claude"
+                          ],
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "nativeSessionId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        },
+                        "nativeAgentId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        }
+                      },
+                      "required": [
+                        "machineId",
+                        "harness",
+                        "nativeSessionId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "subscriptionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "additionalProperties": false,
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "session"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "session"
+                      ],
+                      "not": {
+                        "required": [
+                          "subscriptionId"
+                        ]
+                      }
+                    },
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "subscription"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "subscriptionId"
+                      ],
+                      "not": {
+                        "required": [
+                          "session"
+                        ]
+                      }
+                    }
+                  ]
+                },
+                "to": {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "session": {
+                      "type": "object",
+                      "properties": {
+                        "machineId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        },
+                        "harness": {
+                          "type": "string",
+                          "enum": [
+                            "pi",
+                            "omp",
+                            "hermes",
+                            "codex",
+                            "claude"
+                          ],
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "nativeSessionId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        },
+                        "nativeAgentId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        }
+                      },
+                      "required": [
+                        "machineId",
+                        "harness",
+                        "nativeSessionId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "subscriptionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "additionalProperties": false,
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "session"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "session"
+                      ],
+                      "not": {
+                        "required": [
+                          "subscriptionId"
+                        ]
+                      }
+                    },
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "subscription"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "subscriptionId"
+                      ],
+                      "not": {
+                        "required": [
+                          "session"
+                        ]
+                      }
+                    }
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 8192,
+                  "pattern": "^[^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f][^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*$"
+                },
+                "inReplyTo": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "createdAt": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "expiresAt": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "queued",
+                    "dispatched",
+                    "accepted",
+                    "refused",
+                    "expired",
+                    "unknown"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "required": [
+                "id",
+                "sender",
+                "text",
+                "createdAt",
+                "expiresAt",
+                "status"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "message"
+          ],
+          "additionalProperties": false
+        },
+        "cursor": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "eventId",
+        "name",
+        "timestamp",
+        "data",
+        "cursor"
+      ],
+      "additionalProperties": false
+    },
+    "HostedEventSubscribeInput": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "message.received"
+          ],
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "arguments": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "additionalProperties": false
+        },
+        "delivery": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "webhook"
+              ],
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^https://"
+            },
+            "secret": {
+              "type": "string",
+              "minLength": 38,
+              "maxLength": 94,
+              "pattern": "^whsec_[A-Za-z0-9+/]+={0,2}$"
+            }
+          },
+          "required": [
+            "mode",
+            "url",
+            "secret"
+          ],
+          "additionalProperties": false
+        },
+        "cursor": {
+          "type": "null",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "ttlMs": {
+          "type": [
+            "null",
+            "integer"
+          ],
+          "minimum": 1,
+          "maximum": 604800000
+        }
+      },
+      "required": [
+        "name",
+        "arguments",
+        "delivery"
+      ],
+      "additionalProperties": false
+    },
+    "HostedEventSubscribeOutput": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "refreshBefore": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "cursor": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "refreshBefore",
+        "cursor",
+        "truncated"
+      ],
+      "additionalProperties": false
+    },
+    "HostedEventUnsubscribeInput": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "message.received"
+          ],
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "arguments": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "additionalProperties": false
+        },
+        "delivery": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "webhook"
+              ],
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^https://"
+            },
+            "secret": {
+              "type": "string",
+              "minLength": 38,
+              "maxLength": 94,
+              "pattern": "^whsec_[A-Za-z0-9+/]+={0,2}$"
+            }
+          },
+          "required": [
+            "mode",
+            "url"
+          ],
+          "additionalProperties": false,
+          "not": {
+            "required": [
+              "secret"
+            ]
+          }
+        }
+      },
+      "required": [
+        "name",
+        "arguments",
+        "delivery"
+      ],
+      "additionalProperties": false
+    },
+    "InspectorConfig": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "principals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "owner": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "tokenHash": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "messaging": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "owner"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 256
+        },
+        "oauth": {
+          "type": "object",
+          "properties": {
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "issuer": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "jwksUrl": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "bindings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "subject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "principalId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  }
+                },
+                "required": [
+                  "subject",
+                  "principalId"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1,
+              "maxItems": 256
+            }
+          },
+          "required": [
+            "resource",
+            "issuer",
+            "jwksUrl",
+            "bindings"
+          ],
+          "additionalProperties": false
+        },
+        "hosted": {
+          "type": "object",
+          "properties": {
+            "stateDirectory": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "callbackHosts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 253,
+                "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+              },
+              "minItems": 0,
+              "maxItems": 256
+            }
+          },
+          "required": [
+            "stateDirectory",
+            "callbackHosts"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "host",
+        "port",
+        "principals"
+      ],
+      "additionalProperties": false
+    },
+    "InspectorHostedConfig": {
+      "type": "object",
+      "properties": {
+        "stateDirectory": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "callbackHosts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+          },
+          "minItems": 0,
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "stateDirectory",
+        "callbackHosts"
       ],
       "additionalProperties": false
     },
@@ -1490,31 +2530,53 @@
         "from": {
           "type": "object",
           "properties": {
-            "machineId": {
+            "kind": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-            },
-            "harness": {
-              "type": "string",
-              "enum": [
-                "pi",
-                "omp",
-                "hermes",
-                "codex",
-                "claude"
-              ],
               "minLength": 1,
               "maxLength": 256
             },
-            "nativeSessionId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            "session": {
+              "type": "object",
+              "properties": {
+                "machineId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "harness": {
+                  "type": "string",
+                  "enum": [
+                    "pi",
+                    "omp",
+                    "hermes",
+                    "codex",
+                    "claude"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "nativeSessionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "nativeAgentId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                }
+              },
+              "required": [
+                "machineId",
+                "harness",
+                "nativeSessionId"
+              ],
+              "additionalProperties": false
             },
-            "nativeAgentId": {
+            "subscriptionId": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
@@ -1522,40 +2584,96 @@
             }
           },
           "required": [
-            "machineId",
-            "harness",
-            "nativeSessionId"
+            "kind"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "session"
+                  ]
+                }
+              },
+              "required": [
+                "session"
+              ],
+              "not": {
+                "required": [
+                  "subscriptionId"
+                ]
+              }
+            },
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "subscription"
+                  ]
+                }
+              },
+              "required": [
+                "subscriptionId"
+              ],
+              "not": {
+                "required": [
+                  "session"
+                ]
+              }
+            }
+          ]
         },
         "to": {
           "type": "object",
           "properties": {
-            "machineId": {
+            "kind": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-            },
-            "harness": {
-              "type": "string",
-              "enum": [
-                "pi",
-                "omp",
-                "hermes",
-                "codex",
-                "claude"
-              ],
               "minLength": 1,
               "maxLength": 256
             },
-            "nativeSessionId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            "session": {
+              "type": "object",
+              "properties": {
+                "machineId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "harness": {
+                  "type": "string",
+                  "enum": [
+                    "pi",
+                    "omp",
+                    "hermes",
+                    "codex",
+                    "claude"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "nativeSessionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "nativeAgentId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                }
+              },
+              "required": [
+                "machineId",
+                "harness",
+                "nativeSessionId"
+              ],
+              "additionalProperties": false
             },
-            "nativeAgentId": {
+            "subscriptionId": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
@@ -1563,11 +2681,45 @@
             }
           },
           "required": [
-            "machineId",
-            "harness",
-            "nativeSessionId"
+            "kind"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "session"
+                  ]
+                }
+              },
+              "required": [
+                "session"
+              ],
+              "not": {
+                "required": [
+                  "subscriptionId"
+                ]
+              }
+            },
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "subscription"
+                  ]
+                }
+              },
+              "required": [
+                "subscriptionId"
+              ],
+              "not": {
+                "required": [
+                  "session"
+                ]
+              }
+            }
+          ]
         },
         "text": {
           "type": "string",
@@ -1712,31 +2864,53 @@
             "from": {
               "type": "object",
               "properties": {
-                "machineId": {
+                "kind": {
                   "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                },
-                "harness": {
-                  "type": "string",
-                  "enum": [
-                    "pi",
-                    "omp",
-                    "hermes",
-                    "codex",
-                    "claude"
-                  ],
                   "minLength": 1,
                   "maxLength": 256
                 },
-                "nativeSessionId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                "session": {
+                  "type": "object",
+                  "properties": {
+                    "machineId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "harness": {
+                      "type": "string",
+                      "enum": [
+                        "pi",
+                        "omp",
+                        "hermes",
+                        "codex",
+                        "claude"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "nativeSessionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "nativeAgentId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "machineId",
+                    "harness",
+                    "nativeSessionId"
+                  ],
+                  "additionalProperties": false
                 },
-                "nativeAgentId": {
+                "subscriptionId": {
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128,
@@ -1744,40 +2918,96 @@
                 }
               },
               "required": [
-                "machineId",
-                "harness",
-                "nativeSessionId"
+                "kind"
               ],
-              "additionalProperties": false
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "session"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "session"
+                  ],
+                  "not": {
+                    "required": [
+                      "subscriptionId"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "subscription"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "subscriptionId"
+                  ],
+                  "not": {
+                    "required": [
+                      "session"
+                    ]
+                  }
+                }
+              ]
             },
             "to": {
               "type": "object",
               "properties": {
-                "machineId": {
+                "kind": {
                   "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                },
-                "harness": {
-                  "type": "string",
-                  "enum": [
-                    "pi",
-                    "omp",
-                    "hermes",
-                    "codex",
-                    "claude"
-                  ],
                   "minLength": 1,
                   "maxLength": 256
                 },
-                "nativeSessionId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                "session": {
+                  "type": "object",
+                  "properties": {
+                    "machineId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "harness": {
+                      "type": "string",
+                      "enum": [
+                        "pi",
+                        "omp",
+                        "hermes",
+                        "codex",
+                        "claude"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "nativeSessionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "nativeAgentId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "machineId",
+                    "harness",
+                    "nativeSessionId"
+                  ],
+                  "additionalProperties": false
                 },
-                "nativeAgentId": {
+                "subscriptionId": {
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128,
@@ -1785,11 +3015,45 @@
                 }
               },
               "required": [
-                "machineId",
-                "harness",
-                "nativeSessionId"
+                "kind"
               ],
-              "additionalProperties": false
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "session"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "session"
+                  ],
+                  "not": {
+                    "required": [
+                      "subscriptionId"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "subscription"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "subscriptionId"
+                  ],
+                  "not": {
+                    "required": [
+                      "session"
+                    ]
+                  }
+                }
+              ]
             },
             "text": {
               "type": "string",
@@ -1854,31 +3118,53 @@
               "from": {
                 "type": "object",
                 "properties": {
-                  "machineId": {
+                  "kind": {
                     "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                  },
-                  "harness": {
-                    "type": "string",
-                    "enum": [
-                      "pi",
-                      "omp",
-                      "hermes",
-                      "codex",
-                      "claude"
-                    ],
                     "minLength": 1,
                     "maxLength": 256
                   },
-                  "nativeSessionId": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                  "session": {
+                    "type": "object",
+                    "properties": {
+                      "machineId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      },
+                      "harness": {
+                        "type": "string",
+                        "enum": [
+                          "pi",
+                          "omp",
+                          "hermes",
+                          "codex",
+                          "claude"
+                        ],
+                        "minLength": 1,
+                        "maxLength": 256
+                      },
+                      "nativeSessionId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      },
+                      "nativeAgentId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      }
+                    },
+                    "required": [
+                      "machineId",
+                      "harness",
+                      "nativeSessionId"
+                    ],
+                    "additionalProperties": false
                   },
-                  "nativeAgentId": {
+                  "subscriptionId": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 128,
@@ -1886,40 +3172,96 @@
                   }
                 },
                 "required": [
-                  "machineId",
-                  "harness",
-                  "nativeSessionId"
+                  "kind"
                 ],
-                "additionalProperties": false
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "session"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "session"
+                    ],
+                    "not": {
+                      "required": [
+                        "subscriptionId"
+                      ]
+                    }
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "subscription"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "subscriptionId"
+                    ],
+                    "not": {
+                      "required": [
+                        "session"
+                      ]
+                    }
+                  }
+                ]
               },
               "to": {
                 "type": "object",
                 "properties": {
-                  "machineId": {
+                  "kind": {
                     "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                  },
-                  "harness": {
-                    "type": "string",
-                    "enum": [
-                      "pi",
-                      "omp",
-                      "hermes",
-                      "codex",
-                      "claude"
-                    ],
                     "minLength": 1,
                     "maxLength": 256
                   },
-                  "nativeSessionId": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                  "session": {
+                    "type": "object",
+                    "properties": {
+                      "machineId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      },
+                      "harness": {
+                        "type": "string",
+                        "enum": [
+                          "pi",
+                          "omp",
+                          "hermes",
+                          "codex",
+                          "claude"
+                        ],
+                        "minLength": 1,
+                        "maxLength": 256
+                      },
+                      "nativeSessionId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      },
+                      "nativeAgentId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      }
+                    },
+                    "required": [
+                      "machineId",
+                      "harness",
+                      "nativeSessionId"
+                    ],
+                    "additionalProperties": false
                   },
-                  "nativeAgentId": {
+                  "subscriptionId": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 128,
@@ -1927,11 +3269,45 @@
                   }
                 },
                 "required": [
-                  "machineId",
-                  "harness",
-                  "nativeSessionId"
+                  "kind"
                 ],
-                "additionalProperties": false
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "session"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "session"
+                    ],
+                    "not": {
+                      "required": [
+                        "subscriptionId"
+                      ]
+                    }
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "subscription"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "subscriptionId"
+                    ],
+                    "not": {
+                      "required": [
+                        "session"
+                      ]
+                    }
+                  }
+                ]
               },
               "text": {
                 "type": "string",
@@ -2112,31 +3488,53 @@
         "to": {
           "type": "object",
           "properties": {
-            "machineId": {
+            "kind": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-            },
-            "harness": {
-              "type": "string",
-              "enum": [
-                "pi",
-                "omp",
-                "hermes",
-                "codex",
-                "claude"
-              ],
               "minLength": 1,
               "maxLength": 256
             },
-            "nativeSessionId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            "session": {
+              "type": "object",
+              "properties": {
+                "machineId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "harness": {
+                  "type": "string",
+                  "enum": [
+                    "pi",
+                    "omp",
+                    "hermes",
+                    "codex",
+                    "claude"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "nativeSessionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "nativeAgentId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                }
+              },
+              "required": [
+                "machineId",
+                "harness",
+                "nativeSessionId"
+              ],
+              "additionalProperties": false
             },
-            "nativeAgentId": {
+            "subscriptionId": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
@@ -2144,11 +3542,45 @@
             }
           },
           "required": [
-            "machineId",
-            "harness",
-            "nativeSessionId"
+            "kind"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "session"
+                  ]
+                }
+              },
+              "required": [
+                "session"
+              ],
+              "not": {
+                "required": [
+                  "subscriptionId"
+                ]
+              }
+            },
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "subscription"
+                  ]
+                }
+              },
+              "required": [
+                "subscriptionId"
+              ],
+              "not": {
+                "required": [
+                  "session"
+                ]
+              }
+            }
+          ]
         },
         "text": {
           "type": "string",
@@ -2239,31 +3671,53 @@
         "to": {
           "type": "object",
           "properties": {
-            "machineId": {
+            "kind": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-            },
-            "harness": {
-              "type": "string",
-              "enum": [
-                "pi",
-                "omp",
-                "hermes",
-                "codex",
-                "claude"
-              ],
               "minLength": 1,
               "maxLength": 256
             },
-            "nativeSessionId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            "session": {
+              "type": "object",
+              "properties": {
+                "machineId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "harness": {
+                  "type": "string",
+                  "enum": [
+                    "pi",
+                    "omp",
+                    "hermes",
+                    "codex",
+                    "claude"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "nativeSessionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "nativeAgentId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                }
+              },
+              "required": [
+                "machineId",
+                "harness",
+                "nativeSessionId"
+              ],
+              "additionalProperties": false
             },
-            "nativeAgentId": {
+            "subscriptionId": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
@@ -2271,11 +3725,45 @@
             }
           },
           "required": [
-            "machineId",
-            "harness",
-            "nativeSessionId"
+            "kind"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "session"
+                  ]
+                }
+              },
+              "required": [
+                "session"
+              ],
+              "not": {
+                "required": [
+                  "subscriptionId"
+                ]
+              }
+            },
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "subscription"
+                  ]
+                }
+              },
+              "required": [
+                "subscriptionId"
+              ],
+              "not": {
+                "required": [
+                  "session"
+                ]
+              }
+            }
+          ]
         },
         "text": {
           "type": "string",
@@ -2594,6 +4082,26 @@
               "maxLength": 4096
             }
           },
+          "required": [
+            "limit"
+          ],
+          "additionalProperties": false
+        },
+        "recipients": {
+          "type": "object",
+          "properties": {
+            "cursor": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          "maxItems": 100,
           "required": [
             "limit"
           ],
@@ -8760,31 +10268,53 @@
                 "from": {
                   "type": "object",
                   "properties": {
-                    "machineId": {
+                    "kind": {
                       "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                    },
-                    "harness": {
-                      "type": "string",
-                      "enum": [
-                        "pi",
-                        "omp",
-                        "hermes",
-                        "codex",
-                        "claude"
-                      ],
                       "minLength": 1,
                       "maxLength": 256
                     },
-                    "nativeSessionId": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    "session": {
+                      "type": "object",
+                      "properties": {
+                        "machineId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        },
+                        "harness": {
+                          "type": "string",
+                          "enum": [
+                            "pi",
+                            "omp",
+                            "hermes",
+                            "codex",
+                            "claude"
+                          ],
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "nativeSessionId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        },
+                        "nativeAgentId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        }
+                      },
+                      "required": [
+                        "machineId",
+                        "harness",
+                        "nativeSessionId"
+                      ],
+                      "additionalProperties": false
                     },
-                    "nativeAgentId": {
+                    "subscriptionId": {
                       "type": "string",
                       "minLength": 1,
                       "maxLength": 128,
@@ -8792,40 +10322,96 @@
                     }
                   },
                   "required": [
-                    "machineId",
-                    "harness",
-                    "nativeSessionId"
+                    "kind"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "session"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "session"
+                      ],
+                      "not": {
+                        "required": [
+                          "subscriptionId"
+                        ]
+                      }
+                    },
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "subscription"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "subscriptionId"
+                      ],
+                      "not": {
+                        "required": [
+                          "session"
+                        ]
+                      }
+                    }
+                  ]
                 },
                 "to": {
                   "type": "object",
                   "properties": {
-                    "machineId": {
+                    "kind": {
                       "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                    },
-                    "harness": {
-                      "type": "string",
-                      "enum": [
-                        "pi",
-                        "omp",
-                        "hermes",
-                        "codex",
-                        "claude"
-                      ],
                       "minLength": 1,
                       "maxLength": 256
                     },
-                    "nativeSessionId": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    "session": {
+                      "type": "object",
+                      "properties": {
+                        "machineId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        },
+                        "harness": {
+                          "type": "string",
+                          "enum": [
+                            "pi",
+                            "omp",
+                            "hermes",
+                            "codex",
+                            "claude"
+                          ],
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "nativeSessionId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        },
+                        "nativeAgentId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        }
+                      },
+                      "required": [
+                        "machineId",
+                        "harness",
+                        "nativeSessionId"
+                      ],
+                      "additionalProperties": false
                     },
-                    "nativeAgentId": {
+                    "subscriptionId": {
                       "type": "string",
                       "minLength": 1,
                       "maxLength": 128,
@@ -8833,11 +10419,45 @@
                     }
                   },
                   "required": [
-                    "machineId",
-                    "harness",
-                    "nativeSessionId"
+                    "kind"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "session"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "session"
+                      ],
+                      "not": {
+                        "required": [
+                          "subscriptionId"
+                        ]
+                      }
+                    },
+                    {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "subscription"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "subscriptionId"
+                      ],
+                      "not": {
+                        "required": [
+                          "session"
+                        ]
+                      }
+                    }
+                  ]
                 },
                 "text": {
                   "type": "string",
@@ -8903,31 +10523,53 @@
                     "from": {
                       "type": "object",
                       "properties": {
-                        "machineId": {
+                        "kind": {
                           "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                        },
-                        "harness": {
-                          "type": "string",
-                          "enum": [
-                            "pi",
-                            "omp",
-                            "hermes",
-                            "codex",
-                            "claude"
-                          ],
                           "minLength": 1,
                           "maxLength": 256
                         },
-                        "nativeSessionId": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        "session": {
+                          "type": "object",
+                          "properties": {
+                            "machineId": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                            },
+                            "harness": {
+                              "type": "string",
+                              "enum": [
+                                "pi",
+                                "omp",
+                                "hermes",
+                                "codex",
+                                "claude"
+                              ],
+                              "minLength": 1,
+                              "maxLength": 256
+                            },
+                            "nativeSessionId": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                            },
+                            "nativeAgentId": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                            }
+                          },
+                          "required": [
+                            "machineId",
+                            "harness",
+                            "nativeSessionId"
+                          ],
+                          "additionalProperties": false
                         },
-                        "nativeAgentId": {
+                        "subscriptionId": {
                           "type": "string",
                           "minLength": 1,
                           "maxLength": 128,
@@ -8935,40 +10577,96 @@
                         }
                       },
                       "required": [
-                        "machineId",
-                        "harness",
-                        "nativeSessionId"
+                        "kind"
                       ],
-                      "additionalProperties": false
+                      "additionalProperties": false,
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "kind": {
+                              "enum": [
+                                "session"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "session"
+                          ],
+                          "not": {
+                            "required": [
+                              "subscriptionId"
+                            ]
+                          }
+                        },
+                        {
+                          "properties": {
+                            "kind": {
+                              "enum": [
+                                "subscription"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "subscriptionId"
+                          ],
+                          "not": {
+                            "required": [
+                              "session"
+                            ]
+                          }
+                        }
+                      ]
                     },
                     "to": {
                       "type": "object",
                       "properties": {
-                        "machineId": {
+                        "kind": {
                           "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                        },
-                        "harness": {
-                          "type": "string",
-                          "enum": [
-                            "pi",
-                            "omp",
-                            "hermes",
-                            "codex",
-                            "claude"
-                          ],
                           "minLength": 1,
                           "maxLength": 256
                         },
-                        "nativeSessionId": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                        "session": {
+                          "type": "object",
+                          "properties": {
+                            "machineId": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                            },
+                            "harness": {
+                              "type": "string",
+                              "enum": [
+                                "pi",
+                                "omp",
+                                "hermes",
+                                "codex",
+                                "claude"
+                              ],
+                              "minLength": 1,
+                              "maxLength": 256
+                            },
+                            "nativeSessionId": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                            },
+                            "nativeAgentId": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                            }
+                          },
+                          "required": [
+                            "machineId",
+                            "harness",
+                            "nativeSessionId"
+                          ],
+                          "additionalProperties": false
                         },
-                        "nativeAgentId": {
+                        "subscriptionId": {
                           "type": "string",
                           "minLength": 1,
                           "maxLength": 128,
@@ -8976,11 +10674,45 @@
                         }
                       },
                       "required": [
-                        "machineId",
-                        "harness",
-                        "nativeSessionId"
+                        "kind"
                       ],
-                      "additionalProperties": false
+                      "additionalProperties": false,
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "kind": {
+                              "enum": [
+                                "session"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "session"
+                          ],
+                          "not": {
+                            "required": [
+                              "subscriptionId"
+                            ]
+                          }
+                        },
+                        {
+                          "properties": {
+                            "kind": {
+                              "enum": [
+                                "subscription"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "subscriptionId"
+                          ],
+                          "not": {
+                            "required": [
+                              "session"
+                            ]
+                          }
+                        }
+                      ]
                     },
                     "text": {
                       "type": "string",
@@ -9045,31 +10777,53 @@
                       "from": {
                         "type": "object",
                         "properties": {
-                          "machineId": {
+                          "kind": {
                             "type": "string",
-                            "minLength": 1,
-                            "maxLength": 128,
-                            "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                          },
-                          "harness": {
-                            "type": "string",
-                            "enum": [
-                              "pi",
-                              "omp",
-                              "hermes",
-                              "codex",
-                              "claude"
-                            ],
                             "minLength": 1,
                             "maxLength": 256
                           },
-                          "nativeSessionId": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 128,
-                            "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                          "session": {
+                            "type": "object",
+                            "properties": {
+                              "machineId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              },
+                              "harness": {
+                                "type": "string",
+                                "enum": [
+                                  "pi",
+                                  "omp",
+                                  "hermes",
+                                  "codex",
+                                  "claude"
+                                ],
+                                "minLength": 1,
+                                "maxLength": 256
+                              },
+                              "nativeSessionId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              },
+                              "nativeAgentId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              }
+                            },
+                            "required": [
+                              "machineId",
+                              "harness",
+                              "nativeSessionId"
+                            ],
+                            "additionalProperties": false
                           },
-                          "nativeAgentId": {
+                          "subscriptionId": {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": 128,
@@ -9077,40 +10831,96 @@
                           }
                         },
                         "required": [
-                          "machineId",
-                          "harness",
-                          "nativeSessionId"
+                          "kind"
                         ],
-                        "additionalProperties": false
+                        "additionalProperties": false,
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "session"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "session"
+                            ],
+                            "not": {
+                              "required": [
+                                "subscriptionId"
+                              ]
+                            }
+                          },
+                          {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "subscription"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "subscriptionId"
+                            ],
+                            "not": {
+                              "required": [
+                                "session"
+                              ]
+                            }
+                          }
+                        ]
                       },
                       "to": {
                         "type": "object",
                         "properties": {
-                          "machineId": {
+                          "kind": {
                             "type": "string",
-                            "minLength": 1,
-                            "maxLength": 128,
-                            "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                          },
-                          "harness": {
-                            "type": "string",
-                            "enum": [
-                              "pi",
-                              "omp",
-                              "hermes",
-                              "codex",
-                              "claude"
-                            ],
                             "minLength": 1,
                             "maxLength": 256
                           },
-                          "nativeSessionId": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 128,
-                            "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                          "session": {
+                            "type": "object",
+                            "properties": {
+                              "machineId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              },
+                              "harness": {
+                                "type": "string",
+                                "enum": [
+                                  "pi",
+                                  "omp",
+                                  "hermes",
+                                  "codex",
+                                  "claude"
+                                ],
+                                "minLength": 1,
+                                "maxLength": 256
+                              },
+                              "nativeSessionId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              },
+                              "nativeAgentId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              }
+                            },
+                            "required": [
+                              "machineId",
+                              "harness",
+                              "nativeSessionId"
+                            ],
+                            "additionalProperties": false
                           },
-                          "nativeAgentId": {
+                          "subscriptionId": {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": 128,
@@ -9118,11 +10928,45 @@
                           }
                         },
                         "required": [
-                          "machineId",
-                          "harness",
-                          "nativeSessionId"
+                          "kind"
                         ],
-                        "additionalProperties": false
+                        "additionalProperties": false,
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "session"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "session"
+                            ],
+                            "not": {
+                              "required": [
+                                "subscriptionId"
+                              ]
+                            }
+                          },
+                          {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "subscription"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "subscriptionId"
+                            ],
+                            "not": {
+                              "required": [
+                                "session"
+                              ]
+                            }
+                          }
+                        ]
                       },
                       "text": {
                         "type": "string",
@@ -9174,6 +11018,154 @@
               "required": [
                 "message",
                 "replies"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "recipients": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "ref": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256
+                          },
+                          "session": {
+                            "type": "object",
+                            "properties": {
+                              "machineId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              },
+                              "harness": {
+                                "type": "string",
+                                "enum": [
+                                  "pi",
+                                  "omp",
+                                  "hermes",
+                                  "codex",
+                                  "claude"
+                                ],
+                                "minLength": 1,
+                                "maxLength": 256
+                              },
+                              "nativeSessionId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              },
+                              "nativeAgentId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                              }
+                            },
+                            "required": [
+                              "machineId",
+                              "harness",
+                              "nativeSessionId"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "subscriptionId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128,
+                            "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "additionalProperties": false,
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "session"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "session"
+                            ],
+                            "not": {
+                              "required": [
+                                "subscriptionId"
+                              ]
+                            }
+                          },
+                          {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "subscription"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "subscriptionId"
+                            ],
+                            "not": {
+                              "required": [
+                                "session"
+                              ]
+                            }
+                          }
+                        ]
+                      },
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512
+                      },
+                      "application": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      },
+                      "available": {
+                        "type": "boolean"
+                      },
+                      "expiresAt": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "ref",
+                      "name",
+                      "application",
+                      "available"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 100
+                },
+                "nextCursor": {
+                  "type": [
+                    "null",
+                    "string"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "required": [
+                "recipients",
+                "nextCursor"
               ],
               "additionalProperties": false
             }
@@ -9311,31 +11303,53 @@
             "from": {
               "type": "object",
               "properties": {
-                "machineId": {
+                "kind": {
                   "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                },
-                "harness": {
-                  "type": "string",
-                  "enum": [
-                    "pi",
-                    "omp",
-                    "hermes",
-                    "codex",
-                    "claude"
-                  ],
                   "minLength": 1,
                   "maxLength": 256
                 },
-                "nativeSessionId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                "session": {
+                  "type": "object",
+                  "properties": {
+                    "machineId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "harness": {
+                      "type": "string",
+                      "enum": [
+                        "pi",
+                        "omp",
+                        "hermes",
+                        "codex",
+                        "claude"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "nativeSessionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "nativeAgentId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "machineId",
+                    "harness",
+                    "nativeSessionId"
+                  ],
+                  "additionalProperties": false
                 },
-                "nativeAgentId": {
+                "subscriptionId": {
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128,
@@ -9343,40 +11357,96 @@
                 }
               },
               "required": [
-                "machineId",
-                "harness",
-                "nativeSessionId"
+                "kind"
               ],
-              "additionalProperties": false
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "session"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "session"
+                  ],
+                  "not": {
+                    "required": [
+                      "subscriptionId"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "subscription"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "subscriptionId"
+                  ],
+                  "not": {
+                    "required": [
+                      "session"
+                    ]
+                  }
+                }
+              ]
             },
             "to": {
               "type": "object",
               "properties": {
-                "machineId": {
+                "kind": {
                   "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                },
-                "harness": {
-                  "type": "string",
-                  "enum": [
-                    "pi",
-                    "omp",
-                    "hermes",
-                    "codex",
-                    "claude"
-                  ],
                   "minLength": 1,
                   "maxLength": 256
                 },
-                "nativeSessionId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                "session": {
+                  "type": "object",
+                  "properties": {
+                    "machineId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "harness": {
+                      "type": "string",
+                      "enum": [
+                        "pi",
+                        "omp",
+                        "hermes",
+                        "codex",
+                        "claude"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "nativeSessionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "nativeAgentId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "machineId",
+                    "harness",
+                    "nativeSessionId"
+                  ],
+                  "additionalProperties": false
                 },
-                "nativeAgentId": {
+                "subscriptionId": {
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128,
@@ -9384,11 +11454,45 @@
                 }
               },
               "required": [
-                "machineId",
-                "harness",
-                "nativeSessionId"
+                "kind"
               ],
-              "additionalProperties": false
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "session"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "session"
+                  ],
+                  "not": {
+                    "required": [
+                      "subscriptionId"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "subscription"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "subscriptionId"
+                  ],
+                  "not": {
+                    "required": [
+                      "session"
+                    ]
+                  }
+                }
+              ]
             },
             "text": {
               "type": "string",
@@ -9440,31 +11544,53 @@
             "to": {
               "type": "object",
               "properties": {
-                "machineId": {
+                "kind": {
                   "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
-                },
-                "harness": {
-                  "type": "string",
-                  "enum": [
-                    "pi",
-                    "omp",
-                    "hermes",
-                    "codex",
-                    "claude"
-                  ],
                   "minLength": 1,
                   "maxLength": 256
                 },
-                "nativeSessionId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                "session": {
+                  "type": "object",
+                  "properties": {
+                    "machineId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "harness": {
+                      "type": "string",
+                      "enum": [
+                        "pi",
+                        "omp",
+                        "hermes",
+                        "codex",
+                        "claude"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "nativeSessionId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    },
+                    "nativeAgentId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                    }
+                  },
+                  "required": [
+                    "machineId",
+                    "harness",
+                    "nativeSessionId"
+                  ],
+                  "additionalProperties": false
                 },
-                "nativeAgentId": {
+                "subscriptionId": {
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128,
@@ -9472,11 +11598,45 @@
                 }
               },
               "required": [
-                "machineId",
-                "harness",
-                "nativeSessionId"
+                "kind"
               ],
-              "additionalProperties": false
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "session"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "session"
+                  ],
+                  "not": {
+                    "required": [
+                      "subscriptionId"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "subscription"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "subscriptionId"
+                  ],
+                  "not": {
+                    "required": [
+                      "session"
+                    ]
+                  }
+                }
+              ]
             },
             "text": {
               "type": "string",
@@ -9795,6 +11955,396 @@
         "isIdle"
       ],
       "additionalProperties": false
+    },
+    "Recipient": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "session": {
+              "type": "object",
+              "properties": {
+                "machineId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "harness": {
+                  "type": "string",
+                  "enum": [
+                    "pi",
+                    "omp",
+                    "hermes",
+                    "codex",
+                    "claude"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "nativeSessionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                },
+                "nativeAgentId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                }
+              },
+              "required": [
+                "machineId",
+                "harness",
+                "nativeSessionId"
+              ],
+              "additionalProperties": false
+            },
+            "subscriptionId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "session"
+                  ]
+                }
+              },
+              "required": [
+                "session"
+              ],
+              "not": {
+                "required": [
+                  "subscriptionId"
+                ]
+              }
+            },
+            {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "subscription"
+                  ]
+                }
+              },
+              "required": [
+                "subscriptionId"
+              ],
+              "not": {
+                "required": [
+                  "session"
+                ]
+              }
+            }
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "application": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "expiresAt": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "ref",
+        "name",
+        "application",
+        "available"
+      ],
+      "additionalProperties": false
+    },
+    "RecipientListInput": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "limit"
+      ],
+      "additionalProperties": false
+    },
+    "RecipientListOutput": {
+      "type": "object",
+      "properties": {
+        "recipients": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "session": {
+                    "type": "object",
+                    "properties": {
+                      "machineId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      },
+                      "harness": {
+                        "type": "string",
+                        "enum": [
+                          "pi",
+                          "omp",
+                          "hermes",
+                          "codex",
+                          "claude"
+                        ],
+                        "minLength": 1,
+                        "maxLength": 256
+                      },
+                      "nativeSessionId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      },
+                      "nativeAgentId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                      }
+                    },
+                    "required": [
+                      "machineId",
+                      "harness",
+                      "nativeSessionId"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "subscriptionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "session"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "session"
+                    ],
+                    "not": {
+                      "required": [
+                        "subscriptionId"
+                      ]
+                    }
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "subscription"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "subscriptionId"
+                    ],
+                    "not": {
+                      "required": [
+                        "session"
+                      ]
+                    }
+                  }
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "application": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "available": {
+                "type": "boolean"
+              },
+              "expiresAt": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "ref",
+              "name",
+              "application",
+              "available"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 100
+        },
+        "nextCursor": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "recipients",
+        "nextCursor"
+      ],
+      "additionalProperties": false
+    },
+    "RecipientRef": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "session": {
+          "type": "object",
+          "properties": {
+            "machineId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            },
+            "harness": {
+              "type": "string",
+              "enum": [
+                "pi",
+                "omp",
+                "hermes",
+                "codex",
+                "claude"
+              ],
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "nativeSessionId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            },
+            "nativeAgentId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+            }
+          },
+          "required": [
+            "machineId",
+            "harness",
+            "nativeSessionId"
+          ],
+          "additionalProperties": false
+        },
+        "subscriptionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "session"
+              ]
+            }
+          },
+          "required": [
+            "session"
+          ],
+          "not": {
+            "required": [
+              "subscriptionId"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "subscription"
+              ]
+            }
+          },
+          "required": [
+            "subscriptionId"
+          ],
+          "not": {
+            "required": [
+              "session"
+            ]
+          }
+        }
+      ]
     },
     "SessionInspectInput": {
       "type": "object",
@@ -19034,7 +21584,17 @@
   },
   "title": "WireTypes",
   "required": [
+    "ConnectorConfig",
     "ConnectorMessageAck",
+    "HostedEventArguments",
+    "HostedEventData",
+    "HostedEventDelivery",
+    "HostedEventEnvelope",
+    "HostedEventSubscribeInput",
+    "HostedEventSubscribeOutput",
+    "HostedEventUnsubscribeInput",
+    "InspectorConfig",
+    "InspectorHostedConfig",
     "ListMachine",
     "ListSession",
     "Message",
@@ -19049,6 +21609,10 @@
     "NativeMessage",
     "NativeNotice",
     "NativeSnapshot",
+    "Recipient",
+    "RecipientListInput",
+    "RecipientListOutput",
+    "RecipientRef",
     "SessionInspectInput",
     "SessionInspection",
     "SessionListInput",

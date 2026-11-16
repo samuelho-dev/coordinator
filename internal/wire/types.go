@@ -52,6 +52,23 @@ func (r SessionRef) Key() string {
 	return out.String()
 }
 
+type RecipientRef struct {
+	Kind           string      `json:"kind"`
+	Session        *SessionRef `json:"session,omitempty"`
+	SubscriptionID string      `json:"subscriptionId,omitempty"`
+}
+
+func SessionRecipient(ref SessionRef) RecipientRef {
+	return RecipientRef{Kind: "session", Session: &ref}
+}
+
+func (r RecipientRef) Key() string {
+	if r.Kind == "session" && r.Session != nil {
+		return "session:" + r.Session.Key()
+	}
+	return "subscription:" + r.SubscriptionID
+}
+
 type ProcessIdentity struct {
 	PID           int    `json:"pid"`
 	StartIdentity string `json:"startIdentity"`
@@ -246,11 +263,16 @@ type InspectorOAuthConfig struct {
 	JWKSURL  string                  `json:"jwksUrl"`
 	Bindings []InspectorOAuthBinding `json:"bindings"`
 }
+type InspectorHostedConfig struct {
+	StateDirectory string   `json:"stateDirectory"`
+	CallbackHosts  []string `json:"callbackHosts"`
+}
 type InspectorConfig struct {
-	Host       string                `json:"host"`
-	Port       int                   `json:"port"`
-	Principals []InspectorPrincipal  `json:"principals"`
-	OAuth      *InspectorOAuthConfig `json:"oauth,omitempty"`
+	Host       string                 `json:"host"`
+	Port       int                    `json:"port"`
+	Principals []InspectorPrincipal   `json:"principals"`
+	OAuth      *InspectorOAuthConfig  `json:"oauth,omitempty"`
+	Hosted     *InspectorHostedConfig `json:"hosted,omitempty"`
 }
 type ConnectorConfig struct {
 	InspectorURL string             `json:"inspectorUrl"`
@@ -258,6 +280,7 @@ type ConnectorConfig struct {
 	TokenFile    string             `json:"tokenFile,omitempty"`
 	Messaging    bool               `json:"messaging,omitempty"`
 	Project      *ConfiguredProject `json:"project,omitempty"`
+	CodexSocket  string             `json:"codexSocket,omitempty"`
 }
 type ConfiguredProject struct {
 	Root string `json:"root"`
@@ -308,6 +331,21 @@ type SessionListOutput struct {
 	Sessions   []ListSession `json:"sessions"`
 	NextCursor *string       `json:"nextCursor"`
 }
+type RecipientListInput struct {
+	Cursor string `json:"cursor,omitempty"`
+	Limit  int    `json:"limit"`
+}
+type Recipient struct {
+	Ref         RecipientRef `json:"ref"`
+	Name        string       `json:"name"`
+	Application string       `json:"application"`
+	Available   bool         `json:"available"`
+	ExpiresAt   *float64     `json:"expiresAt,omitempty"`
+}
+type RecipientListOutput struct {
+	Recipients []Recipient `json:"recipients"`
+	NextCursor *string     `json:"nextCursor"`
+}
 type SessionInspectInput struct {
 	Ref SessionRef `json:"ref"`
 }
@@ -318,9 +356,9 @@ type MessageCaller struct {
 	Ref         SessionRef `json:"ref"`
 }
 type MessageSendParams struct {
-	To        SessionRef `json:"to"`
-	Text      string     `json:"text"`
-	RequestID string     `json:"requestId,omitempty"`
+	To        RecipientRef `json:"to"`
+	Text      string       `json:"text"`
+	RequestID string       `json:"requestId,omitempty"`
 }
 type MessageReplyParams struct {
 	ReplyID   string `json:"replyId"`
@@ -328,7 +366,7 @@ type MessageReplyParams struct {
 	RequestID string `json:"requestId,omitempty"`
 }
 type MessageSendInput struct {
-	To        SessionRef     `json:"to"`
+	To        RecipientRef   `json:"to"`
 	Text      string         `json:"text"`
 	RequestID string         `json:"requestId,omitempty"`
 	Caller    *MessageCaller `json:"caller,omitempty"`
@@ -343,15 +381,15 @@ type MessageGetInput struct {
 	MessageID string `json:"messageId"`
 }
 type Message struct {
-	ID        string      `json:"id"`
-	Sender    string      `json:"sender"`
-	From      *SessionRef `json:"from,omitempty"`
-	To        *SessionRef `json:"to,omitempty"`
-	Text      string      `json:"text"`
-	InReplyTo string      `json:"inReplyTo,omitempty"`
-	CreatedAt float64     `json:"createdAt"`
-	ExpiresAt float64     `json:"expiresAt"`
-	Status    string      `json:"status"`
+	ID        string        `json:"id"`
+	Sender    string        `json:"sender"`
+	From      *RecipientRef `json:"from,omitempty"`
+	To        *RecipientRef `json:"to,omitempty"`
+	Text      string        `json:"text"`
+	InReplyTo string        `json:"inReplyTo,omitempty"`
+	CreatedAt float64       `json:"createdAt"`
+	ExpiresAt float64       `json:"expiresAt"`
+	Status    string        `json:"status"`
 }
 type MessageRecord struct {
 	Message Message   `json:"message"`
@@ -362,4 +400,41 @@ type ConnectorMessageAck struct {
 	Incarnation string `json:"incarnation"`
 	MessageID   string `json:"messageId"`
 	Status      string `json:"status"`
+}
+
+type HostedEventArguments struct {
+	Name string `json:"name"`
+}
+type HostedEventDelivery struct {
+	Mode   string `json:"mode"`
+	URL    string `json:"url"`
+	Secret string `json:"secret,omitempty"`
+}
+type HostedEventSubscribeInput struct {
+	Name      string               `json:"name"`
+	Arguments HostedEventArguments `json:"arguments"`
+	Delivery  HostedEventDelivery  `json:"delivery"`
+	Cursor    *string              `json:"cursor,omitempty"`
+	TTLMS     *int64               `json:"ttlMs,omitempty"`
+}
+type HostedEventUnsubscribeInput struct {
+	Name      string               `json:"name"`
+	Arguments HostedEventArguments `json:"arguments"`
+	Delivery  HostedEventDelivery  `json:"delivery"`
+}
+type HostedEventSubscribeOutput struct {
+	ID            string  `json:"id"`
+	RefreshBefore string  `json:"refreshBefore"`
+	Cursor        *string `json:"cursor"`
+	Truncated     bool    `json:"truncated"`
+}
+type HostedEventData struct {
+	Message Message `json:"message"`
+}
+type HostedEventEnvelope struct {
+	EventID   string          `json:"eventId"`
+	Name      string          `json:"name"`
+	Timestamp string          `json:"timestamp"`
+	Data      HostedEventData `json:"data"`
+	Cursor    *string         `json:"cursor"`
 }

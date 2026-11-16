@@ -245,3 +245,47 @@ func TestInstallMessagingRequiresOptIn(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallCodexSocketOptIn(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("installer requires nonroot owner")
+	}
+	root := privateTempDir(t)
+	config := filepath.Join(root, "inspector.json")
+	unsetEnv(t, "COORDINATOR_API_URL")
+	unsetEnv(t, "COORDINATOR_API_TOKEN")
+	cfg := wire.ConnectorConfig{InspectorURL: "http://127.0.0.1:8787", APIToken: "test-token-1234567890", Messaging: true}
+	if err := os.WriteFile(config, jsonBytes(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(root, "codex.sock")
+	for _, args := range [][]string{
+		{"--target", "claude", "--messaging", "--codex-socket", socket},
+		{"--target", "codex", "--codex-socket", socket},
+		{"--target", "codex", "--messaging", "--codex-socket", "relative.sock"},
+	} {
+		args = append(args, "--config", config, "--destination", filepath.Join(root, "invalid"))
+		if err := install(args); err == nil {
+			t.Fatal("accepted invalid socket opt-in")
+		}
+	}
+	dest := filepath.Join(root, "codex")
+	if err := install([]string{"--target", "codex", "--messaging", "--codex-socket", socket, "--config", config, "--destination", dest}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dest, "codex-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var installed wire.ConnectorConfig
+	if err := json.Unmarshal(data, &installed); err != nil || installed.CodexSocket != socket {
+		t.Fatalf("invalid installed config: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(dest, "codex-config.json")); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("installed config is not private")
+	}
+	toml, err := os.ReadFile(filepath.Join(dest, "mcp.toml"))
+	if err != nil || !strings.Contains(string(toml), `args = ["codex-mcp"]`) || !strings.Contains(string(toml), filepath.Join(dest, "codex-config.json")) {
+		t.Fatal("missing codex MCP opt-in")
+	}
+}

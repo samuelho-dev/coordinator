@@ -197,6 +197,12 @@ func (c *Client) call(ctx context.Context, name string, input any, out any) erro
 		return failure(400, "Invalid inspection request or response")
 	}
 	switch v := out.(type) {
+	case *wire.RecipientListOutput:
+		x, e := wire.Decode[wire.RecipientListOutput](bytes.NewReader(wrapper.Result), responseLimit)
+		if e != nil {
+			return failure(400, "Invalid inspection request or response")
+		}
+		*v = x
 	case *wire.SessionListOutput:
 		x, e := wire.Decode[wire.SessionListOutput](bytes.NewReader(wrapper.Result), responseLimit)
 		if e != nil {
@@ -229,6 +235,11 @@ func (c *Client) call(ctx context.Context, name string, input any, out any) erro
 func (c *Client) List(ctx context.Context, in wire.SessionListInput) (wire.SessionListOutput, error) {
 	var out wire.SessionListOutput
 	e := c.call(ctx, "session.list", in, &out)
+	return out, e
+}
+func (c *Client) Recipients(ctx context.Context, in wire.RecipientListInput) (wire.RecipientListOutput, error) {
+	var out wire.RecipientListOutput
+	e := c.call(ctx, "recipient.list", in, &out)
 	return out, e
 }
 func (c *Client) Inspect(ctx context.Context, ref wire.SessionRef) (wire.SessionInspection, error) {
@@ -289,4 +300,27 @@ func (c *Client) ListAll(ctx context.Context, in wire.SessionListInput) (wire.Se
 		out.Machines = append(out.Machines, machines[k])
 	}
 	return out, nil
+}
+func (c *Client) ListAllRecipients(ctx context.Context) (wire.RecipientListOutput, error) {
+	out := wire.RecipientListOutput{Recipients: []wire.Recipient{}}
+	in := wire.RecipientListInput{Limit: 100}
+	seen := map[string]bool{}
+	for {
+		page, err := c.Recipients(ctx, in)
+		if err != nil {
+			return out, err
+		}
+		out.Recipients = append(out.Recipients, page.Recipients...)
+		if len(out.Recipients) > 4096 {
+			return out, failure(413, "Response exceeds bound")
+		}
+		if page.NextCursor == nil {
+			return out, nil
+		}
+		if seen[*page.NextCursor] || len(seen) >= 4096 {
+			return out, failure(400, "Invalid recipient cursor")
+		}
+		seen[*page.NextCursor] = true
+		in.Cursor = *page.NextCursor
+	}
 }

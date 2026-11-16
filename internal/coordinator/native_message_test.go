@@ -17,6 +17,7 @@ import (
 
 func TestReceiverPrivatePipe(t *testing.T) {
 	ref := wire.SessionRef{MachineID: "machine", Harness: "hermes", NativeSessionID: "session"}
+	recipient := wire.SessionRecipient(ref)
 	announcements := make(chan wire.ConnectorAnnounce, 4)
 	acks := make(chan wire.ConnectorMessageAck, 4)
 	var polls atomic.Int32
@@ -31,7 +32,7 @@ func TestReceiverPrivatePipe(t *testing.T) {
 		case "/connector/poll":
 			result := wire.ConnectorPollResult{Requests: []wire.InspectionRequest{}}
 			if polls.Add(1) == 1 {
-				result.Messages = []wire.Message{{ID: "original", Sender: "peer", To: &ref, Text: "hello", CreatedAt: 1, ExpiresAt: 2, Status: "dispatched"}}
+				result.Messages = []wire.Message{{ID: "original", Sender: "peer", To: &recipient, Text: "hello", CreatedAt: 1, ExpiresAt: 2, Status: "dispatched"}}
 			}
 			_ = json.NewEncoder(w).Encode(result)
 			return

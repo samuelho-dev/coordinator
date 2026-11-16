@@ -271,6 +271,7 @@ process.stdin.on('data', chunk => {
   while ((end = buffer.indexOf('\\n')) >= 0) {
     const message = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
     if (message.method === 'list') console.log(JSON.stringify({version:1,id:message.id,result:{machines:[],sessions:[{ref:{machineId:'machine',harness:'pi',nativeSessionId:'session'}}],nextCursor:null}}));
+    if (message.method === 'recipients') console.log(JSON.stringify({version:1,id:message.id,result:{recipients:[{ref:{kind:'subscription',subscriptionId:'chat'},name:'Chat',application:'chatgpt',available:true}],nextCursor:null}}));
     if (message.method === 'shutdown') process.exit(0);
   }
 });` + "`" + `, {
@@ -328,6 +329,7 @@ process.stdin.on('data', chunk => {
                         }
                     }
                 ],
+                recipients: [{ref:{kind:'subscription',subscriptionId:'chat'},name:'Chat',application:'chatgpt',available:true}],
                 nextCursor: null
             });
             await handlers.get('session_shutdown')({}, ctx);
@@ -360,6 +362,7 @@ process.stdin.on('data', chunk => {
   while ((end = buffer.indexOf('\\n')) >= 0) {
     const message = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
     if (message.method === 'list') console.log(JSON.stringify({version:1,id:message.id,result:{machines:[],sessions:[{ref:{machineId:'machine',harness:'omp',nativeSessionId:'fleet-session'}}],nextCursor:null}}));
+    if (message.method === 'recipients') console.log(JSON.stringify({version:1,id:message.id,result:{recipients:[{ref:{kind:'subscription',subscriptionId:'chat'},name:'Chat',application:'chatgpt',available:true}],nextCursor:null}}));
     if (message.method === 'shutdown') process.exit(0);
   }
 });` + "`" + `, {
@@ -427,6 +430,7 @@ process.stdin.on('data', chunk => {
                 }, ctx);
                 assert.ok(result.text.startsWith(text));
                 assert.ok(result.text.includes('fleet-session'));
+                assert.ok(result.text.includes('"subscriptionId":"chat"'));
                 assert.equal(result.images, images);
                 if (harness === 'pi') assert.equal(result.action, 'transform');
                 else assert.equal('action' in result, false);
@@ -458,13 +462,14 @@ let count = 0;
 readline.createInterface({input:process.stdin}).on('line', line => {
  const f = JSON.parse(line);
  if (f.method === 'update' && !count++) {
-   const message = {id:'original',sender:'peer',to:{machineId:'machine',harness:process.argv[4],nativeSessionId:'session'},text:'hello',createdAt:Date.now(),expiresAt:Date.now()+600000,status:'dispatched'};
-   send({id:'wrong',method:'message',message:{...message,to:{...message.to,nativeSessionId:'other'}}});
+   const message = {id:'original',sender:'peer',to:{kind:'session',session:{machineId:'machine',harness:process.argv[4],nativeSessionId:'session'}},text:'hello',createdAt:Date.now(),expiresAt:Date.now()+600000,status:'dispatched'};
+   send({id:'wrong',method:'message',message:{...message,to:{...message.to,session:{...message.to.session,nativeSessionId:'other'}}}});
    send({id:'expired',method:'message',message:{...message,id:'expired',expiresAt:Date.now()-1}});
    send({id:'invalid',method:'message',message:{...message,id:'invalid',text:null}});
    send({id:'delivery',method:'message',message});
    send({id:'duplicate',method:'message',message});
  }
+ if (f.method === 'recipients') send({id:f.id,result:{recipients:[{ref:{kind:'subscription',subscriptionId:'chat'},name:'Chat',application:'chatgpt',available:true}],nextCursor:null}});
  if (f.method === 'message.reply') send({id:f.id,result:{id:'reply',inReplyTo:f.reply.replyId}});
  if (f.method === 'shutdown') process.exit(0);
 });
@@ -479,6 +484,8 @@ try {
   const host = {on:(name,fn)=>handlers.set(name,fn),registerCommand(){},registerTool:t=>tools.set(t.name,t),registerMessageRenderer(){},sendMessage:(m,o)=>messages.push([m,o])};
   registerNative(host,harness,()=>null);
   await handlers.get('session_start')({},ctx);
+  const recipients = await tools.get('coordinator_recipient_list').execute('list',{limit:1});
+  assert.equal(recipients.details.recipients[0].ref.subscriptionId,'chat');
   const reply = await tools.get('coordinator_message_reply').execute('tool',{replyId:'original',text:'answer'},undefined,undefined,ctx);
   assert.equal(messages.length,1);
   assert.match(messages[0][0].content,/replyID: original/);
@@ -525,6 +532,13 @@ process.stdin.on('data', chunk => {
   while ((end = buffer.indexOf('\\n')) >= 0) {
     const frame = JSON.parse(buffer.slice(0,end)); buffer = buffer.slice(end+1);
     if (frame.method === 'shutdown') process.exit(0);
+    if (frame.method === 'recipients') {
+      const second = frame.recipients.cursor === 'recipient-two';
+      if (frame.recipients.cursor && !second) throw new Error('recipient cursor lost');
+      const recipient = {ref:{kind:'subscription',subscriptionId:second?'two':'one'},name:'Chat',application:'chatgpt',available:true};
+      process.stdout.write(JSON.stringify({version:1,id:frame.id,result:{recipients:[recipient],nextCursor:second?null:'recipient-two'}})+'\\n');
+      continue;
+    }
     if (frame.method !== 'list') continue;
     const second = frame.input.cursor === 'page-two';
     if (frame.input.cursor && !second) throw new Error('cursor lost');
@@ -546,11 +560,13 @@ process.stdin.on('data', chunk => {
   assert.equal(messages[0].options.triggerTurn, false);
   const full = messages[0].message.details;
   assert.deepEqual(full.sessions.map(session=>session.ref.nativeSessionId), ['one','two']);
+  assert.deepEqual(full.recipients.map(recipient=>recipient.ref.subscriptionId), ['one','two']);
   assert.equal(full.nextCursor, null);
   assert.equal(full.machines.length, 1);
   assert.equal(full.machines[0].resources.cpu.usedPercent.stale, undefined);
   assert.ok(Buffer.byteLength(messages[0].message.content)>65536);
   const transformed = await handlers.get('input')({text:'coordinate review'},ctx);
+  assert.ok(transformed.text.includes('"subscriptionId":"two"'));
   assert.ok(transformed.text.includes('"nativeSessionId":"two"'));
   await handlers.get('turn_end')({}, ctx);
   await command('list');

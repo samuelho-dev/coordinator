@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/samuelho-dev/coordinator/internal/coordinator"
 	"github.com/samuelho-dev/coordinator/internal/integrations"
+	"github.com/samuelho-dev/coordinator/internal/wire"
 )
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
@@ -48,8 +50,18 @@ func install(args []string) (err error) {
 	_ = f.Bool("source", false, "")
 	dry := f.Bool("dry-run", false, "")
 	messaging := f.Bool("messaging", false, "")
+	codexSocket := f.String("codex-socket", "", "")
 	if err = f.Parse(args); err != nil {
 		return err
+	}
+	socketSpecified := false
+	f.Visit(func(f *flag.Flag) {
+		if f.Name == "codex-socket" {
+			socketSpecified = true
+		}
+	})
+	if socketSpecified && (*target != "codex" || !*messaging || !canonicalPath(*codexSocket) || *codexSocket == string(filepath.Separator)) {
+		return errors.New("codex socket requires codex messaging and an absolute canonical path")
 	}
 	if f.NArg() != 0 || !canonicalPath(*dest) || (*configFile != "" && !canonicalPath(*configFile)) {
 		return errors.New("invalid install path")
@@ -109,6 +121,20 @@ func install(args []string) (err error) {
 	}
 	command := func(mode string) string { return env + shellQuote(binaryDest) + " " + mode }
 	files := map[string][]byte{"connector.sh": []byte("#!/bin/sh\nexec env " + command("connector") + "\n"), "mcp.sh": []byte("#!/bin/sh\nexec env " + command("mcp") + "\n"), filepath.Join("dist", "bin", runtime.GOOS+"-"+arch, "coordinator"): binaryData}
+	mcpConfig := *configFile
+	mcpMode := "mcp"
+	if socketSpecified {
+		cfg.CodexSocket = *codexSocket
+		if _, ok := os.LookupEnv("COORDINATOR_API_TOKEN"); ok {
+			cfg.APIToken = ""
+		}
+		if err = wire.Validate(cfg); err != nil {
+			return errors.New("invalid codex socket configuration")
+		}
+		files["codex-config.json"] = jsonBytes(cfg)
+		mcpConfig = filepath.Join(*dest, "codex-config.json")
+		mcpMode = "codex-mcp"
+	}
 	activation := ""
 	mcp := map[string]any{"command": binaryDest, "args": []string{"mcp"}}
 	if *configFile != "" {
@@ -153,12 +179,15 @@ func install(args []string) (err error) {
 				activation = "claude --plugin-dir " + shellQuote(*dest) + " --dangerously-load-development-channels server:coordinator; approve the hooks and MCP tools"
 			}
 		} else {
-			line := fmt.Sprintf("[mcp_servers.coordinator]\ncommand = %q\nargs = [\"mcp\"]\nenv_vars = [\"COORDINATOR_API_TOKEN\", \"COORDINATOR_API_URL\", \"XDG_CONFIG_HOME\"]\n", binaryDest)
-			if *configFile != "" {
-				line += fmt.Sprintf("\n[mcp_servers.coordinator.env]\nCOORDINATOR_CONNECTOR_CONFIG = %q\n", *configFile)
+			line := fmt.Sprintf("[mcp_servers.coordinator]\ncommand = %q\nargs = [%q]\nenv_vars = [\"COORDINATOR_API_TOKEN\", \"COORDINATOR_API_URL\", \"XDG_CONFIG_HOME\", \"XDG_STATE_HOME\"]\n", binaryDest, mcpMode)
+			if mcpConfig != "" {
+				line += fmt.Sprintf("\n[mcp_servers.coordinator.env]\nCOORDINATOR_CONNECTOR_CONFIG = %q\n", mcpConfig)
 			}
 			files["mcp.toml"] = []byte(line)
 			activation = "Merge generated hooks/hooks.json and mcp.toml into Codex settings; approve each hook in /hooks"
+			if socketSpecified {
+				activation += "; connect to an already running shared Codex app-server at the configured private socket; embedded or unreachable servers fail closed"
+			}
 		}
 	case "hermes":
 		hooks := map[string]any{}
@@ -219,7 +248,7 @@ func install(args []string) (err error) {
 	result := map[string]any{"destination": *dest, "binary": binaryDest, "activation": activation, "dryRun": *dry}
 	if *target == "codex" && *messaging {
 		result["receiver"] = false
-		result["receiverReason"] = "Codex has no trusted per-tool-call thread binding; only unbound send and get are available"
+		result["receiverReason"] = "receiver requires an opted-in private socket and a running shared Codex server with the exact loaded thread"
 	}
 	if *target == "pi" || *target == "omp" {
 		result["plugin"] = plugin

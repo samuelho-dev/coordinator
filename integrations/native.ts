@@ -1,8 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import type { NativeSnapshot, SessionRef, SessionListInput, Message as PeerMessage, MessageSendParams, MessageReplyParams, MessageGetInput } from './wire.generated.ts'
-import { SessionListInputSchema, SessionInspectInputSchema, MessageSendParamsSchema, MessageReplyParamsSchema, MessageGetInputSchema } from './wire.generated.ts'
+import type { NativeSnapshot, SessionRef, SessionListInput, RecipientListInput, Message as PeerMessage, MessageSendParams, MessageReplyParams, MessageGetInput } from './wire.generated.ts'
+import { SessionListInputSchema, SessionInspectInputSchema, RecipientListInputSchema, MessageSendParamsSchema, MessageReplyParamsSchema, MessageGetInputSchema } from './wire.generated.ts'
 
 const MAX_FRAME = 65536
 const MAX_PENDING = 128
@@ -24,7 +24,7 @@ export type Host = {
   on(name: 'input', handler: (event: Input, ctx: Context) => Promise<unknown>): unknown
   on(name: string, handler: (event: Event, ctx: Context) => Promise<void>): unknown
   registerCommand(name: string, options: { description: string; handler(args: string): Promise<void> }): void
-  registerTool(tool: { name: string; label: string; description: string; parameters: object; execute(id: string, params: SessionListInput | { ref: SessionRef } | MessageSendParams | MessageReplyParams | MessageGetInput, signal?: AbortSignal, onUpdate?: unknown, ctx?: Context): Promise<unknown> }): void
+  registerTool(tool: { name: string; label: string; description: string; parameters: object; execute(id: string, params: SessionListInput | RecipientListInput | { ref: SessionRef } | MessageSendParams | MessageReplyParams | MessageGetInput, signal?: AbortSignal, onUpdate?: unknown, ctx?: Context): Promise<unknown> }): void
   registerMessageRenderer(name: string, renderer: (message: { content: unknown; details?: unknown }) => unknown): void
   sendMessage(message: { customType: string; content: string; display: boolean; details?: unknown }, options: { triggerTurn: boolean; deliverAs?: 'followUp' }): void
 }
@@ -97,7 +97,7 @@ export class NativePipe {
   }
   update(snapshot: NativeSnapshot) { this.send({ method: 'update', snapshot }) }
   acknowledge(id: string, status: 'accepted' | 'refused' | 'unknown') { this.send({ id, method: 'message_ack', ack: { status } }) }
-  request(method: 'list' | 'inspect' | 'message.send' | 'message.reply' | 'message.get', data: { input?: SessionListInput; ref?: SessionRef; send?: MessageSendParams; reply?: MessageReplyParams; get?: MessageGetInput; snapshot?: NativeSnapshot }, signal?: AbortSignal): Promise<unknown> {
+  request(method: 'list' | 'recipients' | 'inspect' | 'message.send' | 'message.reply' | 'message.get', data: { input?: SessionListInput; recipients?: RecipientListInput; ref?: SessionRef; send?: MessageSendParams; reply?: MessageReplyParams; get?: MessageGetInput; snapshot?: NativeSnapshot }, signal?: AbortSignal): Promise<unknown> {
     if (this.closed || this.pending.size >= MAX_PENDING) return Promise.reject(new Error('Coordinator unavailable'))
     if (signal?.aborted) return Promise.reject(new Error('Coordinator request aborted'))
     const id = randomUUID()
@@ -161,9 +161,9 @@ export function registerNative(host: Host, harness: 'pi' | 'omp', render: (text:
               [...message.text].length <= 8192 && message.text.trim().length > 0 &&
               !/[\x00-\x08\x0b-\x1f\x7f-\x9f]/u.test(message.text) && Buffer.byteLength(message.text) <= 16384 &&
               typeof message.expiresAt === 'number' && Number.isFinite(message.expiresAt) && now < message.expiresAt &&
-              snapshot && message.to && typeof message.to.machineId === 'string' && /^[^\s\x00-\x1f\x7f-\x9f]{1,128}$/u.test(message.to.machineId) &&
-              message.to.harness === harness && message.to.nativeSessionId === snapshot.nativeSessionId &&
-              (message.to.nativeAgentId ?? '') === (snapshot.nativeAgentId ?? '')) {
+              snapshot && message.to?.kind === 'session' && message.to.session && typeof message.to.session.machineId === 'string' && /^[^\s\x00-\x1f\x7f-\x9f]{1,128}$/u.test(message.to.session.machineId) &&
+              message.to.session.harness === harness && message.to.session.nativeSessionId === snapshot.nativeSessionId &&
+              (message.to.session.nativeAgentId ?? '') === (snapshot.nativeAgentId ?? '')) {
             const prior = delivered.get(message.id)
             if (prior) result = prior.status
             else if (delivered.size < 1024) {
@@ -187,7 +187,7 @@ export function registerNative(host: Host, harness: 'pi' | 'omp', render: (text:
       })
     }
   }
-  const request = (method: 'list' | 'inspect', data: { input?: SessionListInput; ref?: SessionRef }, signal?: AbortSignal) => pipe ? pipe.request(method, data, signal) : Promise.reject(new Error('Coordinator unavailable'))
+  const request = (method: 'list' | 'recipients' | 'inspect', data: { input?: SessionListInput; recipients?: RecipientListInput; ref?: SessionRef }, signal?: AbortSignal) => pipe ? pipe.request(method, data, signal) : Promise.reject(new Error('Coordinator unavailable'))
   const listAll = async () => {
     const sessions: unknown[] = []
     const machines = new Map<string, { value: object; observedAt: number; staleCount: number }>()
@@ -221,10 +221,23 @@ export function registerNative(host: Host, harness: 'pi' | 'omp', render: (text:
       seen.add(page.nextCursor)
       cursor = page.nextCursor
     }
-    return { machines: [...machines].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, item]) => item.value), sessions, nextCursor: null }
+    const recipients: unknown[] = []
+    seen.clear()
+    cursor = undefined
+    for (;;) {
+      const page = await request('recipients', { recipients: { limit: 100, ...(cursor ? { cursor } : {}) } })
+      if (!page || typeof page !== 'object' || !('recipients' in page) || !Array.isArray(page.recipients) || !('nextCursor' in page) || (page.nextCursor !== null && (typeof page.nextCursor !== 'string' || page.nextCursor.length === 0))) throw new Error('Invalid recipient response')
+      recipients.push(...page.recipients)
+      if (recipients.length > 4096) throw new Error('Response exceeds bound')
+      if (page.nextCursor === null) break
+      if (seen.has(page.nextCursor) || seen.size >= 4096) throw new Error('Invalid recipient cursor')
+      seen.add(page.nextCursor)
+      cursor = page.nextCursor
+    }
+    return { machines: [...machines].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, item]) => item.value), sessions, recipients, nextCursor: null }
   }
   host.registerMessageRenderer('coordinator-list', (message) => typeof message.content === 'string' ? render(message.content, message.details !== undefined) : undefined)
-  host.registerCommand('coordinator', { description: 'List visible sessions, their machines, and native metadata', handler: async (args: string) => {
+  host.registerCommand('coordinator', { description: 'List visible recipients, sessions, their machines, and native metadata', handler: async (args: string) => {
     if (args.trim() !== 'list') { host.sendMessage({ customType: 'coordinator-list', content: 'Usage: /coordinator list', display: true }, { triggerTurn: false }); return }
     try {
       const result = await listAll()
@@ -237,8 +250,13 @@ export function registerNative(host: Host, harness: 'pi' | 'omp', render: (text:
     const result = await request(name, data, signal)
     return { content: [{ type: 'text', text: JSON.stringify(result) }], details: result }
   } })
+  host.registerTool({ name: 'coordinator_recipient_list', label: 'Coordinator recipient.list', description: 'List available same-owner message recipients.', parameters: RecipientListInputSchema, execute: async (_id, params, signal) => {
+    if (!('limit' in params)) throw new Error('Invalid recipient input')
+    const result = await request('recipients', { recipients: params }, signal)
+    return { content: [{ type: 'text', text: JSON.stringify(result) }], details: result }
+  } })
   for (const [name, parameters, description] of [
-    ['send', MessageSendParamsSchema, 'Send a peer message to an exact session; this has side effects.'],
+    ['send', MessageSendParamsSchema, 'Send a peer message to an exact recipient; this has side effects.'],
     ['reply', MessageReplyParamsSchema, 'Reply to a peer message using its original id as replyId; this has side effects.'],
     ['get', MessageGetInputSchema, 'Get a peer message and its correlated replies.']
   ] as const) host.registerTool({ name: `coordinator_message_${name}`, label: `Coordinator message.${name}`, description, parameters, execute: async (_id, params, signal, _onUpdate, ctx) => {
