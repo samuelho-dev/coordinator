@@ -35,7 +35,7 @@ func (t *claudeTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 }
 
 func (t *claudeTransport) deliver(ctx context.Context, ref wire.SessionRef, message wire.Message) (string, error) {
-	if message.To == nil || *message.To != ref || ctx.Err() != nil {
+	if message.To == nil || message.To.Kind != "session" || message.To.Session == nil || message.To.Session.Key() != ref.Key() || ctx.Err() != nil {
 		return "refused", nil
 	}
 	params, err := json.Marshal(struct {

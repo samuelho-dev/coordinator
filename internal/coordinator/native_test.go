@@ -179,6 +179,29 @@ func TestNativeListPreservesPagination(t *testing.T) {
 	if second.NextCursor != nil || second.Sessions[0].Ref == first.Sessions[0].Ref {
 		t.Fatal("continuation did not advance to the second session")
 	}
+	if err := encoder.Encode(wire.NativeMessage{Version: 1, ID: "recipients", Method: "recipients", Recipients: &wire.RecipientListInput{Limit: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-frames:
+		var result wire.RecipientListOutput
+		if frame.ID != "recipients" || frame.Error != nil || json.Unmarshal(frame.Result, &result) != nil || result.NextCursor != nil {
+			t.Fatalf("invalid recipient page: %+v", frame)
+		}
+	case <-ctx.Done():
+		t.Fatal("native recipients did not respond")
+	}
+	if err := encoder.Encode(wire.NativeMessage{Version: 1, ID: "missing", Method: "recipients"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-frames:
+		if frame.ID != "missing" || frame.Error == nil {
+			t.Fatalf("missing recipient input accepted: %+v", frame)
+		}
+	case <-ctx.Done():
+		t.Fatal("native recipients did not reject missing input")
+	}
 	input.Close()
 	if err := <-done; err != nil {
 		t.Fatal(err)

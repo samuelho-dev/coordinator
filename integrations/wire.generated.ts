@@ -42,17 +42,39 @@ export interface WireTypes {
 export interface Message {
   id: string;
   sender: string;
-  from?: {
-    machineId: string;
-    harness: "pi" | "omp" | "hermes" | "codex" | "claude";
-    nativeSessionId: string;
-    nativeAgentId?: string;
+  from?: (
+    | {
+        kind?: "session";
+      }
+    | {
+        kind?: "subscription";
+      }
+  ) & {
+    kind: string;
+    session?: {
+      machineId: string;
+      harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+      nativeSessionId: string;
+      nativeAgentId?: string;
+    };
+    subscriptionId?: string;
   };
-  to?: {
-    machineId: string;
-    harness: "pi" | "omp" | "hermes" | "codex" | "claude";
-    nativeSessionId: string;
-    nativeAgentId?: string;
+  to?: (
+    | {
+        kind?: "session";
+      }
+    | {
+        kind?: "subscription";
+      }
+  ) & {
+    kind: string;
+    session?: {
+      machineId: string;
+      harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+      nativeSessionId: string;
+      nativeAgentId?: string;
+    };
+    subscriptionId?: string;
   };
   text: string;
   inReplyTo?: string;
@@ -67,17 +89,39 @@ export interface MessageRecord {
   message: {
     id: string;
     sender: string;
-    from?: {
-      machineId: string;
-      harness: "pi" | "omp" | "hermes" | "codex" | "claude";
-      nativeSessionId: string;
-      nativeAgentId?: string;
+    from?: (
+      | {
+          kind?: "session";
+        }
+      | {
+          kind?: "subscription";
+        }
+    ) & {
+      kind: string;
+      session?: {
+        machineId: string;
+        harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+        nativeSessionId: string;
+        nativeAgentId?: string;
+      };
+      subscriptionId?: string;
     };
-    to?: {
-      machineId: string;
-      harness: "pi" | "omp" | "hermes" | "codex" | "claude";
-      nativeSessionId: string;
-      nativeAgentId?: string;
+    to?: (
+      | {
+          kind?: "session";
+        }
+      | {
+          kind?: "subscription";
+        }
+    ) & {
+      kind: string;
+      session?: {
+        machineId: string;
+        harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+        nativeSessionId: string;
+        nativeAgentId?: string;
+      };
+      subscriptionId?: string;
     };
     text: string;
     inReplyTo?: string;
@@ -91,17 +135,39 @@ export interface MessageRecord {
   replies: {
     id: string;
     sender: string;
-    from?: {
-      machineId: string;
-      harness: "pi" | "omp" | "hermes" | "codex" | "claude";
-      nativeSessionId: string;
-      nativeAgentId?: string;
+    from?: (
+      | {
+          kind?: "session";
+        }
+      | {
+          kind?: "subscription";
+        }
+    ) & {
+      kind: string;
+      session?: {
+        machineId: string;
+        harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+        nativeSessionId: string;
+        nativeAgentId?: string;
+      };
+      subscriptionId?: string;
     };
-    to?: {
-      machineId: string;
-      harness: "pi" | "omp" | "hermes" | "codex" | "claude";
-      nativeSessionId: string;
-      nativeAgentId?: string;
+    to?: (
+      | {
+          kind?: "session";
+        }
+      | {
+          kind?: "subscription";
+        }
+    ) & {
+      kind: string;
+      session?: {
+        machineId: string;
+        harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+        nativeSessionId: string;
+        nativeAgentId?: string;
+      };
+      subscriptionId?: string;
     };
     text: string;
     inReplyTo?: string;
@@ -116,11 +182,22 @@ export interface MessageReplyParams {
   requestId?: string;
 }
 export interface MessageSendParams {
-  to: {
-    machineId: string;
-    harness: "pi" | "omp" | "hermes" | "codex" | "claude";
-    nativeSessionId: string;
-    nativeAgentId?: string;
+  to: (
+    | {
+        kind?: "session";
+      }
+    | {
+        kind?: "subscription";
+      }
+  ) & {
+    kind: string;
+    session?: {
+      machineId: string;
+      harness: "pi" | "omp" | "hermes" | "codex" | "claude";
+      nativeSessionId: string;
+      nativeAgentId?: string;
+    };
+    subscriptionId?: string;
   };
   text: string;
   requestId?: string;
@@ -245,7 +322,7 @@ export const SessionListInputSchema = {"type":"object","properties":{"cursor":{"
 
 export const SessionInspectInputSchema = {"type":"object","properties":{"ref":{"type":"object","properties":{"machineId":{"type":"string","minLength":1,"maxLength":256},"harness":{"type":"string","enum":["pi","omp","hermes","codex","claude"],"minLength":1,"maxLength":256},"nativeSessionId":{"type":"string","minLength":1,"maxLength":256},"nativeAgentId":{"type":"string","minLength":1,"maxLength":256}},"required":["machineId","harness","nativeSessionId"],"additionalProperties":false}},"required":["ref"],"additionalProperties":false} as const;
 
-export const MessageSendParamsSchema = {"type":"object","properties":{"to":{"type":"object","properties":{"machineId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"},"harness":{"type":"string","enum":["pi","omp","hermes","codex","claude"],"minLength":1,"maxLength":256},"nativeSessionId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"},"nativeAgentId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"}},"required":["machineId","harness","nativeSessionId"],"additionalProperties":false},"text":{"type":"string","minLength":1,"maxLength":8192,"pattern":"^[^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f][^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*$"},"requestId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"}},"required":["to","text"],"additionalProperties":false} as const;
+export const MessageSendParamsSchema = {"type":"object","properties":{"to":{"type":"object","properties":{"kind":{"type":"string","minLength":1,"maxLength":256},"session":{"type":"object","properties":{"machineId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"},"harness":{"type":"string","enum":["pi","omp","hermes","codex","claude"],"minLength":1,"maxLength":256},"nativeSessionId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"},"nativeAgentId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"}},"required":["machineId","harness","nativeSessionId"],"additionalProperties":false},"subscriptionId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"}},"required":["kind"],"additionalProperties":false,"oneOf":[{"properties":{"kind":{"enum":["session"]}},"required":["session"],"not":{"required":["subscriptionId"]}},{"properties":{"kind":{"enum":["subscription"]}},"required":["subscriptionId"],"not":{"required":["session"]}}]},"text":{"type":"string","minLength":1,"maxLength":8192,"pattern":"^[^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f][^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*$"},"requestId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"}},"required":["to","text"],"additionalProperties":false} as const;
 
 export const MessageReplyParamsSchema = {"type":"object","properties":{"replyId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"},"text":{"type":"string","minLength":1,"maxLength":8192,"pattern":"^[^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*[^\\s\\x00-\\x1f\\x7f-\\x9f][^\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]*$"},"requestId":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[^\\s\\x00-\\x1f\\x7f-\\x9f]+$"}},"required":["replyId","text"],"additionalProperties":false} as const;
 

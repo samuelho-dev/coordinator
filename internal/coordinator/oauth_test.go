@@ -247,7 +247,7 @@ func TestOAuthMessagingAndNativeIsolation(t *testing.T) {
 	read := "coordinator:read"
 	both := read + " coordinator:message"
 	alice := oauthSession(t, e, token("alice", both))
-	args := map[string]any{"to": e.ref, "text": "hello"}
+	args := map[string]any{"to": wire.SessionRecipient(e.ref), "text": "hello"}
 	for _, tc := range []struct{ sub, scope string }{{"alice", read}, {"readonly", both}} {
 		oauthStatus(t, oauthCall(t, oauthSession(t, e, token(tc.sub, tc.scope)), "message.send", args), 403)
 	}
@@ -275,7 +275,7 @@ func TestOAuthMessagingAndNativeIsolation(t *testing.T) {
 		}
 	}
 	caller := map[string]any{"connectorId": "connector", "incarnation": "first", "ref": e.ref}
-	withCaller := map[string]any{"to": e.ref, "text": "bad", "caller": caller}
+	withCaller := map[string]any{"to": wire.SessionRecipient(e.ref), "text": "bad", "caller": caller}
 	if out := oauthCall(t, alice, "message.send", withCaller); !out.IsError {
 		t.Fatal("OAuth caller accepted")
 	}

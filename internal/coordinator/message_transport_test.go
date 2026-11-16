@@ -37,7 +37,7 @@ func TestMessageLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	sent, err := client.SendMessage(ctx, wire.MessageSendInput{To: ref, Text: "hello"})
+	sent, err := client.SendMessage(ctx, wire.MessageSendInput{To: wire.SessionRecipient(ref), Text: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestScopedMessageSchemaRejectsCaller(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cs.Close()
-	result, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "message.send", Arguments: map[string]any{"to": map[string]any{"machineId": "machine", "harness": "omp", "nativeSessionId": "session"}, "text": "hello", "caller": map[string]any{}}})
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "message.send", Arguments: map[string]any{"to": map[string]any{"kind": "session", "session": map[string]any{"machineId": "machine", "harness": "omp", "nativeSessionId": "session"}}, "text": "hello", "caller": map[string]any{}}})
 	if err == nil && (result == nil || !result.IsError) {
 		t.Fatal("caller accepted")
 	}
@@ -118,7 +118,8 @@ func TestSourceDeliveryAndOptIn(t *testing.T) {
 				case "/connector/poll":
 					result := wire.ConnectorPollResult{Requests: []wire.InspectionRequest{}}
 					if polls.Add(1) == 1 {
-						result.Messages = []wire.Message{{ID: "message", Sender: "peer", To: &ref, Text: "hello", CreatedAt: 1, ExpiresAt: 2, Status: "dispatched"}}
+						target := wire.SessionRecipient(ref)
+						result.Messages = []wire.Message{{ID: "message", Sender: "peer", To: &target, Text: "hello", CreatedAt: 1, ExpiresAt: 2, Status: "dispatched"}}
 					}
 					_ = json.NewEncoder(w).Encode(result)
 					return

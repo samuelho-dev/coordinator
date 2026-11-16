@@ -22,7 +22,7 @@ type hostedRoundTrip func(*http.Request) (*http.Response, error)
 func (f hostedRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func hostedTestSubscription() hostedSubscription {
-	return hostedSubscription{ID: "id", Owner: "owner", PrincipalID: "principal", Name: "name", URL: "https://example.com/hook", Secret: "whsec_" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)), ExpiresAt: time.Now().Add(time.Hour)}
+	return hostedSubscription{ID: "id", Generation: "generation", Owner: "owner", PrincipalID: "principal", Name: "name", URL: "https://example.com/hook", Secret: "whsec_" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)), ExpiresAt: time.Now().Add(time.Hour)}
 }
 
 func TestHostedSigningAndChallenge(t *testing.T) {
@@ -41,6 +41,9 @@ func TestHostedSigningAndChallenge(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("X-MCP-Subscription-Id") != sub.ID || r.Header.Get("webhook-id") == "" || r.Header.Get("webhook-timestamp") == "" {
+			t.Fatal("missing mandatory callback headers")
+		}
 		mac := hmac.New(sha256.New, key)
 		mac.Write([]byte(r.Header.Get("webhook-id") + "." + r.Header.Get("webhook-timestamp") + "."))
 		mac.Write(body)
@@ -48,16 +51,28 @@ func TestHostedSigningAndChallenge(t *testing.T) {
 			t.Fatal("signature differs from exact bytes")
 		}
 		var challenge struct {
+			Type      string `json:"type"`
 			Challenge string `json:"challenge"`
 		}
-		if err := json.Unmarshal(body, &challenge); err != nil {
-			t.Fatal(err)
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&challenge); err != nil || challenge.Type != "verification" {
+			t.Fatalf("invalid verification body: %s", body)
+		}
+		if err := dec.Decode(new(any)); err != io.EOF {
+			t.Fatal("extra verification data")
 		}
 		if challenge.Challenge == lastChallenge || challenge.Challenge == "" {
 			t.Fatal("challenge reused")
 		}
 		lastChallenge = challenge.Challenge
-		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+		response, err := json.Marshal(struct {
+			Challenge string `json:"challenge"`
+		}{challenge.Challenge})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(response))}, nil
 	})
 	if err := d.verify(context.Background(), sub); err != nil {
 		t.Fatal(err)
@@ -135,5 +150,124 @@ func TestHostedStoreRestoreAndUnsafePaths(t *testing.T) {
 	}
 	if _, err := openHostedStore(dir); err == nil {
 		t.Fatal("accepted symlink")
+	}
+}
+
+func TestHostedRotationSignaturesAndPersistence(t *testing.T) {
+	d, err := newHostedDelivery([]string{"example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := hostedTestSubscription()
+	previousKey := bytes.Repeat([]byte{9}, 32)
+	currentKey := bytes.Repeat([]byte{7}, 32)
+	sub.PreviousSecret = "whsec_" + base64.StdEncoding.EncodeToString(previousKey)
+	sub.PreviousSecretUntil = time.Now().Add(5 * time.Minute)
+	dir := filepath.Join(privateTempDir(t), "hosted")
+	store, err := openHostedStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.put(sub); err != nil {
+		t.Fatal(err)
+	}
+	store, err = openHostedStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, ok, err := store.get(sub.ID)
+	if err != nil || !ok || sub.PreviousSecret != "whsec_"+base64.StdEncoding.EncodeToString(previousKey) || sub.PreviousSecretUntil.IsZero() {
+		t.Fatal("rotation state not persisted")
+	}
+	wantPrevious := true
+	d.client.Transport = hostedRoundTrip(func(r *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Header.Get("X-MCP-Subscription-Id") != sub.ID || r.Header.Get("webhook-id") != "event-id" || string(body) != `{"event":"value"}` {
+			t.Fatal("incorrect delivery")
+		}
+		signatures := strings.Split(r.Header.Get("webhook-signature"), " ")
+		keys := [][]byte{currentKey}
+		if wantPrevious {
+			keys = append(keys, previousKey)
+		}
+		if len(signatures) != len(keys) {
+			t.Fatalf("incorrect signature count: %v", signatures)
+		}
+		for i, key := range keys {
+			mac := hmac.New(sha256.New, key)
+			mac.Write([]byte("event-id." + r.Header.Get("webhook-timestamp") + "."))
+			mac.Write(body)
+			if signatures[i] != "v1,"+base64.StdEncoding.EncodeToString(mac.Sum(nil)) {
+				t.Fatal("invalid rotation signature")
+			}
+		}
+		return &http.Response{StatusCode: 204, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	if _, _, err := d.send(context.Background(), sub, "event-id", []byte(`{"event":"value"}`)); err != nil {
+		t.Fatal(err)
+	}
+	wantPrevious = false
+	sub.PreviousSecretUntil = time.Now().Add(-time.Second)
+	if _, _, err := d.send(context.Background(), sub, "event-id", []byte(`{"event":"value"}`)); err != nil {
+		t.Fatal(err)
+	}
+	sub.PreviousSecret = "invalid"
+	if _, _, err := d.send(context.Background(), sub, "event-id", []byte(`{"event":"value"}`)); err == nil {
+		t.Fatal("accepted invalid previous key")
+	}
+	if err := store.put(sub); err == nil {
+		t.Fatal("stored invalid previous key")
+	}
+	sub.PreviousSecret = ""
+	if err := store.put(sub); err == nil {
+		t.Fatal("stored unpaired previous expiry")
+	}
+}
+
+func TestHostedStoreRejectsDuplicateAndIdentityMismatch(t *testing.T) {
+	dir := filepath.Join(privateTempDir(t), "hosted")
+	store, err := openHostedStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := hostedTestSubscription()
+	if err := store.put(sub); err != nil {
+		t.Fatal(err)
+	}
+	changed := sub
+	changed.PrincipalID = "other"
+	if err := store.put(changed); err == nil {
+		t.Fatal("accepted identity mismatch")
+	}
+	changed = sub
+	changed.Generation = "another-generation"
+	if err := store.put(changed); err == nil {
+		t.Fatal("accepted active generation replacement")
+	}
+	if err := store.remove(sub.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.put(changed); err != nil {
+		t.Fatalf("rejected new generation after removal: %v", err)
+	}
+	missing := sub
+	missing.Generation = ""
+	if err := store.put(missing); err == nil {
+		t.Fatal("accepted missing generation")
+	}
+	expired := sub
+	expired.ExpiresAt = time.Now().Add(-time.Hour)
+	data, err := json.Marshal([]hostedSubscription{expired, sub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "subscriptions.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openHostedStore(dir); err == nil {
+		t.Fatal("accepted duplicate expired identity")
 	}
 }

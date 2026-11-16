@@ -1,4 +1,4 @@
-# Coordinator inspector chart 0.3.0-beta.14
+# Coordinator inspector chart 0.3.0-beta.15
 
 This chart deploys the private native-session inspector: one Deployment and internal ClusterIP Service named `<release>-inspector`, plus only explicitly retained legacy PVC manifests. By default its state is ephemeral and it mounts no PVC. It can optionally mount a separately managed existing claim for hosted state. It creates no database, migrations, task queue, native agents, ingress, namespace, NetworkPolicy or provider CRDs. See the [root README](../../../README.md) for configuration, native host setup, metrics and verification.
 

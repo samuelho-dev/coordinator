@@ -21,6 +21,12 @@ func Handler(reg *Registry) http.Handler {
 			return wire.SessionListOutput{}, e
 		}
 		return reg.List(p, in)
+	}, recipients: func(ctx context.Context, req *mcp.CallToolRequest, in wire.RecipientListInput) (wire.RecipientListOutput, error) {
+		p, e := principalForMCP(req.Extra, false)
+		if e != nil {
+			return wire.RecipientListOutput{}, e
+		}
+		return reg.Recipients(p, in)
 	}, inspect: func(ctx context.Context, req *mcp.CallToolRequest, ref wire.SessionRef) (wire.SessionInspection, error) {
 		p, e := principalForMCP(req.Extra, false)
 		if e != nil {
@@ -42,7 +48,10 @@ func Handler(reg *Registry) http.Handler {
 			return wire.Message{}, e
 		}
 		if oauthCaller(req.Extra.TokenInfo) {
-			return wire.Message{}, failure(403, "Bound reply caller required")
+			if in.Caller != nil {
+				return wire.Message{}, failure(403, "OAuth callers cannot bind native sessions")
+			}
+			return reg.ReplyHostedMessage(p, in)
 		}
 		return reg.ReplyMessage(p, in)
 	}, get: func(ctx context.Context, req *mcp.CallToolRequest, in wire.MessageGetInput) (wire.MessageRecord, error) {
@@ -52,6 +61,9 @@ func Handler(reg *Registry) http.Handler {
 		}
 		return reg.GetMessage(p, in)
 	}}, nil)
+	if reg.hosted != nil {
+		reg.hosted.register(server)
+	}
 	transport := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: httpLimit})
 	opts := &auth.RequireBearerTokenOptions{Scopes: []string{readScope}, AllowMissingExpiration: true}
 	if reg.oauth != nil {

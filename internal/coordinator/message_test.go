@@ -45,10 +45,10 @@ func TestMessageExternalReceiverAndReply(t *testing.T) {
 	if e != nil || !page.Sessions[0].Messaging {
 		t.Fatalf("receiver missing: %+v %v", page, e)
 	}
-	if _, e = r.SendMessage(disabled, wire.MessageSendInput{To: ref, Text: "x"}); e == nil {
+	if _, e = r.SendMessage(disabled, wire.MessageSendInput{To: wire.SessionRecipient(ref), Text: "x"}); e == nil {
 		t.Fatal("disabled sender accepted")
 	}
-	input := wire.MessageSendInput{To: ref, Text: "hello", RequestID: "request"}
+	input := wire.MessageSendInput{To: wire.SessionRecipient(ref), Text: "hello", RequestID: "request"}
 	m, e := r.SendMessage(a, input)
 	if e != nil {
 		t.Fatal(e)
@@ -110,11 +110,11 @@ func TestMessageReverseAndFencing(t *testing.T) {
 		t.Fatal(e)
 	}
 	from := &wire.MessageCaller{ConnectorID: src.ConnectorID, Incarnation: src.Incarnation, Ref: source}
-	m, e := r.SendMessage(a, wire.MessageSendInput{To: pub.Sessions[0].Ref, Text: "hello", Caller: from})
+	m, e := r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(pub.Sessions[0].Ref), Text: "hello", Caller: from})
 	if e != nil {
 		t.Fatal(e)
 	}
-	if m.Sender != source.NativeSessionID || m.From == nil || m.From.Key() != source.Key() {
+	if m.Sender != source.NativeSessionID || m.From == nil || m.From.Key() != wire.SessionRecipient(source).Key() {
 		t.Fatalf("bound sender lost its exact session identity: %+v", m)
 	}
 	target := &wire.MessageCaller{ConnectorID: recv.ConnectorID, Incarnation: recv.Incarnation, Ref: pub.Sessions[0].Ref}
@@ -122,10 +122,10 @@ func TestMessageReverseAndFencing(t *testing.T) {
 		t.Fatal(e)
 	}
 	reply, e := r.ReplyMessage(b, wire.MessageReplyInput{ReplyID: m.ID, Text: "back", Caller: target})
-	if e != nil || reply.To == nil || reply.To.Key() != source.Key() {
+	if e != nil || reply.To == nil || reply.To.Key() != wire.SessionRecipient(source).Key() {
 		t.Fatalf("reverse: %+v %v", reply, e)
 	}
-	if reply.Sender != pub.Sessions[0].Ref.NativeSessionID || reply.From == nil || reply.From.Key() != pub.Sessions[0].Ref.Key() {
+	if reply.Sender != pub.Sessions[0].Ref.NativeSessionID || reply.From == nil || reply.From.Key() != wire.SessionRecipient(pub.Sessions[0].Ref).Key() {
 		t.Fatalf("reply sender lost its exact session identity: %+v", reply)
 	}
 	batch, e := r.Poll(a, wire.ConnectorPoll{ConnectorID: src.ConnectorID, Incarnation: src.Incarnation})
@@ -157,20 +157,20 @@ func TestMessageCapacityAndExpiry(t *testing.T) {
 		t.Fatal(e)
 	}
 	for i := range 32 {
-		if _, e := r.SendMessage(a, wire.MessageSendInput{To: pub.Sessions[0].Ref, Text: fmt.Sprint(i)}); e != nil {
+		if _, e := r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(pub.Sessions[0].Ref), Text: fmt.Sprint(i)}); e != nil {
 			t.Fatal(e)
 		}
 	}
-	if _, e := r.SendMessage(a, wire.MessageSendInput{To: pub.Sessions[0].Ref, Text: "overflow"}); e == nil {
+	if _, e := r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(pub.Sessions[0].Ref), Text: "overflow"}); e == nil {
 		t.Fatal("target capacity not enforced")
 	}
 	for _, m := range r.messages {
 		m.created = time.Now().Add(-11 * time.Minute)
 	}
-	if _, e := r.SendMessage(a, wire.MessageSendInput{To: pub.Sessions[0].Ref, Text: strings.Repeat("x", 8193)}); e == nil {
+	if _, e := r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(pub.Sessions[0].Ref), Text: strings.Repeat("x", 8193)}); e == nil {
 		t.Fatal("oversized text accepted")
 	}
-	if _, e := r.SendMessage(a, wire.MessageSendInput{To: pub.Sessions[0].Ref, Text: "after expiry"}); e != nil {
+	if _, e := r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(pub.Sessions[0].Ref), Text: "after expiry"}); e != nil {
 		t.Fatal(e)
 	}
 }
@@ -194,7 +194,7 @@ func TestMessageReceiverClaimsAndRecordLimit(t *testing.T) {
 	if _, e := r.Announce(b, forged); e == nil {
 		t.Fatal("competing receiver")
 	}
-	m, e := r.SendMessage(a, wire.MessageSendInput{To: pub.Sessions[0].Ref, Text: "question"})
+	m, e := r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(pub.Sessions[0].Ref), Text: "question"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -228,7 +228,7 @@ func TestMessageGlobalAndReplyBounds(t *testing.T) {
 		t.Fatal(e)
 	}
 	ref := pub.Sessions[0].Ref
-	root, e := r.SendMessage(a, wire.MessageSendInput{To: ref, Text: "root"})
+	root, e := r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(ref), Text: "root"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -255,11 +255,11 @@ func TestMessageGlobalAndReplyBounds(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if _, err = r.SendMessage(a, wire.MessageSendInput{To: ref, Text: "x"}); err != nil {
+		if _, err = r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(ref), Text: "x"}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, e = r.SendMessage(a, wire.MessageSendInput{To: ref, Text: "overflow"}); e == nil {
+	if _, e = r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(ref), Text: "overflow"}); e == nil {
 		t.Fatal("global bound not enforced")
 	}
 }
@@ -272,7 +272,7 @@ func TestMessageReplyRequiresDispatch(t *testing.T) {
 	caller := &wire.MessageCaller{ConnectorID: recv.ConnectorID, Incarnation: recv.Incarnation, Ref: ref}
 	poll := wire.ConnectorPoll{ConnectorID: recv.ConnectorID, Incarnation: recv.Incarnation}
 	send := func() wire.Message {
-		m, e := r.SendMessage(a, wire.MessageSendInput{To: ref, Text: "hello"})
+		m, e := r.SendMessage(a, wire.MessageSendInput{To: wire.SessionRecipient(ref), Text: "hello"})
 		if e != nil {
 			t.Fatal(e)
 		}

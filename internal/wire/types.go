@@ -356,9 +356,9 @@ type MessageCaller struct {
 	Ref         SessionRef `json:"ref"`
 }
 type MessageSendParams struct {
-	To        SessionRef `json:"to"`
-	Text      string     `json:"text"`
-	RequestID string     `json:"requestId,omitempty"`
+	To        RecipientRef `json:"to"`
+	Text      string       `json:"text"`
+	RequestID string       `json:"requestId,omitempty"`
 }
 type MessageReplyParams struct {
 	ReplyID   string `json:"replyId"`
@@ -366,7 +366,7 @@ type MessageReplyParams struct {
 	RequestID string `json:"requestId,omitempty"`
 }
 type MessageSendInput struct {
-	To        SessionRef     `json:"to"`
+	To        RecipientRef   `json:"to"`
 	Text      string         `json:"text"`
 	RequestID string         `json:"requestId,omitempty"`
 	Caller    *MessageCaller `json:"caller,omitempty"`
@@ -381,15 +381,15 @@ type MessageGetInput struct {
 	MessageID string `json:"messageId"`
 }
 type Message struct {
-	ID        string      `json:"id"`
-	Sender    string      `json:"sender"`
-	From      *SessionRef `json:"from,omitempty"`
-	To        *SessionRef `json:"to,omitempty"`
-	Text      string      `json:"text"`
-	InReplyTo string      `json:"inReplyTo,omitempty"`
-	CreatedAt float64     `json:"createdAt"`
-	ExpiresAt float64     `json:"expiresAt"`
-	Status    string      `json:"status"`
+	ID        string        `json:"id"`
+	Sender    string        `json:"sender"`
+	From      *RecipientRef `json:"from,omitempty"`
+	To        *RecipientRef `json:"to,omitempty"`
+	Text      string        `json:"text"`
+	InReplyTo string        `json:"inReplyTo,omitempty"`
+	CreatedAt float64       `json:"createdAt"`
+	ExpiresAt float64       `json:"expiresAt"`
+	Status    string        `json:"status"`
 }
 type MessageRecord struct {
 	Message Message   `json:"message"`
@@ -400,4 +400,41 @@ type ConnectorMessageAck struct {
 	Incarnation string `json:"incarnation"`
 	MessageID   string `json:"messageId"`
 	Status      string `json:"status"`
+}
+
+type HostedEventArguments struct {
+	Name string `json:"name"`
+}
+type HostedEventDelivery struct {
+	Mode   string `json:"mode"`
+	URL    string `json:"url"`
+	Secret string `json:"secret,omitempty"`
+}
+type HostedEventSubscribeInput struct {
+	Name      string               `json:"name"`
+	Arguments HostedEventArguments `json:"arguments"`
+	Delivery  HostedEventDelivery  `json:"delivery"`
+	Cursor    *string              `json:"cursor,omitempty"`
+	TTLMS     *int64               `json:"ttlMs,omitempty"`
+}
+type HostedEventUnsubscribeInput struct {
+	Name      string               `json:"name"`
+	Arguments HostedEventArguments `json:"arguments"`
+	Delivery  HostedEventDelivery  `json:"delivery"`
+}
+type HostedEventSubscribeOutput struct {
+	ID            string  `json:"id"`
+	RefreshBefore string  `json:"refreshBefore"`
+	Cursor        *string `json:"cursor"`
+	Truncated     bool    `json:"truncated"`
+}
+type HostedEventData struct {
+	Message Message `json:"message"`
+}
+type HostedEventEnvelope struct {
+	EventID   string          `json:"eventId"`
+	Name      string          `json:"name"`
+	Timestamp string          `json:"timestamp"`
+	Data      HostedEventData `json:"data"`
+	Cursor    *string         `json:"cursor"`
 }

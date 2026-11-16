@@ -29,8 +29,10 @@ const hostedLimit = 128
 const hostedBodyLimit = 65536
 
 type hostedSubscription struct {
-	ID, Owner, PrincipalID, Name, URL, Secret string
-	ExpiresAt                                 time.Time
+	ID, Generation, Owner, PrincipalID, Name, URL, Secret string
+	PreviousSecret                                        string
+	PreviousSecretUntil                                   time.Time
+	ExpiresAt                                             time.Time
 }
 
 type hostedStore struct {
@@ -40,11 +42,21 @@ type hostedStore struct {
 }
 
 func validHostedSubscription(s hostedSubscription) bool {
-	if len(s.ID) == 0 || len(s.ID) > 128 || len(s.Owner) == 0 || len(s.Owner) > 256 || len(s.PrincipalID) == 0 || len(s.PrincipalID) > 256 || len(s.Name) == 0 || len(s.Name) > 256 || len(s.URL) > 2048 || s.ExpiresAt.IsZero() {
+	if len(s.ID) == 0 || len(s.ID) > 128 || strings.ContainsAny(s.ID, "\r\n") || len(s.Generation) == 0 || len(s.Generation) > 128 || strings.ContainsAny(s.Generation, "\r\n") || len(s.Owner) == 0 || len(s.Owner) > 256 || len(s.PrincipalID) == 0 || len(s.PrincipalID) > 256 || len(s.Name) == 0 || len(s.Name) > 256 || len(s.URL) > 2048 || s.ExpiresAt.IsZero() {
 		return false
 	}
-	_, err := hostedKey(s.Secret)
-	return err == nil && validHostedURL(s.URL) != nil
+	if _, err := hostedKey(s.Secret); err != nil {
+		return false
+	}
+	if (s.PreviousSecret == "") != s.PreviousSecretUntil.IsZero() || s.PreviousSecretUntil.After(s.ExpiresAt) {
+		return false
+	}
+	if s.PreviousSecret != "" {
+		if _, err := hostedKey(s.PreviousSecret); err != nil {
+			return false
+		}
+	}
+	return validHostedURL(s.URL) != nil
 }
 
 func openHostedStore(directory string) (*hostedStore, error) {
@@ -71,13 +83,15 @@ func openHostedStore(directory string) (*hostedStore, error) {
 	if err = dec.Decode(new(any)); err != io.EOF {
 		return nil, errors.New("invalid hosted state")
 	}
+	seen := make(map[string]struct{}, len(records))
 	for _, sub := range records {
 		if !validHostedSubscription(sub) {
 			return nil, errors.New("invalid hosted state")
 		}
-		if _, exists := s.subscriptions[sub.ID]; exists {
+		if _, exists := seen[sub.ID]; exists {
 			return nil, errors.New("duplicate hosted subscription")
 		}
+		seen[sub.ID] = struct{}{}
 		if sub.ExpiresAt.After(time.Now()) {
 			s.subscriptions[sub.ID] = sub
 		}
@@ -148,6 +162,9 @@ func (s *hostedStore) put(sub hostedSubscription) error {
 		if existing.ExpiresAt.After(time.Now()) {
 			next[id] = existing
 		}
+	}
+	if existing, ok := next[sub.ID]; ok && (existing.Generation != sub.Generation || existing.Owner != sub.Owner || existing.PrincipalID != sub.PrincipalID || existing.URL != sub.URL || existing.Name != sub.Name) {
+		return errors.New("hosted subscription identity mismatch")
 	}
 	next[sub.ID] = sub
 	if len(next) > hostedLimit {
@@ -301,24 +318,37 @@ func newHostedDelivery(callbackHosts []string) (*hostedDelivery, error) {
 func (d *hostedDelivery) send(ctx context.Context, sub hostedSubscription, id string, body []byte) ([]byte, int, error) {
 	u := validHostedURL(sub.URL)
 	key, err := hostedKey(sub.Secret)
-	if u == nil || err != nil || len(id) == 0 || len(id) > 256 || strings.ContainsAny(id, ".\r\n") || len(body) > hostedBodyLimit || !sub.ExpiresAt.After(time.Now()) {
+	now := time.Now()
+	if u == nil || err != nil || !validHostedSubscription(sub) || len(id) == 0 || len(id) > 256 || strings.ContainsAny(id, ".\r\n") || len(body) > hostedBodyLimit || !sub.ExpiresAt.After(now) {
 		return nil, 0, errors.New("invalid callback request")
 	}
 	if _, ok := d.hosts[u.Hostname()]; !ok {
 		return nil, 0, errors.New("callback host not allowed")
 	}
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	timestamp := strconv.FormatInt(now.Unix(), 10)
 	mac := hmac.New(sha256.New, key)
 	fmt.Fprintf(mac, "%s.%s.", id, timestamp)
 	mac.Write(body)
+	signature := "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	if sub.PreviousSecret != "" && sub.PreviousSecretUntil.After(now) {
+		previousKey, err := hostedKey(sub.PreviousSecret)
+		if err != nil {
+			return nil, 0, errors.New("invalid callback request")
+		}
+		mac = hmac.New(sha256.New, previousKey)
+		fmt.Fprintf(mac, "%s.%s.", id, timestamp)
+		mac.Write(body)
+		signature += " v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sub.URL, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, errors.New("invalid callback request")
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-MCP-Subscription-Id", sub.ID)
 	req.Header.Set("webhook-id", id)
 	req.Header.Set("webhook-timestamp", timestamp)
-	req.Header.Set("webhook-signature", "v1,"+base64.StdEncoding.EncodeToString(mac.Sum(nil)))
+	req.Header.Set("webhook-signature", signature)
 	resp, err := d.client.Do(req)
 	if err != nil {
 		return nil, 0, errors.New("callback request failed")
@@ -340,8 +370,9 @@ func (d *hostedDelivery) verify(ctx context.Context, sub hostedSubscription) err
 	}
 	challenge := base64.RawURLEncoding.EncodeToString(nonce[:])
 	body, err := json.Marshal(struct {
+		Type      string `json:"type"`
 		Challenge string `json:"challenge"`
-	}{challenge})
+	}{"verification", challenge})
 	if err != nil {
 		return errors.New("challenge generation failed")
 	}

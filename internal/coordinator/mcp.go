@@ -11,12 +11,13 @@ import (
 )
 
 type mcpReader struct {
-	list    func(context.Context, *mcp.CallToolRequest, wire.SessionListInput) (wire.SessionListOutput, error)
-	inspect func(context.Context, *mcp.CallToolRequest, wire.SessionRef) (wire.SessionInspection, error)
-	send    func(context.Context, *mcp.CallToolRequest, wire.MessageSendInput) (wire.Message, error)
-	reply   func(context.Context, *mcp.CallToolRequest, wire.MessageReplyInput) (wire.Message, error)
-	get     func(context.Context, *mcp.CallToolRequest, wire.MessageGetInput) (wire.MessageRecord, error)
-	bound   bool
+	list       func(context.Context, *mcp.CallToolRequest, wire.SessionListInput) (wire.SessionListOutput, error)
+	recipients func(context.Context, *mcp.CallToolRequest, wire.RecipientListInput) (wire.RecipientListOutput, error)
+	inspect    func(context.Context, *mcp.CallToolRequest, wire.SessionRef) (wire.SessionInspection, error)
+	send       func(context.Context, *mcp.CallToolRequest, wire.MessageSendInput) (wire.Message, error)
+	reply      func(context.Context, *mcp.CallToolRequest, wire.MessageReplyInput) (wire.Message, error)
+	get        func(context.Context, *mcp.CallToolRequest, wire.MessageGetInput) (wire.MessageRecord, error)
+	bound      bool
 }
 
 func toolResult(v any, err error) *mcp.CallToolResult {
@@ -76,6 +77,8 @@ func makeMCP(reader mcpReader, options *mcp.ServerOptions) *mcp.Server {
 	inspectIn, _ := wire.Schema("SessionInspectInput")
 	listOut, _ := wire.Schema("SessionListOutput")
 	inspectOut, _ := wire.Schema("SessionInspection")
+	recipientIn, _ := wire.Schema("RecipientListInput")
+	recipientOut, _ := wire.Schema("RecipientListOutput")
 	output := func(inner *jsonschema.Schema) *jsonschema.Schema {
 		return &jsonschema.Schema{Type: "object", Properties: map[string]*jsonschema.Schema{"result": inner}, Required: []string{"result"}}
 	}
@@ -85,6 +88,17 @@ func makeMCP(reader mcpReader, options *mcp.ServerOptions) *mcp.Server {
 			return toolResult(nil, failure(400, "Invalid inspection request or response")), nil
 		}
 		out, e := reader.list(ctx, req, in)
+		return toolResult(out, e), nil
+	})
+	s.AddTool(&mcp.Tool{Name: "recipient.list", Description: "List available exact messaging recipients", InputSchema: recipientIn, OutputSchema: output(recipientOut), Annotations: annotations}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		in, e := wire.Decode[wire.RecipientListInput](bytes.NewReader(req.Params.Arguments), httpLimit)
+		if e != nil {
+			return toolResult(nil, failure(400, "Invalid recipient request")), nil
+		}
+		if reader.recipients == nil {
+			return toolResult(nil, failure(503, "Recipient discovery unavailable")), nil
+		}
+		out, e := reader.recipients(ctx, req, in)
 		return toolResult(out, e), nil
 	})
 	s.AddTool(&mcp.Tool{Name: "session.inspect", Description: "Inspect a native session", InputSchema: inspectIn, OutputSchema: output(inspectOut), Annotations: annotations}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -104,7 +118,7 @@ func makeMCP(reader mcpReader, options *mcp.ServerOptions) *mcp.Server {
 	getIn, _ := wire.Schema("MessageGetInput")
 	messageOut, _ := wire.Schema("Message")
 	recordOut, _ := wire.Schema("MessageRecord")
-	s.AddTool(&mcp.Tool{Name: "message.send", Description: "Send to the exact intended session ref supplied by the user or task launch. Never infer a parent/recipient from project, label, cwd or a shared credential; if its receiver is unavailable, stop rather than choosing another session. Unbound clients have no agent identity. This has side effects.", InputSchema: sendIn, OutputSchema: output(messageOut)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.AddTool(&mcp.Tool{Name: "message.send", Description: "Send to the exact recipient ref supplied by the user or task launch. Never infer a recipient; if unavailable, stop. This has side effects.", InputSchema: sendIn, OutputSchema: output(messageOut)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var in wire.MessageSendInput
 		var e error
 		if reader.bound {
@@ -149,6 +163,8 @@ func makeMCP(reader mcpReader, options *mcp.ServerOptions) *mcp.Server {
 func ServeMCP(ctx context.Context, client *Client) error {
 	s := makeMCP(mcpReader{list: func(ctx context.Context, _ *mcp.CallToolRequest, in wire.SessionListInput) (wire.SessionListOutput, error) {
 		return client.List(ctx, in)
+	}, recipients: func(ctx context.Context, _ *mcp.CallToolRequest, in wire.RecipientListInput) (wire.RecipientListOutput, error) {
+		return client.Recipients(ctx, in)
 	}, inspect: func(ctx context.Context, _ *mcp.CallToolRequest, ref wire.SessionRef) (wire.SessionInspection, error) {
 		return client.Inspect(ctx, ref)
 	}, bound: true, send: func(ctx context.Context, _ *mcp.CallToolRequest, in wire.MessageSendInput) (wire.Message, error) {

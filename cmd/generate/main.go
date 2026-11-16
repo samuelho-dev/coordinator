@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	names := []string{"SessionRef", "RecipientRef", "Recipient", "RecipientListInput", "RecipientListOutput", "InspectorHostedConfig", "InspectorConfig", "ConnectorConfig", "SessionPresence", "SessionInspection", "SessionListInput", "SessionListOutput", "SessionInspectInput", "ListMachine", "ListSession", "NativeSnapshot", "NativeEvent", "NativeNotice", "NativeMessage", "MessageCaller", "MessageSendParams", "MessageReplyParams", "MessageSendInput", "MessageReplyInput", "MessageGetInput", "Message", "MessageRecord", "ConnectorMessageAck"}
+	names := []string{"SessionRef", "RecipientRef", "Recipient", "RecipientListInput", "RecipientListOutput", "InspectorHostedConfig", "InspectorConfig", "ConnectorConfig", "SessionPresence", "SessionInspection", "SessionListInput", "SessionListOutput", "SessionInspectInput", "ListMachine", "ListSession", "NativeSnapshot", "NativeEvent", "NativeNotice", "NativeMessage", "MessageCaller", "MessageSendParams", "MessageReplyParams", "MessageSendInput", "MessageReplyInput", "MessageGetInput", "Message", "MessageRecord", "ConnectorMessageAck", "HostedEventArguments", "HostedEventDelivery", "HostedEventSubscribeInput", "HostedEventUnsubscribeInput", "HostedEventSubscribeOutput", "HostedEventData", "HostedEventEnvelope"}
 	sort.Strings(names)
 	defs := map[string]*jsonschema.Schema{}
 	properties := map[string]*jsonschema.Schema{}

@@ -40,19 +40,20 @@ type NativeError struct {
 	Message string `json:"message"`
 }
 type NativeMessage struct {
-	Version  int                  `json:"version"`
-	ID       string               `json:"id,omitempty"`
-	Method   string               `json:"method,omitempty"`
-	Snapshot *NativeSnapshot      `json:"snapshot,omitempty"`
-	Ref      *SessionRef          `json:"ref,omitempty"`
-	Input    *SessionListInput    `json:"input,omitempty"`
-	Result   json.RawMessage      `json:"result,omitempty"`
-	Error    *NativeError         `json:"error,omitempty"`
-	Notice   *NativeNotice        `json:"notice,omitempty"`
-	Status   *ProgramStatus       `json:"status,omitempty"`
-	Message  *Message             `json:"message,omitempty"`
-	Send     *MessageSendParams   `json:"send,omitempty"`
-	Reply    *MessageReplyParams  `json:"reply,omitempty"`
-	Get      *MessageGetInput     `json:"get,omitempty"`
-	Ack      *ConnectorMessageAck `json:"ack,omitempty"`
+	Version    int                  `json:"version"`
+	ID         string               `json:"id,omitempty"`
+	Method     string               `json:"method,omitempty"`
+	Snapshot   *NativeSnapshot      `json:"snapshot,omitempty"`
+	Ref        *SessionRef          `json:"ref,omitempty"`
+	Input      *SessionListInput    `json:"input,omitempty"`
+	Recipients *RecipientListInput  `json:"recipients,omitempty"`
+	Result     json.RawMessage      `json:"result,omitempty"`
+	Error      *NativeError         `json:"error,omitempty"`
+	Notice     *NativeNotice        `json:"notice,omitempty"`
+	Status     *ProgramStatus       `json:"status,omitempty"`
+	Message    *Message             `json:"message,omitempty"`
+	Send       *MessageSendParams   `json:"send,omitempty"`
+	Reply      *MessageReplyParams  `json:"reply,omitempty"`
+	Get        *MessageGetInput     `json:"get,omitempty"`
+	Ack        *ConnectorMessageAck `json:"ack,omitempty"`
 }

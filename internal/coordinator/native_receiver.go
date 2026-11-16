@@ -91,7 +91,7 @@ func RunReceiver(ctx context.Context, cfg Config, harness string, sessionID stri
 			if e := checkHost(ctx); e != nil {
 				return "unknown", e
 			}
-			if message.To == nil || message.To.Key() != ref.Key() {
+			if message.To == nil || message.To.Kind != "session" || message.To.Session == nil || message.To.Session.Key() != ref.Key() {
 				return "refused", nil
 			}
 			id, e := connectorID()

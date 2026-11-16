@@ -170,7 +170,7 @@ func RunNative(ctx context.Context, cfg Config, harness string, pid int, in io.R
 		observerMu.Lock()
 		p, err := observer.presence()
 		observerMu.Unlock()
-		if err != nil || message.To == nil || p.Ref.Key() != message.To.Key() {
+		if err != nil || message.To == nil || message.To.Kind != "session" || message.To.Session == nil || p.Ref.Key() != message.To.Session.Key() {
 			return "refused", nil
 		}
 		id, err := connectorID()
@@ -391,7 +391,7 @@ func RunNative(ctx context.Context, cfg Config, harness string, pid int, in io.R
 					default:
 					}
 				}
-			case "list", "inspect", "message.send", "message.reply", "message.get":
+			case "list", "recipients", "inspect", "message.send", "message.reply", "message.get":
 				if m.ID == "" {
 					return errors.New("missing request id")
 				}
@@ -435,6 +435,13 @@ func RunNative(ctx context.Context, cfg Config, harness string, pid int, in io.R
 							return
 						}
 						v, e := client.List(c, *m.Input)
+						respond(m.ID, v, e)
+					} else if m.Method == "recipients" {
+						if m.Recipients == nil {
+							respond(m.ID, nil, errors.New("missing input"))
+							return
+						}
+						v, e := client.Recipients(c, *m.Recipients)
 						respond(m.ID, v, e)
 					} else if m.Method == "message.send" {
 						if m.Send == nil {

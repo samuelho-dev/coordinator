@@ -48,13 +48,21 @@ For a hosted MCP client, optionally add `oauth` to the private inspector server 
     "issuer": "https://idp.example.net",
     "jwksUrl": "https://idp.example.net/.well-known/jwks.json",
     "bindings": [{"subject": "IDP_SUBJECT", "principalId": "hosted"}]
+  },
+  "hosted": {
+    "stateDirectory": "/var/lib/coordinator",
+    "callbackHosts": ["callbacks.example.net"]
   }
 }
 ```
 
-The `resource` is the exact public `/mcp` URL; issuer and JWKS URL require HTTPS except for loopback tests. The IdP issues [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access tokens with `typ: at+jwt`, RS256 or ES256 signature, exact issuer and resource audience, expiration and an allowlisted subject; `nbf` is honored. Scopes are a space-separated `scope` string or an `scp` string array (Authelia); tokens containing both are rejected. `coordinator:read` is required for MCP access. `message.send` also requires `coordinator:message` and the bound principal's `messaging: true`; `message.get` is limited to an original participant. OAuth cannot publish presence, access health or connector routes, enroll, provide a caller identity or send bound replies.
+The `resource` is the exact public `/mcp` URL; issuer and JWKS URL require HTTPS except for loopback tests. The IdP issues [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) JWT access tokens with `typ: at+jwt`, RS256 or ES256 signature, exact issuer and resource audience, expiration and an allowlisted subject; `nbf` is honored. Scopes are a space-separated `scope` string or an `scp` string array (Authelia); tokens containing both are rejected. `coordinator:read` is required for MCP access; messaging also requires `coordinator:message` and the bound principal's `messaging: true`. OAuth cannot publish presence, access health or connector routes, enroll, or claim a native caller identity.
 
 Protected-resource metadata advertises `coordinator:read`, adding `coordinator:message` only when an OAuth-bound principal has messaging enabled. Native bearer messaging permissions do not add OAuth scopes. Keep a read-only hosted client's allowed API scope at `coordinator:read`; after a metadata change, refresh the hosted connector's metadata before reconnecting.
+
+The optional `hosted` configuration enables event subscriptions on supported ChatGPT Work surfaces. Use a durable, owner-controlled 0700 directory and exact operator-approved lowercase callback DNS hosts; wildcards and private callback targets are not allowed. The example's OAuth-bound `hosted` principal has messaging enabled, and its IdP token needs both `coordinator:read` and `coordinator:message`. Subscribe to `message.received` with arguments `{"name":"My destination"}` and an approved webhook delivery. Subscriptions and hosted message/reply correlation are persisted; native-only messages and presence are volatile. Callback acceptance does not prove a model processed the message. Replies are authorized to the authenticated account, not verified as originating from the original ChatGPT chat.
+
+Active subscription refresh preserves outstanding messages. Unsubscribe or expiry permanently revokes that lifecycle's delivery and reply authority, even if the same destination is subscribed again. Queued hosted replies survive inspector restart only for the exact original native connector/incarnation; replacements cannot inherit them.
 
 Use an external IdP for authorization code with [S256 PKCE](https://www.rfc-editor.org/rfc/rfc7636), refresh and client registration or pre-registration; Coordinator is not a login server. Follow [MCP authorization](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) and configure the public gateway to allow only `/mcp`, `/.well-known/oauth-protected-resource`, and `/.well-known/oauth-protected-resource/mcp`; keep native routes and probes private. Never put tokens, client secrets or other credentials in URLs, logs or Git.
 
@@ -102,12 +110,13 @@ The destination must be new and its parent private. The installer stages a binar
 
 ```sh
 coordinator list
+coordinator recipients
 printf '%s\n' '{"ref":{"machineId":"installation-uuid","harness":"omp","nativeSessionId":"session-id"}}' | coordinator inspect
 ```
 
-Copy the complete `ref` from a listed session, including `nativeAgentId` when present. Pi/OMP also provide `/coordinator list` without starting a model turn.
+Copy the complete `ref` from a listed session, including `nativeAgentId` when present. Pi/OMP also provide `/coordinator list` without starting a model turn. Use `coordinator recipients` or `recipient.list` to discover available native and subscribed hosted destinations; native sessions remain separately available for metrics.
 
-Lists return `{machines, sessions, nextCursor}`. CLI and slash-list displays drain pages; Pi's `coordinator_session_list` and MCP `session.list` preserve pagination with `limit` (1–100), optional `cursor`, `machineId` and `repository` (the exact remote Git common-directory path). `session.inspect` accepts the complete ref. HTTP MCP is at `/mcp`; `coordinator mcp` provides stdio.
+Session lists return `{machines, sessions, nextCursor}`. CLI and slash-list displays drain pages; Pi's `coordinator_session_list` and MCP `session.list` preserve pagination with `limit` (1–100), optional `cursor`, `machineId` and `repository` (the exact remote Git common-directory path). `recipient.list` also accepts `limit` and optional `cursor`. `session.inspect` accepts the complete ref. HTTP MCP is at `/mcp`; `coordinator mcp` provides stdio.
 
 ### Peer messaging
 
@@ -115,18 +124,27 @@ Messaging is off by default. Enable it independently on the server principal (`i
 
 ```sh
 coordinator message send <<'JSON'
-{"to":{"machineId":"installation-uuid","harness":"pi","nativeSessionId":"session-id"},"text":"Please review this change","requestId":"request-1"}
+{"to":{"kind":"session","session":{"machineId":"installation-uuid","harness":"pi","nativeSessionId":"session-id"}},"text":"Please review this change","requestId":"request-1"}
 JSON
 coordinator message get <<'JSON'
 {"messageId":"message-id"}
 JSON
 ```
 
-Pi/OMP support native send and correlated reply tools. Claude's receiver is a development preview requiring the printed development-channel activation command. Hermes requires its staged plugin, `plugins.entries.coordinator.allow_gateway_injection: true`, the same client configuration in the gateway, and `/coordinator enable` in the actual session. Codex supports unbound send/get, not receive or bound replies.
+Pi/OMP support native send and correlated reply tools. Claude's receiver is a development preview requiring the printed development-channel activation command. Hermes requires its staged plugin, `plugins.entries.coordinator.allow_gateway_injection: true`, the same client configuration in the gateway, and `/coordinator enable` in the actual session.
 
-Peer text is not user approval or system instruction. Receivers reply using the original message ID as `replyId`; host tools supply caller identity. `accepted` means native admission, not completion. Delivery expires after 10 minutes; records last up to 30 minutes. Discovery and mailboxes are in memory and are lost on inspector restart.
+Codex uses the normal MCP bridge by default, with unbound send/get. To opt into messaging with a shared, already running Codex app-server, resolve its chosen listener symlink and stage with the actual socket path:
 
-The public `sender` is the verified native session ID, or `unbound` for CLI/stdio/OAuth clients without a native caller binding; it is never the credential/principal ID. `from` carries the complete bound session ref. Select a peer only from an exact user-supplied or launch-bound ref, not a shared credential name, project, cwd or title. If the intended parent has no receiver, use the existing task terminal or issue rather than another session.
+```sh
+SOCKET="$(realpath /chosen/server.sock)"
+coordinator install --target codex --messaging --codex-socket "$SOCKET" --destination "$PRIVATE/codex-host"
+```
+
+Merge the generated settings and approve hooks. The resolved socket must be owned by the native user, mode 0600, in a private owned directory; the exact thread must be loaded on that shared host. An unsafe socket, embedded server, or unreachable server fails closed. Installation does not change socket permissions or start, restart, resume, or create a server.
+
+Peer text is not user approval or system instruction. Native receivers reply using the original message ID as `replyId`; host tools supply exact native caller identity. `accepted` means transport admission, not completion. Delivery expires after 10 minutes; records last up to 30 minutes. Native-only message records and native discovery are in memory and are lost on inspector restart; hosted message and reply correlation is persisted.
+
+`recipient.list` returns discriminated refs: `kind: "session"` with the complete native session ref, or `kind: "subscription"` with `subscriptionId` for an active hosted callback. Native `from` identifies the verified bound session; an OAuth sender is attributed to the authenticated principal, not a verified ChatGPT chat. Select native peers by exact ref, not a shared credential name, project, cwd or title. If the intended parent has no receiver, use the existing task terminal or issue rather than another session.
 
 ## Metrics and provenance
 
@@ -137,6 +155,8 @@ CPU/RSS capacity percentages use that execution scope's capacity. Shared process
 ### Coordinated migration
 
 Inspectors, adapters, MCP bridges and connectors require compatible strict contracts; MCP negotiation does not negotiate tool schemas. Update them together, explicitly restart affected services and reload native hosts/new sessions. Existing sessions retain loaded code. Preserve existing broker/PVC state; a source update is not authorization to delete it.
+
+The beta.15 recipient contract changes `message.send.to` and message `from`/`to` from native session refs to discriminated recipient refs. Deploy the inspector and native readers/adapters together; beta.14 callers are not compatible with this message shape.
 
 ## Source
 

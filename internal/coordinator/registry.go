@@ -56,18 +56,24 @@ type cursor struct {
 	expires                           time.Time
 }
 type Registry struct {
-	mu              sync.Mutex
-	principals      map[string]wire.InspectorPrincipal
-	hashes          map[string][]byte
-	connectors      map[string]*connector
-	sessions        map[string]*session
-	pending         map[string]*pending
-	cursors         map[string]cursor
-	receivers       map[string]*connector
-	messages        map[string]*messageEntry
-	messageRequests map[string]messageRequest
-	oauth           *oauthAccess
-	closed          bool
+	mu                 sync.Mutex
+	principals         map[string]wire.InspectorPrincipal
+	hashes             map[string][]byte
+	connectors         map[string]*connector
+	sessions           map[string]*session
+	pending            map[string]*pending
+	cursors            map[string]cursor
+	receivers          map[string]*connector
+	messages           map[string]*messageEntry
+	messageRequests    map[string]messageRequest
+	oauth              *oauthAccess
+	hosted             *hostedAccess
+	hostedErr          error
+	journalAfterRename func() error
+	hostedCancel       context.CancelFunc
+	hostedDone         chan struct{}
+	recipientCursors   map[string]cursor
+	closed             bool
 }
 
 func NewRegistry(cfg wire.InspectorConfig) (*Registry, error) {
@@ -75,6 +81,7 @@ func NewRegistry(cfg wire.InspectorConfig) (*Registry, error) {
 	r.receivers = map[string]*connector{}
 	r.messages = map[string]*messageEntry{}
 	r.messageRequests = map[string]messageRequest{}
+	r.recipientCursors = map[string]cursor{}
 	seen := map[string]bool{}
 	for _, p := range cfg.Principals {
 		var b []byte
@@ -105,6 +112,23 @@ func NewRegistry(cfg wire.InspectorConfig) (*Registry, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	if cfg.Hosted != nil {
+		if r.oauth == nil {
+			return nil, failure(500, "Hosted messaging requires OAuth")
+		}
+		var err error
+		r.hosted, err = newHostedAccess(r, *cfg.Hosted)
+		if err != nil {
+			return nil, err
+		}
+		if err = r.loadHostedMessages(); err != nil {
+			r.hosted.close()
+			return nil, err
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		r.hostedCancel, r.hostedDone = cancel, make(chan struct{})
+		go r.runHostedMessages(ctx)
 	}
 	return r, nil
 }
@@ -187,9 +211,21 @@ func (r *Registry) prune() {
 			delete(r.cursors, id)
 		}
 	}
+	for id, c := range r.recipientCursors {
+		if !now.Before(c.expires) {
+			delete(r.recipientCursors, id)
+		}
+	}
 	r.pruneMessages(now)
 }
 func (r *Registry) Close() {
+	if r.hostedCancel != nil {
+		r.hostedCancel()
+		<-r.hostedDone
+	}
+	if r.hosted != nil {
+		r.hosted.close()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closed = true
@@ -330,6 +366,9 @@ func (r *Registry) Announce(p wire.InspectorPrincipal, in wire.ConnectorAnnounce
 		r.receivers[id] = c
 	}
 	r.invalidateMessages()
+	if r.hostedErr != nil {
+		return ok, r.hostedErr
+	}
 	return ok, nil
 }
 func (r *Registry) shared(owner string) map[string]bool {
@@ -547,11 +586,25 @@ func (r *Registry) Poll(p wire.InspectorPrincipal, in wire.ConnectorPoll) (wire.
 		return out, failure(401, "Unauthorized")
 	}
 	r.prune()
+	if r.hostedErr != nil {
+		return out, r.hostedErr
+	}
 	c := r.find(p, in)
 	if c == nil || !live(c) {
 		return out, failure(409, "Connector must announce presence")
 	}
 	r.pollMessages(c, &out)
+	if r.hosted != nil {
+		for _, message := range out.Messages {
+			if m := r.messages[message.ID]; m != nil && m.reverse.subscriptionID != "" {
+				if _, err := r.saveHostedMessages(); err != nil {
+					r.hostedErr = err
+					return wire.ConnectorPollResult{}, err
+				}
+				break
+			}
+		}
+	}
 	for _, q := range r.pending {
 		if q.connector != c || q.delivered || q.incarnation != c.incarnation {
 			continue
@@ -684,6 +737,9 @@ func (r *Registry) Disconnect(p wire.InspectorPrincipal, in wire.ConnectorDiscon
 	c.disconnected = true
 	c.received = wall()
 	r.invalidateMessages()
+	if r.hostedErr != nil {
+		return ok, r.hostedErr
+	}
 	for _, q := range r.pending {
 		if q.connector == c {
 			r.fail(q, failure(409, "Native session disconnected"))
