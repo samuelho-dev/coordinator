@@ -22,7 +22,7 @@ func TestHostedEventsLifecycle(t *testing.T) {
 	alice := wire.InspectorPrincipal{ID: "alice", Owner: "owner", Messaging: true}
 	bob := wire.InspectorPrincipal{ID: "bob", Owner: "other", Messaging: true}
 	r := &Registry{principals: map[string]wire.InspectorPrincipal{"alice": alice, "bob": bob}, oauth: &oauthAccess{bindings: map[string]wire.InspectorPrincipal{"alice": alice, "bob": bob}}}
-	h, err := newHostedAccess(r, wire.InspectorHostedConfig{StateDirectory: filepath.Join(privateTempDir(t), "events"), CallbackHosts: []string{"example.com"}})
+	h, err := newHostedAccess(r, wire.InspectorHostedConfig{StateDirectory: filepath.Join(privateTempDir(t), "events"), CallbackHosts: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +117,19 @@ func TestHostedEventsLifecycle(t *testing.T) {
 	params := func(key string) map[string]any {
 		return map[string]any{"name": hostedEventName, "arguments": map[string]any{"name": "Chat"}, "delivery": map[string]any{"mode": "webhook", "url": "https://example.com/callback", "secret": key}, "cursor": nil}
 	}
+	denied := call("alice", "events/subscribe", params(secret(1)))
+	deniedError, ok := denied["error"].(map[string]any)
+	if !ok || deniedError["code"] != float64(-32015) {
+		t.Fatalf("missing callback approval error: %v", denied)
+	}
+	data, ok := deniedError["data"].(map[string]any)
+	if !ok || len(data) != 2 || data["reason"] != "host_not_allowed" || data["hostname"] != "example.com" || len(events) != 0 {
+		t.Fatalf("unsafe callback approval response: %v", denied)
+	}
+	if records, err := h.subscriptions.list(); err != nil || len(records) != 0 {
+		t.Fatal("unapproved callback activated a subscription")
+	}
+	h.delivery.hosts["example.com"] = struct{}{}
 	invalid := params(secret(1))
 	invalid["arguments"] = map[string]any{"name": "Chat", "extra": true}
 	if got := call("alice", "events/subscribe", invalid); got["error"] == nil {

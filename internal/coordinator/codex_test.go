@@ -15,12 +15,22 @@ import (
 	"github.com/samuelho-dev/coordinator/internal/wire"
 )
 
-func TestCodexProxyIdentityAndDelivery(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0700); err != nil {
+func codexSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "cx-")
+	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "app.sock")
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir, err = filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dir, "s")
+}
+
+func TestCodexProxyIdentityAndDelivery(t *testing.T) {
+	path := codexSocketPath(t)
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatal(err)
@@ -140,11 +150,7 @@ func TestCodexProxyIdentityAndDelivery(t *testing.T) {
 }
 
 func TestCodexSocketRequiresPrivateOwnedSocket(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "app.sock")
+	path := codexSocketPath(t)
 	listener, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatal(err)

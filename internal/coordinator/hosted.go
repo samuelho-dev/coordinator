@@ -285,7 +285,8 @@ func (h *hostedAccess) subscribe(ctx context.Context, _ *mcp.ServerSession, in *
 		return nil, hostedInvalid()
 	}
 	if _, ok := h.delivery.hosts[u.Hostname()]; !ok {
-		return nil, hostedInvalid()
+		data, _ := json.Marshal(map[string]string{"reason": "host_not_allowed", "hostname": u.Hostname()})
+		return nil, &jsonrpc.Error{Code: -32015, Message: "Callback hostname requires operator approval", Data: data}
 	}
 	ttl := hostedDefaultTTL
 	if in.TTLMS != nil {

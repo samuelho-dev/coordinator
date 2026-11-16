@@ -146,7 +146,7 @@ func constrain(s *jsonschema.Schema, t reflect.Type) {
 		case "recipients":
 			p.MaxItems = n(100)
 		case "callbackHosts":
-			p.MinItems = n(1)
+			p.MinItems = n(0)
 			p.MaxItems = n(256)
 			p.Items.MinLength = n(1)
 			p.Items.MaxLength = n(253)
