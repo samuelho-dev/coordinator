@@ -7,6 +7,12 @@
 {{- $settings := .Values.inspector -}}
 {{- $secret := required "inspector.existingSecret is required" $settings.existingSecret -}}
 {{- $caSecret := .Values.tls.existingCaSecret -}}
+{{- $hostedClaim := $settings.hostedState.existingClaim -}}
+{{- range .Values.legacyStorage.claims -}}
+{{- if and $hostedClaim (eq $hostedClaim .name) }}{{ fail "inspector.hostedState.existingClaim must not name a retained legacy claim" }}{{ end -}}
+{{- end -}}
+{{- $checksumValues := deepCopy .Values -}}
+{{- if not $hostedClaim }}{{- $_ := unset $checksumValues.inspector "hostedState" -}}{{- end -}}
 {{- if hasKey $settings.podAnnotations "checksum/values" }}{{ fail "podAnnotations must not override checksum/values" }}{{ end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -32,7 +38,7 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: inspector
       annotations:
-        checksum/values: {{ toJson .Values | sha256sum }}
+        checksum/values: {{ toJson $checksumValues | sha256sum }}
         {{- with $settings.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -56,6 +62,9 @@ spec:
         runAsGroup: 1000
         runAsNonRoot: true
         fsGroup: 1000
+        {{- if $hostedClaim }}
+        fsGroupChangePolicy: OnRootMismatch
+        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       initContainers:
@@ -107,6 +116,9 @@ spec:
           volumeMounts:
             - {name: config, mountPath: /config, readOnly: true}
             - {name: tmp, mountPath: /tmp}
+            {{- if $hostedClaim }}
+            - {name: hosted-state, mountPath: /var/lib/coordinator, subPath: hosted}
+            {{- end }}
             {{- if $caSecret }}
             - {name: ca, mountPath: /etc/coordinator/ca, readOnly: true}
             {{- end }}
@@ -122,6 +134,11 @@ spec:
           emptyDir: {medium: Memory}
         - name: tmp
           emptyDir: {}
+        {{- if $hostedClaim }}
+        - name: hosted-state
+          persistentVolumeClaim:
+            claimName: {{ $hostedClaim | quote }}
+        {{- end }}
         {{- if $caSecret }}
         - name: ca
           secret:

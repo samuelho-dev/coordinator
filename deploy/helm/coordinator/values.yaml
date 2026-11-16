@@ -16,6 +16,9 @@ inspector:
   deploymentAnnotations: {}
   podAnnotations: {}
   resources: {}
+  hostedState:
+    # Existing, separately managed claim; empty disables the mount.
+    existingClaim: ""
 legacyStorage:
   # REQUIRED operator decision, never inferred from a source/image update:
   # fresh: inventory confirms this release tracks no legacy PVCs; claims stays [].
@@ -28,4 +31,4 @@ legacyStorage:
   # null omits storageClassName; use "" only if live spec explicitly disables it.
   claims: []
 # Operator-owned TLS termination and NetworkPolicies must route to <release>-inspector.
-# No ingress, public Service, database, runner, shared PVC mounts or migrations.
+# No ingress, public Service, database, runner or migrations.

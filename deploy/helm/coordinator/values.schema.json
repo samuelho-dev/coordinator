@@ -40,12 +40,16 @@
     },
     "inspector": {
       "type": "object", "additionalProperties": false,
-      "required": ["existingSecret", "port", "deploymentAnnotations", "podAnnotations", "resources"],
+      "required": ["existingSecret", "port", "deploymentAnnotations", "podAnnotations", "resources", "hostedState"],
       "properties": {
         "existingSecret": {"$ref": "#/definitions/name"},
         "port": {"type": "integer", "minimum": 1, "maximum": 65535},
         "deploymentAnnotations": {"$ref": "#/definitions/strings"},
         "podAnnotations": {"allOf": [{"$ref": "#/definitions/strings"}], "properties": {"checksum/values": false}},
+        "hostedState": {
+          "type": "object", "additionalProperties": false, "required": ["existingClaim"],
+          "properties": {"existingClaim": {"anyOf": [{"const": ""}, {"$ref": "#/definitions/name"}]}}
+        },
         "resources": {
           "type": "object", "additionalProperties": false,
           "properties": {"requests": {"$ref": "#/definitions/quantities"}, "limits": {"$ref": "#/definitions/quantities"}}
