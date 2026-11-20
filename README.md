@@ -1,14 +1,25 @@
 # Coordinator
 
-Self-hosted session inspection and opt-in messaging for Pi, OMP, Claude Code, Codex and Hermes on Linux/macOS.
+A self-hosted MCP server for inspecting and messaging native agent sessions, with a matching CLI and per-host connectors.
+
+It observes Pi, OMP, Claude Code, Codex and Hermes sessions on Linux/macOS across one or more machines. Inspection covers identity, model, activity, workspace and Git context, plus machine/container and session CPU/memory usage. Messaging is opt-in, asynchronous and addressed by exact recipient.
+
+It does not collect transcripts or token/cost telemetry, run agent tasks, or provide remote tool execution.
 
 ## Functionality
 
-- Discover sessions across machines; inspect model, activity, workspace and Git context.
-- Read machine/container and session CPU/memory usage.
-- Discover native messaging recipients, send messages, reply and check delivery.
+**Inspection** — `session.list` and `session.inspect`:
 
-No transcript collection, token/cost telemetry or agent task execution.
+- Discover sessions across machines, filter by machine or Git repository.
+- Read model, activity, workspace, Git, terminal, process and program-status metadata.
+- Read CPU/memory counters from the agent's own machine/container, with explicit availability and provenance.
+
+**Messaging** — `recipient.list`, `message.send`, `message.reply` and `message.get`:
+
+- Discover exact native receivers and hosted subscriptions.
+- Send, reply and track delivery correlation between native agents.
+
+MCP clients (`/mcp` or stdio) and the CLI expose the same operations. Pi/OMP additionally provide `/coordinator list` without a model turn.
 
 ## Install
 
