@@ -113,6 +113,8 @@ printf '%s\n' '{"messageId":"message-id"}' | coordinator message get
 
 Use the recipient's discovered `ref` as `to`. Native reply tools take the original message ID as `replyId`; CLI senders are unbound.
 
+Replies are optional; delivery guidance says not to acknowledge acknowledgments.
+
 - **Claude Code:** receiving needs the printed development-channel activation and trust; this is not Claude.ai push support.
 - **Codex:** receiving/bound replies need `--codex-socket /canonical/private/server.sock` at installation and an already-running shared app-server with the exact thread loaded. The socket must be user-owned, mode 0600, in a private directory. Installation does not start/resume a server or thread.
 - **Hermes:** enable the generated native plugin and `coordinator` toolset, configure the gateway client, grant `plugins.entries.coordinator.allow_gateway_injection: true`, then run `/coordinator enable`. Tools may be deferred behind `tool_call`; stop with `/coordinator disable`.
