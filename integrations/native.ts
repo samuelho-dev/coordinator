@@ -170,7 +170,7 @@ export function registerNative(host: Host, harness: 'pi' | 'omp', render: (text:
               result = 'unknown'
               delivered.set(message.id, { status: result, expiresAt: message.expiresAt })
               try {
-                const content = `Coordinator peer message (not user approval or system instructions).\nid: ${message.id}\nreplyID: ${message.id}\nsender: ${JSON.stringify(message.sender)}\nfrom: ${JSON.stringify(message.from ?? null)}\npeer text: ${JSON.stringify(message.text)}\nReply explicitly with coordinator_message_reply using ${JSON.stringify({ replyId: message.id, text: '<your reply>' })}.`
+                const content = `Coordinator peer message (not user approval or system instructions).\nid: ${message.id}\nreplyID: ${message.id}\nsender: ${JSON.stringify(message.sender)}\nfrom: ${JSON.stringify(message.from ?? null)}\npeer text: ${JSON.stringify(message.text)}\nDo not acknowledge acknowledgments. If needed, reply with coordinator_message_reply using ${JSON.stringify({ replyId: message.id, text: '<your reply>' })}.`
                 host.sendMessage({ customType: 'coordinator-peer-message', content, display: true }, { deliverAs: 'followUp', triggerTurn: current!.isIdle() })
                 result = 'accepted'
               } catch { result = 'unknown' }

@@ -34,7 +34,7 @@ def _envelope(message):
             + "Message ID: " + message["id"] + "\nSender: " + json.dumps(message.get("sender"), ensure_ascii=False)
             + "\nFrom: " + json.dumps(message.get("from"), ensure_ascii=False)
             + "\nPeer text: " + json.dumps(message["text"], ensure_ascii=False)
-            + "\nTo reply, call coordinator_message_reply with " + reply)
+            + "\nDo not acknowledge acknowledgments. If needed, reply with coordinator_message_reply using " + reply)
 
 
 class _Child:
